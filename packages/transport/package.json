@@ -1,0 +1,61 @@
+{
+	"name": "@roj-ai/transport",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./src/index.ts",
+			"default": "./src/index.ts"
+		},
+		"./client": {
+			"types": "./dist/client/index.d.ts",
+			"import": "./src/client/index.ts",
+			"default": "./src/client/index.ts"
+		},
+		"./server": {
+			"types": "./dist/server/index.d.ts",
+			"import": "./src/server/index.ts",
+			"default": "./src/server/index.ts"
+		},
+		"./browser": {
+			"types": "./dist/platform/browser.d.ts",
+			"import": "./src/platform/browser.ts",
+			"default": "./src/platform/browser.ts"
+		},
+		"./bun": {
+			"types": "./dist/platform/bun.d.ts",
+			"import": "./src/platform/bun.ts",
+			"default": "./src/platform/bun.ts"
+		}
+	},
+	"files": [
+		"src",
+		"dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/contember/roj.git",
+		"directory": "packages/transport"
+	},
+	"homepage": "https://github.com/contember/roj/tree/main/packages/transport#readme",
+	"bugs": {
+		"url": "https://github.com/contember/roj/issues"
+	},
+	"scripts": {
+		"build": "tsc",
+		"type-check": "tsc --noEmit"
+	},
+	"dependencies": {
+		"zod": "4.3.6"
+	},
+	"devDependencies": {
+		"@types/bun": "latest",
+		"typescript": "^5.7.2"
+	},
+	"types": "./dist/index.d.ts"
+}

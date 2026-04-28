@@ -1,0 +1,35 @@
+{
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"ts:build": "tsc --build && bun run ts:resolve-aliases",
+		"ts:clean": "tsc --build --clean",
+		"ts:watch": "tsc --build --watch",
+		"ts:resolve-aliases": "for pkg in packages/*/tsconfig.json; do bunx tsc-alias -p \"$pkg\" 2>/dev/null; done",
+		"lint": "biome lint .",
+		"lint:fix": "biome lint . --write"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "catalog:build",
+		"tsc-alias": "^1.8.16",
+		"typescript": "5.9.3"
+	},
+	"workspaces": {
+		"packages": [
+			"packages/*"
+		],
+		"catalog": {
+			"@types/bun": "^1.3.3"
+		},
+		"catalogs": {
+			"build": {
+				"@biomejs/biome": "^2.3.13",
+				"typescript": "^5.9.3"
+			},
+			"libs": {
+				"hono": "^4.10.7",
+				"zod": "^4.1.12"
+			}
+		}
+	}
+}

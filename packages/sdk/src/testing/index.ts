@@ -1,0 +1,7 @@
+export { bootstrapForTesting } from './bootstrap-for-testing.js'
+export { createNodeFileSystem, createNodePlatform, createNodeProcessRunner } from './node-platform.js'
+export { NotificationCollector } from './notification-collector.js'
+export { createMultiAgentPreset, createTestPreset } from './preset-helpers.js'
+export type { TestAgentDefinition } from './preset-helpers.js'
+export { TestHarness, TestSession } from './test-harness.js'
+export { waitForAgentIdle, waitForAllAgentsIdle } from './wait-helpers.js'

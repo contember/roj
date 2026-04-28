@@ -1,0 +1,45 @@
+{
+	"name": "@roj-ai/shared",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./src/index.ts",
+			"default": "./src/index.ts"
+		},
+		"./rpc": {
+			"types": "./dist/rpc/index.d.ts",
+			"import": "./src/rpc/index.ts",
+			"default": "./src/rpc/index.ts"
+		}
+	},
+	"files": [
+		"src",
+		"dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/contember/roj.git",
+		"directory": "packages/shared"
+	},
+	"homepage": "https://github.com/contember/roj/tree/main/packages/shared#readme",
+	"bugs": {
+		"url": "https://github.com/contember/roj/issues"
+	},
+	"scripts": {
+		"type-check": "tsc --noEmit"
+	},
+	"dependencies": {
+		"zod": "catalog:libs"
+	},
+	"devDependencies": {
+		"@roj-ai/sdk": "workspace:*",
+		"typescript": "^5.7.2"
+	},
+	"types": "./dist/index.d.ts"
+}

@@ -1,0 +1,14 @@
+name: Extract info about the version
+description: Resolve npm tag from git tag version
+inputs:
+  version:
+    description: Semver
+    required: true
+outputs:
+  npmTag:
+    description: Resolved tag for NPM
+  versions:
+    description: String of possible tags separated by space
+runs:
+  using: node24
+  main: index.cjs

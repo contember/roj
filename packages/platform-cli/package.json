@@ -1,0 +1,30 @@
+{
+	"name": "@roj-ai/platform-cli",
+	"version": "0.1.0",
+	"type": "module",
+	"bin": {
+		"roj": "./src/main.ts"
+	},
+	"files": [
+		"src",
+		"dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/contember/roj.git",
+		"directory": "packages/platform-cli"
+	},
+	"homepage": "https://github.com/contember/roj/tree/main/packages/platform-cli#readme",
+	"bugs": {
+		"url": "https://github.com/contember/roj/issues"
+	},
+	"dependencies": {
+		"@roj-ai/sandbox-runtime": "workspace:*"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:"
+	}
+}

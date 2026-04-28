@@ -1,0 +1,137 @@
+{
+	"requestHash": "a2d25f26d5351f21",
+	"request": {
+		"url": "https://openrouter.ai/api/v1/chat/completions",
+		"method": "POST",
+		"headers": {
+			"content-type": "application/json"
+		},
+		"body": {
+			"model": "anthropic/claude-haiku-4.5",
+			"messages": [
+				{
+					"role": "system",
+					"content": [
+						{
+							"type": "text",
+							"text": "You have access to tools. Use them as needed. Be brief.",
+							"cache_control": {
+								"type": "ephemeral"
+							}
+						}
+					]
+				},
+				{
+					"role": "user",
+					"content": "What is the weather in Prague?"
+				},
+				{
+					"role": "assistant",
+					"content": "",
+					"tool_calls": [
+						{
+							"id": "call_001",
+							"type": "function",
+							"function": {
+								"name": "get_weather",
+								"arguments": "{\"city\":\"Prague\"}"
+							}
+						}
+					]
+				},
+				{
+					"role": "tool",
+					"content": "Sunny, 22°C",
+					"tool_call_id": "call_001"
+				}
+			],
+			"stream": false,
+			"stream_options": {
+				"include_usage": true
+			},
+			"tools": [
+				{
+					"type": "function",
+					"function": {
+						"name": "get_weather",
+						"description": "Get current weather for a city",
+						"parameters": {
+							"$schema": "https://json-schema.org/draft/2020-12/schema",
+							"type": "object",
+							"properties": {
+								"city": {
+									"type": "string"
+								}
+							},
+							"required": [
+								"city"
+							],
+							"additionalProperties": false
+						}
+					}
+				}
+			]
+		}
+	},
+	"response": {
+		"status": 200,
+		"headers": {
+			"access-control-allow-origin": "*",
+			"cf-ray": "9dedbf52cb82f9ca-PRG",
+			"connection": "keep-alive",
+			"content-encoding": "gzip",
+			"content-type": "application/json",
+			"date": "Thu, 19 Mar 2026 16:10:31 GMT",
+			"permissions-policy": "payment=(self \"https://checkout.stripe.com\" \"https://connect-js.stripe.com\" \"https://js.stripe.com\" \"https://*.js.stripe.com\" \"https://hooks.stripe.com\")",
+			"referrer-policy": "no-referrer, strict-origin-when-cross-origin",
+			"server": "cloudflare",
+			"transfer-encoding": "chunked",
+			"x-content-type-options": "nosniff"
+		},
+		"body": {
+			"id": "gen-1773936627-44y2bJvvPcI3R1THWHi1",
+			"object": "chat.completion",
+			"created": 1773936627,
+			"model": "anthropic/claude-4.5-haiku-20251001",
+			"provider": "Amazon Bedrock",
+			"system_fingerprint": null,
+			"choices": [
+				{
+					"index": 0,
+					"logprobs": null,
+					"finish_reason": "stop",
+					"native_finish_reason": "stop",
+					"message": {
+						"role": "assistant",
+						"content": "The weather in Prague is currently **sunny** with a temperature of **22°C** (about 72°F).",
+						"refusal": null,
+						"reasoning": null
+					}
+				}
+			],
+			"usage": {
+				"prompt_tokens": 681,
+				"completion_tokens": 28,
+				"total_tokens": 709,
+				"cost": 0.000821,
+				"is_byok": false,
+				"prompt_tokens_details": {
+					"cached_tokens": 0,
+					"cache_write_tokens": 0,
+					"audio_tokens": 0,
+					"video_tokens": 0
+				},
+				"cost_details": {
+					"upstream_inference_cost": 0.000821,
+					"upstream_inference_prompt_cost": 0.000681,
+					"upstream_inference_completions_cost": 0.00014
+				},
+				"completion_tokens_details": {
+					"reasoning_tokens": 0,
+					"image_tokens": 0,
+					"audio_tokens": 0
+				}
+			}
+		}
+	}
+}

@@ -1,0 +1,24 @@
+{
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		"outDir": "./dist",
+		"rootDir": ".",
+		"composite": true,
+		"emitDeclarationOnly": true,
+		"noEmit": false,
+		"jsx": "react-jsx",
+		"lib": ["ES2022", "DOM", "DOM.Iterable"],
+		"types": ["@types/bun", "vite/client"],
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"allowImportingTsExtensions": true
+	},
+	"include": ["agent/**/*", "server.ts", "spa/**/*", "tests/**/*"],
+	"exclude": ["node_modules", "dist", "spa/dist"],
+	"references": [
+		{ "path": "../sdk" },
+		{ "path": "../client" },
+		{ "path": "../client-react" },
+		{ "path": "../standalone-server" }
+	]
+}

@@ -1,0 +1,119 @@
+{
+	"requestHash": "0de84e0acaf8418e",
+	"request": {
+		"url": "https://api.anthropic.com/v1/messages",
+		"method": "POST",
+		"headers": {
+			"content-type": "application/json",
+			"anthropic-version": "2023-06-01",
+			"anthropic-dangerous-direct-browser-access": "true"
+		},
+		"body": {
+			"model": "claude-haiku-4-5-20251001",
+			"max_tokens": 100000,
+			"system": [
+				{
+					"type": "text",
+					"text": "You are a helpful assistant.",
+					"cache_control": {
+						"type": "ephemeral"
+					}
+				}
+			],
+			"messages": [
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "Hi"
+						}
+					]
+				},
+				{
+					"role": "assistant",
+					"content": [
+						{
+							"type": "text",
+							"text": "Hello!"
+						}
+					]
+				},
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "[System] The user prefers Czech language."
+						},
+						{
+							"type": "text",
+							"text": "How are you?"
+						}
+					]
+				}
+			],
+			"stream": false
+		}
+	},
+	"response": {
+		"status": 200,
+		"headers": {
+			"anthropic-organization-id": "88f06382-85f0-4a77-882c-b9cb5f669db5",
+			"anthropic-ratelimit-input-tokens-limit": "4000000",
+			"anthropic-ratelimit-input-tokens-remaining": "4000000",
+			"anthropic-ratelimit-input-tokens-reset": "2026-03-19T16:33:43Z",
+			"anthropic-ratelimit-output-tokens-limit": "800000",
+			"anthropic-ratelimit-output-tokens-remaining": "800000",
+			"anthropic-ratelimit-output-tokens-reset": "2026-03-19T16:33:44Z",
+			"anthropic-ratelimit-requests-limit": "4000",
+			"anthropic-ratelimit-requests-remaining": "3999",
+			"anthropic-ratelimit-requests-reset": "2026-03-19T16:33:43Z",
+			"anthropic-ratelimit-tokens-limit": "4800000",
+			"anthropic-ratelimit-tokens-remaining": "4800000",
+			"anthropic-ratelimit-tokens-reset": "2026-03-19T16:33:43Z",
+			"cf-cache-status": "DYNAMIC",
+			"cf-ray": "9dede166a888f970-PRG",
+			"connection": "keep-alive",
+			"content-encoding": "gzip",
+			"content-security-policy": "default-src 'none'; frame-ancestors 'none'",
+			"content-type": "application/json",
+			"date": "Thu, 19 Mar 2026 16:33:44 GMT",
+			"request-id": "req_011CZCm7m13K9WF7fsNkr6hP",
+			"server": "cloudflare",
+			"server-timing": "proxy;dur=1214",
+			"strict-transport-security": "max-age=31536000; includeSubDomains; preload",
+			"transfer-encoding": "chunked",
+			"vary": "Accept-Encoding",
+			"x-envoy-upstream-service-time": "1214",
+			"x-robots-tag": "none",
+			"set-cookie": "_cfuvid=BN7dz6oIh6mC.RHxKzr9.QSy0VX1sy3ALM_ScOzONRU-1773938023.4668062-1.0.1.1-wtCw7wk27dHSWwJBg9IpACk6IGkeMylbvUOHk5VjaMs; HttpOnly; SameSite=None; Secure; Path=/; Domain=api.anthropic.com"
+		},
+		"body": {
+			"model": "claude-haiku-4-5-20251001",
+			"id": "msg_0159sMuCn4c4om9jMhDv2fff",
+			"type": "message",
+			"role": "assistant",
+			"content": [
+				{
+					"type": "text",
+					"text": "Ahoj! 👋\n\nJsem v pořádku, děkuji za optání. Jak se máš ty? Jak mohu pomoct?"
+				}
+			],
+			"stop_reason": "end_turn",
+			"stop_sequence": null,
+			"usage": {
+				"input_tokens": 36,
+				"cache_creation_input_tokens": 0,
+				"cache_read_input_tokens": 0,
+				"cache_creation": {
+					"ephemeral_5m_input_tokens": 0,
+					"ephemeral_1h_input_tokens": 0
+				},
+				"output_tokens": 42,
+				"service_tier": "standard",
+				"inference_geo": "not_available"
+			}
+		}
+	}
+}

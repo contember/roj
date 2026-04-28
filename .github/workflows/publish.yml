@@ -1,0 +1,54 @@
+name: Publish
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Extract version
+        id: versions
+        uses: ./.github/actions/extract-version
+        with:
+          version: ${{ github.ref }}
+
+      - name: Lint
+        run: bun run lint
+
+      - name: TypeScript build
+        run: bun run ts:build
+
+      - name: Prepare package manifests
+        run: node ./scripts/npm-publish/prepare-packages.mjs "${{ github.ref_name }}"
+
+      - name: Publish NPM
+        run: bash ./scripts/npm-publish/run.sh
+        env:
+          NPM_TAG: ${{ steps.versions.outputs.npmTag }}

@@ -1,0 +1,137 @@
+{
+	"requestHash": "4309dbf47a0f4b14",
+	"request": {
+		"url": "https://openrouter.ai/api/v1/chat/completions",
+		"method": "POST",
+		"headers": {
+			"content-type": "application/json"
+		},
+		"body": {
+			"model": "anthropic/claude-haiku-4.5",
+			"messages": [
+				{
+					"role": "system",
+					"content": [
+						{
+							"type": "text",
+							"text": "You have access to tools. If a tool fails, explain the error to the user briefly.",
+							"cache_control": {
+								"type": "ephemeral"
+							}
+						}
+					]
+				},
+				{
+					"role": "user",
+					"content": "What is the weather in Prague?"
+				},
+				{
+					"role": "assistant",
+					"content": "",
+					"tool_calls": [
+						{
+							"id": "call_001",
+							"type": "function",
+							"function": {
+								"name": "get_weather",
+								"arguments": "{\"city\":\"Prague\"}"
+							}
+						}
+					]
+				},
+				{
+					"role": "tool",
+					"content": "[ERROR] Service unavailable: weather API is down",
+					"tool_call_id": "call_001"
+				}
+			],
+			"stream": false,
+			"stream_options": {
+				"include_usage": true
+			},
+			"tools": [
+				{
+					"type": "function",
+					"function": {
+						"name": "get_weather",
+						"description": "Get current weather for a city",
+						"parameters": {
+							"$schema": "https://json-schema.org/draft/2020-12/schema",
+							"type": "object",
+							"properties": {
+								"city": {
+									"type": "string"
+								}
+							},
+							"required": [
+								"city"
+							],
+							"additionalProperties": false
+						}
+					}
+				}
+			]
+		}
+	},
+	"response": {
+		"status": 200,
+		"headers": {
+			"access-control-allow-origin": "*",
+			"cf-ray": "9dede1b658c2b391-PRG",
+			"connection": "keep-alive",
+			"content-encoding": "gzip",
+			"content-type": "application/json",
+			"date": "Thu, 19 Mar 2026 16:33:57 GMT",
+			"permissions-policy": "payment=(self \"https://checkout.stripe.com\" \"https://connect-js.stripe.com\" \"https://js.stripe.com\" \"https://*.js.stripe.com\" \"https://hooks.stripe.com\")",
+			"referrer-policy": "no-referrer, strict-origin-when-cross-origin",
+			"server": "cloudflare",
+			"transfer-encoding": "chunked",
+			"x-content-type-options": "nosniff"
+		},
+		"body": {
+			"id": "gen-1773938036-7xNZGwBZpP2JJ1v5otV4",
+			"object": "chat.completion",
+			"created": 1773938036,
+			"model": "anthropic/claude-4.5-haiku-20251001",
+			"provider": "Amazon Bedrock",
+			"system_fingerprint": null,
+			"choices": [
+				{
+					"index": 0,
+					"logprobs": null,
+					"finish_reason": "stop",
+					"native_finish_reason": "stop",
+					"message": {
+						"role": "assistant",
+						"content": "I apologize, but I'm unable to retrieve the current weather for Prague at the moment. The weather API service is currently unavailable. Please try again in a few moments, or you can check a weather website like Weather.com, AccuWeather, or your local weather service for current conditions in Prague.",
+						"refusal": null,
+						"reasoning": null
+					}
+				}
+			],
+			"usage": {
+				"prompt_tokens": 689,
+				"completion_tokens": 67,
+				"total_tokens": 756,
+				"cost": 0.001024,
+				"is_byok": false,
+				"prompt_tokens_details": {
+					"cached_tokens": 0,
+					"cache_write_tokens": 0,
+					"audio_tokens": 0,
+					"video_tokens": 0
+				},
+				"cost_details": {
+					"upstream_inference_cost": 0.001024,
+					"upstream_inference_prompt_cost": 0.000689,
+					"upstream_inference_completions_cost": 0.000335
+				},
+				"completion_tokens_details": {
+					"reasoning_tokens": 0,
+					"image_tokens": 0,
+					"audio_tokens": 0
+				}
+			}
+		}
+	}
+}

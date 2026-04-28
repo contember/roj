@@ -1,0 +1,47 @@
+{
+	"name": "@roj-ai/standalone-server",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "./src/index.ts",
+	"bin": {
+		"roj-standalone": "./src/main.ts"
+	},
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./src/index.ts",
+			"default": "./src/index.ts"
+		}
+	},
+	"files": [
+		"src",
+		"dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/contember/roj.git",
+		"directory": "packages/standalone-server"
+	},
+	"homepage": "https://github.com/contember/roj/tree/main/packages/standalone-server#readme",
+	"bugs": {
+		"url": "https://github.com/contember/roj/issues"
+	},
+	"scripts": {
+		"type-check": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@roj-ai/client": "workspace:*",
+		"@roj-ai/sdk": "workspace:*",
+		"@roj-ai/shared": "workspace:*",
+		"@roj-ai/transport": "workspace:*",
+		"hono": "catalog:libs"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:",
+		"typescript": "catalog:build"
+	},
+	"types": "./dist/index.d.ts"
+}

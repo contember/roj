@@ -1,0 +1,123 @@
+{
+	"request": {
+		"model": "anthropic/claude-haiku-4.5",
+		"systemPrompt": "# System Overview\n\nYou are an agent in a multi-agent system.\n\n## Critical Rules\n\n1. **Your text output is NOT visible to anyone** - it goes to a debug buffer only\n2. **You MUST use tools to communicate** - all communication happens through tool calls\n3. **NEVER generate `<message` tags** - these are system-generated only, never write them yourself\n\n## Message Format\n\nYou receive messages in this format:\n<message from=\"user\">\nUser's message here\n</message>\n\n<message from=\"agent_abc123\">\nMessage from another agent\n</message>\n\nThese tags are system-generated.\n\n## Communication Tools\n\nAll communication happens through tool calls. See your role briefing below for the specific tools available to you.\n\n## Efficiency: Parallel Tool Calls\n\n**You can and SHOULD call multiple tools in a single response when they are independent.**\n- If you need to spawn an agent AND send a message, do both in one response — don't wait between them.\n- If you need to perform multiple independent tool operations, call them all at once.\n- When spawning multiple independent agents, spawn them all in one response.\n- When informing a user/communicator about an action, combine the notification with the action itself.\n- Only wait (sequential calls) when one tool's result is needed as input for another.\n\n## Waiting Protocol\n\nAfter sending a message (to another agent or user), if you have no other work to do, output **only** the word:\nWAITING\n\nThis must be the sole text content of your response (no tool calls alongside it). It is a system signal read by the runtime indicating you are waiting for a response before continuing.\n\n### Incorrect Behavior (NEVER do these)\n\n❌ WRONG - Never continue with text after WAITING\n❌ WRONG - Never generate fake responses after WAITING\n\n## Communication Style\n\n- Match the user's formality level\n- Avoid unnecessary filler phrases\n- Speak in the same language as the user (see <message from=\"user\">)\n\n## Your Role: Entry Agent (Orchestrator)\n\nYou are the entry point for user communication AND you orchestrate child agents. See your available tools for capabilities.\n\n## User Communication (MANDATORY)\n\n**Every time you receive a user message, you MUST respond to the user via `tell_user` or `ask_user` before stopping.** The user is waiting for a response and will see nothing unless you explicitly call a communication tool.\n\n- **Direct response**: If you can answer immediately, call `tell_user`.\n- **Delegating work**: If you spawn child agents or start background work, call `tell_user` to inform the user what is happening (e.g. \"I'm starting work on your request…\"). Once the work is done, call `tell_user` again with the results.\n- **Need more info**: If you need clarification, call `ask_user`.\n\n**Never stop without calling `tell_user` or `ask_user`.** Silent processing leaves the user with no feedback.\n\n## Asking Users Questions\n\nWhen you need to ask the user multiple questions, **call `ask_user` multiple times in a single response** rather than asking one question at a time. The user will receive all questions as a single questionnaire, which is much better UX than being asked one-by-one.\n\nOnly ask questions sequentially when a later question depends on the answer to an earlier one.\n\n### Prefer Structured Input Types\n\nWhen asking questions, prefer `single_choice`, `multi_choice`, or `confirm` over free-text `text` input whenever the possible answers are known. Only use `text` when the answer is truly open-ended. Structured inputs are faster for users and produce more consistent answers.\n\n## Working Environment\n\nYou have access to the following directories:\n\n- `/home/matej21/projects/contember/roj/data/sessions/__UUID__` — Your session directory. Use this for plans, notes, temporary files, scripts, and any artifacts you create.\n- `/tmp/roj-demo-e2e` — The workspace directory. This contains the project files. Your final outputs (code, assets) should be written here.\n\nUse these paths consistently across all tools (file operations, shell commands, etc.).\n\nYou are a web app builder. You create web applications based on user descriptions.\n\nWhen asked to build an app:\n1. Create the project files in the current directory (index.html, style.css, app.js)\n2. The dev server auto-starts — your files are served immediately\n\nUse plain HTML, CSS, and JavaScript. Do NOT use React, npm, or any build tools.\nKeep it clean and modern. Always include a complete, working implementation in a single index.html or with separate .css/.js files.",
+		"messages": [
+			{
+				"role": "user",
+				"content": "## Directory Structure\n\n### Workspace (/tmp/roj-demo-e2e)\n```\n/tmp/roj-demo-e2e/\n\n```\n\n### Session (/home/matej21/projects/contember/roj/data/sessions/__UUID__)\n```\n/home/matej21/projects/contember/roj/data/sessions/__UUID__/\n└── session.log (1.1KB)\n```"
+			},
+			{
+				"role": "user",
+				"content": "[User]: Create an index.html file with the text \"Hello from roj\"."
+			},
+			{
+				"role": "assistant",
+				"content": "I'll create an index.html file with \"Hello from roj\" in the workspace directory.",
+				"toolCalls": [
+					{
+						"id": "toolu_bdrk_01L1vuhUpKeBkV4j93M8uMhr",
+						"name": "write_file",
+						"input": {
+							"path": "/tmp/roj-demo-e2e/index.html",
+							"content": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>ROJ</title>\n</head>\n<body>\n    <h1>Hello from roj</h1>\n</body>\n</html>"
+						}
+					}
+				]
+			},
+			{
+				"role": "tool",
+				"toolCallId": "toolu_bdrk_01L1vuhUpKeBkV4j93M8uMhr",
+				"content": "{\n  \"path\": \"/tmp/roj-demo-e2e/index.html\",\n  \"size\": 223\n}",
+				"cacheControl": {
+					"type": "ephemeral"
+				}
+			},
+			{
+				"role": "user",
+				"content": "<session-context>\n## Session Services\n\n- dev: Development server for previewing the app — ready (port __PORT__)\n\nUse service tools (service_start, service_stop, service_restart, service_status, service_logs) to manage these services.\n</session-context>"
+			}
+		],
+		"tools": [
+			{
+				"name": "send_message",
+				"description": "Send a message to another agent. Use to: \"parent\" to report back to your parent agent, or a specific agent ID for child agents. (async, in response will ONLY confirm sending)"
+			},
+			{
+				"name": "tell_user",
+				"description": "Send a message to the user (async, in response will ONLY confirm sending)."
+			},
+			{
+				"name": "ask_user",
+				"description": "Ask the user a question. One question per call, but you can call ask_user multiple times in a single response. The response will arrive in your mailbox. Prefer single_choice/multi_choice/confirm when possible options are known; use text only when the answer is truly open-ended. (async, in response will ONLY confirm sending)"
+			},
+			{
+				"name": "service_start",
+				"description": "Start a stopped or failed session service. Only call this if the session context shows the service is not running — if it is already \"ready\", you do not need to start it. Available services: dev"
+			},
+			{
+				"name": "service_stop",
+				"description": "Stop a running session service. Available services: dev"
+			},
+			{
+				"name": "service_restart",
+				"description": "Restart a session service (stop + start). Available services: dev"
+			},
+			{
+				"name": "service_status",
+				"description": "Get the status of a session service including port, error, and recent log lines. Only call this to troubleshoot issues — if the session context already shows the service as \"ready\", you do not need to check status. Available services: dev"
+			},
+			{
+				"name": "service_logs",
+				"description": "Get recent log output from a session service. Available services: dev"
+			},
+			{
+				"name": "read_file",
+				"description": "Read the contents of a file. For image files, the image is returned visually. For other binary files, only metadata is returned."
+			},
+			{
+				"name": "list_directory",
+				"description": "List the contents of a directory. Returns a compact tree view."
+			},
+			{
+				"name": "write_file",
+				"description": "Write content to a file. Automatically creates parent directories — no need to mkdir first. Creates the file if it doesn't exist, overwrites if it does."
+			},
+			{
+				"name": "replace_in_file",
+				"description": "Replace text in a file. More efficient and safer than write_file for targeted changes. Use write_file only for new files or complete rewrites."
+			},
+			{
+				"name": "run_command",
+				"description": "Execute a shell command. Returns stdout, stderr, and exit code."
+			}
+		],
+		"stopSequences": [
+			"<message"
+		]
+	},
+	"response": {
+		"content": "Perfect! I've created the index.html file with \"Hello from roj\". The dev server is already running on port 43395, so your file is now being served and you can view it in the browser.",
+		"toolCalls": [
+			{
+				"id": "toolu_bdrk_01Qt8fHN7Py9Pii7LudKjmCx",
+				"name": "tell_user",
+				"input": {
+					"message": "✓ Created index.html with \"Hello from roj\". The dev server is running and your app is ready to view at http://localhost:43395"
+				}
+			}
+		],
+		"finishReason": "tool_calls",
+		"metrics": {
+			"promptTokens": 4592,
+			"completionTokens": 131,
+			"totalTokens": 4723,
+			"latencyMs": 2770,
+			"model": "anthropic/claude-4.5-haiku-20251001",
+			"provider": "openrouter",
+			"cost": 0.0063765,
+			"cacheWriteTokens": 4518
+		},
+		"providerRequestId": "gen-1776949208-GMZ2QYaFqfafkWfmIUkV"
+	}
+}

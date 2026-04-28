@@ -1,0 +1,163 @@
+{
+	"name": "@roj-ai/sdk",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./src/index.ts",
+			"default": "./src/index.ts"
+		},
+		"./platform": {
+			"types": "./dist/platform/index.d.ts",
+			"import": "./src/platform/index.ts",
+			"default": "./src/platform/index.ts"
+		},
+		"./bun-platform": {
+			"types": "./dist/bun-platform/index.d.ts",
+			"import": "./src/bun-platform/index.ts",
+			"default": "./src/bun-platform/index.ts"
+		},
+		"./bootstrap": {
+			"types": "./dist/bootstrap.d.ts",
+			"import": "./src/bootstrap.ts",
+			"default": "./src/bootstrap.ts"
+		},
+		"./config": {
+			"types": "./dist/config.d.ts",
+			"import": "./src/config.ts",
+			"default": "./src/config.ts"
+		},
+		"./user-config": {
+			"types": "./dist/user-config.d.ts",
+			"import": "./src/user-config.ts",
+			"default": "./src/user-config.ts"
+		},
+		"./tools": {
+			"types": "./dist/core/tools/index.d.ts",
+			"import": "./src/core/tools/index.ts",
+			"default": "./src/core/tools/index.ts"
+		},
+		"./transport/http/app": {
+			"types": "./dist/transport/http/app.d.ts",
+			"import": "./src/transport/http/app.ts",
+			"default": "./src/transport/http/app.ts"
+		},
+		"./transport/adapter": {
+			"types": "./dist/transport/adapter/index.d.ts",
+			"import": "./src/transport/adapter/index.ts",
+			"default": "./src/transport/adapter/index.ts"
+		},
+		"./session-manager": {
+			"types": "./dist/core/sessions/session-manager.d.ts",
+			"import": "./src/core/sessions/session-manager.ts",
+			"default": "./src/core/sessions/session-manager.ts"
+		},
+		"./llm/provider": {
+			"types": "./dist/core/llm/provider.d.ts",
+			"import": "./src/core/llm/provider.ts",
+			"default": "./src/core/llm/provider.ts"
+		},
+		"./llm/mock": {
+			"types": "./dist/core/llm/mock.d.ts",
+			"import": "./src/core/llm/mock.ts",
+			"default": "./src/core/llm/mock.ts"
+		},
+		"./llm/snapshot-middleware": {
+			"types": "./dist/core/llm/snapshot-middleware.d.ts",
+			"import": "./src/core/llm/snapshot-middleware.ts",
+			"default": "./src/core/llm/snapshot-middleware.ts"
+		},
+		"./testing": {
+			"types": "./dist/testing/index.d.ts",
+			"import": "./src/testing/index.ts",
+			"default": "./src/testing/index.ts"
+		},
+		"./tools/filesystem": {
+			"types": "./dist/plugins/filesystem/index.d.ts",
+			"import": "./src/plugins/filesystem/index.ts",
+			"default": "./src/plugins/filesystem/index.ts"
+		},
+		"./tools/shell": {
+			"types": "./dist/plugins/shell/index.d.ts",
+			"import": "./src/plugins/shell/index.ts",
+			"default": "./src/plugins/shell/index.ts"
+		},
+		"./workers": {
+			"types": "./dist/plugins/workers/index.d.ts",
+			"import": "./src/plugins/workers/index.ts",
+			"default": "./src/plugins/workers/index.ts"
+		},
+		"./workers/context": {
+			"types": "./dist/plugins/workers/context.d.ts",
+			"import": "./src/plugins/workers/context.ts",
+			"default": "./src/plugins/workers/context.ts"
+		},
+		"./workers/definition": {
+			"types": "./dist/plugins/workers/definition.d.ts",
+			"import": "./src/plugins/workers/definition.ts",
+			"default": "./src/plugins/workers/definition.ts"
+		},
+		"./file-store": {
+			"types": "./dist/core/file-store/file-store.d.ts",
+			"import": "./src/core/file-store/file-store.ts",
+			"default": "./src/core/file-store/file-store.ts"
+		},
+		"./prompts": {
+			"types": "./dist/prompts/index.d.ts",
+			"import": "./src/prompts/index.ts",
+			"default": "./src/prompts/index.ts"
+		},
+		"./protocols": {
+			"types": "./dist/transport/protocols/index.d.ts",
+			"import": "./src/transport/protocols/index.ts",
+			"default": "./src/transport/protocols/index.ts"
+		},
+		"./rpc": {
+			"types": "./dist/transport/rpc/index.d.ts",
+			"import": "./src/transport/rpc/index.ts",
+			"default": "./src/transport/rpc/index.ts"
+		},
+		"./projections": {
+			"types": "./dist/projections/index.d.ts",
+			"import": "./src/projections/index.ts",
+			"default": "./src/projections/index.ts"
+		}
+	},
+	"files": [
+		"src",
+		"dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/contember/roj.git",
+		"directory": "packages/sdk"
+	},
+	"homepage": "https://github.com/contember/roj/tree/main/packages/sdk#readme",
+	"bugs": {
+		"url": "https://github.com/contember/roj/issues"
+	},
+	"scripts": {
+		"type-check": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@roj-ai/transport": "workspace:*",
+		"@hono/zod-validator": "0.7.6",
+		"hono": "4.12.5",
+		"ignore": "7.0.5",
+		"tokenx": "^1.3.0",
+		"uuidv7": "^1.1.0",
+		"ws": "^8.18.0",
+		"zod": "4.3.6"
+	},
+	"devDependencies": {
+		"@types/bun": "latest",
+		"@types/ws": "^8.5.10",
+		"typescript": "^5.7.2"
+	},
+	"types": "./dist/index.d.ts"
+}

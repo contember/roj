@@ -1,0 +1,49 @@
+{
+	"name": "@roj-ai/client",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./src/index.ts",
+			"default": "./src/index.ts"
+		},
+		"./api": {
+			"types": "./dist/api/client.d.ts",
+			"import": "./src/api/client.ts",
+			"default": "./src/api/client.ts"
+		},
+		"./platform": {
+			"types": "./dist/platform/index.d.ts",
+			"import": "./src/platform/index.ts",
+			"default": "./src/platform/index.ts"
+		}
+	},
+	"files": [
+		"src",
+		"dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/contember/roj.git",
+		"directory": "packages/client"
+	},
+	"homepage": "https://github.com/contember/roj/tree/main/packages/client#readme",
+	"bugs": {
+		"url": "https://github.com/contember/roj/issues"
+	},
+	"scripts": {
+		"type-check": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@roj-ai/shared": "workspace:*"
+	},
+	"devDependencies": {
+		"typescript": "5.9.3"
+	},
+	"types": "./dist/index.d.ts"
+}

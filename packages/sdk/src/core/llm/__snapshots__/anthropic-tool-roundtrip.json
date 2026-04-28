@@ -1,0 +1,139 @@
+{
+	"requestHash": "26d06aa4dd730906",
+	"request": {
+		"url": "https://api.anthropic.com/v1/messages",
+		"method": "POST",
+		"headers": {
+			"content-type": "application/json",
+			"anthropic-version": "2023-06-01",
+			"anthropic-dangerous-direct-browser-access": "true"
+		},
+		"body": {
+			"model": "claude-haiku-4-5-20251001",
+			"max_tokens": 100000,
+			"system": [
+				{
+					"type": "text",
+					"text": "You have access to tools. Use them as needed. Be brief.",
+					"cache_control": {
+						"type": "ephemeral"
+					}
+				}
+			],
+			"messages": [
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "What is the weather in Prague?"
+						}
+					]
+				},
+				{
+					"role": "assistant",
+					"content": [
+						{
+							"type": "tool_use",
+							"id": "call_001",
+							"name": "get_weather",
+							"input": {
+								"city": "Prague"
+							}
+						}
+					]
+				},
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "tool_result",
+							"tool_use_id": "call_001",
+							"content": "Sunny, 22°C"
+						}
+					]
+				}
+			],
+			"stream": false,
+			"tools": [
+				{
+					"name": "get_weather",
+					"description": "Get current weather for a city",
+					"input_schema": {
+						"$schema": "https://json-schema.org/draft/2020-12/schema",
+						"type": "object",
+						"properties": {
+							"city": {
+								"type": "string"
+							}
+						},
+						"required": [
+							"city"
+						],
+						"additionalProperties": false
+					}
+				}
+			]
+		}
+	},
+	"response": {
+		"status": 200,
+		"headers": {
+			"anthropic-organization-id": "88f06382-85f0-4a77-882c-b9cb5f669db5",
+			"anthropic-ratelimit-input-tokens-limit": "4000000",
+			"anthropic-ratelimit-input-tokens-remaining": "4000000",
+			"anthropic-ratelimit-input-tokens-reset": "2026-03-19T16:10:24Z",
+			"anthropic-ratelimit-output-tokens-limit": "800000",
+			"anthropic-ratelimit-output-tokens-remaining": "800000",
+			"anthropic-ratelimit-output-tokens-reset": "2026-03-19T16:10:24Z",
+			"anthropic-ratelimit-requests-limit": "4000",
+			"anthropic-ratelimit-requests-remaining": "3999",
+			"anthropic-ratelimit-requests-reset": "2026-03-19T16:10:24Z",
+			"anthropic-ratelimit-tokens-limit": "4800000",
+			"anthropic-ratelimit-tokens-remaining": "4800000",
+			"anthropic-ratelimit-tokens-reset": "2026-03-19T16:10:24Z",
+			"cf-cache-status": "DYNAMIC",
+			"cf-ray": "9dedbf3b7dc558b7-PRG",
+			"connection": "keep-alive",
+			"content-encoding": "gzip",
+			"content-security-policy": "default-src 'none'; frame-ancestors 'none'",
+			"content-type": "application/json",
+			"date": "Thu, 19 Mar 2026 16:10:24 GMT",
+			"request-id": "req_011CZCjLbLFdYq9YhiB1wqc8",
+			"server": "cloudflare",
+			"server-timing": "proxy;dur=582",
+			"strict-transport-security": "max-age=31536000; includeSubDomains; preload",
+			"transfer-encoding": "chunked",
+			"vary": "Accept-Encoding",
+			"x-envoy-upstream-service-time": "582",
+			"x-robots-tag": "none",
+			"set-cookie": "_cfuvid=.PPc5yShlznr1xBqJcWZsEVyLLN1Ei2yftwUpnXO3Xw-1773936623.9176295-1.0.1.1-V.P8C9UmP9TxXkVWzHSkQK6vFXtz6jQxApXI31unNKY; HttpOnly; SameSite=None; Secure; Path=/; Domain=api.anthropic.com"
+		},
+		"body": {
+			"model": "claude-haiku-4-5-20251001",
+			"id": "msg_01EVwPCTTH9TM8KFuk6SV25P",
+			"type": "message",
+			"role": "assistant",
+			"content": [
+				{
+					"type": "text",
+					"text": "The weather in Prague is currently **sunny** with a temperature of **22°C** (about 72°F)."
+				}
+			],
+			"stop_reason": "end_turn",
+			"stop_sequence": null,
+			"usage": {
+				"input_tokens": 681,
+				"cache_creation_input_tokens": 0,
+				"cache_read_input_tokens": 0,
+				"cache_creation": {
+					"ephemeral_5m_input_tokens": 0,
+					"ephemeral_1h_input_tokens": 0
+				},
+				"output_tokens": 28,
+				"service_tier": "standard",
+				"inference_geo": "not_available"
+			}
+		}
+	}
+}

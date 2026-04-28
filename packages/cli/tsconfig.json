@@ -1,0 +1,16 @@
+{
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		"outDir": "./dist",
+		"rootDir": "./src",
+		"composite": true,
+		"emitDeclarationOnly": false
+	},
+	"include": ["src/**/*"],
+	"exclude": ["node_modules", "dist"],
+	"references": [
+		{ "path": "../sdk" },
+		{ "path": "../shared" },
+		{ "path": "../transport" }
+	]
+}

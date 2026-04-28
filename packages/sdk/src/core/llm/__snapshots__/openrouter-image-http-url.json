@@ -1,0 +1,107 @@
+{
+	"requestHash": "9d088a3f19b2fd9d",
+	"request": {
+		"url": "https://openrouter.ai/api/v1/chat/completions",
+		"method": "POST",
+		"headers": {
+			"content-type": "application/json"
+		},
+		"body": {
+			"model": "anthropic/claude-haiku-4.5",
+			"messages": [
+				{
+					"role": "system",
+					"content": [
+						{
+							"type": "text",
+							"text": "Describe images briefly. One sentence.",
+							"cache_control": {
+								"type": "ephemeral"
+							}
+						}
+					]
+				},
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "What do you see in this image?"
+						},
+						{
+							"type": "image_url",
+							"image_url": {
+								"url": "https://www.google.com/images/branding/googlelogo/2x/googlelogo_color_272x92dp.png"
+							}
+						}
+					]
+				}
+			],
+			"stream": false,
+			"stream_options": {
+				"include_usage": true
+			}
+		}
+	},
+	"response": {
+		"status": 200,
+		"headers": {
+			"access-control-allow-origin": "*",
+			"cf-ray": "9dedeead9a89f980-PRG",
+			"connection": "keep-alive",
+			"content-encoding": "gzip",
+			"content-type": "application/json",
+			"date": "Thu, 19 Mar 2026 16:42:50 GMT",
+			"permissions-policy": "payment=(self \"https://checkout.stripe.com\" \"https://connect-js.stripe.com\" \"https://js.stripe.com\" \"https://*.js.stripe.com\" \"https://hooks.stripe.com\")",
+			"referrer-policy": "no-referrer, strict-origin-when-cross-origin",
+			"server": "cloudflare",
+			"transfer-encoding": "chunked",
+			"x-content-type-options": "nosniff"
+		},
+		"body": {
+			"id": "gen-1773938567-1NZkDyP9onPqkohtFbCD",
+			"object": "chat.completion",
+			"created": 1773938567,
+			"model": "anthropic/claude-4.5-haiku-20251001",
+			"provider": "Amazon Bedrock",
+			"system_fingerprint": null,
+			"choices": [
+				{
+					"index": 0,
+					"logprobs": null,
+					"finish_reason": "stop",
+					"native_finish_reason": "stop",
+					"message": {
+						"role": "assistant",
+						"content": "This is the Google logo, featuring the word \"Google\" written in the company's signature multi-colored style with blue, red, yellow, blue, green, and red letters.",
+						"refusal": null,
+						"reasoning": null
+					}
+				}
+			],
+			"usage": {
+				"prompt_tokens": 166,
+				"completion_tokens": 40,
+				"total_tokens": 206,
+				"cost": 0.000366,
+				"is_byok": false,
+				"prompt_tokens_details": {
+					"cached_tokens": 0,
+					"cache_write_tokens": 0,
+					"audio_tokens": 0,
+					"video_tokens": 0
+				},
+				"cost_details": {
+					"upstream_inference_cost": 0.000366,
+					"upstream_inference_prompt_cost": 0.000166,
+					"upstream_inference_completions_cost": 0.0002
+				},
+				"completion_tokens_details": {
+					"reasoning_tokens": 0,
+					"image_tokens": 0,
+					"audio_tokens": 0
+				}
+			}
+		}
+	}
+}

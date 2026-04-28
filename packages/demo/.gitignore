@@ -1,0 +1,4 @@
+# Runtime-created by the standalone server
+data/
+# SPA build output (built on demand)
+spa/dist/

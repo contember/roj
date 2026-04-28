@@ -1,0 +1,17 @@
+{
+	"compilerOptions": {
+		"target": "esnext",
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"types": ["bun"],
+		"strict": true,
+		"skipLibCheck": true,
+		"composite": true,
+		"emitDeclarationOnly": true,
+		"outDir": "./dist"
+	},
+	"include": ["src"],
+	"references": [
+		{ "path": "../sandbox-runtime" }
+	]
+}

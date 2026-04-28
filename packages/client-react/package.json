@@ -1,0 +1,64 @@
+{
+	"name": "@roj-ai/client-react",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./src/index.ts",
+			"default": "./src/index.ts"
+		},
+		"./stores": {
+			"types": "./dist/stores/index.d.ts",
+			"import": "./src/stores/index.ts",
+			"default": "./src/stores/index.ts"
+		},
+		"./chat": {
+			"types": "./dist/components/chat/index.d.ts",
+			"import": "./src/components/chat/index.ts",
+			"default": "./src/components/chat/index.ts"
+		},
+		"./debug-theme.css": "./src/debug-theme.css"
+	},
+	"files": [
+		"src",
+		"dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/contember/roj.git",
+		"directory": "packages/client-react"
+	},
+	"homepage": "https://github.com/contember/roj/tree/main/packages/client-react#readme",
+	"bugs": {
+		"url": "https://github.com/contember/roj/issues"
+	},
+	"scripts": {
+		"type-check": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@roj-ai/client": "workspace:*",
+		"@roj-ai/shared": "workspace:*",
+		"@roj-ai/transport": "workspace:*",
+		"marked": "^17.0.1",
+		"zustand": "5.0.11"
+	},
+	"devDependencies": {
+		"@roj-ai/sdk": "workspace:*",
+		"@types/react": "19.2.14",
+		"@types/react-dom": "19.2.3",
+		"react": "19.2.4",
+		"react-dom": "19.2.4",
+		"typescript": "5.9.3"
+	},
+	"peerDependencies": {
+		"lucide-react": "*",
+		"react": "19.2.4",
+		"react-dom": "19.2.4"
+	},
+	"types": "./dist/index.d.ts"
+}

@@ -1,0 +1,129 @@
+{
+	"requestHash": "461b7b71cfc83975",
+	"request": {
+		"url": "https://openrouter.ai/api/v1/chat/completions",
+		"method": "POST",
+		"headers": {
+			"content-type": "application/json"
+		},
+		"body": {
+			"model": "anthropic/claude-haiku-4.5",
+			"messages": [
+				{
+					"role": "system",
+					"content": [
+						{
+							"type": "text",
+							"text": "You have access to tools. Use the get_weather tool to answer weather questions.",
+							"cache_control": {
+								"type": "ephemeral"
+							}
+						}
+					]
+				},
+				{
+					"role": "user",
+					"content": "What is the weather in Prague?"
+				}
+			],
+			"stream": false,
+			"stream_options": {
+				"include_usage": true
+			},
+			"tools": [
+				{
+					"type": "function",
+					"function": {
+						"name": "get_weather",
+						"description": "Get current weather for a city",
+						"parameters": {
+							"$schema": "https://json-schema.org/draft/2020-12/schema",
+							"type": "object",
+							"properties": {
+								"city": {
+									"type": "string"
+								}
+							},
+							"required": [
+								"city"
+							],
+							"additionalProperties": false
+						}
+					}
+				}
+			]
+		}
+	},
+	"response": {
+		"status": 200,
+		"headers": {
+			"access-control-allow-origin": "*",
+			"cf-ray": "9dedbf46ed6ff9ca-PRG",
+			"connection": "keep-alive",
+			"content-encoding": "gzip",
+			"content-type": "application/json",
+			"date": "Thu, 19 Mar 2026 16:10:27 GMT",
+			"permissions-policy": "payment=(self \"https://checkout.stripe.com\" \"https://connect-js.stripe.com\" \"https://js.stripe.com\" \"https://*.js.stripe.com\" \"https://hooks.stripe.com\")",
+			"referrer-policy": "no-referrer, strict-origin-when-cross-origin",
+			"server": "cloudflare",
+			"transfer-encoding": "chunked",
+			"x-content-type-options": "nosniff"
+		},
+		"body": {
+			"id": "gen-1773936625-EHb9IEcI2aCIL1NQdq1Q",
+			"object": "chat.completion",
+			"created": 1773936625,
+			"model": "anthropic/claude-4.5-haiku-20251001",
+			"provider": "Amazon Bedrock",
+			"system_fingerprint": null,
+			"choices": [
+				{
+					"index": 0,
+					"logprobs": null,
+					"finish_reason": "tool_calls",
+					"native_finish_reason": "tool_calls",
+					"message": {
+						"role": "assistant",
+						"content": null,
+						"refusal": null,
+						"reasoning": null,
+						"tool_calls": [
+							{
+								"type": "function",
+								"index": 0,
+								"id": "toolu_bdrk_013fHQNNNxkZx7soJQKbgk99",
+								"function": {
+									"name": "get_weather",
+									"arguments": "{\"city\": \"Prague\"}"
+								}
+							}
+						]
+					}
+				}
+			],
+			"usage": {
+				"prompt_tokens": 611,
+				"completion_tokens": 54,
+				"total_tokens": 665,
+				"cost": 0.000881,
+				"is_byok": false,
+				"prompt_tokens_details": {
+					"cached_tokens": 0,
+					"cache_write_tokens": 0,
+					"audio_tokens": 0,
+					"video_tokens": 0
+				},
+				"cost_details": {
+					"upstream_inference_cost": 0.000881,
+					"upstream_inference_prompt_cost": 0.000611,
+					"upstream_inference_completions_cost": 0.00027
+				},
+				"completion_tokens_details": {
+					"reasoning_tokens": 0,
+					"image_tokens": 0,
+					"audio_tokens": 0
+				}
+			}
+		}
+	}
+}

@@ -1,0 +1,19 @@
+/**
+ * @roj-ai/client
+ *
+ * Vanilla TypeScript client for the roj agent server. No React — React hooks
+ * and chat components live in `@roj-ai/client-react`.
+ */
+
+export {
+	api,
+	configureApiBaseUrl,
+	createApiClient,
+	getApiBaseUrl,
+	configureProjectId,
+	RpcClient,
+	RpcError,
+	useApiError,
+} from './api/client'
+export type { ApiClient } from './api/client'
+export { unwrap } from './api/unwrap'

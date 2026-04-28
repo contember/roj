@@ -1,0 +1,55 @@
+{
+	"name": "@roj-ai/sandbox-runtime",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./src/index.ts",
+			"default": "./src/index.ts"
+		},
+		"./server": {
+			"types": "./dist/server.d.ts",
+			"import": "./src/server.ts",
+			"default": "./src/server.ts"
+		},
+		"./user-config": {
+			"types": "./dist/user-config-loader.d.ts",
+			"import": "./src/user-config-loader.ts",
+			"default": "./src/user-config-loader.ts"
+		}
+	},
+	"files": [
+		"src",
+		"dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/contember/roj.git",
+		"directory": "packages/sandbox-runtime"
+	},
+	"homepage": "https://github.com/contember/roj/tree/main/packages/sandbox-runtime#readme",
+	"bugs": {
+		"url": "https://github.com/contember/roj/issues"
+	},
+	"scripts": {
+		"dev": "bun --watch src/main.ts ../../example/roj.config.ts",
+		"start": "bun src/main.ts",
+		"build": "bun build src/main.ts --outdir dist --target bun",
+		"type-check": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@roj-ai/sdk": "workspace:*",
+		"@roj-ai/transport": "workspace:*",
+		"hono": "4.12.5"
+	},
+	"devDependencies": {
+		"@types/bun": "latest",
+		"typescript": "^5.7.2"
+	},
+	"types": "./dist/index.d.ts"
+}

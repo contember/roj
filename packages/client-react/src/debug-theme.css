@@ -1,0 +1,7 @@
+@theme {
+	--color-accent-lime: #DFFF40;
+	--color-accent-peri: #9BB5FC;
+	--color-surface: #F2F4F6;
+	--shadow-soft: 0 4px 24px rgba(0, 0, 0, 0.05);
+	--shadow-card: 0 2px 12px rgba(0, 0, 0, 0.04);
+}

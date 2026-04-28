@@ -1,0 +1,108 @@
+{
+	"requestHash": "e5bd1099125a0aaf",
+	"request": {
+		"url": "https://openrouter.ai/api/v1/chat/completions",
+		"method": "POST",
+		"headers": {
+			"content-type": "application/json"
+		},
+		"body": {
+			"model": "anthropic/claude-haiku-4.5",
+			"messages": [
+				{
+					"role": "system",
+					"content": [
+						{
+							"type": "text",
+							"text": "You are a helpful assistant.",
+							"cache_control": {
+								"type": "ephemeral"
+							}
+						}
+					]
+				},
+				{
+					"role": "user",
+					"content": "Hi"
+				},
+				{
+					"role": "assistant",
+					"content": "Hello!"
+				},
+				{
+					"role": "system",
+					"content": "The user prefers Czech language."
+				},
+				{
+					"role": "user",
+					"content": "How are you?"
+				}
+			],
+			"stream": false,
+			"stream_options": {
+				"include_usage": true
+			}
+		}
+	},
+	"response": {
+		"status": 200,
+		"headers": {
+			"access-control-allow-origin": "*",
+			"cf-ray": "9dede1a81a33b391-PRG",
+			"connection": "keep-alive",
+			"content-encoding": "gzip",
+			"content-type": "application/json",
+			"date": "Thu, 19 Mar 2026 16:33:55 GMT",
+			"permissions-policy": "payment=(self \"https://checkout.stripe.com\" \"https://connect-js.stripe.com\" \"https://js.stripe.com\" \"https://*.js.stripe.com\" \"https://hooks.stripe.com\")",
+			"referrer-policy": "no-referrer, strict-origin-when-cross-origin",
+			"server": "cloudflare",
+			"transfer-encoding": "chunked",
+			"x-content-type-options": "nosniff"
+		},
+		"body": {
+			"id": "gen-1773938034-ruVDEapmIKBZfzz4g5Vs",
+			"object": "chat.completion",
+			"created": 1773938034,
+			"model": "anthropic/claude-4.5-haiku-20251001",
+			"provider": "Amazon Bedrock",
+			"system_fingerprint": null,
+			"choices": [
+				{
+					"index": 0,
+					"logprobs": null,
+					"finish_reason": "stop",
+					"native_finish_reason": "stop",
+					"message": {
+						"role": "assistant",
+						"content": "Jsem v pořádku, děkuji za optání! 😊 \n\nJak se máš ty? Jak se ti daří? Mohu ti nějak pomoci?",
+						"refusal": null,
+						"reasoning": null
+					}
+				}
+			],
+			"usage": {
+				"prompt_tokens": 33,
+				"completion_tokens": 49,
+				"total_tokens": 82,
+				"cost": 0.000278,
+				"is_byok": false,
+				"prompt_tokens_details": {
+					"cached_tokens": 0,
+					"cache_write_tokens": 0,
+					"audio_tokens": 0,
+					"video_tokens": 0
+				},
+				"cost_details": {
+					"upstream_inference_cost": 0.000278,
+					"upstream_inference_prompt_cost": 0.000033,
+					"upstream_inference_completions_cost": 0.000245
+				},
+				"completion_tokens_details": {
+					"reasoning_tokens": 0,
+					"image_tokens": 0,
+					"audio_tokens": 0
+				}
+			}
+		}
+	}
+}

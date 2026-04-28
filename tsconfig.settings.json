@@ -1,0 +1,17 @@
+{
+	"compilerOptions": {
+		"composite": true,
+		"isolatedModules": true,
+		"lib": [
+			"esnext"
+		],
+		"emitDeclarationOnly": true,
+		"declaration": true,
+		"module": "esnext",
+		"moduleResolution": "Bundler",
+		"skipLibCheck": true,
+		"noImplicitAny": true,
+		"strict": true,
+		"target": "esnext"
+	}
+}

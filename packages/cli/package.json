@@ -1,0 +1,36 @@
+{
+	"name": "@roj-ai/cli",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "./src/main.ts",
+	"files": [
+		"src",
+		"dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/contember/roj.git",
+		"directory": "packages/cli"
+	},
+	"homepage": "https://github.com/contember/roj/tree/main/packages/cli#readme",
+	"bugs": {
+		"url": "https://github.com/contember/roj/issues"
+	},
+	"scripts": {
+		"dev": "bun run src/main.ts",
+		"build": "tsc",
+		"type-check": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@roj-ai/sdk": "workspace:*",
+		"@roj-ai/shared": "workspace:*",
+		"@roj-ai/transport": "workspace:*"
+	},
+	"devDependencies": {
+		"@types/bun": "latest",
+		"typescript": "^5.7.2"
+	}
+}

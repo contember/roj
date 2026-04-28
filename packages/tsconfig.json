@@ -1,0 +1,17 @@
+{
+	"files": [],
+	"include": [],
+	"references": [
+		{ "path": "./transport" },
+		{ "path": "./shared" },
+		{ "path": "./sdk" },
+		{ "path": "./client" },
+		{ "path": "./client-react" },
+		{ "path": "./debug" },
+		{ "path": "./cli" },
+		{ "path": "./platform-cli" },
+		{ "path": "./standalone-server" },
+		{ "path": "./sandbox-runtime" },
+		{ "path": "./demo" }
+	]
+}
