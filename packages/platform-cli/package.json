@@ -3,7 +3,7 @@
 	"version": "0.1.0",
 	"type": "module",
 	"bin": {
-		"roj": "./src/main.ts"
+		"roj": "./dist/main.js"
 	},
 	"files": [
 		"src",

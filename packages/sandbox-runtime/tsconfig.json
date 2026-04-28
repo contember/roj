@@ -4,7 +4,6 @@
 		"outDir": "./dist",
 		"rootDir": "./src",
 		"composite": true,
-		"emitDeclarationOnly": true,
 		"types": ["@types/bun"],
 		"baseUrl": ".",
 		"paths": {

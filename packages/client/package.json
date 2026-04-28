@@ -2,22 +2,22 @@
 	"name": "@roj-ai/client",
 	"version": "0.1.0",
 	"type": "module",
-	"main": "./src/index.ts",
+	"main": "./dist/index.js",
 	"exports": {
 		".": {
 			"types": "./dist/index.d.ts",
-			"import": "./src/index.ts",
-			"default": "./src/index.ts"
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
 		},
 		"./api": {
 			"types": "./dist/api/client.d.ts",
-			"import": "./src/api/client.ts",
-			"default": "./src/api/client.ts"
+			"import": "./dist/api/client.js",
+			"default": "./dist/api/client.js"
 		},
 		"./platform": {
 			"types": "./dist/platform/index.d.ts",
-			"import": "./src/platform/index.ts",
-			"default": "./src/platform/index.ts"
+			"import": "./dist/platform/index.js",
+			"default": "./dist/platform/index.js"
 		}
 	},
 	"files": [

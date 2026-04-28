@@ -2,127 +2,117 @@
 	"name": "@roj-ai/sdk",
 	"version": "0.1.0",
 	"type": "module",
-	"main": "./src/index.ts",
+	"main": "./dist/index.js",
 	"exports": {
 		".": {
 			"types": "./dist/index.d.ts",
-			"import": "./src/index.ts",
-			"default": "./src/index.ts"
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
 		},
 		"./platform": {
 			"types": "./dist/platform/index.d.ts",
-			"import": "./src/platform/index.ts",
-			"default": "./src/platform/index.ts"
+			"import": "./dist/platform/index.js",
+			"default": "./dist/platform/index.js"
 		},
 		"./bun-platform": {
 			"types": "./dist/bun-platform/index.d.ts",
-			"import": "./src/bun-platform/index.ts",
-			"default": "./src/bun-platform/index.ts"
+			"import": "./dist/bun-platform/index.js",
+			"default": "./dist/bun-platform/index.js"
 		},
 		"./bootstrap": {
 			"types": "./dist/bootstrap.d.ts",
-			"import": "./src/bootstrap.ts",
-			"default": "./src/bootstrap.ts"
+			"import": "./dist/bootstrap.js",
+			"default": "./dist/bootstrap.js"
 		},
 		"./config": {
 			"types": "./dist/config.d.ts",
-			"import": "./src/config.ts",
-			"default": "./src/config.ts"
+			"import": "./dist/config.js",
+			"default": "./dist/config.js"
 		},
 		"./user-config": {
 			"types": "./dist/user-config.d.ts",
-			"import": "./src/user-config.ts",
-			"default": "./src/user-config.ts"
+			"import": "./dist/user-config.js",
+			"default": "./dist/user-config.js"
 		},
 		"./tools": {
 			"types": "./dist/core/tools/index.d.ts",
-			"import": "./src/core/tools/index.ts",
-			"default": "./src/core/tools/index.ts"
+			"import": "./dist/core/tools/index.js",
+			"default": "./dist/core/tools/index.js"
 		},
 		"./transport/http/app": {
 			"types": "./dist/transport/http/app.d.ts",
-			"import": "./src/transport/http/app.ts",
-			"default": "./src/transport/http/app.ts"
+			"import": "./dist/transport/http/app.js",
+			"default": "./dist/transport/http/app.js"
 		},
 		"./transport/adapter": {
 			"types": "./dist/transport/adapter/index.d.ts",
-			"import": "./src/transport/adapter/index.ts",
-			"default": "./src/transport/adapter/index.ts"
+			"import": "./dist/transport/adapter/index.js",
+			"default": "./dist/transport/adapter/index.js"
 		},
 		"./session-manager": {
 			"types": "./dist/core/sessions/session-manager.d.ts",
-			"import": "./src/core/sessions/session-manager.ts",
-			"default": "./src/core/sessions/session-manager.ts"
+			"import": "./dist/core/sessions/session-manager.js",
+			"default": "./dist/core/sessions/session-manager.js"
 		},
 		"./llm/provider": {
 			"types": "./dist/core/llm/provider.d.ts",
-			"import": "./src/core/llm/provider.ts",
-			"default": "./src/core/llm/provider.ts"
+			"import": "./dist/core/llm/provider.js",
+			"default": "./dist/core/llm/provider.js"
 		},
 		"./llm/mock": {
 			"types": "./dist/core/llm/mock.d.ts",
-			"import": "./src/core/llm/mock.ts",
-			"default": "./src/core/llm/mock.ts"
+			"import": "./dist/core/llm/mock.js",
+			"default": "./dist/core/llm/mock.js"
 		},
 		"./llm/snapshot-middleware": {
 			"types": "./dist/core/llm/snapshot-middleware.d.ts",
-			"import": "./src/core/llm/snapshot-middleware.ts",
-			"default": "./src/core/llm/snapshot-middleware.ts"
+			"import": "./dist/core/llm/snapshot-middleware.js",
+			"default": "./dist/core/llm/snapshot-middleware.js"
 		},
 		"./testing": {
 			"types": "./dist/testing/index.d.ts",
-			"import": "./src/testing/index.ts",
-			"default": "./src/testing/index.ts"
+			"import": "./dist/testing/index.js",
+			"default": "./dist/testing/index.js"
 		},
 		"./tools/filesystem": {
 			"types": "./dist/plugins/filesystem/index.d.ts",
-			"import": "./src/plugins/filesystem/index.ts",
-			"default": "./src/plugins/filesystem/index.ts"
+			"import": "./dist/plugins/filesystem/index.js",
+			"default": "./dist/plugins/filesystem/index.js"
 		},
 		"./tools/shell": {
 			"types": "./dist/plugins/shell/index.d.ts",
-			"import": "./src/plugins/shell/index.ts",
-			"default": "./src/plugins/shell/index.ts"
+			"import": "./dist/plugins/shell/index.js",
+			"default": "./dist/plugins/shell/index.js"
 		},
 		"./workers": {
 			"types": "./dist/plugins/workers/index.d.ts",
-			"import": "./src/plugins/workers/index.ts",
-			"default": "./src/plugins/workers/index.ts"
+			"import": "./dist/plugins/workers/index.js",
+			"default": "./dist/plugins/workers/index.js"
 		},
 		"./workers/context": {
 			"types": "./dist/plugins/workers/context.d.ts",
-			"import": "./src/plugins/workers/context.ts",
-			"default": "./src/plugins/workers/context.ts"
+			"import": "./dist/plugins/workers/context.js",
+			"default": "./dist/plugins/workers/context.js"
 		},
 		"./workers/definition": {
 			"types": "./dist/plugins/workers/definition.d.ts",
-			"import": "./src/plugins/workers/definition.ts",
-			"default": "./src/plugins/workers/definition.ts"
+			"import": "./dist/plugins/workers/definition.js",
+			"default": "./dist/plugins/workers/definition.js"
 		},
 		"./file-store": {
 			"types": "./dist/core/file-store/file-store.d.ts",
-			"import": "./src/core/file-store/file-store.ts",
-			"default": "./src/core/file-store/file-store.ts"
+			"import": "./dist/core/file-store/file-store.js",
+			"default": "./dist/core/file-store/file-store.js"
 		},
 		"./prompts": {
 			"types": "./dist/prompts/index.d.ts",
-			"import": "./src/prompts/index.ts",
-			"default": "./src/prompts/index.ts"
-		},
-		"./protocols": {
-			"types": "./dist/transport/protocols/index.d.ts",
-			"import": "./src/transport/protocols/index.ts",
-			"default": "./src/transport/protocols/index.ts"
+			"import": "./dist/prompts/index.js",
+			"default": "./dist/prompts/index.js"
 		},
 		"./rpc": {
 			"types": "./dist/transport/rpc/index.d.ts",
-			"import": "./src/transport/rpc/index.ts",
-			"default": "./src/transport/rpc/index.ts"
-		},
-		"./projections": {
-			"types": "./dist/projections/index.d.ts",
-			"import": "./src/projections/index.ts",
-			"default": "./src/projections/index.ts"
+			"import": "./dist/transport/rpc/index.js",
+			"default": "./dist/transport/rpc/index.js"
 		}
 	},
 	"files": [

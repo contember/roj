@@ -2,22 +2,22 @@
 	"name": "@roj-ai/client-react",
 	"version": "0.1.0",
 	"type": "module",
-	"main": "./src/index.ts",
+	"main": "./dist/index.js",
 	"exports": {
 		".": {
 			"types": "./dist/index.d.ts",
-			"import": "./src/index.ts",
-			"default": "./src/index.ts"
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
 		},
 		"./stores": {
 			"types": "./dist/stores/index.d.ts",
-			"import": "./src/stores/index.ts",
-			"default": "./src/stores/index.ts"
+			"import": "./dist/stores/index.js",
+			"default": "./dist/stores/index.js"
 		},
 		"./chat": {
 			"types": "./dist/components/chat/index.d.ts",
-			"import": "./src/components/chat/index.ts",
-			"default": "./src/components/chat/index.ts"
+			"import": "./dist/components/chat/index.js",
+			"default": "./dist/components/chat/index.js"
 		},
 		"./debug-theme.css": "./src/debug-theme.css"
 	},

@@ -2,10 +2,9 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"ts:build": "tsc --build && bun run ts:resolve-aliases",
+		"ts:build": "bun run scripts/ts-build.mjs",
 		"ts:clean": "tsc --build --clean",
 		"ts:watch": "tsc --build --watch",
-		"ts:resolve-aliases": "for pkg in packages/*/tsconfig.json; do bunx tsc-alias -p \"$pkg\" 2>/dev/null; done",
 		"lint": "biome lint .",
 		"lint:fix": "biome lint . --write"
 	},

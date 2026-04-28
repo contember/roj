@@ -2,32 +2,32 @@
 	"name": "@roj-ai/transport",
 	"version": "0.1.0",
 	"type": "module",
-	"main": "./src/index.ts",
+	"main": "./dist/index.js",
 	"exports": {
 		".": {
 			"types": "./dist/index.d.ts",
-			"import": "./src/index.ts",
-			"default": "./src/index.ts"
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
 		},
 		"./client": {
 			"types": "./dist/client/index.d.ts",
-			"import": "./src/client/index.ts",
-			"default": "./src/client/index.ts"
+			"import": "./dist/client/index.js",
+			"default": "./dist/client/index.js"
 		},
 		"./server": {
 			"types": "./dist/server/index.d.ts",
-			"import": "./src/server/index.ts",
-			"default": "./src/server/index.ts"
+			"import": "./dist/server/index.js",
+			"default": "./dist/server/index.js"
 		},
 		"./browser": {
 			"types": "./dist/platform/browser.d.ts",
-			"import": "./src/platform/browser.ts",
-			"default": "./src/platform/browser.ts"
+			"import": "./dist/platform/browser.js",
+			"default": "./dist/platform/browser.js"
 		},
 		"./bun": {
 			"types": "./dist/platform/bun.d.ts",
-			"import": "./src/platform/bun.ts",
-			"default": "./src/platform/bun.ts"
+			"import": "./dist/platform/bun.js",
+			"default": "./dist/platform/bun.js"
 		}
 	},
 	"files": [
