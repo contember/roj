@@ -1,9 +1,32 @@
 import type { SessionId } from '@roj-ai/shared'
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { configureApiBaseUrl } from '@roj-ai/client'
 import { buildApiBaseUrl, buildWsUrl } from '@roj-ai/client/platform'
 import { useConnectionStore, configureConnectionUrl } from './stores/connection-store'
 import { useSessionStore, type ServiceInfo } from './stores/session-store'
+
+/**
+ * Auth token for a roj instance. Pass a plain string for a static (non-refreshing)
+ * token, or an object with a `refresh()` callback to have `useChat` auto-renew the
+ * token before it expires. The host typically wires `refresh` to a server endpoint
+ * that calls `tokens.create` on the platform.
+ */
+export type ChatTokenSource =
+	| string
+	| {
+		initial: ChatTokenSnapshot
+		refresh: () => Promise<ChatTokenSnapshot>
+		/** Trigger refresh this many ms before `expiresAt` (default 30000). */
+		refreshLeadMs?: number
+	}
+
+export interface ChatTokenSnapshot {
+	token: string
+	/** ISO 8601 timestamp. Omit for tokens that don't expire. */
+	expiresAt?: string
+	/** Optional preview URLs keyed by service code, e.g. from `tokens.create({ previewServiceCodes })`. */
+	previewUrls?: Record<string, string>
+}
 
 export interface UseChatOptions {
 	/** Platform URL (e.g. https://roj.example.com) */
@@ -12,8 +35,8 @@ export interface UseChatOptions {
 	instanceId: string
 	/** Session ID */
 	sessionId: string
-	/** Instance token for authentication */
-	token: string
+	/** Instance token for authentication. String for static; object for self-refreshing. */
+	token: ChatTokenSource
 	/** Whether to auto-connect on mount (default: true) */
 	autoConnect?: boolean
 	/** Called for every WebSocket message (type, payload) — escape hatch for custom types */
@@ -43,6 +66,11 @@ export interface ChatState {
 	// Instance init progress
 	initStatus: 'connecting' | 'initializing' | 'ready' | 'failed'
 	initSteps: Array<{ step: string; detail?: string; timestamp: number }>
+
+	// Auth — reactive view of the current token and any preview URLs derived from it.
+	// Rotates automatically when the host supplied a refreshable `ChatTokenSource`.
+	currentToken: string
+	previewUrls: Record<string, string>
 
 	// Actions
 	sendMessage: (content: string) => Promise<void>
@@ -78,6 +106,15 @@ export interface ChatState {
  * )
  * ```
  */
+const DEFAULT_REFRESH_LEAD_MS = 30_000
+
+function normalizeTokenSource(source: ChatTokenSource): ChatTokenSnapshot {
+	if (typeof source === 'string') {
+		return { token: source }
+	}
+	return source.initial
+}
+
 export function useChat(options: UseChatOptions): ChatState {
 	const { platformUrl, instanceId, sessionId, token, autoConnect = true, onMessage } = options
 
@@ -86,6 +123,59 @@ export function useChat(options: UseChatOptions): ChatState {
 	const disconnect = useConnectionStore((s) => s.disconnect)
 	const addMessageHandler = useConnectionStore((s) => s.addMessageHandler)
 	const removeMessageHandler = useConnectionStore((s) => s.removeMessageHandler)
+
+	// Token state — kept in a ref for the WS URL builder (re-read on every reconnect)
+	// AND in React state so consumers (preview iframe etc.) re-render when it rotates.
+	const [tokenSnapshot, setTokenSnapshot] = useState<ChatTokenSnapshot>(() => normalizeTokenSource(token))
+	const tokenSnapshotRef = useRef(tokenSnapshot)
+	tokenSnapshotRef.current = tokenSnapshot
+
+	// Identity-stable refresh callback so the refresh effect doesn't restart on every render.
+	const refreshFnRef = useRef<(() => Promise<ChatTokenSnapshot>) | null>(null)
+	const refreshLeadMsRef = useRef(DEFAULT_REFRESH_LEAD_MS)
+	if (typeof token === 'string') {
+		refreshFnRef.current = null
+	} else {
+		refreshFnRef.current = token.refresh
+		refreshLeadMsRef.current = token.refreshLeadMs ?? DEFAULT_REFRESH_LEAD_MS
+	}
+
+	// `refreshNonce` bump re-runs the refresh effect after a transient failure
+	// without rotating the snapshot itself.
+	const [refreshNonce, setRefreshNonce] = useState(0)
+
+	// Schedule the next refresh based on the most recent snapshot's expiresAt.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: refreshNonce intentionally retriggers the effect after a failed refresh
+	useEffect(() => {
+		if (!refreshFnRef.current || !tokenSnapshot.expiresAt) return
+		const expiresAtMs = new Date(tokenSnapshot.expiresAt).getTime()
+		if (Number.isNaN(expiresAtMs)) return
+
+		let cancelled = false
+		let retryHandle: ReturnType<typeof setTimeout> | undefined
+
+		const fireInMs = Math.max(expiresAtMs - Date.now() - refreshLeadMsRef.current, 1000)
+		const handle = setTimeout(async () => {
+			if (cancelled) return
+			try {
+				const fresh = await refreshFnRef.current!()
+				if (!cancelled) setTokenSnapshot(fresh)
+			} catch (err) {
+				if (cancelled) return
+				console.error('[useChat] Token refresh failed:', err)
+				// Retry after a short backoff so a transient failure doesn't strand the session.
+				retryHandle = setTimeout(() => {
+					if (!cancelled) setRefreshNonce((n) => n + 1)
+				}, 5000)
+			}
+		}, fireInMs)
+
+		return () => {
+			cancelled = true
+			clearTimeout(handle)
+			if (retryHandle) clearTimeout(retryHandle)
+		}
+	}, [tokenSnapshot, refreshNonce])
 
 	// Session store
 	const messages = useSessionStore((s) => s.messages)
@@ -117,12 +207,15 @@ export function useChat(options: UseChatOptions): ChatState {
 	const onMessageRef = useRef(onMessage)
 	onMessageRef.current = onMessage
 
-	// Configure URLs + connect
+	// Configure URLs + connect.
+	// The WS URL builder closes over `tokenSnapshotRef`, so token rotations are
+	// picked up on the next reconnect without re-running this effect (which would
+	// tear down the live socket).
 	useEffect(() => {
 		if (!autoConnect) return
 
 		configureConnectionUrl((_pid: string, sid: string) => {
-			return buildWsUrl({ platformUrl, instanceId, sessionId: sid, token })
+			return buildWsUrl({ platformUrl, instanceId, sessionId: sid, token: tokenSnapshotRef.current.token })
 		})
 		configureApiBaseUrl(buildApiBaseUrl(platformUrl, instanceId))
 
@@ -134,7 +227,7 @@ export function useChat(options: UseChatOptions): ChatState {
 			disconnect()
 			clearSession()
 		}
-	}, [autoConnect, platformUrl, instanceId, sessionId, token, loadSession, disconnect, clearSession])
+	}, [autoConnect, platformUrl, instanceId, sessionId, loadSession, disconnect, clearSession])
 
 	// Auto-recover on connection drop
 	const sessionStatus = useSessionStore((s) => s.status)
@@ -198,6 +291,8 @@ export function useChat(options: UseChatOptions): ChatState {
 		services,
 		initStatus,
 		initSteps,
+		currentToken: tokenSnapshot.token,
+		previewUrls: tokenSnapshot.previewUrls ?? {},
 		sendMessage,
 		uploadFile,
 		removeAttachment,

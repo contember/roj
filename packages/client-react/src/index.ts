@@ -13,7 +13,7 @@ export type { PendingAttachment, PendingQuestion, QuestionSubmitStatus, ServiceI
 
 // Main hook
 export { useChat } from './useChat'
-export type { ChatState, UseChatOptions } from './useChat'
+export type { ChatState, ChatTokenSnapshot, ChatTokenSource, UseChatOptions } from './useChat'
 
 // Preview URL
 export { usePreviewUrl } from './usePreviewUrl'
