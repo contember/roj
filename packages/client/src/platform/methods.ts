@@ -151,11 +151,23 @@ export interface CreateInstanceTokenInput {
 	origin?: string
 	expiresIn?: number // token TTL in seconds (default 24h, max 7d)
 	meta?: Record<string, unknown> // custom claims propagated to plugin method caller context
+	/**
+	 * Service codes (e.g. ['dev']) for which the platform should also build a
+	 * ready-to-use preview URL with the freshly minted token baked in.
+	 * Saves callers from having to know `baseDomain` or compose the URL.
+	 */
+	previewServiceCodes?: string[]
 }
 
 export interface CreateInstanceTokenOutput {
 	token: string
 	expiresAt: string
+	/**
+	 * Preview URLs keyed by service code, populated when `previewServiceCodes`
+	 * was set on the request. Each URL carries the token in `?token=` and is
+	 * suitable for direct use as an iframe `src`.
+	 */
+	previewUrls?: Record<string, string>
 }
 
 // ============================================================================
@@ -305,6 +317,34 @@ export interface GetServiceUrlOutput {
 }
 
 // ============================================================================
+// Session files
+// ============================================================================
+
+/**
+ * Which file namespace inside the session to read from.
+ * - `workspace` — the user-facing workspace dir produced by session plugins (e.g. `dist/Course.zip`).
+ * - `session` — internal session storage under the SDK's `dataPath/sessions/{sessionId}`.
+ */
+export type SessionFileScope = 'workspace' | 'session'
+
+export interface CreateSessionFileDownloadUrlInput {
+	instanceId: string
+	sessionId: string
+	scope: SessionFileScope
+	/** Scope-relative path (no leading slash). Path traversal (`..`) is rejected. */
+	path: string
+	/** TTL in seconds. Default 300, max 3600. */
+	ttlSeconds?: number
+}
+
+export interface CreateSessionFileDownloadUrlOutput {
+	/** Signed, time-limited URL serving the file's bytes. */
+	url: string
+	/** ISO 8601 expiry of the signed URL. */
+	expiresAt: string
+}
+
+// ============================================================================
 // Method registry
 // ============================================================================
 
@@ -326,6 +366,9 @@ export const platformMethods = defineMethods({
 
 	// Services
 	'services.getUrl': method<GetServiceUrlInput, GetServiceUrlOutput>(),
+
+	// Session files (signed-URL gateway in front of SDK's session/workspace + session/files routes)
+	'sessionFiles.createDownloadUrl': method<CreateSessionFileDownloadUrlInput, CreateSessionFileDownloadUrlOutput>(),
 
 	// Bundles
 	'bundles.list': method<ListBundlesInput, ListBundlesOutput>(),

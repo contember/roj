@@ -31,7 +31,7 @@ export type { BuildPreviewUrlOptions, BuildWsUrlOptions } from './urls'
 
 // REST client
 export { createRojClient } from './rest-client'
-export type { RojClient, RojClientOptions } from './rest-client'
+export type { RojClient, RojClientOptions, SessionRpcInput } from './rest-client'
 
 // Errors
 export { RojApiError } from './errors'

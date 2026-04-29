@@ -16,6 +16,8 @@ import type {
 	PublishSessionOutput,
 	CreateInstanceTokenInput,
 	CreateInstanceTokenOutput,
+	CreateSessionFileDownloadUrlInput,
+	CreateSessionFileDownloadUrlOutput,
 	ListBundlesInput,
 	ListBundlesOutput,
 	DeleteBundleOutput,
@@ -38,6 +40,13 @@ export interface RojClientOptions {
 	apiKey: string
 }
 
+export interface SessionRpcInput {
+	instanceId: string
+	sessionId: string
+	method: string
+	input?: Record<string, unknown>
+}
+
 export interface RojClient {
 	instances: {
 		create(input: CreateInstanceInput): Promise<CreateInstanceOutput>
@@ -50,9 +59,27 @@ export interface RojClient {
 		create(input: CreateSessionInput): Promise<CreateSessionOutput>
 		list(instanceId: string): Promise<ListSessionsOutput>
 		publish(input: PublishSessionInput): Promise<PublishSessionOutput>
+		/**
+		 * Call a plugin/session RPC method on a running session.
+		 *
+		 * Auto-mints and caches an instance token; the cached token is reused until
+		 * its expiry minus a small leeway. Suitable for server-to-server callers
+		 * that don't have a browser cookie or pre-existing instance token.
+		 */
+		rpc<T = unknown>(input: SessionRpcInput): Promise<T>
 	}
 	tokens: {
 		create(input: CreateInstanceTokenInput): Promise<CreateInstanceTokenOutput>
+	}
+	sessionFiles: {
+		/**
+		 * Mint a short-lived signed URL that streams the bytes of a session-bound file
+		 * back to the caller. Use after a session plugin has produced an artifact
+		 * (e.g. workspace `dist/Course.zip`) and the caller wants to fetch it without
+		 * routing through the dev preview proxy. `scope` selects between the workspace
+		 * dir and the SDK's session storage.
+		 */
+		createDownloadUrl(input: CreateSessionFileDownloadUrlInput): Promise<CreateSessionFileDownloadUrlOutput>
 	}
 	bundles: {
 		list(input?: ListBundlesInput): Promise<ListBundlesOutput>
@@ -70,6 +97,16 @@ export interface RojClient {
 	}
 }
 
+// Re-mint instance tokens this many milliseconds before their server-stated expiry.
+// Covers both clock skew between client and server and the latency of an in-flight
+// session RPC that started just before expiry.
+const TOKEN_REFRESH_LEEWAY_MS = 30_000
+
+interface CachedToken {
+	token: string
+	expiresAtMs: number
+}
+
 export function createRojClient(options: RojClientOptions): RojClient {
 	const rpc = createRpcClient<PlatformMethods>(`${options.url}/api/v1`, {
 		headers: { Authorization: `Bearer ${options.apiKey}` },
@@ -84,6 +121,56 @@ export function createRojClient(options: RojClientOptions): RojClient {
 		return result.value
 	}
 
+	const instanceTokenCache = new Map<string, CachedToken>()
+	const inflightTokenMint = new Map<string, Promise<string>>()
+	async function getInstanceToken(instanceId: string): Promise<string> {
+		const cached = instanceTokenCache.get(instanceId)
+		if (cached && cached.expiresAtMs - TOKEN_REFRESH_LEEWAY_MS > Date.now()) {
+			return cached.token
+		}
+		const inflight = inflightTokenMint.get(instanceId)
+		if (inflight) return inflight
+		const promise = (async () => {
+			try {
+				const fresh = await call('tokens.create', { instanceId })
+				instanceTokenCache.set(instanceId, {
+					token: fresh.token,
+					expiresAtMs: new Date(fresh.expiresAt).getTime(),
+				})
+				return fresh.token
+			} finally {
+				inflightTokenMint.delete(instanceId)
+			}
+		})()
+		inflightTokenMint.set(instanceId, promise)
+		return promise
+	}
+
+	async function callSessionRpc<T>(input: SessionRpcInput, retriedAfter401 = false): Promise<T> {
+		const token = await getInstanceToken(input.instanceId)
+		const url = `${options.url}/api/v1/instances/${input.instanceId}/sessions/${input.sessionId}/rpc`
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				Authorization: `Bearer ${token}`,
+			},
+			body: JSON.stringify({ method: input.method, input: input.input ?? {} }),
+		})
+		// Token may have been revoked or rotated server-side before its stated `expiresAt`.
+		// Evict the cache and retry once with a freshly minted token.
+		if (response.status === 401 && !retriedAfter401) {
+			instanceTokenCache.delete(input.instanceId)
+			return callSessionRpc<T>(input, true)
+		}
+		const body = await response.json().catch(() => null) as { ok?: boolean; value?: unknown; error?: { type: string; message: string } } | null
+		if (!response.ok || !body || body.ok === false) {
+			const error = body?.error ?? { type: 'transport_error', message: `HTTP ${response.status}` }
+			throw new RojApiError(error)
+		}
+		return body.value as T
+	}
+
 	return {
 		instances: {
 			create: (input) => call('instances.create', input),
@@ -96,9 +183,13 @@ export function createRojClient(options: RojClientOptions): RojClient {
 			create: (input) => call('sessions.create', input),
 			list: (instanceId) => call('sessions.list', { instanceId }),
 			publish: (input) => call('sessions.publish', input),
+			rpc: (input) => callSessionRpc(input),
 		},
 		tokens: {
 			create: (input) => call('tokens.create', input),
+		},
+		sessionFiles: {
+			createDownloadUrl: (input) => call('sessionFiles.createDownloadUrl', input),
 		},
 		bundles: {
 			list: (input) => call('bundles.list', input ?? {}),
