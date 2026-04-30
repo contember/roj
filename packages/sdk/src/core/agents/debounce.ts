@@ -1,5 +1,5 @@
-import { MailboxMessage } from '../../plugins/mailbox/schema'
-import { PendingToolResult } from '../tools/schema'
+import { MailboxMessage } from '../../plugins/mailbox/schema.js'
+import { PendingToolResult } from '../tools/schema.js'
 
 /**
  * Context provided to debounce callback for decision making.

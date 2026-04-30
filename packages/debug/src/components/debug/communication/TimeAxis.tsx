@@ -1,5 +1,5 @@
-import type { TimeSegment } from './types'
-import { LAYOUT } from './types'
+import type { TimeSegment } from './types.js'
+import { LAYOUT } from './types.js'
 
 interface TimeAxisProps {
 	segments: TimeSegment[]

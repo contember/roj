@@ -1,4 +1,4 @@
-import type { RpcError } from './rpc-definition'
+import type { RpcError } from './rpc-definition.js'
 
 export class RojApiError extends Error {
 	public readonly type: string

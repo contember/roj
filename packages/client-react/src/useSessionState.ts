@@ -1,4 +1,4 @@
-import { useSessionStore } from './stores/session-store'
+import { useSessionStore } from './stores/session-store.js'
 
 export function useSessionState(): Record<string, unknown> {
 	return useSessionStore((s) => s.sessionState)

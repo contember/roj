@@ -1,8 +1,8 @@
 import z4 from 'zod/v4'
 import { agentIdSchema } from '~/core/agents/schema.js'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
-import { createEventsFactory } from '../events/types'
-import { toolCallIdSchema } from './schema'
+import { createEventsFactory } from '../events/types.js'
+import { toolCallIdSchema } from './schema.js'
 
 export const toolEvents = createEventsFactory({
 	events: {

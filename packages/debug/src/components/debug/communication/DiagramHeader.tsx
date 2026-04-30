@@ -1,6 +1,6 @@
-import { DebugLink } from '../DebugNavigation'
-import type { DiagramParticipant } from './types'
-import { COLORS, LAYOUT } from './types'
+import { DebugLink } from '../DebugNavigation.js'
+import type { DiagramParticipant } from './types.js'
+import { COLORS, LAYOUT } from './types.js'
 
 interface DiagramHeaderProps {
 	participants: DiagramParticipant[]

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { type PendingAttachment, useSessionStore } from '../../stores/session-store'
+import { type PendingAttachment, useSessionStore } from '../../stores/session-store.js'
 
 interface MessageInputProps {
 	disabled?: boolean

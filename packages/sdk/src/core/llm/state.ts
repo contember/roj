@@ -4,7 +4,7 @@ import type { LLMMessage } from '~/core/agents/state'
 import { createEventsFactory } from '~/core/events/types'
 import { toolCallIdSchema } from '~/core/tools/schema'
 import { messageIdSchema } from '~/plugins/mailbox/schema'
-import { llmCallIdSchema } from './schema'
+import { llmCallIdSchema } from './schema.js'
 
 // ============================================================================
 // Supporting types for LLM events

@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 
-import { build } from './build'
-import { uploadResource } from './resource'
-import { upload } from './upload'
+import { build } from './build.js'
+import { uploadResource } from './resource.js'
+import { upload } from './upload.js'
 
 function getArg(args: string[], flag: string): string | undefined {
 	const idx = args.indexOf(flag)

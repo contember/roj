@@ -1,3 +1,3 @@
-export * from './definition'
-export * from './executor'
-export * from './schema'
+export * from './definition.js'
+export * from './executor.js'
+export * from './schema.js'

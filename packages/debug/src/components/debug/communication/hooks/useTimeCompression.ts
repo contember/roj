@@ -1,5 +1,5 @@
 import { useMemo } from 'react'
-import type { TimeCompressionConfig, TimeSegment } from '../types'
+import type { TimeCompressionConfig, TimeSegment } from '../types.js'
 
 const DEFAULT_CONFIG: TimeCompressionConfig = {
 	pixelsPerSecond: 50,

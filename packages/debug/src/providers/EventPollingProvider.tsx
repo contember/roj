@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { useEventStore } from '../stores/event-store'
+import { useEventStore } from '../stores/event-store.js'
 
 interface EventPollingProviderProps {
 	sessionId: string

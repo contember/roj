@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ZoomPanState } from '../types'
+import type { ZoomPanState } from '../types.js'
 
 const MIN_ZOOM = 0.25
 const MAX_ZOOM = 4

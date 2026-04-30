@@ -1,5 +1,5 @@
-import type { DiagramParticipant } from './types'
-import { LAYOUT } from './types'
+import type { DiagramParticipant } from './types.js'
+import { LAYOUT } from './types.js'
 
 interface ParticipantLaneProps {
 	participant: DiagramParticipant

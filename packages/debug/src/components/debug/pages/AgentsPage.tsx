@@ -4,10 +4,10 @@ import { AgentId } from '@roj-ai/shared'
 import type { RpcOutput } from '@roj-ai/shared/rpc'
 import { useCallback, useEffect, useState } from 'react'
 import { api, unwrap } from '@roj-ai/client'
-import { useAgentTree, useEventStore } from '../../../stores/event-store'
-import { useDebugContext } from '../DebugContext'
-import { DebugLink, useDebugSessionId } from '../DebugNavigation'
-import { AgentDetailPage } from './AgentDetailPage'
+import { useAgentTree, useEventStore } from '../../../stores/event-store.js'
+import { useDebugContext } from '../DebugContext.js'
+import { DebugLink, useDebugSessionId } from '../DebugNavigation.js'
+import { AgentDetailPage } from './AgentDetailPage.js'
 
 export function AgentsPage() {
 	const sessionId = useDebugSessionId()

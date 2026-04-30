@@ -4,7 +4,7 @@ import { COMMUNICATOR_ROLE, ORCHESTRATOR_ROLE } from '~/core/agents/agent-roles'
 import { createEventsFactory } from '~/core/events/types'
 import { messageIdSchema } from '~/plugins/mailbox/schema'
 import { uploadIdSchema } from '~/plugins/uploads/schema'
-import { WorkerId, workerIdSchema } from '../workers/worker'
+import { WorkerId, workerIdSchema } from '../workers/worker.js'
 
 export type MailboxMessageSender =
 	| AgentId

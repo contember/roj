@@ -1,8 +1,8 @@
 import type { BuiltinEvent, DomainEvent, InferenceCompletedEvent, InferenceFailedEvent } from '@roj-ai/sdk'
 import { useCallback, useMemo, useState } from 'react'
-import { DebugLink, useDebugSessionId } from '../DebugNavigation'
+import { DebugLink, useDebugSessionId } from '../DebugNavigation.js'
 import { api, unwrap } from '@roj-ai/client'
-import { useEvents, useEventStore } from '../../../stores/event-store'
+import { useEvents, useEventStore } from '../../../stores/event-store.js'
 
 const EVENT_TYPES = [
 	'all',

@@ -9,7 +9,7 @@ import { createEventsFactory } from '~/core/events/types'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { ChatMessageContentItem } from '~/core/llm/llm-log-types.js'
 import type { PendingToolResult, ToolCallId } from '~/core/tools/schema.js'
-import { MessageId } from '../../plugins/mailbox/schema'
+import { MessageId } from '../../plugins/mailbox/schema.js'
 
 export { MessageId }
 

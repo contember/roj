@@ -1,6 +1,6 @@
-import { createRpcClient } from './rpc-client'
-import type { MethodInput, MethodOutput } from './rpc-definition'
-import type { PlatformMethods, PlatformMethodName } from './methods'
+import { createRpcClient } from './rpc-client.js'
+import type { MethodInput, MethodOutput } from './rpc-definition.js'
+import type { PlatformMethods, PlatformMethodName } from './methods.js'
 import type {
 	CreateInstanceInput,
 	CreateInstanceOutput,
@@ -30,8 +30,8 @@ import type {
 	ListResourcesInput,
 	ListResourcesOutput,
 	DeleteResourceOutput,
-} from './methods'
-import { RojApiError } from './errors'
+} from './methods.js'
+import { RojApiError } from './errors.js'
 
 export interface RojClientOptions {
 	/** Platform URL (e.g. https://roj.example.com) */

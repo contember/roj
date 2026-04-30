@@ -1,7 +1,7 @@
 import type { DebugChatMessage } from '@roj-ai/shared'
 import { useState } from 'react'
-import { DebugLink } from '../DebugNavigation'
-import { useChatDebug, useEventStore } from '../../../stores/event-store'
+import { DebugLink } from '../DebugNavigation.js'
+import { useChatDebug, useEventStore } from '../../../stores/event-store.js'
 
 export function UserChatPage() {
 

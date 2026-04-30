@@ -10,7 +10,7 @@
 import { uuidv7 } from 'uuidv7'
 import z from 'zod/v4'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
-import { ToolContext } from './context'
+import { ToolContext } from './context.js'
 
 // ============================================================================
 // ToolCallId - Branded type

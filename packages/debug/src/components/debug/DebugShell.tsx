@@ -1,7 +1,7 @@
 import { type ReactNode, useState } from 'react'
 import { api, unwrap } from '@roj-ai/client'
-import { useEventPolling } from '../../providers/EventPollingProvider'
-import { useEventStore, useMetrics } from '../../stores/event-store'
+import { useEventPolling } from '../../providers/EventPollingProvider.js'
+import { useEventStore, useMetrics } from '../../stores/event-store.js'
 
 export interface NavItem {
 	to: string

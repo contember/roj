@@ -1,5 +1,5 @@
-import { DebugLink, useDebugParams, useDebugSessionId } from '../DebugNavigation'
-import { LLMCallDetail } from '../LLMCallDetail'
+import { DebugLink, useDebugParams, useDebugSessionId } from '../DebugNavigation.js'
+import { LLMCallDetail } from '../LLMCallDetail.js'
 
 export function LLMCallPage() {
 	const sessionId = useDebugSessionId()

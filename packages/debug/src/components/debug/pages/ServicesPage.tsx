@@ -1,8 +1,8 @@
 import { useCallback, useState } from 'react'
 import type { ServiceEntry, ServiceStatus } from '@roj-ai/shared'
 import { api } from '@roj-ai/client'
-import { useDebugSessionId } from '../DebugNavigation'
-import { useEventStore } from '../../../stores/event-store'
+import { useDebugSessionId } from '../DebugNavigation.js'
+import { useEventStore } from '../../../stores/event-store.js'
 
 const statusColors: Record<ServiceStatus, string> = {
 	stopped: 'bg-slate-100 text-slate-700',

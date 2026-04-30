@@ -1,11 +1,11 @@
 import type { AskUserInputType } from '@roj-ai/shared'
 import { useState } from 'react'
-import type { QuestionSubmitStatus } from '../../stores/session-store'
-import { Confirm } from './inputs/Confirm'
-import { MultiChoice } from './inputs/MultiChoice'
-import { Rating } from './inputs/Rating'
-import { SingleChoice } from './inputs/SingleChoice'
-import { TextInput } from './inputs/TextInput'
+import type { QuestionSubmitStatus } from '../../stores/session-store.js'
+import { Confirm } from './inputs/Confirm.js'
+import { MultiChoice } from './inputs/MultiChoice.js'
+import { Rating } from './inputs/Rating.js'
+import { SingleChoice } from './inputs/SingleChoice.js'
+import { TextInput } from './inputs/TextInput.js'
 
 interface QuestionItemProps {
 	questionId: string

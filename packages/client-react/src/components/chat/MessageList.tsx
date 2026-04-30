@@ -1,7 +1,7 @@
 import type { ChatMessage } from '@roj-ai/shared'
-import { AgentMessage } from './AgentMessage'
-import { AskUserMessage } from './AskUserMessage'
-import { UserMessage } from './UserMessage'
+import { AgentMessage } from './AgentMessage.js'
+import { AskUserMessage } from './AskUserMessage.js'
+import { UserMessage } from './UserMessage.js'
 
 interface MessageListProps {
 	messages: ChatMessage[]

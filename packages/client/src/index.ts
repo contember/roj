@@ -14,6 +14,6 @@ export {
 	RpcClient,
 	RpcError,
 	useApiError,
-} from './api/client'
-export type { ApiClient } from './api/client'
-export { unwrap } from './api/unwrap'
+} from './api/client.js'
+export type { ApiClient } from './api/client.js'
+export { unwrap } from './api/unwrap.js'

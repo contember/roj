@@ -1,7 +1,7 @@
-import { SessionContext } from '../sessions/context'
-import { AgentConfig } from './agent'
-import { AgentId } from './schema'
-import { AgentState } from './state'
+import { SessionContext } from '../sessions/context.js'
+import { AgentConfig } from './agent.js'
+import { AgentId } from './schema.js'
+import { AgentState } from './state.js'
 
 export type AgentContext<TInput = unknown> =
 	& SessionContext

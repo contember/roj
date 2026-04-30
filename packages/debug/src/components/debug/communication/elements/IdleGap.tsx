@@ -1,5 +1,5 @@
-import type { DiagramParticipant, TimeSegment } from '../types'
-import { COLORS, LAYOUT } from '../types'
+import type { DiagramParticipant, TimeSegment } from '../types.js'
+import { COLORS, LAYOUT } from '../types.js'
 
 interface IdleGapProps {
 	segment: TimeSegment

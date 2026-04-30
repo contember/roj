@@ -9,7 +9,7 @@
 
 import { uuidv7 } from 'uuidv7'
 import z from 'zod/v4'
-import type { LLMToolCall } from './state'
+import type { LLMToolCall } from './state.js'
 
 // ============================================================================
 // LLMCallId - Branded type

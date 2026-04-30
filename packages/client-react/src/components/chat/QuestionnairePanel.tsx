@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
-import { type PendingQuestion, useSessionStore } from '../../stores/session-store'
-import { QuestionItem } from './QuestionItem'
+import { type PendingQuestion, useSessionStore } from '../../stores/session-store.js'
+import { QuestionItem } from './QuestionItem.js'
 
 interface QuestionnairePanelProps {
 	questions: PendingQuestion[]

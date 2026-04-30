@@ -1,4 +1,4 @@
-import type { PendingQuestion, QuestionSubmitStatus } from '../../stores/session-store'
+import type { PendingQuestion, QuestionSubmitStatus } from '../../stores/session-store.js'
 
 interface QuestionnaireSummaryProps {
 	questions: PendingQuestion[]

@@ -6,21 +6,21 @@
  */
 
 // Stores
-export { configureConnectionUrl, useAutoConnect, useConnectionStore } from './stores/connection-store'
-export type { ConnectionStatus, RawMessageHandler, WsUrlBuilder } from './stores/connection-store'
-export { useSessionMessageHandler, useSessionStore } from './stores/session-store'
-export type { PendingAttachment, PendingQuestion, QuestionSubmitStatus, ServiceInfo } from './stores/session-store'
+export { configureConnectionUrl, useAutoConnect, useConnectionStore } from './stores/connection-store.js'
+export type { ConnectionStatus, RawMessageHandler, WsUrlBuilder } from './stores/connection-store.js'
+export { useSessionMessageHandler, useSessionStore } from './stores/session-store.js'
+export type { PendingAttachment, PendingQuestion, QuestionSubmitStatus, ServiceInfo } from './stores/session-store.js'
 
 // Main hook
-export { useChat } from './useChat'
-export type { ChatState, ChatTokenSnapshot, ChatTokenSource, UseChatOptions } from './useChat'
+export { useChat } from './useChat.js'
+export type { ChatState, ChatTokenSnapshot, ChatTokenSource, UseChatOptions } from './useChat.js'
 
 // Preview URL
-export { usePreviewUrl } from './usePreviewUrl'
-export type { UsePreviewUrlOptions } from './usePreviewUrl'
+export { usePreviewUrl } from './usePreviewUrl.js'
+export type { UsePreviewUrlOptions } from './usePreviewUrl.js'
 
 // Session state hooks
-export { useSessionState, useSessionStateValue, useUpdateSessionState } from './useSessionState'
+export { useSessionState, useSessionStateValue, useUpdateSessionState } from './useSessionState.js'
 
 // Chat components
 export {
@@ -37,4 +37,4 @@ export {
 	SingleChoice,
 	TextInput,
 	UserMessage,
-} from './components/chat'
+} from './components/chat/index.js'

@@ -3,7 +3,7 @@ import { AgentId, ChatMessageId, SessionId } from '@roj-ai/shared'
 import { useEffect } from 'react'
 import { create } from 'zustand'
 import { api, configureProjectId, getApiBaseUrl, unwrap } from '@roj-ai/client'
-import { useConnectionStore } from './connection-store'
+import { useConnectionStore } from './connection-store.js'
 
 function isChatMessage(msg: unknown): msg is ChatMessage {
 	return typeof msg === 'object' && msg !== null && 'type' in msg && 'timestamp' in msg

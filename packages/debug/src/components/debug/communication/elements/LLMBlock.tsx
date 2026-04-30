@@ -1,6 +1,6 @@
-import { useDebugNavigate } from '../../DebugNavigation'
-import type { DiagramLLMBlock, DiagramParticipant } from '../types'
-import { COLORS, LAYOUT } from '../types'
+import { useDebugNavigate } from '../../DebugNavigation.js'
+import type { DiagramLLMBlock, DiagramParticipant } from '../types.js'
+import { COLORS, LAYOUT } from '../types.js'
 
 interface LLMBlockProps {
 	block: DiagramLLMBlock

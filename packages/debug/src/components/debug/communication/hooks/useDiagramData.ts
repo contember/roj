@@ -1,8 +1,8 @@
 import type { AgentTreeNode } from '@roj-ai/shared'
 import type { BuiltinEvent, DomainEvent } from '@roj-ai/sdk'
 import { useMemo } from 'react'
-import type { DiagramData, DiagramLLMBlock, DiagramMessage, DiagramParticipant, DiagramToolBlock, ParticipantRole, ParticipantStatus } from '../types'
-import { useTimeCompression } from './useTimeCompression'
+import type { DiagramData, DiagramLLMBlock, DiagramMessage, DiagramParticipant, DiagramToolBlock, ParticipantRole, ParticipantStatus } from '../types.js'
+import { useTimeCompression } from './useTimeCompression.js'
 
 interface UseDiagramDataProps {
 	events: DomainEvent[]

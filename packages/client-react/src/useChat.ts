@@ -2,8 +2,8 @@ import type { SessionId } from '@roj-ai/shared'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { configureApiBaseUrl } from '@roj-ai/client'
 import { buildApiBaseUrl, buildWsUrl } from '@roj-ai/client/platform'
-import { useConnectionStore, configureConnectionUrl } from './stores/connection-store'
-import { useSessionStore, type ServiceInfo } from './stores/session-store'
+import { useConnectionStore, configureConnectionUrl } from './stores/connection-store.js'
+import { useSessionStore, type ServiceInfo } from './stores/session-store.js'
 
 /**
  * Auth token for a roj instance. Pass a plain string for a static (non-refreshing)

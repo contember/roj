@@ -7,10 +7,10 @@ import {
 	useMetrics,
 	useSessionInfo,
 	useTimeline,
-} from "../../../stores/event-store";
-import { formatDuration } from "../../../utils/format";
-import { useDebugNavigate } from "../DebugNavigation";
-import { TimelineDetailInspector } from "../TimelineDetailInspector";
+} from "../../../stores/event-store.js";
+import { formatDuration } from "../../../utils/format.js";
+import { useDebugNavigate } from "../DebugNavigation.js";
+import { TimelineDetailInspector } from "../TimelineDetailInspector.js";
 
 export function DashboardPage() {
 	const sessionInfo = useSessionInfo();

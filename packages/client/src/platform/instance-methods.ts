@@ -7,8 +7,8 @@
  *
  * Shared between worker (server) and client SDK.
  */
-import { defineMethods, method } from './rpc-definition'
-import type { PublishSessionOutput, GetAgentLogsOutput } from './methods'
+import { defineMethods, method } from './rpc-definition.js'
+import type { PublishSessionOutput, GetAgentLogsOutput } from './methods.js'
 
 // ============================================================================
 // Sandbox methods

@@ -4,8 +4,8 @@
  * Single source of truth for all platform API method types.
  * Shared between worker (server) and client SDK.
  */
-import { defineMethods, method } from './rpc-definition'
-import type { SandboxState } from './sandbox-state'
+import { defineMethods, method } from './rpc-definition.js'
+import type { SandboxState } from './sandbox-state.js'
 
 // ============================================================================
 // Instance methods

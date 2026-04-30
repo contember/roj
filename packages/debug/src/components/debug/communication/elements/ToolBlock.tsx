@@ -1,5 +1,5 @@
-import type { DiagramParticipant, DiagramToolBlock } from '../types'
-import { COLORS, LAYOUT } from '../types'
+import type { DiagramParticipant, DiagramToolBlock } from '../types.js'
+import { COLORS, LAYOUT } from '../types.js'
 
 interface ToolBlockProps {
 	block: DiagramToolBlock

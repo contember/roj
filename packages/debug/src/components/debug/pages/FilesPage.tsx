@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, getApiBaseUrl } from '@roj-ai/client'
-import { useDebugSessionId } from '../DebugNavigation'
+import { useDebugSessionId } from '../DebugNavigation.js'
 
 type Root = 'session' | 'workspace'
 

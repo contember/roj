@@ -4,7 +4,7 @@ import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { ToolDefinition } from '~/core/tools/definition.js'
 import type { ToolCallId } from '~/core/tools/schema.js'
 import type { Result } from '~/lib/utils/result.js'
-import { ModelId } from './schema'
+import { ModelId } from './schema.js'
 
 // Re-export LLMMessage types from agents/state for backwards compatibility
 export type { AssistantLLMMessage, LLMMessage, SystemLLMMessage, ToolCall, ToolLLMMessage, UserLLMMessage }

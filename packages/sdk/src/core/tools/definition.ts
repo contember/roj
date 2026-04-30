@@ -1,5 +1,5 @@
 import z4 from 'zod/v4'
-import { ToolExecutionCallback } from './schema'
+import { ToolExecutionCallback } from './schema.js'
 
 export type ToolDefinition<TInput = unknown> = {
 	name: string

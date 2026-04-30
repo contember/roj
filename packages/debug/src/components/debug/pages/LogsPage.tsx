@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@roj-ai/client";
-import { useDebugSessionId } from "../DebugNavigation";
+import { useDebugSessionId } from "../DebugNavigation.js";
 
 type LogLevel = "debug" | "info" | "warn" | "error";
 

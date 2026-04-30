@@ -2,8 +2,8 @@ import type { LLMCallLogEntry } from '@roj-ai/sdk'
 import type { AgentId } from '@roj-ai/shared'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, unwrap } from '@roj-ai/client'
-import { useEventStore } from '../../../stores/event-store'
-import { DebugLink, useDebugSessionId } from '../DebugNavigation'
+import { useEventStore } from '../../../stores/event-store.js'
+import { DebugLink, useDebugSessionId } from '../DebugNavigation.js'
 
 function isLLMCallLogEntry(data: unknown): data is LLMCallLogEntry {
 	return typeof data === 'object' && data !== null && 'id' in data && 'status' in data && 'request' in data

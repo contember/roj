@@ -5,20 +5,20 @@
  */
 
 // Message components
-export { AgentMessage } from './AgentMessage'
-export { AskUserMessage } from './AskUserMessage'
-export { MessageInput } from './MessageInput'
-export { MessageList } from './MessageList'
-export { UserMessage } from './UserMessage'
+export { AgentMessage } from './AgentMessage.js'
+export { AskUserMessage } from './AskUserMessage.js'
+export { MessageInput } from './MessageInput.js'
+export { MessageList } from './MessageList.js'
+export { UserMessage } from './UserMessage.js'
 
 // Questionnaire components
-export { QuestionItem } from './QuestionItem'
-export { QuestionnairePanel } from './QuestionnairePanel'
-export { QuestionnaireSummary } from './QuestionnaireSummary'
+export { QuestionItem } from './QuestionItem.js'
+export { QuestionnairePanel } from './QuestionnairePanel.js'
+export { QuestionnaireSummary } from './QuestionnaireSummary.js'
 
 // Input components
-export { Confirm } from './inputs/Confirm'
-export { MultiChoice } from './inputs/MultiChoice'
-export { Rating } from './inputs/Rating'
-export { SingleChoice } from './inputs/SingleChoice'
-export { TextInput } from './inputs/TextInput'
+export { Confirm } from './inputs/Confirm.js'
+export { MultiChoice } from './inputs/MultiChoice.js'
+export { Rating } from './inputs/Rating.js'
+export { SingleChoice } from './inputs/SingleChoice.js'
+export { TextInput } from './inputs/TextInput.js'

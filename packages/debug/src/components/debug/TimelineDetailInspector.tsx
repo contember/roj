@@ -1,5 +1,5 @@
 import type { TimelineItem } from '@roj-ai/shared'
-import { LLMCallDetail } from './LLMCallDetail'
+import { LLMCallDetail } from './LLMCallDetail.js'
 
 export function TimelineDetailInspector({
 	sessionId,

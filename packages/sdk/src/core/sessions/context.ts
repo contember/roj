@@ -4,10 +4,10 @@ import type { LLMLogger } from '~/core/llm/logger'
 import type { LLMProvider } from '~/core/llm/provider'
 import type { Logger } from '~/lib/logger/logger'
 import type { Platform } from '~/platform/index.js'
-import type { FileStore } from '../file-store/types'
-import type { SessionId } from './schema'
-import type { SessionEnvironment } from './session-environment'
-import type { SessionState } from './state'
+import type { FileStore } from '../file-store/types.js'
+import type { SessionId } from './schema.js'
+import type { SessionEnvironment } from './session-environment.js'
+import type { SessionState } from './state.js'
 
 export type SessionContext<TSessionInput = unknown> = {
 	readonly sessionId: SessionId

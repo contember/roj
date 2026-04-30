@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from 'react'
-import { useSessionStore } from './stores/session-store'
+import { useSessionStore } from './stores/session-store.js'
 import { buildPreviewUrl } from '@roj-ai/client/platform'
 
 export interface UsePreviewUrlOptions {

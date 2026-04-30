@@ -5,16 +5,16 @@
  */
 
 // Context (host app must provide this)
-export { DebugContext, useDebugContext, type DebugContextValue } from './DebugContext'
+export { DebugContext, useDebugContext, type DebugContextValue } from './DebugContext.js'
 
 // Navigation utilities
-export { DebugLink, useDebugNavigate, useDebugParams, useDebugSessionId } from './DebugNavigation'
+export { DebugLink, useDebugNavigate, useDebugParams, useDebugSessionId } from './DebugNavigation.js'
 
 // Shell (layout without router dependency)
-export { BackIcon, DebugShell, getNavItemClassName, navItems, type NavItem } from './DebugShell'
+export { BackIcon, DebugShell, getNavItemClassName, navItems, type NavItem } from './DebugShell.js'
 
 // Detail components
-export { LLMCallDetail } from './LLMCallDetail'
+export { LLMCallDetail } from './LLMCallDetail.js'
 
 // Pages
 export {
@@ -31,7 +31,7 @@ export {
 	ServicesPage,
 	TimelinePage,
 	UserChatPage,
-} from './pages'
+} from './pages/index.js'
 
 // Communication diagram components
-export { CommunicationDiagram } from './communication/CommunicationDiagram'
+export { CommunicationDiagram } from './communication/CommunicationDiagram.js'

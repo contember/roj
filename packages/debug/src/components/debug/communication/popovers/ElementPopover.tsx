@@ -1,4 +1,4 @@
-import type { DiagramLLMBlock, DiagramMessage, DiagramToolBlock, PopoverElement, TimeSegment } from '../types'
+import type { DiagramLLMBlock, DiagramMessage, DiagramToolBlock, PopoverElement, TimeSegment } from '../types.js'
 
 interface ElementPopoverProps {
 	element: PopoverElement

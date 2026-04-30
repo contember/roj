@@ -1,4 +1,4 @@
-import type { LLMMessage } from '../llm/provider'
+import type { LLMMessage } from '../llm/provider.js'
 
 // ============================================================================
 // Plugin Dequeue

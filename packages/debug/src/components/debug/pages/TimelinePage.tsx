@@ -1,8 +1,8 @@
 import type { TimelineItem } from '@roj-ai/shared'
 import { useState } from 'react'
-import { DebugLink, useDebugSessionId } from '../DebugNavigation'
-import { useEventStore, useTimeline } from '../../../stores/event-store'
-import { LLMCallDetail } from '../LLMCallDetail'
+import { DebugLink, useDebugSessionId } from '../DebugNavigation.js'
+import { useEventStore, useTimeline } from '../../../stores/event-store.js'
+import { LLMCallDetail } from '../LLMCallDetail.js'
 
 export function TimelinePage() {
 	const sessionId = useDebugSessionId()

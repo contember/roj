@@ -1,6 +1,6 @@
-import { useAgentTree, useEvents, useEventStore } from '../../../stores/event-store'
-import { CommunicationDiagram } from '../communication/CommunicationDiagram'
-import { useDiagramData } from '../communication/hooks/useDiagramData'
+import { useAgentTree, useEvents, useEventStore } from '../../../stores/event-store.js'
+import { CommunicationDiagram } from '../communication/CommunicationDiagram.js'
+import { useDiagramData } from '../communication/hooks/useDiagramData.js'
 
 export function CommunicationPage() {
 	// Get events and agents from event store (already loaded by DebugLayout)

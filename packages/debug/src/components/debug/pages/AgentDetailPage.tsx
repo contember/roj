@@ -7,13 +7,13 @@ import type {
 import { AgentId } from "@roj-ai/shared";
 import { type FormEvent, useCallback, useMemo, useState } from "react";
 import { api, unwrap } from "@roj-ai/client";
-import { useAgentDetail, useEventStore } from "../../../stores/event-store";
-import { formatDuration } from "../../../utils/format";
+import { useAgentDetail, useEventStore } from "../../../stores/event-store.js";
+import { formatDuration } from "../../../utils/format.js";
 import {
 	DebugLink,
 	useDebugParams,
 	useDebugSessionId,
-} from "../DebugNavigation";
+} from "../DebugNavigation.js";
 
 function formatTime(ts: number | undefined): string | null {
 	if (ts === undefined) return null;

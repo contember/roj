@@ -1,7 +1,7 @@
 import type { GlobalMailboxMessage } from '@roj-ai/shared'
 import { useState } from 'react'
-import { useEventStore, useGlobalMailbox } from '../../../stores/event-store'
-import { DebugLink } from '../DebugNavigation'
+import { useEventStore, useGlobalMailbox } from '../../../stores/event-store.js'
+import { DebugLink } from '../DebugNavigation.js'
 
 export function MailboxPage() {
 	// Get mailbox from event store (already loaded by DebugLayout)

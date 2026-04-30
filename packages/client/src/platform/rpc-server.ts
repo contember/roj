@@ -10,7 +10,7 @@
  *   // In Hono route:
  *   app.post('/rpc', (c) => router.handle(c.req.json(), ctx))
  */
-import type { MethodDef, MethodInput, MethodOutput, RpcError, RpcRequest, RpcResponse } from './rpc-definition'
+import type { MethodDef, MethodInput, MethodOutput, RpcError, RpcRequest, RpcResponse } from './rpc-definition.js'
 
 export type MethodHandler<
 	Methods extends Record<string, MethodDef>,

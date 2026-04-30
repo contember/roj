@@ -1,5 +1,5 @@
-import type { DiagramMessage, DiagramParticipant } from '../types'
-import { LAYOUT } from '../types'
+import type { DiagramMessage, DiagramParticipant } from '../types.js'
+import { LAYOUT } from '../types.js'
 
 interface MessageArrowProps {
 	message: DiagramMessage

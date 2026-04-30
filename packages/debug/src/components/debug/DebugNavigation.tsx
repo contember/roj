@@ -8,7 +8,7 @@
 import type { SessionId } from '@roj-ai/shared'
 import type { ReactNode } from 'react'
 import { useCallback } from 'react'
-import { useDebugContext } from './DebugContext'
+import { useDebugContext } from './DebugContext.js'
 
 /**
  * Get the session ID from the debug context.

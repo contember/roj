@@ -8,7 +8,7 @@
  *   })
  *   const result = await client.call('instances.create', { ... })
  */
-import type { MethodDef, MethodInput, MethodOutput, RpcError, RpcResponse } from './rpc-definition'
+import type { MethodDef, MethodInput, MethodOutput, RpcError, RpcResponse } from './rpc-definition.js'
 
 export interface RpcClientOptions {
 	headers?: Record<string, string>

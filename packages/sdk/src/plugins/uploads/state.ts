@@ -1,6 +1,6 @@
 import z4 from 'zod/v4'
 import { createEventsFactory } from '~/core/events/types'
-import { uploadIdSchema } from './schema'
+import { uploadIdSchema } from './schema.js'
 
 export const uploadEvents = createEventsFactory({
 	events: {

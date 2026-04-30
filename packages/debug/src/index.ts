@@ -19,10 +19,10 @@ export {
 	useMetrics,
 	useSessionInfo,
 	useTimeline,
-} from './stores/event-store'
+} from './stores/event-store.js'
 
 // Event polling provider
-export { EventPollingProvider, useEventPolling } from './providers/EventPollingProvider'
+export { EventPollingProvider, useEventPolling } from './providers/EventPollingProvider.js'
 
 // Debug components (context, navigation, shell, pages, diagrams)
 export {
@@ -51,5 +51,5 @@ export {
 	useDebugParams,
 	useDebugSessionId,
 	UserChatPage,
-} from './components/debug'
-export type { DebugContextValue, NavItem } from './components/debug'
+} from './components/debug/index.js'
+export type { DebugContextValue, NavItem } from './components/debug/index.js'

@@ -6,9 +6,9 @@ import {
 	defaultDebounceCallback,
 	waitForResponseDebounceCallback,
 } from '~/core/agents/debounce.js'
-import { MailboxMessage, MessageId } from '../../plugins/mailbox/schema'
-import { PendingToolResult, ToolCallId } from '../tools/schema'
-import { AgentId } from './schema'
+import { MailboxMessage, MessageId } from '../../plugins/mailbox/schema.js'
+import { PendingToolResult, ToolCallId } from '../tools/schema.js'
+import { AgentId } from './schema.js'
 
 describe('Debounce Callbacks', () => {
 	const createMessage = (timestampOffset = 0): MailboxMessage => ({
