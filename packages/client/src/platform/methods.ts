@@ -158,24 +158,20 @@ export interface CreateInstanceTokenInput {
 	origin?: string
 	expiresIn?: number // token TTL in seconds (default 24h, max 7d)
 	meta?: Record<string, unknown> // custom claims propagated to plugin method caller context
-	/**
-	 * Service codes (e.g. ['dev']) for which the platform should also build a
-	 * ready-to-use preview URL with the freshly minted token baked in.
-	 * Saves callers from having to know `baseDomain` or compose the URL.
-	 */
-	previewServiceCodes?: string[]
 }
 
 export interface CreateInstanceTokenOutput {
 	token: string
 	expiresAt: string
-	/**
-	 * Preview URLs keyed by service code, populated when `previewServiceCodes`
-	 * was set on the request. Each URL carries the token in `?token=` and is
-	 * suitable for direct use as an iframe `src`.
-	 */
-	previewUrls?: Record<string, string>
 }
+
+// Build preview URLs in browser code via `usePreviewUrl` from
+// `@roj-ai/client-react` (subscribes to live service registrations) or, in
+// non-React contexts, by calling `services.getUrl` to obtain the registered
+// short code and passing it to `buildPreviewUrl` together with the token.
+// The previous `tokens.create({ previewServiceCodes })` shortcut was removed
+// because it built URLs from raw input strings without resolving the actual
+// short code, producing 404s.
 
 // ============================================================================
 // Bundle methods
