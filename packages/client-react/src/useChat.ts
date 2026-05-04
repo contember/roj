@@ -1,6 +1,6 @@
 import type { SessionId } from '@roj-ai/shared'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { configureApiBaseUrl } from '@roj-ai/client'
+import { configureApiBaseUrl, configureAuthToken } from '@roj-ai/client'
 import { buildApiBaseUrl, buildWsUrl } from '@roj-ai/client/platform'
 import { useConnectionStore, configureConnectionUrl } from './stores/connection-store.js'
 import { useSessionStore, type ServiceInfo } from './stores/session-store.js'
@@ -24,8 +24,6 @@ export interface ChatTokenSnapshot {
 	token: string
 	/** ISO 8601 timestamp. Omit for tokens that don't expire. */
 	expiresAt?: string
-	/** Optional preview URLs keyed by service code, e.g. from `tokens.create({ previewServiceCodes })`. */
-	previewUrls?: Record<string, string>
 }
 
 export interface UseChatOptions {
@@ -67,10 +65,10 @@ export interface ChatState {
 	initStatus: 'connecting' | 'initializing' | 'ready' | 'failed'
 	initSteps: Array<{ step: string; detail?: string; timestamp: number }>
 
-	// Auth — reactive view of the current token and any preview URLs derived from it.
-	// Rotates automatically when the host supplied a refreshable `ChatTokenSource`.
+	// Auth — reactive view of the current token. Rotates automatically when the
+	// host supplied a refreshable `ChatTokenSource`. Use `usePreviewUrl` to
+	// derive iframe URLs from the live service registry.
 	currentToken: string
-	previewUrls: Record<string, string>
 
 	// Actions
 	sendMessage: (content: string) => Promise<void>
@@ -218,6 +216,10 @@ export function useChat(options: UseChatOptions): ChatState {
 			return buildWsUrl({ platformUrl, instanceId, sessionId: sid, token: tokenSnapshotRef.current.token })
 		})
 		configureApiBaseUrl(buildApiBaseUrl(platformUrl, instanceId))
+		// HTTP RPC auth: send the instance token via Authorization: Bearer.
+		// Avoids the cookie/exchange round-trip and works under cross-origin
+		// third-party-cookie blocking.
+		configureAuthToken(tokenSnapshotRef.current.token)
 
 		loadSession(sessionId as unknown as SessionId, instanceId).catch((err) => {
 			console.error('[useChat] Session load failed:', err)
@@ -226,8 +228,16 @@ export function useChat(options: UseChatOptions): ChatState {
 		return () => {
 			disconnect()
 			clearSession()
+			configureAuthToken(null)
 		}
 	}, [autoConnect, platformUrl, instanceId, sessionId, loadSession, disconnect, clearSession])
+
+	// Re-configure the auth header whenever the token rotates so subsequent
+	// RPC calls use the fresh credential.
+	useEffect(() => {
+		if (!autoConnect) return
+		configureAuthToken(tokenSnapshot.token)
+	}, [autoConnect, tokenSnapshot.token])
 
 	// Auto-recover on connection drop
 	const sessionStatus = useSessionStore((s) => s.status)
@@ -292,7 +302,6 @@ export function useChat(options: UseChatOptions): ChatState {
 		initStatus,
 		initSteps,
 		currentToken: tokenSnapshot.token,
-		previewUrls: tokenSnapshot.previewUrls ?? {},
 		sendMessage,
 		uploadFile,
 		removeAttachment,

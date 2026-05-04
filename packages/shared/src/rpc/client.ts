@@ -79,6 +79,7 @@ type BatchResults<T extends readonly BatchEntry<unknown>[]> = {
  */
 export class RpcClient {
 	private projectId: string | null = null
+	private authToken: string | null = null
 
 	constructor(private baseUrl: string = '') {}
 
@@ -104,12 +105,34 @@ export class RpcClient {
 		return this.projectId
 	}
 
+	/**
+	 * Set the bearer token for authenticated RPC calls. Sent as
+	 * `Authorization: Bearer <token>` so the platform doesn't have to fall
+	 * back to cookie auth (which requires a separate `/exchange` round-trip
+	 * and breaks under cross-origin third-party-cookie blocking).
+	 */
+	setAuthToken(token: string | null): void {
+		this.authToken = token
+	}
+
+	/**
+	 * Get the currently configured bearer token.
+	 */
+	getAuthToken(): string | null {
+		return this.authToken
+	}
+
 	private getRpcUrl(): string {
 		let url = `${this.baseUrl}/rpc`
 		if (this.projectId) {
 			url += `?project=${encodeURIComponent(this.projectId)}`
 		}
 		return url
+	}
+
+	private buildHeaders(extra: Record<string, string>): Record<string, string> {
+		if (!this.authToken) return extra
+		return { ...extra, Authorization: `Bearer ${this.authToken}` }
 	}
 
 	/**
@@ -121,7 +144,7 @@ export class RpcClient {
 	): Promise<Result<RpcOutput<M>, RpcErrorInfo>> {
 		const response = await fetch(this.getRpcUrl(), {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: this.buildHeaders({ 'Content-Type': 'application/json' }),
 			body: JSON.stringify({ method, input }),
 			credentials: 'include',
 		})
@@ -151,7 +174,7 @@ export class RpcClient {
 
 		const response = await fetch(this.getRpcUrl(), {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: this.buildHeaders({ 'Content-Type': 'application/json' }),
 			body: JSON.stringify({
 				batch: entries.map(e => ({ method: e.method, input: e.input })),
 			}),

@@ -8,6 +8,7 @@
 export {
 	api,
 	configureApiBaseUrl,
+	configureAuthToken,
 	createApiClient,
 	getApiBaseUrl,
 	configureProjectId,

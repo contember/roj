@@ -19,13 +19,16 @@ function createApiClientFromRpc(getClient: () => RpcClient): ApiClient {
 			const client = getClient()
 			const baseUrl = client.getBaseUrl()
 			const projectId = client.getProjectId()
+			const authToken = client.getAuthToken()
 			let url = `${baseUrl}/sessions/${sessionId}/upload`
 			if (projectId) {
 				url += `?project=${encodeURIComponent(projectId)}`
 			}
+			const headers: Record<string, string> = authToken ? { Authorization: `Bearer ${authToken}` } : {}
 			const response = await fetch(url, {
 				method: 'POST',
 				body: formData,
+				headers,
 				credentials: 'include',
 			})
 
@@ -43,9 +46,13 @@ let rpcClient = new RpcClient('')
 
 export function configureApiBaseUrl(url: string): void {
 	const projectId = rpcClient.getProjectId()
+	const authToken = rpcClient.getAuthToken()
 	rpcClient = new RpcClient(url)
 	if (projectId) {
 		rpcClient.setProjectId(projectId)
+	}
+	if (authToken) {
+		rpcClient.setAuthToken(authToken)
 	}
 }
 
@@ -55,6 +62,19 @@ export function getApiBaseUrl(): string {
 
 export function configureProjectId(projectId: string | null): void {
 	rpcClient.setProjectId(projectId)
+}
+
+/**
+ * Set the bearer token used by the shared `api` client for authenticated
+ * RPC calls. Sent as `Authorization: Bearer <token>` so the platform doesn't
+ * have to fall back to cookie auth.
+ *
+ * `useChat` calls this automatically when given a token; host code only
+ * needs it when constructing API calls outside of `useChat` (e.g. server-
+ * side scripts or custom hooks).
+ */
+export function configureAuthToken(token: string | null): void {
+	rpcClient.setAuthToken(token)
 }
 
 export function createApiClient(baseUrl: string = ''): ApiClient {
