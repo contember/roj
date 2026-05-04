@@ -35,28 +35,34 @@ export async function uploadResource(pathOrDir: string, options: {
 	}
 
 	try {
-		// 1. Upload file
-		console.log(`Uploading file: ${filename}`)
+		// 1. Hash file content for dedup
 		const file = Bun.file(filePath)
-		const formData = new FormData()
-		formData.append('file', file, filename)
+		const buf = await file.arrayBuffer()
+		const contentHash = await sha256Hex(buf)
 
-		const uploadResponse = await fetch(`${options.url}/api/v1/files/upload`, {
-			method: 'POST',
-			headers,
-			body: formData,
-		})
+		// 2. Preflight upload — if hash already known, server skips R2 put.
+		let uploadResult = await postFile({ url: options.url, apiKey: options.apiKey, contentHash, filename, mimeType })
+		if (uploadResult.status === 409 && uploadResult.body?.error === 'file-required') {
+			uploadResult = await postFile({
+				url: options.url,
+				apiKey: options.apiKey,
+				contentHash,
+				filename,
+				mimeType,
+				body: { buf, filename, mimeType },
+			})
+		}
 
-		if (!uploadResponse.ok) {
-			const error = await uploadResponse.json().catch(() => ({ error: uploadResponse.statusText }))
-			console.error('File upload failed:', (error as { error?: string }).error ?? uploadResponse.statusText)
+		if (uploadResult.status >= 400 || !uploadResult.body?.ok || !uploadResult.body.fileId) {
+			console.error('File upload failed:', uploadResult.body?.error ?? `HTTP ${uploadResult.status}`)
 			process.exit(1)
 		}
 
-		const uploadResult = await uploadResponse.json() as { fileId: string }
-		console.log(`File uploaded: ${uploadResult.fileId}`)
+		const fileId = uploadResult.body.fileId
+		const dedupNote = uploadResult.body.deduped ? ' (deduped, reused existing R2 object)' : ''
+		console.log(`File uploaded: ${fileId}${dedupNote}`)
 
-		// 2. Check if resource exists
+		// 3. Check if resource exists
 		const getResponse = await fetch(`${options.url}/api/v1/rpc`, {
 			method: 'POST',
 			headers: { ...headers, 'Content-Type': 'application/json' },
@@ -75,18 +81,22 @@ export async function uploadResource(pathOrDir: string, options: {
 					method: 'resources.addRevision',
 					input: {
 						resourceSlug: options.slug,
-						fileId: uploadResult.fileId,
+						fileId,
 						label: options.label,
 					},
 				}),
 			})
 
-			const revResult = await revResponse.json() as { ok: boolean; value?: { revisionId: string } }
-			if (!revResult.ok) {
+			const revResult = await revResponse.json() as { ok: boolean; value?: { revisionId: string; noop?: boolean } }
+			if (!revResult.ok || !revResult.value) {
 				console.error('Failed to add revision:', revResult)
 				process.exit(1)
 			}
-			console.log(`Revision added: ${revResult.value?.revisionId}`)
+			if (revResult.value.noop) {
+				console.log(`Unchanged: latest revision already points at this file (revisionId=${revResult.value.revisionId})`)
+			} else {
+				console.log(`Revision added: ${revResult.value.revisionId}`)
+			}
 		} else {
 			// 3b. Resource doesn't exist → create
 			console.log(`Creating resource "${options.slug}"...`)
@@ -99,7 +109,7 @@ export async function uploadResource(pathOrDir: string, options: {
 						slug: options.slug,
 						name: options.name,
 						description: options.description,
-						fileId: uploadResult.fileId,
+						fileId,
 						label: options.label,
 					},
 				}),
@@ -118,6 +128,58 @@ export async function uploadResource(pathOrDir: string, options: {
 			execSync(`rm -rf ${JSON.stringify(tempDir)}`)
 		}
 	}
+}
+
+interface PostFileArgs {
+	url: string
+	apiKey: string
+	contentHash: string
+	filename: string
+	mimeType: string
+	body?: { buf: ArrayBuffer; filename: string; mimeType: string }
+}
+
+interface PostFileResult {
+	status: number
+	body: {
+		ok?: boolean
+		error?: string
+		fileId?: string
+		filename?: string
+		mimeType?: string
+		size?: number
+		r2Key?: string
+		deduped?: boolean
+	} | null
+}
+
+async function postFile(args: PostFileArgs): Promise<PostFileResult> {
+	const formData = new FormData()
+	formData.append('contentHash', args.contentHash)
+	formData.append('filename', args.filename)
+	formData.append('mimeType', args.mimeType)
+	if (args.body) {
+		formData.append('file', new Blob([args.body.buf], { type: args.body.mimeType }), args.body.filename)
+	}
+
+	const response = await fetch(`${args.url}/api/v1/files/upload`, {
+		method: 'POST',
+		headers: { Authorization: `Bearer ${args.apiKey}` },
+		body: formData,
+	})
+
+	const body = await response.json().catch(() => null) as PostFileResult['body']
+	return { status: response.status, body }
+}
+
+async function sha256Hex(buf: ArrayBuffer): Promise<string> {
+	const digest = await crypto.subtle.digest('SHA-256', buf)
+	const bytes = new Uint8Array(digest)
+	let hex = ''
+	for (let i = 0; i < bytes.length; i++) {
+		hex += bytes[i].toString(16).padStart(2, '0')
+	}
+	return hex
 }
 
 function guessMimeType(filename: string): string {

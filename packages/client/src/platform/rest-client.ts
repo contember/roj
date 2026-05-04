@@ -86,7 +86,7 @@ export interface RojClient {
 		delete(input: { bundleId?: string; bundleSlug?: string }): Promise<DeleteBundleOutput>
 	}
 	files: {
-		upload(file: File | Blob, filename?: string): Promise<{ ok: true; fileId: string; filename: string; mimeType: string; size: number; r2Key: string }>
+		upload(file: File | Blob, filename?: string): Promise<{ ok: true; fileId: string; filename: string; mimeType: string; size: number; r2Key: string; deduped: boolean }>
 	}
 	resources: {
 		create(input: CreateResourceInput): Promise<CreateResourceOutput>
@@ -197,18 +197,28 @@ export function createRojClient(options: RojClientOptions): RojClient {
 		},
 		files: {
 			upload: async (file, filename) => {
-				const formData = new FormData()
-				formData.append('file', file, filename)
-				const response = await fetch(`${options.url}/api/v1/files/upload`, {
-					method: 'POST',
-					headers: { Authorization: `Bearer ${options.apiKey}` },
-					body: formData,
-				})
-				if (!response.ok) {
-					const body = await response.json().catch(() => ({ message: response.statusText }))
-					throw new RojApiError({ type: 'http_error', message: body.error ?? body.message ?? response.statusText })
+				const buf = await file.arrayBuffer()
+				const contentHash = await sha256Hex(buf)
+				const resolvedFilename = filename ?? (file instanceof File ? file.name : 'upload.bin')
+				const mimeType = file.type || 'application/octet-stream'
+
+				// Preflight without body — server reuses an existing File when the hash already exists.
+				let result = await postFile({ url: options.url, apiKey: options.apiKey, contentHash, filename: resolvedFilename, mimeType })
+				if (result.status === 409 && result.body?.error === 'file-required') {
+					result = await postFile({
+						url: options.url,
+						apiKey: options.apiKey,
+						contentHash,
+						filename: resolvedFilename,
+						mimeType,
+						body: new Blob([buf], { type: mimeType }),
+					})
 				}
-				return response.json()
+
+				if (!result.body?.ok) {
+					throw new RojApiError({ type: 'http_error', message: result.body?.error ?? `HTTP ${result.status}` })
+				}
+				return result.body as { ok: true; fileId: string; filename: string; mimeType: string; size: number; r2Key: string; deduped: boolean }
 			},
 		},
 		resources: {
@@ -219,4 +229,54 @@ export function createRojClient(options: RojClientOptions): RojClient {
 			delete: (resourceId) => call('resources.delete', { resourceId }),
 		},
 	}
+}
+
+interface PostFileArgs {
+	url: string
+	apiKey: string
+	contentHash: string
+	filename: string
+	mimeType: string
+	body?: Blob
+}
+
+interface PostFileResult {
+	status: number
+	body: {
+		ok?: boolean
+		error?: string
+		fileId?: string
+		filename?: string
+		mimeType?: string
+		size?: number
+		r2Key?: string
+		deduped?: boolean
+	} | null
+}
+
+async function postFile(args: PostFileArgs): Promise<PostFileResult> {
+	const formData = new FormData()
+	formData.append('contentHash', args.contentHash)
+	formData.append('filename', args.filename)
+	formData.append('mimeType', args.mimeType)
+	if (args.body) {
+		formData.append('file', args.body, args.filename)
+	}
+	const response = await fetch(`${args.url}/api/v1/files/upload`, {
+		method: 'POST',
+		headers: { Authorization: `Bearer ${args.apiKey}` },
+		body: formData,
+	})
+	const body = await response.json().catch(() => null) as PostFileResult['body']
+	return { status: response.status, body }
+}
+
+async function sha256Hex(buf: ArrayBuffer): Promise<string> {
+	const digest = await crypto.subtle.digest('SHA-256', buf)
+	const bytes = new Uint8Array(digest)
+	let hex = ''
+	for (let i = 0; i < bytes.length; i++) {
+		hex += bytes[i].toString(16).padStart(2, '0')
+	}
+	return hex
 }

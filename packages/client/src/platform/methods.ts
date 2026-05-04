@@ -225,6 +225,8 @@ export interface AddResourceRevisionInput {
 
 export interface AddResourceRevisionOutput {
 	revisionId: string
+	/** True when the latest existing revision already pointed at this fileId and label, so no new revision was created. */
+	noop?: boolean
 }
 
 export interface GetResourceInput {
