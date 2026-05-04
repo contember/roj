@@ -109,6 +109,13 @@ export interface CreateSessionInput {
 	blocking?: boolean
 	origin?: string
 	expiresIn?: number // token TTL in seconds (default 24h, max 7d)
+	/**
+	 * Optional first user message delivered to the agent right after the
+	 * session is created. Mirrors `autoCreateSession.initialPrompt` on
+	 * `instances.create` — useful for seeding context (e.g. translation
+	 * contracts) on every newly opened chat.
+	 */
+	initialPrompt?: string
 }
 
 export interface CreateSessionOutput {
