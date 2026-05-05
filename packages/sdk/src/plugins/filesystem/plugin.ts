@@ -12,6 +12,7 @@ import { Err, Ok } from '~/lib/utils/result.js'
 import type { Result } from '~/lib/utils/result.js'
 import type { ToolError } from '../../core/tools/executor.js'
 import {
+	ALWAYS_IGNORED_NAMES,
 	buildDirectoryListingPreamble,
 	CALLS_DIR,
 	checkDeniedPaths,
@@ -270,7 +271,12 @@ export const filesystemPlugin = definePlugin('filesystem')
 						})
 					}
 
-					const ig = respectGitignore ? await loadGitignoreViaStore(input.path, input.path, fileStore) : null
+					const roots = fileStore.getRoots()
+					const containingRoot = roots.workspace
+							&& (input.path === roots.workspace || input.path.startsWith(roots.workspace + '/'))
+						? roots.workspace
+						: roots.session
+					const ig = respectGitignore ? await loadGitignoreViaStore(input.path, containingRoot, fileStore) : null
 
 					async function collectEntries(dirPath: string): Promise<TreeEntry[]> {
 						const listResult = await fileStore.list(dirPath)
@@ -278,6 +284,7 @@ export const filesystemPlugin = definePlugin('filesystem')
 
 						const entries: TreeEntry[] = []
 						for (const item of listResult.value as FileEntry[]) {
+							if (ALWAYS_IGNORED_NAMES.has(item.name)) continue
 							if (!includeHidden && item.name.startsWith('.')) continue
 							if (deniedPaths.includes(item.name)) continue
 

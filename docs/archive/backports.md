@@ -78,3 +78,7 @@ Skipped (not relevant to buresh-cloud):
 
 Skipped (not relevant to buresh-cloud):
 - `b2784d3d` — webmaster CLAUDE.md refresh after core/ refactor (paths documented separately in buresh-cloud)
+
+## Ad-hoc backports past `50a00b44`
+
+- [x] `41bab476` — always skip `node_modules` in `list_directory` and load `.gitignore` from the workspace/session root containing the listed path (filesystem helpers + plugin)

@@ -11,6 +11,9 @@ import { Err, Ok, Result } from '../../lib/utils/result.js'
 export const EVENTS_DIR = '.events'
 export const CALLS_DIR = 'calls'
 
+/** Directory/file names that are always skipped when listing, regardless of gitignore. */
+export const ALWAYS_IGNORED_NAMES = new Set(['node_modules'])
+
 // ============================================================================
 // Path validation
 // ============================================================================
@@ -160,6 +163,7 @@ export async function collectTreeEntries(
 
 	const entries: TreeEntry[] = []
 	for (const item of listResult.value) {
+		if (ALWAYS_IGNORED_NAMES.has(item.name)) continue
 		if (!options.includeHidden && item.name.startsWith('.')) continue
 		if (options.deniedPaths?.includes(item.name)) continue
 
