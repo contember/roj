@@ -365,15 +365,65 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 	},
 
 	submitAllAnswers: async () => {
-		const { pendingQuestions, draftAnswers, answerQuestion } = get()
+		const { sessionId, entryAgentId, pendingQuestions, draftAnswers } = get()
+		if (!sessionId || !entryAgentId) return
 
-		// Submit answers sequentially
-		for (const question of pendingQuestions) {
-			const answer = draftAnswers.get(question.questionId)
-			if (answer !== undefined) {
-				await answerQuestion(question.questionId, answer)
-			}
+		const toSubmit = pendingQuestions
+			.map((q) => ({ question: q, answer: draftAnswers.get(q.questionId) }))
+			.filter((entry): entry is { question: PendingQuestion; answer: unknown } => entry.answer !== undefined)
+		if (toSubmit.length === 0) return
+
+		const submittingStatus = new Map(get().questionSubmitStatus)
+		for (const { question } of toSubmit) {
+			submittingStatus.set(question.questionId, 'submitting')
 		}
+		set({ questionSubmitStatus: submittingStatus })
+
+		const agentId = AgentId(entryAgentId)
+		const result = await api.batch((b) =>
+			toSubmit.map(({ question, answer }) =>
+				b.add('user-chat.answerQuestion', {
+					sessionId,
+					agentId,
+					questionId: ChatMessageId(question.questionId),
+					answer,
+				}),
+			),
+		)
+
+		if (!result.ok) {
+			console.error('Failed to submit answers:', result.error)
+			const errorStatus = new Map(get().questionSubmitStatus)
+			for (const { question } of toSubmit) {
+				errorStatus.set(question.questionId, 'error')
+			}
+			set({
+				questionSubmitStatus: errorStatus,
+				error: result.error.message,
+			})
+			return
+		}
+
+		const submittedIds = new Set(toSubmit.map(({ question }) => question.questionId))
+		const submittedAnswers = new Map(toSubmit.map(({ question, answer }) => [question.questionId, answer]))
+		const successStatus = new Map(get().questionSubmitStatus)
+		for (const id of submittedIds) {
+			successStatus.set(id, 'success')
+		}
+		const newDrafts = new Map(get().draftAnswers)
+		for (const id of submittedIds) {
+			newDrafts.delete(id)
+		}
+		set({
+			pendingQuestions: get().pendingQuestions.filter((q) => !submittedIds.has(q.questionId)),
+			messages: get().messages.map((m) =>
+				m.type === 'ask_user' && submittedIds.has(m.questionId)
+					? { ...m, answered: true, answer: submittedAnswers.get(m.questionId) }
+					: m,
+			),
+			questionSubmitStatus: successStatus,
+			draftAnswers: newDrafts,
+		})
 	},
 
 	setMessageContext: (context) => {
