@@ -7,14 +7,16 @@
 
 export {
 	api,
+	BatchBuilder,
 	configureApiBaseUrl,
 	configureAuthToken,
 	createApiClient,
 	getApiBaseUrl,
 	configureProjectId,
+	instanceApi,
 	RpcClient,
 	RpcError,
 	useApiError,
 } from './api/client.js'
-export type { ApiClient } from './api/client.js'
+export type { ApiClient, BatchEntry, InstanceApiClient } from './api/client.js'
 export { unwrap } from './api/unwrap.js'

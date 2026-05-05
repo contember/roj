@@ -2,7 +2,7 @@ import type { AskUserInputType, ChatMessage } from '@roj-ai/shared'
 import { AgentId, ChatMessageId, SessionId } from '@roj-ai/shared'
 import { useEffect } from 'react'
 import { create } from 'zustand'
-import { api, configureProjectId, getApiBaseUrl, unwrap } from '@roj-ai/client'
+import { api, configureProjectId, instanceApi, unwrap } from '@roj-ai/client'
 import { useConnectionStore } from './connection-store.js'
 
 function isChatMessage(msg: unknown): msg is ChatMessage {
@@ -410,48 +410,35 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 	},
 
 	fetchServiceUrl: (_instanceId, sessionId, serviceType) => {
-		// Fire-and-forget: call DO RPC to get/start service, update store on success
-		const baseUrl = getApiBaseUrl()
-		fetch(`${baseUrl}/rpc`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ method: 'getServiceUrl', input: { sessionId, serviceType } }),
-			credentials: 'include',
-		})
-			.then(r => r.json() as Promise<{ url: string | null }>)
-			.then(data => {
-				if (data.url) {
-					const newServices = new Map(get().services)
-					newServices.set(serviceType, { serviceType, status: 'ready', code: data.url })
-					set({ services: newServices })
-				}
+		// Fire-and-forget: call platform instance RPC to get/start service.
+		// Goes through `instanceApi` so the bearer token configured by `useChat`
+		// is attached — raw fetch would land at the instance route without a
+		// credential and 401.
+		instanceApi.call('getServiceUrl', { sessionId, serviceType })
+			.then(result => {
+				if (!result.ok || !result.value.url) return
+				const newServices = new Map(get().services)
+				newServices.set(serviceType, { serviceType, status: 'ready', code: result.value.url })
+				set({ services: newServices })
 			})
 			.catch(() => {/* ignore — service will appear via WS when ready */})
 	},
 
 	fetchAllServiceUrls: (sessionId) => {
-		// Bulk fetch all service URLs — does not depend on WS notification
-		const baseUrl = getApiBaseUrl()
-		fetch(`${baseUrl}/rpc`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ method: 'getServiceUrls', input: { sessionId } }),
-			credentials: 'include',
-		})
-			.then(r => r.json() as Promise<{ ok: boolean; value?: { services: Array<{ serviceType: string; code: string; port: number }> } }>)
-			.then(data => {
-				if (data.ok && data.value?.services) {
-					const newServices = new Map(get().services)
-					for (const svc of data.value.services) {
-						newServices.set(svc.serviceType, {
-							serviceType: svc.serviceType,
-							status: 'ready',
-							code: svc.code,
-							port: svc.port,
-						})
-					}
-					set({ services: newServices })
+		// Bulk fetch all service URLs — does not depend on WS notification.
+		instanceApi.call('getServiceUrls', { sessionId })
+			.then(result => {
+				if (!result.ok) return
+				const newServices = new Map(get().services)
+				for (const svc of result.value.services) {
+					newServices.set(svc.serviceType, {
+						serviceType: svc.serviceType,
+						status: 'ready',
+						code: svc.code,
+						port: svc.port,
+					})
 				}
+				set({ services: newServices })
 			})
 			.catch(() => {/* ignore */})
 	},

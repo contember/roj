@@ -142,6 +142,23 @@ export class RpcClient {
 		method: M,
 		input: RpcInput<M>,
 	): Promise<Result<RpcOutput<M>, RpcErrorInfo>> {
+		return this.callUntyped(method, input) as Promise<Result<RpcOutput<M>, RpcErrorInfo>>
+	}
+
+	/**
+	 * Low-level RPC call that bypasses the typed method registry.
+	 *
+	 * Same transport, headers, and auth as `call`, but with `string` method
+	 * names and `unknown` input/output. Intended for callers that operate
+	 * against a different method registry than the agent runtime's
+	 * `RpcMethods` (e.g. platform/instance methods defined in
+	 * `@roj-ai/client/platform`). Build a typed wrapper on top — do not call
+	 * directly from app code.
+	 */
+	async callUntyped(
+		method: string,
+		input: unknown,
+	): Promise<Result<unknown, RpcErrorInfo>> {
 		const response = await fetch(this.getRpcUrl(), {
 			method: 'POST',
 			headers: this.buildHeaders({ 'Content-Type': 'application/json' }),
@@ -149,16 +166,23 @@ export class RpcClient {
 			credentials: 'include',
 		})
 
-		const data = (await response.json()) as RpcResponse
+		const data = (await response.json().catch(() => ({}))) as RpcResponse
 
-		// Transport error (non-200 for invalid JSON, missing method)
+		// Transport error (non-200 for invalid JSON, missing method, auth failure, …).
+		// The instance-auth 401 body uses `{ error: { code, message } }` rather than
+		// `{ error: { type, message } }`; normalize it so callers always see a
+		// well-formed `RpcErrorInfo`.
 		if (!response.ok) {
-			return Err(data.error ?? { type: 'transport_error', message: 'Request failed' })
+			const raw = data.error as { type?: string; code?: string; message?: string; details?: unknown } | undefined
+			if (raw && (raw.type || raw.code) && raw.message) {
+				return Err({ type: raw.type ?? raw.code ?? 'transport_error', message: raw.message, details: raw.details })
+			}
+			return Err({ type: 'transport_error', message: `Request failed (HTTP ${response.status})` })
 		}
 
 		// Application result
 		if (data.ok) {
-			return Ok(data.value as RpcOutput<M>)
+			return Ok(data.value)
 		}
 
 		return Err(data.error ?? { type: 'unknown_error', message: 'Unknown error' })
