@@ -55,6 +55,18 @@ packages/
 - `packages/standalone-server/CLAUDE.md` — Local single-instance runtime with platform-compatible REST shape
 - `packages/demo/CLAUDE.md` — App Builder demo + snapshot-based e2e test over standalone-server
 
+## Releasing
+
+Pick the next semver after the latest `v*` tag (patch bump unless told
+otherwise) and push the tag — `publish.yml` handles the rest:
+
+```bash
+git tag vX.Y.Z && git push origin vX.Y.Z
+```
+
+Must be on clean `main`. Don't run `scripts/npm-publish/init.sh` (one-time
+bootstrap, already done).
+
 ## Upstream Sync (webmaster → roj)
 
 - **Upstream repo:** `~/projects/contember/webmaster` (still uses `buresh` naming — kept verbatim in paths below)
