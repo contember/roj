@@ -20,6 +20,9 @@
 			"default": "./dist/user-config-loader.js"
 		}
 	},
+	"bin": {
+		"roj-sandbox-runtime": "./dist/main.js"
+	},
 	"files": [
 		"src",
 		"dist"
