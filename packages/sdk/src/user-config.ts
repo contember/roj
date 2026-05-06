@@ -32,6 +32,21 @@ export interface RojConfig {
 	 * `path` is resolved relative to the config file directory.
 	 */
 	localResources?: LocalResource[]
+	/**
+	 * Bundle runtime delivery mode. When `external: true`, `roj build` emits a
+	 * bundle that imports `@roj-ai/*` from the sandbox's installed SDK at run
+	 * time instead of inlining it. The platform resolves the actual SDK version
+	 * from `rojVersion` (build-time) and the lock policy below; only `lockMinor`
+	 * is user-controllable — major is always locked, patch always floats.
+	 */
+	runtime?: RuntimeConfig
+}
+
+export interface RuntimeConfig {
+	/** Opt into externalized SDK loading. Default: false (self-contained bundle). */
+	external?: boolean
+	/** When true, only patch versions float; minor is pinned to build-time. Default: true. Ignored when external !== true. */
+	lockMinor?: boolean
 }
 
 export interface LocalResource {

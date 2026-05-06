@@ -13,9 +13,10 @@ export async function upload(bundlePath: string, options: {
 	const filename = bundlePath.split('/').pop()!
 	const buf = await file.arrayBuffer()
 	const contentHash = await sha256Hex(buf)
+	const metadata = await readMetadataSidecar(bundlePath)
 
 	// 1. Preflight: ask server if it already has this content for the org.
-	let result = await postBundle({ url: options.url, apiKey: options.apiKey, name: options.name, version: options.version, contentHash })
+	let result = await postBundle({ url: options.url, apiKey: options.apiKey, name: options.name, version: options.version, contentHash, metadata })
 
 	// 2. Server reports the bundle bytes are missing — retry with body.
 	if (result.status === 409 && result.body?.error === 'bundle-required') {
@@ -25,6 +26,7 @@ export async function upload(bundlePath: string, options: {
 			name: options.name,
 			version: options.version,
 			contentHash,
+			metadata,
 			body: { buf, filename, mimeType: file.type || 'application/javascript' },
 		})
 	}
@@ -49,6 +51,7 @@ interface PostBundleArgs {
 	name: string
 	version?: string
 	contentHash: string
+	metadata?: string
 	body?: { buf: ArrayBuffer; filename: string; mimeType: string }
 }
 
@@ -70,6 +73,7 @@ async function postBundle(args: PostBundleArgs): Promise<PostBundleResult> {
 	formData.append('name', args.name)
 	formData.append('contentHash', args.contentHash)
 	if (args.version) formData.append('version', args.version)
+	if (args.metadata) formData.append('metadata', args.metadata)
 	if (args.body) {
 		formData.append('bundle', new Blob([args.body.buf], { type: args.body.mimeType }), args.body.filename)
 	}
@@ -96,4 +100,12 @@ async function sha256Hex(buf: ArrayBuffer): Promise<string> {
 
 function shortHash(hex: string): string {
 	return hex.slice(0, 12)
+}
+
+async function readMetadataSidecar(bundlePath: string): Promise<string | undefined> {
+	const sidecar = Bun.file(`${bundlePath}.meta.json`)
+	if (!(await sidecar.exists())) return undefined
+	const text = await sidecar.text()
+	JSON.parse(text)
+	return text
 }
