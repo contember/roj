@@ -581,6 +581,101 @@ describe('mailbox plugin', () => {
 			await harness.shutdown()
 		})
 
+		it('empty-stop LLM response → agent retries; persistent empty → onError reports to parent', async () => {
+			let workerCalls = 0
+			let orchestratorCalls = 0
+
+			const harness = new TestHarness({
+				presets: [createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' })],
+				mockHandler: (request) => {
+					if (request.systemPrompt.includes('Orchestrator')) {
+						orchestratorCalls++
+						if (orchestratorCalls === 1) {
+							return {
+								content: null,
+								toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Do work' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						}
+						return { content: 'Done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+					}
+					workerCalls++
+					// Always empty-stop → triggers retry until exhausted, then onError
+					return { content: null, toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendMessage('Start')
+
+			// Worker ends up errored (not idle); poll for the error message to parent.
+			const deadline = Date.now() + 5000
+			let errMsg: { message: { content: string; from: unknown } } | undefined
+			while (Date.now() < deadline) {
+				const events = await session.getEventsByType(mailboxEvents, 'mailbox_message')
+				errMsg = events.find(e =>
+					e.message.from === AgentId('worker_1')
+					&& typeof e.message.content === 'string'
+					&& e.message.content.startsWith('Agent encountered an error:'),
+				)
+				if (errMsg) break
+				await new Promise((r) => setTimeout(r, 50))
+			}
+
+			// Initial + 2 retries = 3 worker LLM calls
+			expect(workerCalls).toBe(3)
+			expect(errMsg).toBeDefined()
+
+			await harness.shutdown()
+		})
+
+		it('empty-stop LLM response → recovers on retry, no error sent', async () => {
+			let workerCalls = 0
+			let orchestratorCalls = 0
+
+			const harness = new TestHarness({
+				presets: [createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' })],
+				mockHandler: (request) => {
+					if (request.systemPrompt.includes('Orchestrator')) {
+						orchestratorCalls++
+						if (orchestratorCalls === 1) {
+							return {
+								content: null,
+								toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Do work' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						}
+						return { content: 'Done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+					}
+					workerCalls++
+					if (workerCalls === 1) {
+						return { content: null, toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+					}
+					return { content: 'Recovered', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Start')
+
+			expect(workerCalls).toBe(2)
+
+			const events = await session.getEventsByType(mailboxEvents, 'mailbox_message')
+			const errMsg = events.find(e =>
+				typeof e.message.content === 'string'
+				&& e.message.content.startsWith('Agent encountered an error:'),
+			)
+			expect(errMsg).toBeUndefined()
+
+			await harness.shutdown()
+		})
+
 		it('agent without parent → no completion message even with flag true', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset({

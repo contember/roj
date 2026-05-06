@@ -16,7 +16,7 @@ import { withSessionId } from '~/core/events/test-helpers.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import { applyCacheBreakpoint } from '~/core/llm/cache-breakpoints.js'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
-import type { InferenceRequest, LLMMessage, LLMProvider } from '~/core/llm/provider.js'
+import type { InferenceRequest, InferenceResponse, LLMError, LLMMessage, LLMProvider } from '~/core/llm/provider.js'
 import { LLMCallId, ModelId } from '~/core/llm/schema.js'
 import type { LLMResponse } from '~/core/llm/state.js'
 import { llmEvents } from '~/core/llm/state.js'
@@ -46,6 +46,7 @@ import { toolEvents } from '~/core/tools/state.js'
 import { getAgentUnconsumedMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
 import { AGENT_BASE_BRIEFING } from '~/prompts/base.js'
 import { buildEnvironmentSection } from '~/prompts/builder.js'
+import { Err, type Result } from '~/lib/utils/result.js'
 import type { Logger } from '../../lib/logger/logger.js'
 import type { SessionContext } from '../sessions/context.js'
 import type { SessionStore } from '../sessions/session-store.js'
@@ -403,6 +404,9 @@ export class Agent {
 
 	private static readonly MAX_INFERENCE_RETRIES = 3
 
+	/** Max retries for empty-stop LLM responses (provider glitch). Total attempts = this + 1. */
+	private static readonly MAX_EMPTY_RESPONSE_RETRIES = 2
+
 	/**
 	 * Run inference on agent's mailbox.
 	 * Runs when there are unconsumed messages OR pending tool results.
@@ -502,20 +506,54 @@ export class Agent {
 		// Capture llmCallId from the logging provider
 		let llmCallId: LLMCallId | undefined
 
-		const llmResponse = await withLLMRetry(
-			() =>
-				this.llmProvider.inference(request, {
-					sessionId: this.store.sessionId,
+		// Inference with empty-response retry. Providers occasionally return
+		// content: null + toolCalls: [] + finishReason: 'stop' (no signal at all);
+		// retry a few times before giving up. After the last attempt, surface as
+		// a server_error so onError fires and downstream plugins (e.g. mailbox)
+		// can notify the parent.
+		let llmResponse: Result<InferenceResponse, LLMError>
+		let emptyAttempts = 0
+		while (true) {
+			llmResponse = await withLLMRetry(
+				() =>
+					this.llmProvider.inference(request, {
+						sessionId: this.store.sessionId,
+						agentId: this.id,
+						onLLMCallCreated: (callId) => {
+							llmCallId = LLMCallId(callId)
+						},
+						signal: this.abortController.signal,
+						fileStore: this.fileStore,
+						providers: this.llmProviders,
+					}),
+				{ logger: this.logger, signal: this.abortController.signal },
+			)
+
+			if (!llmResponse.ok) break
+
+			const v = llmResponse.value
+			const hasContent = !!(v.content && v.content.trim().length > 0)
+			const hasToolCalls = v.toolCalls.length > 0
+			const isEmptyStop = !hasContent && !hasToolCalls && v.finishReason === 'stop'
+			if (!isEmptyStop) break
+
+			if (emptyAttempts >= Agent.MAX_EMPTY_RESPONSE_RETRIES) {
+				this.logger.error('LLM returned empty stop response after retries', undefined, {
 					agentId: this.id,
-					onLLMCallCreated: (callId) => {
-						llmCallId = LLMCallId(callId)
-					},
-					signal: this.abortController.signal,
-					fileStore: this.fileStore,
-					providers: this.llmProviders,
-				}),
-			{ logger: this.logger, signal: this.abortController.signal },
-		)
+					attempts: emptyAttempts + 1,
+				})
+				llmResponse = Err({
+					type: 'server_error',
+					message: `LLM returned empty response (no content, no tool calls) after ${emptyAttempts + 1} attempts`,
+				})
+				break
+			}
+			emptyAttempts++
+			this.logger.warn('LLM returned empty stop response, retrying', {
+				agentId: this.id,
+				attempt: emptyAttempts,
+			})
+		}
 
 		// Mark plugin messages as consumed (regardless of inference outcome —
 		// messages are already appended to conversationHistory via inference_started)
