@@ -65,10 +65,15 @@ Implemented:
   roj-platform `activatePendingSession`. `resourceIds` are matched against
   `localResources` slugs (see below).
 - `tokens.create` — returns `{ token: '' }`
+- `sessionFiles.createDownloadUrl` — HMAC-signed URL pointing at
+  `GET /api/v1/instances/:id/sessions/:sid/files/{workspace|session}/{path}?token=...`,
+  internally proxied to the SDK's existing `/sessions/:sid/workspace/*` and
+  `/sessions/:sid/files/*` routes. Token binds (instanceId, sessionId, scope,
+  path, expiresAt) and is signed with a per-process random secret, so a leaked
+  URL can only fetch the file it was minted for.
 
 Not implemented (return `method_not_found`):
-- `bundles.*`, `sessions.publish`, `files.upload`, `resources.*`,
-  `sessionFiles.createDownloadUrl`
+- `bundles.*`, `sessions.publish`, `files.upload`, `resources.*`
 
 Files/resources will be added when a concrete consumer needs them.
 

@@ -23,6 +23,8 @@ import { cors } from 'hono/cors'
 import { createInstance, type InstanceState } from './instance.js'
 import { createPlatformApi } from './platform-api.js'
 import { proxyPreview } from './preview-proxy.js'
+import { createSessionFileRoute } from './session-file-route.js'
+import { generateTokenSecret } from './signed-token.js'
 
 export interface StartStandaloneOptions {
 	presets: Preset[]
@@ -93,12 +95,18 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 		sessionRuntime: sessionManager,
 	})
 
+	const tokenSecret = generateTokenSecret()
+	const publicHost = config.host === '0.0.0.0' ? 'localhost' : config.host
+	const publicBaseUrl = `http://${publicHost}:${config.port}`
+
 	const platformApp = createPlatformApi({
 		instance,
 		sessionManager,
 		logger,
 		presets,
 		localResources: options.localResources ?? [],
+		tokenSecret,
+		publicBaseUrl,
 	})
 
 	const outerApp = new Hono()
@@ -116,6 +124,13 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 		const prefix = `/api/v1/instances/${id}/preview/`
 		return proxyPreview(c.req.raw, prefix, sessionManager, logger)
 	})
+
+	// Token-authenticated download URL minted by `sessionFiles.createDownloadUrl`.
+	// Must come BEFORE the agent catch-all so the token gate runs.
+	outerApp.get(
+		'/api/v1/instances/:id/sessions/:sid/files/:scope{workspace|session}/*',
+		createSessionFileRoute({ tokenSecret, agentApp, logger }),
+	)
 
 	// Noop auth-exchange (platform has real cookies; standalone is open)
 	outerApp.post('/api/v1/instances/:id/exchange', (c) => c.json({ ok: true }))

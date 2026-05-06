@@ -20,6 +20,7 @@ import { readFile } from 'node:fs/promises'
 import { basename, extname } from 'node:path'
 import { Hono } from 'hono'
 import type { InstanceState } from './instance.js'
+import { signFileToken } from './signed-token.js'
 
 interface Deps {
 	instance: InstanceState
@@ -27,6 +28,10 @@ interface Deps {
 	logger: Logger
 	presets: Preset[]
 	localResources: LocalResource[]
+	/** HMAC secret for signing download tokens (`sessionFiles.createDownloadUrl`). */
+	tokenSecret: string
+	/** Externally-reachable base URL (e.g. `http://localhost:8765`) used when minting download URLs. */
+	publicBaseUrl: string
 }
 
 interface RpcEnvelope {
@@ -260,6 +265,43 @@ const handlers: Record<string, Handler> = {
 	},
 
 	'tokens.create': async () => ({ token: '' }),
+
+	'sessionFiles.createDownloadUrl': async (
+		deps,
+		input: {
+			instanceId: string
+			sessionId: string
+			scope: 'workspace' | 'session'
+			path: string
+			ttlSeconds?: number
+		},
+	) => {
+		if (input.scope !== 'workspace' && input.scope !== 'session') {
+			throw new Error(`Invalid scope: ${input.scope}`)
+		}
+		if (!input.path || input.path.includes('..')) {
+			throw new Error('Path traversal not allowed')
+		}
+
+		const ttl = Math.min(Math.max(input.ttlSeconds ?? 300, 1), 3600)
+		const expiresAt = Date.now() + ttl * 1000
+
+		const token = signFileToken(deps.tokenSecret, {
+			instanceId: input.instanceId,
+			sessionId: input.sessionId,
+			scope: input.scope,
+			path: input.path,
+			expiresAt,
+		})
+
+		const encodedPath = input.path
+			.split('/')
+			.map(seg => encodeURIComponent(seg))
+			.join('/')
+		const url = `${deps.publicBaseUrl}/api/v1/instances/${input.instanceId}/sessions/${input.sessionId}/files/${input.scope}/${encodedPath}?token=${encodeURIComponent(token)}`
+
+		return { url, expiresAt: new Date(expiresAt).toISOString() }
+	},
 }
 
 function instanceSummary(instance: InstanceState) {
