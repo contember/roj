@@ -51,6 +51,12 @@ interface SessionState {
 	isAgentConnected: boolean
 	error: string | null
 
+	// Set of agentIds currently in the 'thinking' state. The SDK fires
+	// `agentStatus` per agent (entry + sub-agents), so a single boolean would
+	// flip-flop when sub-agents finish before the entry agent. `isAgentTyping`
+	// is derived from `activeAgents.size > 0`.
+	activeAgents: Set<string>
+
 	// Optimistic messages (before server ack)
 	pendingMessages: Map<string, PendingMessageData>
 
@@ -103,6 +109,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 	isAgentTyping: false,
 	isAgentConnected: false,
 	error: null,
+	activeAgents: new Set(),
 	pendingMessages: new Map(),
 	pendingAttachments: new Map(),
 	messageContext: null,
@@ -450,6 +457,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 			isAgentTyping: false,
 			isAgentConnected: false,
 			error: null,
+			activeAgents: new Set(),
 			pendingMessages: new Map(),
 			pendingAttachments: new Map(),
 			messageContext: null,
@@ -530,6 +538,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 						},
 					],
 					isAgentTyping: false,
+					activeAgents: new Set(),
 				})
 				break
 			}
@@ -560,6 +569,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 						},
 					],
 					isAgentTyping: false,
+					activeAgents: new Set(),
 				})
 				break
 			}
@@ -567,8 +577,24 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 			case 'agentStatus': {
 				if (typeof payload !== 'object' || payload === null) return
 				const p = payload as Record<string, unknown>
+				const agentId = typeof p.agentId === 'string' ? p.agentId : null
+				const status = typeof p.status === 'string' ? p.status : null
+				if (!agentId || !status) return
+
+				const next = new Set(get().activeAgents)
+				if (status === 'thinking') {
+					next.add(agentId)
+				} else {
+					next.delete(agentId)
+					// Entry agent reaching `idle` means the whole conversation turn is
+					// done — drop any stale sub-agent ids whose `idle` we may have missed.
+					if (status === 'idle' && agentId === get().entryAgentId) {
+						next.clear()
+					}
+				}
 				set({
-					isAgentTyping: p.status === 'thinking',
+					activeAgents: next,
+					isAgentTyping: next.size > 0,
 				})
 				break
 			}
@@ -698,6 +724,8 @@ export function useSessionMessageHandler(): void {
 				if (status === 'connected' && prevStatus === 'reconnecting') {
 					const { sessionId, fetchAllServiceUrls } = useSessionStore.getState()
 					if (sessionId) {
+						// Drop stale agent activity — we may have missed `idle` events while disconnected.
+						useSessionStore.setState({ activeAgents: new Set(), isAgentTyping: false })
 						fetchAllServiceUrls(sessionId)
 						// Refetch session state
 						api.call('sessionState.get', { sessionId })
