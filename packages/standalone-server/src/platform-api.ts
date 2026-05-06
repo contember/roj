@@ -14,12 +14,11 @@
  * - instances.archive  — no-op; shutdown the server instead
  */
 
-import type { LocalResource, Logger, Preset, SessionManager } from '@roj-ai/sdk'
+import type { Logger, Preset, SessionManager } from '@roj-ai/sdk'
 import { SessionId } from '@roj-ai/sdk'
-import { readFile } from 'node:fs/promises'
-import { basename, extname } from 'node:path'
 import { Hono } from 'hono'
 import type { InstanceState } from './instance.js'
+import type { LocalRegistry } from './local-registry.js'
 import { signFileToken } from './signed-token.js'
 
 interface Deps {
@@ -27,7 +26,7 @@ interface Deps {
 	sessionManager: SessionManager
 	logger: Logger
 	presets: Preset[]
-	localResources: LocalResource[]
+	registry: LocalRegistry
 	/** HMAC secret for signing download tokens (`sessionFiles.createDownloadUrl`). */
 	tokenSecret: string
 	/** Externally-reachable base URL (e.g. `http://localhost:8765`) used when minting download URLs. */
@@ -113,7 +112,7 @@ async function startSession(
 
 	const resources = resolveSessionResources(deps, input.presetId, input.resourceIds)
 	for (const resource of resources) {
-		await injectLocalResource(deps, sessionId, resource)
+		await injectRegistryResource(deps, sessionId, resource)
 	}
 
 	if (input.initialPrompt) {
@@ -131,30 +130,38 @@ async function startSession(
 	return { sessionId }
 }
 
-// Mirror roj-platform's project-init.ts:206 fallback: explicit input takes
-// precedence (anything matching a local slug), otherwise fall back to the
-// preset's defaultResourceSlugs. Input ids that don't match any local slug
-// are warned-and-skipped — they typically come from preventado's Contember
-// resource UUIDs which only exist on the real platform.
+interface ResolvedResource {
+	resourceId: string
+	slug: string
+	name: string | null
+	fileId: string
+	filename: string
+	mimeType: string
+}
+
+// Resolution mirrors roj-platform's project-init.ts:206:
+//   1. explicit input.resourceIds — matched against the local registry by ID
+//      first, then by slug (since local-dev callers often pass slugs as ids).
+//   2. fallback to preset.defaultResourceSlugs (looked up by slug).
 function resolveSessionResources(
 	deps: Deps,
 	presetId: string,
 	inputResourceIds: string[] | undefined,
-): LocalResource[] {
-	const bySlug = new Map(deps.localResources.map(r => [r.slug, r]))
-
+): ResolvedResource[] {
 	if (inputResourceIds && inputResourceIds.length > 0) {
-		const matched: LocalResource[] = []
+		const matched: ResolvedResource[] = []
 		const unmatched: string[] = []
 		for (const id of inputResourceIds) {
-			const local = bySlug.get(id)
-			if (local) matched.push(local)
+			const resource =
+				deps.registry.getResource({ resourceId: id }) ?? deps.registry.getResource({ resourceSlug: id })
+			const resolved = toResolvedResource(resource)
+			if (resolved) matched.push(resolved)
 			else unmatched.push(id)
 		}
 		if (unmatched.length > 0) {
-			deps.logger.warn('Some input resourceIds did not match any localResources slug; ignoring', {
+			deps.logger.warn('Some input resourceIds did not match the local registry; ignoring', {
 				unmatched,
-				availableSlugs: [...bySlug.keys()],
+				availableSlugs: deps.registry.listResources().map(r => r.slug),
 			})
 		}
 		if (matched.length > 0) return matched
@@ -162,37 +169,51 @@ function resolveSessionResources(
 
 	const preset = deps.presets.find(p => p.id === presetId)
 	const slugs = preset?.defaultResourceSlugs ?? []
-	const resolved: LocalResource[] = []
+	const resolved: ResolvedResource[] = []
 	const missing: string[] = []
 	for (const slug of slugs) {
-		const local = bySlug.get(slug)
-		if (local) resolved.push(local)
+		const r = toResolvedResource(deps.registry.getResource({ resourceSlug: slug }))
+		if (r) resolved.push(r)
 		else missing.push(slug)
 	}
 	if (missing.length > 0) {
 		deps.logger.warn(
-			"Preset declares defaultResourceSlugs that aren't registered in localResources; sessions will start with an empty workspace for these slugs",
-			{ presetId, missing, availableSlugs: [...bySlug.keys()] },
+			"Preset declares defaultResourceSlugs not present in the local registry; those slots will be skipped",
+			{ presetId, missing, availableSlugs: deps.registry.listResources().map(r => r.slug) },
 		)
 	}
 	return resolved
 }
 
-async function injectLocalResource(deps: Deps, sessionId: string, resource: LocalResource): Promise<void> {
-	const fileBuffer = await readFile(resource.path)
-	const filename = basename(resource.path)
-	const mimeType = extname(filename).toLowerCase() === '.zip' ? 'application/zip' : 'application/octet-stream'
+function toResolvedResource(resource: ReturnType<LocalRegistry['getResource']>): ResolvedResource | null {
+	if (!resource || !resource.latestRevision) return null
+	const file = resource.latestRevision.file
+	return {
+		resourceId: resource.id,
+		slug: resource.slug,
+		name: resource.name,
+		fileId: file.id,
+		filename: file.filename,
+		mimeType: file.mimeType,
+	}
+}
+
+async function injectRegistryResource(deps: Deps, sessionId: string, resource: ResolvedResource): Promise<void> {
+	const file = await deps.registry.readFileById(resource.fileId)
+	if (!file) {
+		throw new Error(`Registry file not found for resource ${resource.slug} (fileId=${resource.fileId})`)
+	}
 
 	const result = await deps.sessionManager.callPluginMethod(SessionId(sessionId), 'resources.inject', {
 		sessionId,
-		filename,
-		mimeType,
-		size: fileBuffer.length,
-		fileBuffer,
+		filename: resource.filename,
+		mimeType: resource.mimeType,
+		size: file.buffer.length,
+		fileBuffer: file.buffer,
 		metadata: { slug: resource.slug, name: resource.name ?? resource.slug },
 	})
 	if (!result.ok) {
-		deps.logger.error('Local resource injection failed', undefined, {
+		deps.logger.error('Registry resource injection failed', undefined, {
 			sessionId,
 			slug: resource.slug,
 			error: result.error,
@@ -265,6 +286,28 @@ const handlers: Record<string, Handler> = {
 	},
 
 	'tokens.create': async () => ({ token: '' }),
+
+	'resources.create': async (
+		deps,
+		input: { slug: string; name?: string; description?: string; fileId: string; label?: string },
+	) => deps.registry.createResource(input),
+
+	'resources.addRevision': async (
+		deps,
+		input: { resourceId?: string; resourceSlug?: string; fileId: string; label?: string },
+	) => deps.registry.addRevision(input),
+
+	'resources.get': async (deps, input: { resourceId?: string; resourceSlug?: string }) => {
+		const resource = deps.registry.getResource(input)
+		if (!resource) throw new Error('Resource not found')
+		return resource
+	},
+
+	'resources.list': async (deps, _input: { limit?: number; offset?: number }) => ({
+		resources: deps.registry.listResources(),
+	}),
+
+	'resources.delete': async (deps, input: { resourceId: string }) => deps.registry.deleteResource(input.resourceId),
 
 	'sessionFiles.createDownloadUrl': async (
 		deps,

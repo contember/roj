@@ -20,7 +20,9 @@ import { createBunPlatform } from '@roj-ai/sdk/bun-platform'
 import { createBunWebSocketHandlers } from '@roj-ai/transport/bun'
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { createFilesUploadRoute } from './files-upload-route.js'
 import { createInstance, type InstanceState } from './instance.js'
+import { LocalRegistry } from './local-registry.js'
 import { createPlatformApi } from './platform-api.js'
 import { proxyPreview } from './preview-proxy.js'
 import { createSessionFileRoute } from './session-file-route.js'
@@ -99,12 +101,18 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 	const publicHost = config.host === '0.0.0.0' ? 'localhost' : config.host
 	const publicBaseUrl = `http://${publicHost}:${config.port}`
 
+	const registry = new LocalRegistry(config.dataPath, logger)
+	await registry.init()
+	if (options.localResources?.length) {
+		await registry.bootstrapLocalResources(options.localResources)
+	}
+
 	const platformApp = createPlatformApi({
 		instance,
 		sessionManager,
 		logger,
 		presets,
-		localResources: options.localResources ?? [],
+		registry,
 		tokenSecret,
 		publicBaseUrl,
 	})
@@ -116,6 +124,11 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 	outerApp.use('*', cors({ origin: (origin) => origin ?? '*', credentials: true }))
 
 	outerApp.get('/health', (c) => c.json({ status: 'ok', timestamp: Date.now() }))
+
+	// Multipart file upload — must be registered BEFORE the /api/v1 RPC mount
+	// so it isn't treated as JSON RPC.
+	outerApp.post('/api/v1/files/upload', createFilesUploadRoute({ registry }))
+
 	outerApp.route('/api/v1', platformApp)
 
 	// Path-based preview proxy (must come BEFORE the catch-all instance route)

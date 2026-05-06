@@ -62,8 +62,8 @@ Implemented:
   process-singleton)
 - `sessions.create/list` — delegates to SDK `callManagerMethod`. `initialPrompt`
   is delivered as a `user-chat.sendMessage` after creation, mirroring
-  roj-platform `activatePendingSession`. `resourceIds` are matched against
-  `localResources` slugs (see below).
+  roj-platform `activatePendingSession`. `resourceIds` are matched against the
+  local registry (see below).
 - `tokens.create` — returns `{ token: '' }`
 - `sessionFiles.createDownloadUrl` — HMAC-signed URL pointing at
   `GET /api/v1/instances/:id/sessions/:sid/files/{workspace|session}/{path}?token=...`,
@@ -71,16 +71,31 @@ Implemented:
   `/sessions/:sid/files/*` routes. Token binds (instanceId, sessionId, scope,
   path, expiresAt) and is signed with a per-process random secret, so a leaked
   URL can only fetch the file it was minted for.
+- `resources.create/addRevision/get/list/delete` — backed by the on-disk local
+  registry (see below).
+
+Plus the multipart endpoint:
+- `POST /api/v1/files/upload` — two-phase contract matching
+  `@roj-ai/client/platform.files.upload`. Preflight by `contentHash` returns the
+  existing `fileId` if known (deduped); otherwise 409 `file-required`, then
+  retry with the `file` blob.
 
 Not implemented (return `method_not_found`):
-- `bundles.*`, `sessions.publish`, `files.upload`, `resources.*`
+- `bundles.*`, `sessions.publish`
 
 Files/resources will be added when a concrete consumer needs them.
 
-## Local resource registry
+## Local file + resource registry
 
-The platform's resource service is replaced by a tiny on-disk registry
-configured in the user's `roj.config.ts`:
+State lives at `{dataPath}/.roj-platform-state.json` (JSON manifest) plus
+`{dataPath}/.roj-platform-state/files/{fileId}` (raw bytes). Files are
+content-addressable by SHA-256 — re-uploading the same bytes returns the
+existing `fileId` with `deduped: true`. Resources are append-only at the
+revision level, so `resources.list` from a fresh process shows uploads
+and revisions added in previous runs.
+
+The user's config can declare `localResources` to seed the registry at
+startup:
 
 ```ts
 export default defineConfig({
@@ -91,21 +106,28 @@ export default defineConfig({
 })
 ```
 
-`path` resolves relative to the config file. At session start the server
-resolves resources to inject in this order, mirroring roj-platform's
-project-init:
+`path` resolves relative to the config file. Bootstrap is idempotent: if
+a resource with the same `slug` already exists in the manifest, it is
+left alone (so previously uploaded revisions survive restarts).
+
+At session start, resources to inject are resolved in this order
+(mirroring roj-platform's project-init):
 
 1. `input.resourceIds` (from `instances.create.autoCreateSession` or
-   `sessions.create`) — each id is matched against a `localResources` slug.
-   Unmatched ids are warned-and-skipped (they typically come from a remote
-   resource registry that doesn't exist locally).
-2. If nothing matched, falls back to `preset.defaultResourceSlugs`.
+   `sessions.create`) — each value is matched against the registry first
+   by `id`, then by `slug`. Unmatched values are warned-and-skipped.
+2. If nothing matched, fall back to `preset.defaultResourceSlugs`
+   (looked up by slug).
 
-For each resolved resource, the server reads the file and calls
-`resources.inject` directly on the session — same plugin method the SDK's
-`POST /sessions/:sid/inject-resource` HTTP route uses, just bypassing the
-URL fetch.
+For each resolved resource, the server reads the latest revision's file
+bytes from the registry and calls `resources.inject` directly on the
+session — same plugin method the SDK's `POST /sessions/:sid/inject-resource`
+HTTP route uses, just bypassing the URL fetch.
 
 Order at session start: SDK creates session → resources injected (sync,
 in order) → `initialPrompt` sent. The agent's first inference always sees
 the full workspace.
+
+To wipe local registry state, delete
+`{dataPath}/.roj-platform-state.json` and `{dataPath}/.roj-platform-state/`
+(or call `clearLocalRegistry(dataPath)` from `./local-registry.js`).
