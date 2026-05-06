@@ -131,3 +131,38 @@ the full workspace.
 To wipe local registry state, delete
 `{dataPath}/.roj-platform-state.json` and `{dataPath}/.roj-platform-state/`
 (or call `clearLocalRegistry(dataPath)` from `./local-registry.js`).
+
+## Per-instance git layout
+
+Mirrors what roj-platform does inside an E2B sandbox: each instance owns a
+bare repo, each session owns a worktree branched from `main`. The agent
+sees its worktree path as `workspaceDir`; the SDK is git-agnostic and just
+uses it as an opaque directory.
+
+```
+{dataPath}/instances/{instanceId}/repo.git/        ← bare, branch `main`
+{dataPath}/instances/{instanceId}/sessions/{sid}/  ← worktree, branch `session/{sid}`
+```
+
+Why bare + worktrees instead of a plain dir per session:
+- Parallel sessions on one instance get independent commit history.
+- Worktrees share object storage with the bare; only metadata duplicates.
+- `git status` / `git log` behave identically against standalone and against
+  roj-platform's E2B sandbox.
+
+Lifecycle:
+- `startStandaloneServer` initializes the bare on boot (idempotent — skips
+  if `repo.git` already exists). The bare gets an empty `Initial commit` on
+  `main` via plumbing (`mktree`, `commit-tree`, `update-ref`) so subsequent
+  `worktree add -b session/{sid}` calls have something to branch from.
+- `sessions.create` mints the session id locally, `git worktree add`s its
+  worktree, and passes the worktree path to the SDK as `workspaceDir`. If
+  `sessionManager.callManagerMethod('sessions.create', ...)` fails, the
+  worktree is rolled back so retries aren't blocked by an orphaned dir.
+- Worktrees persist across `roj-standalone` restarts. There is currently no
+  automatic cleanup — to nuke instance state, stop the server and
+  `rm -rf {dataPath}/instances/`.
+
+No auto-commit. Resources extracted via `resources.inject` land in the
+worktree as untracked files; whether to commit them is the agent's call,
+matching platform behavior.

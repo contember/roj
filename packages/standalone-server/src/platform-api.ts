@@ -16,7 +16,9 @@
 
 import type { Logger, Preset, SessionManager } from '@roj-ai/sdk'
 import { SessionId } from '@roj-ai/sdk'
+import { randomUUID } from 'node:crypto'
 import { Hono } from 'hono'
+import type { GitInstanceFs } from './git-instance-fs.js'
 import type { InstanceState } from './instance.js'
 import type { LocalRegistry } from './local-registry.js'
 import { signFileToken } from './signed-token.js'
@@ -27,6 +29,8 @@ interface Deps {
 	logger: Logger
 	presets: Preset[]
 	registry: LocalRegistry
+	/** Per-instance bare repo + per-session worktree manager. */
+	gitFs: GitInstanceFs
 	/** HMAC secret for signing download tokens (`sessionFiles.createDownloadUrl`). */
 	tokenSecret: string
 	/** Externally-reachable base URL (e.g. `http://localhost:8765`) used when minting download URLs. */
@@ -100,15 +104,28 @@ interface AutoCreateSessionInput {
 // resources must land in the workspace before the agent's first inference so
 // the agent sees a non-empty workspace. Mirrors roj-platform's project-init
 // (inject-resources → activatePendingSession with initialPrompt).
+//
+// SessionId is minted up-front (rather than letting the SDK generate one) so we
+// can create the matching git worktree before the SDK initializes the session
+// — the worktree path is then passed through as `workspaceDir`.
 async function startSession(
 	deps: Deps,
 	input: { presetId: string; initialPrompt?: string; resourceIds?: string[] },
 ): Promise<{ sessionId: string }> {
+	const sessionId = randomUUID()
+	const workspaceDir = await deps.gitFs.addSessionWorktree(deps.instance.id, sessionId)
+
 	const created = await deps.sessionManager.callManagerMethod('sessions.create', {
 		presetId: input.presetId,
+		sessionId,
+		workspaceDir,
 	})
-	if (!created.ok) throw new Error(created.error.message)
-	const { sessionId } = created.value as { sessionId: string }
+	if (!created.ok) {
+		// Roll back the worktree we just created so a retry isn't blocked by an
+		// orphaned dir. Best-effort — failure here is logged inside removeSessionWorktree.
+		await deps.gitFs.removeSessionWorktree(deps.instance.id, sessionId)
+		throw new Error(created.error.message)
+	}
 
 	const resources = resolveSessionResources(deps, input.presetId, input.resourceIds)
 	for (const resource of resources) {

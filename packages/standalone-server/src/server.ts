@@ -21,6 +21,7 @@ import { createBunWebSocketHandlers } from '@roj-ai/transport/bun'
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { createFilesUploadRoute } from './files-upload-route.js'
+import { GitInstanceFs } from './git-instance-fs.js'
 import { createInstance, type InstanceState } from './instance.js'
 import { LocalRegistry } from './local-registry.js'
 import { createPlatformApi } from './platform-api.js'
@@ -107,12 +108,16 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 		await registry.bootstrapLocalResources(options.localResources)
 	}
 
+	const gitFs = new GitInstanceFs(config.dataPath, logger)
+	await gitFs.initInstance(instance.id)
+
 	const platformApp = createPlatformApi({
 		instance,
 		sessionManager,
 		logger,
 		presets,
 		registry,
+		gitFs,
 		tokenSecret,
 		publicBaseUrl,
 	})
