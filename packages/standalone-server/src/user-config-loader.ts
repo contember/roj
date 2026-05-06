@@ -5,10 +5,10 @@
  * runtime-specific I/O) and out of `@roj-ai/sandbox-runtime` (Bun-specific).
  */
 
-import type { Preset, RojConfig } from '@roj-ai/sdk'
+import type { LocalResource, Preset, RojConfig } from '@roj-ai/sdk'
 import { validatePreset } from '@roj-ai/sdk'
 import { existsSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { dirname, isAbsolute, resolve } from 'node:path'
 
 export async function loadUserConfig(configPath: string): Promise<RojConfig> {
 	const absolutePath = resolve(process.cwd(), configPath)
@@ -63,9 +63,48 @@ export async function loadUserConfig(configPath: string): Promise<RojConfig> {
 		throw new Error(`Duplicate preset IDs: ${[...new Set(duplicates)].join(', ')}`)
 	}
 
+	const configDir = dirname(absolutePath)
+	const localResources = parseLocalResources(typedConfig.localResources, configDir, absolutePath)
+
 	return {
 		presets,
 		sandboxed: typedConfig.sandboxed as boolean | undefined,
 		snapshotter: typedConfig.snapshotter as RojConfig['snapshotter'],
+		localResources,
 	}
+}
+
+function parseLocalResources(raw: unknown, configDir: string, configPath: string): LocalResource[] | undefined {
+	if (raw === undefined) return undefined
+	if (!Array.isArray(raw)) {
+		throw new Error(`'localResources' must be an array: ${configPath}`)
+	}
+
+	const seen = new Set<string>()
+	return raw.map((entry, i) => {
+		if (typeof entry !== 'object' || entry === null) {
+			throw new Error(`localResources[${i}] must be an object: ${configPath}`)
+		}
+		const r = entry as Record<string, unknown>
+		if (typeof r.slug !== 'string' || !r.slug) {
+			throw new Error(`localResources[${i}] missing required 'slug': ${configPath}`)
+		}
+		if (typeof r.path !== 'string' || !r.path) {
+			throw new Error(`localResources[${i}] missing required 'path': ${configPath}`)
+		}
+		if (seen.has(r.slug)) {
+			throw new Error(`Duplicate localResources slug '${r.slug}': ${configPath}`)
+		}
+		seen.add(r.slug)
+
+		const resolvedPath = isAbsolute(r.path) ? r.path : resolve(configDir, r.path)
+		if (!existsSync(resolvedPath)) {
+			throw new Error(`localResources[${i}] file not found: ${resolvedPath} (config: ${configPath})`)
+		}
+		return {
+			slug: r.slug,
+			path: resolvedPath,
+			name: typeof r.name === 'string' ? r.name : undefined,
+		}
+	})
 }

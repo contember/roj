@@ -12,7 +12,7 @@
  *   GET  /health                                  — health check
  */
 
-import type { Config, LLMMiddleware, Logger, Preset, SessionId, SessionManager } from '@roj-ai/sdk'
+import type { Config, LLMMiddleware, LocalResource, Logger, Preset, SessionId, SessionManager } from '@roj-ai/sdk'
 import { bootstrap, createSystemFromServices, loadConfig, validateConfig } from '@roj-ai/sdk'
 import { createApp } from '@roj-ai/sdk/transport/http/app'
 import { createAgentTransport, ServerAdapter } from '@roj-ai/sdk/transport/adapter'
@@ -30,6 +30,12 @@ export interface StartStandaloneOptions {
 	instanceId?: string
 	instanceName?: string
 	llmMiddleware?: LLMMiddleware[]
+	/**
+	 * Local resource registry — files (typically ZIPs) on disk addressable by slug.
+	 * Injected into new sessions via `resources.inject` whenever the preset's
+	 * `defaultResourceSlugs` (or input.resourceIds) match a slug here.
+	 */
+	localResources?: LocalResource[]
 	onShutdown?: () => Promise<void> | void
 	onBeforeStart?: (ctx: { config: Config; logger: Logger }) => void | Promise<void>
 }
@@ -87,7 +93,13 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 		sessionRuntime: sessionManager,
 	})
 
-	const platformApp = createPlatformApi({ instance, sessionManager, logger })
+	const platformApp = createPlatformApi({
+		instance,
+		sessionManager,
+		logger,
+		presets,
+		localResources: options.localResources ?? [],
+	})
 
 	const outerApp = new Hono()
 	// Reflect the request origin and allow credentials — the SPA uses

@@ -49,11 +49,50 @@ worked example.
 ## Platform RPC surface
 
 Implemented:
-- `instances.create/list/get/status/archive` — singleton
-- `sessions.create/list` — delegates to SDK `callManagerMethod`
+- `instances.create/list/get/status/archive` — singleton; `metadata` and
+  `autoCreateSession` honored (last-write-wins on metadata since instance is
+  process-singleton)
+- `sessions.create/list` — delegates to SDK `callManagerMethod`. `initialPrompt`
+  is delivered as a `user-chat.sendMessage` after creation, mirroring
+  roj-platform `activatePendingSession`. `resourceIds` are matched against
+  `localResources` slugs (see below).
 - `tokens.create` — returns `{ token: '' }`
 
 Not implemented (return `method_not_found`):
-- `bundles.*`, `sessions.publish`, `files.upload`, `resources.*`
+- `bundles.*`, `sessions.publish`, `files.upload`, `resources.*`,
+  `sessionFiles.createDownloadUrl`
 
 Files/resources will be added when a concrete consumer needs them.
+
+## Local resource registry
+
+The platform's resource service is replaced by a tiny on-disk registry
+configured in the user's `roj.config.ts`:
+
+```ts
+export default defineConfig({
+  presets: [...],
+  localResources: [
+    { slug: 'kurikulum-template', path: './fixtures/kurikulum-template.zip' },
+  ],
+})
+```
+
+`path` resolves relative to the config file. At session start the server
+resolves resources to inject in this order, mirroring roj-platform's
+project-init:
+
+1. `input.resourceIds` (from `instances.create.autoCreateSession` or
+   `sessions.create`) — each id is matched against a `localResources` slug.
+   Unmatched ids are warned-and-skipped (they typically come from a remote
+   resource registry that doesn't exist locally).
+2. If nothing matched, falls back to `preset.defaultResourceSlugs`.
+
+For each resolved resource, the server reads the file and calls
+`resources.inject` directly on the session — same plugin method the SDK's
+`POST /sessions/:sid/inject-resource` HTTP route uses, just bypassing the
+URL fetch.
+
+Order at session start: SDK creates session → resources injected (sync,
+in order) → `initialPrompt` sent. The agent's first inference always sees
+the full workspace.

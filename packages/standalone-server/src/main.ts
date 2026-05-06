@@ -20,13 +20,19 @@ async function main() {
 		userConfig = await loadUserConfig(absoluteConfigPath)
 		console.log(`Loaded config from: ${absoluteConfigPath}`)
 		console.log(`  Presets: ${userConfig.presets.map(p => p.id).join(', ')}`)
+		if (userConfig.localResources?.length) {
+			console.log(`  Local resources: ${userConfig.localResources.map(r => r.slug).join(', ')}`)
+		}
 	} catch (error) {
 		console.error(`Failed to load config from ${absoluteConfigPath}:`)
 		console.error(error instanceof Error ? error.message : String(error))
 		process.exit(1)
 	}
 
-	await startStandaloneServer({ presets: userConfig.presets })
+	await startStandaloneServer({
+		presets: userConfig.presets,
+		localResources: userConfig.localResources,
+	})
 }
 
 main().catch((error) => {

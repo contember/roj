@@ -22,6 +22,25 @@ export interface RojConfig {
 	extraBinds?: ExtraBind[]
 	/** Presets available in this configuration */
 	presets: Preset[]
+	/**
+	 * Local resource registry — files (typically ZIPs) on disk addressable by slug,
+	 * standing in for the platform's resource service. The standalone server reads
+	 * these at startup and injects them into new sessions whose preset declares a
+	 * matching `defaultResourceSlugs` entry, mirroring roj-platform's
+	 * `inject-resources` step.
+	 *
+	 * `path` is resolved relative to the config file directory.
+	 */
+	localResources?: LocalResource[]
+}
+
+export interface LocalResource {
+	/** Resource slug — matched against preset.defaultResourceSlugs */
+	slug: string
+	/** Filesystem path to the resource file (typically a .zip), relative to the config file */
+	path: string
+	/** Optional human-readable name surfaced in inject-resource metadata */
+	name?: string
 }
 
 /**

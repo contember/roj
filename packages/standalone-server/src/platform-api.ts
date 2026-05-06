@@ -14,7 +14,10 @@
  * - instances.archive  — no-op; shutdown the server instead
  */
 
-import type { Logger, SessionManager } from '@roj-ai/sdk'
+import type { LocalResource, Logger, Preset, SessionManager } from '@roj-ai/sdk'
+import { SessionId } from '@roj-ai/sdk'
+import { readFile } from 'node:fs/promises'
+import { basename, extname } from 'node:path'
 import { Hono } from 'hono'
 import type { InstanceState } from './instance.js'
 
@@ -22,6 +25,8 @@ interface Deps {
 	instance: InstanceState
 	sessionManager: SessionManager
 	logger: Logger
+	presets: Preset[]
+	localResources: LocalResource[]
 }
 
 interface RpcEnvelope {
@@ -77,11 +82,145 @@ async function dispatch(
 
 type Handler = (deps: Deps, input: any) => Promise<unknown>
 
+interface AutoCreateSessionInput {
+	presetId: string
+	initialPrompt?: string
+	resourceIds?: string[]
+	fileIds?: string[]
+	blocking?: boolean
+}
+
+// Shared by `instances.create.autoCreateSession` and `sessions.create`. Creates
+// a session via the SDK session manager, injects any matching local resources,
+// then (if set) pushes `initialPrompt` as a user-chat message — order matters:
+// resources must land in the workspace before the agent's first inference so
+// the agent sees a non-empty workspace. Mirrors roj-platform's project-init
+// (inject-resources → activatePendingSession with initialPrompt).
+async function startSession(
+	deps: Deps,
+	input: { presetId: string; initialPrompt?: string; resourceIds?: string[] },
+): Promise<{ sessionId: string }> {
+	const created = await deps.sessionManager.callManagerMethod('sessions.create', {
+		presetId: input.presetId,
+	})
+	if (!created.ok) throw new Error(created.error.message)
+	const { sessionId } = created.value as { sessionId: string }
+
+	const resources = resolveSessionResources(deps, input.presetId, input.resourceIds)
+	for (const resource of resources) {
+		await injectLocalResource(deps, sessionId, resource)
+	}
+
+	if (input.initialPrompt) {
+		const sent = await deps.sessionManager.callPluginMethod(SessionId(sessionId), 'user-chat.sendMessage', {
+			content: input.initialPrompt,
+		})
+		if (!sent.ok) {
+			deps.logger.warn('Failed to deliver initialPrompt', {
+				sessionId,
+				error: sent.error,
+			})
+		}
+	}
+
+	return { sessionId }
+}
+
+// Mirror roj-platform's project-init.ts:206 fallback: explicit input takes
+// precedence (anything matching a local slug), otherwise fall back to the
+// preset's defaultResourceSlugs. Input ids that don't match any local slug
+// are warned-and-skipped — they typically come from preventado's Contember
+// resource UUIDs which only exist on the real platform.
+function resolveSessionResources(
+	deps: Deps,
+	presetId: string,
+	inputResourceIds: string[] | undefined,
+): LocalResource[] {
+	const bySlug = new Map(deps.localResources.map(r => [r.slug, r]))
+
+	if (inputResourceIds && inputResourceIds.length > 0) {
+		const matched: LocalResource[] = []
+		const unmatched: string[] = []
+		for (const id of inputResourceIds) {
+			const local = bySlug.get(id)
+			if (local) matched.push(local)
+			else unmatched.push(id)
+		}
+		if (unmatched.length > 0) {
+			deps.logger.warn('Some input resourceIds did not match any localResources slug; ignoring', {
+				unmatched,
+				availableSlugs: [...bySlug.keys()],
+			})
+		}
+		if (matched.length > 0) return matched
+	}
+
+	const preset = deps.presets.find(p => p.id === presetId)
+	const slugs = preset?.defaultResourceSlugs ?? []
+	const resolved: LocalResource[] = []
+	const missing: string[] = []
+	for (const slug of slugs) {
+		const local = bySlug.get(slug)
+		if (local) resolved.push(local)
+		else missing.push(slug)
+	}
+	if (missing.length > 0) {
+		deps.logger.warn(
+			"Preset declares defaultResourceSlugs that aren't registered in localResources; sessions will start with an empty workspace for these slugs",
+			{ presetId, missing, availableSlugs: [...bySlug.keys()] },
+		)
+	}
+	return resolved
+}
+
+async function injectLocalResource(deps: Deps, sessionId: string, resource: LocalResource): Promise<void> {
+	const fileBuffer = await readFile(resource.path)
+	const filename = basename(resource.path)
+	const mimeType = extname(filename).toLowerCase() === '.zip' ? 'application/zip' : 'application/octet-stream'
+
+	const result = await deps.sessionManager.callPluginMethod(SessionId(sessionId), 'resources.inject', {
+		sessionId,
+		filename,
+		mimeType,
+		size: fileBuffer.length,
+		fileBuffer,
+		metadata: { slug: resource.slug, name: resource.name ?? resource.slug },
+	})
+	if (!result.ok) {
+		deps.logger.error('Local resource injection failed', undefined, {
+			sessionId,
+			slug: resource.slug,
+			error: result.error,
+		})
+		throw new Error(`Failed to inject resource '${resource.slug}': ${result.error.message ?? result.error.type}`)
+	}
+}
+
 const handlers: Record<string, Handler> = {
-	'instances.create': async ({ instance }) => ({
-		instanceId: instance.id,
-		status: 'ready',
-	}),
+	'instances.create': async (
+		deps,
+		input: { metadata?: Record<string, unknown>; autoCreateSession?: AutoCreateSessionInput },
+	) => {
+		if (input.metadata !== undefined) {
+			deps.instance.metadata = input.metadata
+		}
+
+		let sessionId: string | undefined
+		if (input.autoCreateSession?.presetId) {
+			const result = await startSession(deps, {
+				presetId: input.autoCreateSession.presetId,
+				initialPrompt: input.autoCreateSession.initialPrompt,
+				resourceIds: input.autoCreateSession.resourceIds,
+			})
+			sessionId = result.sessionId
+		}
+
+		return {
+			instanceId: deps.instance.id,
+			status: 'ready',
+			...(sessionId ? { sessionId } : {}),
+		}
+	},
 
 	'instances.list': async ({ instance }) => ({
 		instances: [instanceSummary(instance)],
@@ -109,13 +248,10 @@ const handlers: Record<string, Handler> = {
 
 	'instances.archive': async () => ({ ok: true }),
 
-	'sessions.create': async ({ sessionManager }, input: { presetId: string; initialPrompt?: string }) => {
-		const result = await sessionManager.callManagerMethod('sessions.create', {
-			presetId: input.presetId,
-		})
-		if (!result.ok) throw new Error(result.error.message)
-		return result.value as { sessionId: string }
-	},
+	'sessions.create': async (
+		deps,
+		input: { presetId: string; initialPrompt?: string; resourceIds?: string[] },
+	) => startSession(deps, input),
 
 	'sessions.list': async ({ sessionManager }) => {
 		const result = await sessionManager.callManagerMethod('sessions.list', {})
@@ -135,7 +271,7 @@ function instanceSummary(instance: InstanceState) {
 		bundleSlug: 'standalone',
 		bundleRevisionId: '',
 		vcsType: 'none',
-		metadata: null,
+		metadata: instance.metadata,
 		createdAt: instance.createdAt,
 	}
 }
