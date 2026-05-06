@@ -77,14 +77,11 @@ describe('agents plugin supervision', () => {
 		await harness.shutdown()
 	})
 
-	it('disabled supervision (false) → no tick fires', async () => {
+	it('default (no config) → supervision disabled, no tick fires', async () => {
 		const harness = new TestHarness({
-			presets: [{
-				...createMultiAgentPreset([
-					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
-				], { orchestratorSystem: 'Orchestrator agent.' }),
-				plugins: [{ pluginName: 'agents', definition: agentsPlugin, config: { superviseChildrenIntervalMs: false } }],
-			}],
+			presets: [createMultiAgentPreset([
+				{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+			], { orchestratorSystem: 'Orchestrator agent.' })],
 			mockHandler: (request) => {
 				if (request.systemPrompt.includes('Orchestrator')) {
 					return {
@@ -101,7 +98,7 @@ describe('agents plugin supervision', () => {
 		const session = await harness.createSession('test')
 		await session.sendMessage('Start')
 
-		// Wait long enough for ticks if they were enabled.
+		// Wait long enough for ticks if they were enabled (they shouldn't).
 		await new Promise((r) => setTimeout(r, 300))
 
 		const events = await session.getEventsByType(mailboxEvents, 'mailbox_message')
@@ -196,13 +193,15 @@ describe('agents plugin supervision', () => {
 		// phase 2 just acknowledges any wake-up triggered by the supervision tick.
 		let orchestratorCalls = 0
 
-		const buildHarness = (intervalMs: number | false) => new TestHarness({
+		const buildHarness = (intervalMs: number | undefined) => new TestHarness({
 			eventStore: sharedEventStore,
 			presets: [{
 				...createMultiAgentPreset([
 					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
 				], { orchestratorSystem: 'Orchestrator agent.' }),
-				plugins: [{ pluginName: 'agents', definition: agentsPlugin, config: { superviseChildrenIntervalMs: intervalMs } }],
+				...(intervalMs !== undefined && {
+					plugins: [{ pluginName: 'agents', definition: agentsPlugin, config: { superviseChildrenIntervalMs: intervalMs } }],
+				}),
 			}],
 			mockHandler: (request) => {
 				if (request.systemPrompt.includes('Orchestrator')) {
@@ -221,8 +220,8 @@ describe('agents plugin supervision', () => {
 			},
 		})
 
-		// Phase 1: create session with supervision DISABLED so no ticks fire pre-restart.
-		const harness1 = buildHarness(false)
+		// Phase 1: create session with supervision DISABLED (default) so no ticks pre-restart.
+		const harness1 = buildHarness(undefined)
 		const session1 = await harness1.createSession('test')
 		await session1.sendAndWaitForIdle('Start')
 		const hasWorker = () => {

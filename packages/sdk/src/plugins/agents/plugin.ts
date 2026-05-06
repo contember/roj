@@ -38,16 +38,22 @@ export interface AgentsPluginConfig {
 	/** Map of agent name → spawn info for generating typed tools */
 	agentDefinitions: Map<string, SpawnableAgentInfo>
 	/**
-	 * Supervision tick interval (ms) for parent agents. Sends a periodic
-	 * children-status snapshot via mailbox so the parent stays aware of long-running
-	 * sub-agents and keeps prompt cache warm. Default: 240000 (4 min, just under
-	 * the 5 min cache TTL). Set `false` to disable.
+	 * Supervision tick interval (ms) for parent agents. When set, parent agents
+	 * with active children receive a periodic <children-status> snapshot via
+	 * mailbox so they stay aware of long-running sub-agents and prompt cache
+	 * stays warm.
+	 *
+	 * Default: undefined (disabled). Recommended: 240000 (4 min, just under
+	 * the 5 min prompt cache TTL — see SUPERVISION_INTERVAL_CACHE_FRIENDLY).
 	 */
-	superviseChildrenIntervalMs?: number | false
+	superviseChildrenIntervalMs?: number
 }
 
-/** Default supervision interval — 4 min, just under prompt cache TTL. */
-const DEFAULT_SUPERVISION_INTERVAL_MS = 240_000
+/**
+ * Recommended supervision interval — 4 min, just under prompt cache TTL.
+ * Each tick triggers a parent inference, keeping the prompt cache warm.
+ */
+export const SUPERVISION_INTERVAL_CACHE_FRIENDLY = 240_000
 
 /** Per-session runtime state held in plugin context — timers + trigger callback. */
 interface AgentsPluginContext {
@@ -365,12 +371,13 @@ export const agentsPlugin = definePlugin('agents')
 		},
 	})
 	.sessionHook('onSessionReady', async (ctx) => {
-		const intervalConfig = ctx.pluginConfig.superviseChildrenIntervalMs
-		if (intervalConfig === false) {
+		const intervalMs = ctx.pluginConfig.superviseChildrenIntervalMs
+		if (intervalMs === undefined) {
+			// Supervision disabled (default). No timer wiring; spawn() and
+			// afterInference() check intervalMs === null and skip too.
 			ctx.pluginContext.intervalMs = null
 			return
 		}
-		const intervalMs = intervalConfig ?? DEFAULT_SUPERVISION_INTERVAL_MS
 		ctx.pluginContext.intervalMs = intervalMs
 		ctx.pluginContext.logger = ctx.logger
 
@@ -402,12 +409,18 @@ export const agentsPlugin = definePlugin('agents')
 		}
 		return null
 	})
-	.systemPrompt(() => {
-		return `## Working with Child Agents
+	.systemPrompt((ctx) => {
+		const base = `## Working with Child Agents
 
 - **New task** → spawn a new agent using \`start_<agent_name>\`. You will receive the agent's ID in the result — use it with \`send_message\` for follow-up communication.
 - **Follow-up on an existing task** → send a message to the existing agent via \`send_message\` with the agent's ID. Do NOT spawn a new agent for feedback, corrections, or additional instructions on a task already assigned.
-- Spawned agents communicate back to you via \`send_message\`. Check your incoming messages for their results and progress updates.
+- Spawned agents communicate back to you via \`send_message\`. Check your incoming messages for their results and progress updates.`
+
+		// Only include supervision instructions if supervision is actually enabled
+		// for this session — otherwise the section is misleading bloat.
+		if (ctx.pluginContext.intervalMs === null) return base
+
+		return `${base}
 
 ### Supervision messages
 
