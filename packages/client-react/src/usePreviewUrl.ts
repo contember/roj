@@ -11,6 +11,11 @@ export interface UsePreviewUrlOptions {
 	serviceType?: string
 	/** Platform URL for path-based preview fallback */
 	platformUrl?: string
+	/**
+	 * Force path-based URL construction. Set when the platform doesn't route
+	 * wildcard subdomains — primarily `@roj-ai/standalone-server` in local dev.
+	 */
+	pathBased?: boolean
 }
 
 /**
@@ -35,7 +40,7 @@ export interface UsePreviewUrlOptions {
  * ```
  */
 export function usePreviewUrl(options: UsePreviewUrlOptions): string | null {
-	const { instanceId, baseDomain, token, serviceType, platformUrl } = options
+	const { instanceId, baseDomain, token, serviceType, platformUrl, pathBased } = options
 	const services = useSessionStore((s) => s.services)
 	const sessionId = useSessionStore((s) => s.sessionId)
 	const status = useSessionStore((s) => s.status)
@@ -65,6 +70,6 @@ export function usePreviewUrl(options: UsePreviewUrlOptions): string | null {
 
 		if (!service?.code) return null
 
-		return buildPreviewUrl({ instanceId, code: service.code, baseDomain, token, platformUrl })
-	}, [instanceId, baseDomain, token, serviceType, platformUrl, services])
+		return buildPreviewUrl({ instanceId, code: service.code, baseDomain, token, platformUrl, pathBased })
+	}, [instanceId, baseDomain, token, serviceType, platformUrl, pathBased, services])
 }

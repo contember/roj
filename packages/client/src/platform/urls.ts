@@ -13,17 +13,33 @@ export interface BuildPreviewUrlOptions {
 	token?: string
 	/** Platform URL for path-based preview (used when subdomains aren't available) */
 	platformUrl?: string
+	/**
+	 * Force path-based URL construction. Required for hosts that don't route
+	 * wildcard subdomains to the same handler (notably `@roj-ai/standalone-server`,
+	 * which routes by path only). Has no effect without `platformUrl`.
+	 */
+	pathBased?: boolean
 }
 
 /**
  * Build a dev preview URL for a service running in a roj sandbox.
  *
  * Production: https://dev-{slug}-{code}.{baseDomain}/
- * Local dev:  {platformUrl}/api/v1/instances/{id}/preview/{code}/
+ * Local dev:  {platformUrl}/api/v1/instances/{id}/preview/{code}/ (when pathBased
+ *             or running behind a Cloudflare quick tunnel)
  */
-export function buildPreviewUrl({ instanceId, code, baseDomain, token, platformUrl }: BuildPreviewUrlOptions): string {
-	// Cloudflare quick tunnels are already subdomains — can't nest further
-	if (baseDomain.includes('trycloudflare.com') && platformUrl) {
+export function buildPreviewUrl({
+	instanceId,
+	code,
+	baseDomain,
+	token,
+	platformUrl,
+	pathBased,
+}: BuildPreviewUrlOptions): string {
+	// Path-based fallback: explicit opt-in (standalone server) or quick tunnel
+	// (already a subdomain — can't nest further).
+	const forcePathBased = pathBased || baseDomain.includes('trycloudflare.com')
+	if (forcePathBased && platformUrl) {
 		const base = `${platformUrl}/api/v1/instances/${instanceId}/preview/${code}`
 		return token ? `${base}/?token=${encodeURIComponent(token)}` : base
 	}

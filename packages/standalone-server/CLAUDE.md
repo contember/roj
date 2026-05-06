@@ -33,6 +33,14 @@ GET  /health                                  — health check
 `{code}` in the preview proxy maps to service type (e.g. `dev`). The first
 running session with a matching service wins.
 
+The standalone routes preview by **path only**, not by Host header — it has
+no wildcard subdomain awareness. Browser code that builds preview URLs
+(e.g. `usePreviewUrl` from `@roj-ai/client-react`) must pass
+`pathBased: true` so `buildPreviewUrl` produces
+`{platformUrl}/api/v1/instances/{id}/preview/{code}/` rather than the
+default `dev-{hex}-{code}.{baseDomain}` form. The flag has no effect
+against roj-platform local dev (which routes wildcards via wrangler).
+
 ## Embedding / testing
 
 `startStandaloneServer(options)` returns a `StandaloneHandle` with:
