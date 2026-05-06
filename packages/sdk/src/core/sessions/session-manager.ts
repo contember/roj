@@ -677,15 +677,24 @@ export class SessionManager {
 		const plugins: ConfiguredPlugin[] = []
 
 		for (const pluginDef of this.systemPlugins) {
-			// Determine config: preset explicit > infra auto-derived > no config (void)
+			// Determine config: merge infra (auto-derived) + preset explicit (overrides),
+			// fall back to whichever exists, else no config (void).
 			let config: unknown
 			let hasConfig = false
 
-			if (presetConfigs.has(pluginDef.name)) {
-				config = presetConfigs.get(pluginDef.name)
+			const presetConfig = presetConfigs.get(pluginDef.name)
+			const infraConfig = infraConfigs.get(pluginDef.name)
+			const isMergeable = (v: unknown): v is Record<string, unknown> =>
+				typeof v === 'object' && v !== null && !Array.isArray(v)
+
+			if (presetConfig !== undefined && infraConfig !== undefined && isMergeable(presetConfig) && isMergeable(infraConfig)) {
+				config = { ...infraConfig, ...presetConfig }
 				hasConfig = true
-			} else if (infraConfigs.has(pluginDef.name)) {
-				config = infraConfigs.get(pluginDef.name)
+			} else if (presetConfig !== undefined) {
+				config = presetConfig
+				hasConfig = true
+			} else if (infraConfig !== undefined) {
+				config = infraConfig
 				hasConfig = true
 			}
 

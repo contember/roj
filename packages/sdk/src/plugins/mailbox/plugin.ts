@@ -90,10 +90,30 @@ export const mailboxPlugin = definePlugin("mailbox")
 			toAgentId: agentIdSchema,
 			content: z.string(),
 			debug: z.boolean().optional(),
+			fromSupervisor: z.boolean().optional(),
 		}),
 		output: z.object({ messageId: z.string() }),
 		handler: async (ctx, input) => {
 			const { toAgentId, content } = input;
+
+			if (input.fromSupervisor) {
+				// System-emitted supervision status — bypasses communication validation.
+				const messageId = generateMessageId(getNextMessageSeq(ctx.pluginState));
+				await ctx.emitEvent(
+					mailboxEvents.create("mailbox_message", {
+						toAgentId,
+						message: {
+							id: messageId,
+							from: "supervisor",
+							content,
+							timestamp: Date.now(),
+							consumed: false,
+						},
+					}),
+				);
+				ctx.scheduleAgent(toAgentId);
+				return Ok({ messageId });
+			}
 
 			if (input.debug) {
 				// Debug messages bypass communication validation

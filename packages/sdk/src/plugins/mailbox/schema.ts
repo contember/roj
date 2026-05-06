@@ -58,6 +58,7 @@ export type MailboxMessageSender =
 	| WorkerId
 	| 'user'
 	| 'debug'
+	| 'supervisor'
 	| typeof ORCHESTRATOR_ROLE
 	| typeof COMMUNICATOR_ROLE
 

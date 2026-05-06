@@ -11,6 +11,7 @@ export type MailboxMessageSender =
 	| WorkerId
 	| 'user'
 	| 'debug'
+	| 'supervisor'
 	| typeof ORCHESTRATOR_ROLE
 	| typeof COMMUNICATOR_ROLE
 
@@ -23,7 +24,7 @@ export const mailboxEvents = createEventsFactory({
 				from: z4.union([
 					agentIdSchema,
 					workerIdSchema,
-					z4.enum(['user', 'debug', COMMUNICATOR_ROLE, ORCHESTRATOR_ROLE]),
+					z4.enum(['user', 'debug', 'supervisor', COMMUNICATOR_ROLE, ORCHESTRATOR_ROLE]),
 				]),
 				content: z4.string(),
 				timestamp: z4.number(),
