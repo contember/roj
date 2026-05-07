@@ -613,6 +613,129 @@ describe('uploads plugin', () => {
 			await harness.shutdown()
 		})
 
+		// =========================================================================
+		// uploadAsync method
+		// =========================================================================
+
+		it('uploadAsync returns processing immediately, then statusChanged → ready', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			const fileContent = Buffer.from('Hello, async world!')
+
+			const result = await session.callPluginMethod('uploads.uploadAsync', {
+				sessionId: String(session.sessionId),
+				filename: 'async.txt',
+				mimeType: 'text/plain',
+				size: fileContent.length,
+				fileBuffer: fileContent,
+			})
+
+			const data = okValue(
+				result,
+				z.object({ uploadId: z.string(), status: z.enum(['processing']) }),
+			)
+			expect(data.status).toBe('processing')
+
+			// Wait for the terminal statusChanged notification (ready or failed).
+			const terminal = await harness.notifications.waitFor((n) => {
+				if (n.pluginName !== 'uploads' || n.type !== 'uploadStatusChanged') return false
+				const p = n.payload as { uploadId: string; status: string }
+				return p.uploadId === data.uploadId && (p.status === 'ready' || p.status === 'failed')
+			})
+			expect((terminal.payload as { status: string }).status).toBe('ready')
+
+			// Two attachment_uploaded events were emitted: processing → ready.
+			const events = await session.getEventsByType(uploadEvents, 'attachment_uploaded')
+			const own = events.filter((e) => String(e.uploadId) === data.uploadId)
+			expect(own).toHaveLength(2)
+			expect(own[0].status).toBe('processing')
+			expect(own[1].status).toBe('ready')
+
+			// State only carries ready uploads — processing event is filtered by reducer.
+			const uploads = selectPluginState<UploadsState>(session.state, 'uploads')
+			if (!uploads) throw new Error('Expected uploads state')
+			expect(uploads.pending).toHaveLength(1)
+			expect(uploads.pending[0]?.uploadId).toBe(data.uploadId)
+			expect(uploads.pending[0]?.status).toBe('ready')
+
+			// First notification was processing.
+			const all = harness.notifications.getByType('uploads', 'uploadStatusChanged')
+			expect(all.length).toBeGreaterThanOrEqual(2)
+			expect((all[0]?.payload as { status: string }).status).toBe('processing')
+
+			await harness.shutdown()
+		})
+
+		it('uploadAsync rejects oversize file synchronously (no event)', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+
+			const result = await session.callPluginMethod('uploads.uploadAsync', {
+				sessionId: String(session.sessionId),
+				filename: 'huge.txt',
+				mimeType: 'text/plain',
+				size: 11 * 1024 * 1024,
+				fileBuffer: Buffer.from('tiny'),
+			})
+
+			expect(result.ok).toBe(false)
+			if (!result.ok) {
+				expect(result.error.message).toContain('File too large')
+			}
+
+			const events = await session.getEventsByType(uploadEvents, 'attachment_uploaded')
+			expect(events).toHaveLength(0)
+
+			await harness.shutdown()
+		})
+
+		it('uploadAsync — listPending exposes processing then ready', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+
+			const result = await session.callPluginMethod('uploads.uploadAsync', {
+				sessionId: String(session.sessionId),
+				filename: 'list-async.txt',
+				mimeType: 'text/plain',
+				size: 4,
+				fileBuffer: Buffer.from('data'),
+			})
+
+			const data = okValue(
+				result,
+				z.object({ uploadId: z.string(), status: z.enum(['processing']) }),
+			)
+
+			// Wait for terminal notification so the second meta.json write has landed.
+			await harness.notifications.waitFor((n) => {
+				if (n.pluginName !== 'uploads' || n.type !== 'uploadStatusChanged') return false
+				const p = n.payload as { uploadId: string; status: string }
+				return p.uploadId === data.uploadId && p.status === 'ready'
+			})
+
+			const listResult = await session.callPluginMethod('uploads.listPending', {
+				sessionId: String(session.sessionId),
+			})
+			const list = okValue(listResult, listPendingSchema)
+			const ours = list.uploads.find((u) => u.uploadId === data.uploadId)
+			expect(ours).toBeDefined()
+			expect(ours?.status).toBe('ready')
+
+			await harness.shutdown()
+		})
+
 		it('load deleted upload → error (not ready)', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],

@@ -114,6 +114,93 @@ export function createUploadRoutes(): Hono<AppEnv> {
 	})
 
 	/**
+	 * POST /sessions/:sessionId/upload-async
+	 *
+	 * Async variant of /upload — returns immediately with status: 'processing'
+	 * and continues preprocessing in the background. Clients should listen for
+	 * the `uploads.uploadStatusChanged` notification to learn when the upload
+	 * becomes `ready` or `failed`, or fall back to polling `uploads.listPending`.
+	 *
+	 * Form fields: same as /upload.
+	 *
+	 * Response:
+	 * - 202: { uploadId, status: 'processing' }
+	 * - 400: Validation error
+	 * - 404: Session not found
+	 */
+	app.post('/:sessionId/upload-async', async (c: AppContext) => {
+		const { sessionRuntime, logger } = getServices(c)
+		const sessionId = SessionId(c.req.param('sessionId')!)
+
+		const sessionResult = await sessionRuntime.getSession(sessionId)
+		if (!sessionResult.ok) {
+			return c.json(
+				{ error: { type: 'session_not_found', message: `Session not found: ${sessionId}` } },
+				404,
+			)
+		}
+
+		let body: Record<string, string | File>
+		try {
+			body = await c.req.parseBody()
+		} catch {
+			return c.json(
+				{ error: { type: 'parse_error', message: 'Failed to parse multipart form data' } },
+				400,
+			)
+		}
+
+		const file = body.file
+		if (!file || !(file instanceof File)) {
+			return c.json(
+				{ error: { type: 'validation_error', message: 'No file provided' } },
+				400,
+			)
+		}
+
+		const fileBuffer = Buffer.from(await file.arrayBuffer())
+
+		const result = await sessionRuntime.callPluginMethod(sessionId, 'uploads.uploadAsync', {
+			sessionId: String(sessionId),
+			filename: file.name,
+			mimeType: file.type,
+			size: file.size,
+			fileBuffer,
+		})
+
+		if (!result.ok) {
+			return c.json(
+				{ error: { type: result.error.type, message: result.error.type === 'validation_error' ? result.error.message : 'Upload failed' } },
+				400,
+			)
+		}
+
+		const uploadResult = result.value
+		if (typeof uploadResult !== 'object' || uploadResult === null || !('uploadId' in uploadResult)) {
+			return c.json(
+				{ error: { type: 'internal_error', message: 'Plugin did not return expected result' } },
+				500,
+			)
+		}
+
+		logger.info('File upload accepted (async)', {
+			sessionId,
+			uploadId: uploadResult.uploadId,
+			filename: file.name,
+			mimeType: file.type,
+			size: file.size,
+		})
+
+		return c.json(
+			{
+				uploadId: uploadResult.uploadId,
+				status: 'status' in uploadResult ? uploadResult.status : 'processing',
+			},
+			202,
+		)
+	})
+
+	/**
 	 * POST /sessions/:sessionId/upload-from-url
 	 *
 	 * Download a file from a URL and process it as an upload.

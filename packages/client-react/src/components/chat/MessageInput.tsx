@@ -17,9 +17,9 @@ export function MessageInput({ disabled }: MessageInputProps) {
 
 	const attachments = Array.from(pendingAttachments.values())
 	const hasReadyAttachments = attachments.some((a) => a.status === 'ready')
-	const hasUploadingAttachments = attachments.some((a) => a.status === 'uploading')
+	const hasInFlightAttachments = attachments.some((a) => a.status === 'uploading' || a.status === 'processing')
 
-	const canSubmit = !disabled && !hasUploadingAttachments && (content.trim() || hasReadyAttachments)
+	const canSubmit = !disabled && !hasInFlightAttachments && (content.trim() || hasReadyAttachments)
 
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault()
@@ -164,6 +164,7 @@ interface AttachmentChipProps {
 function AttachmentChip({ attachment, onRemove }: AttachmentChipProps) {
 	const statusStyles = {
 		uploading: 'bg-amber-50 text-amber-700 border-amber-200/80',
+		processing: 'bg-sky-50 text-sky-700 border-sky-200/80',
 		ready: 'bg-emerald-50 text-emerald-700 border-emerald-200/80',
 		failed: 'bg-red-50 text-red-700 border-red-200/80',
 	}
@@ -173,7 +174,7 @@ function AttachmentChip({ attachment, onRemove }: AttachmentChipProps) {
 			className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs ${statusStyles[attachment.status]}`}
 			title={attachment.error || attachment.filename}
 		>
-			{attachment.status === 'uploading' && (
+			{(attachment.status === 'uploading' || attachment.status === 'processing') && (
 				<svg className="animate-spin h-3 w-3" viewBox="0 0 24 24">
 					<circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
 					<path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />

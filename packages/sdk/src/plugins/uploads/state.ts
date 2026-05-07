@@ -9,7 +9,7 @@ export const uploadEvents = createEventsFactory({
 			filename: z4.string(),
 			mimeType: z4.string(),
 			size: z4.number(),
-			status: z4.enum(['ready', 'failed']),
+			status: z4.enum(['processing', 'ready', 'failed']),
 			extractedContent: z4.string().optional(),
 			derivedPaths: z4.array(z4.string()).optional(),
 			error: z4.string().optional(),

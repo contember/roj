@@ -15,7 +15,14 @@ export interface ApiClient {
 	batch<const T extends readonly BatchEntry<unknown>[]>(
 		buildCalls: (b: BatchBuilder) => T,
 	): Promise<Result<BatchResults<T>, RpcErrorInfo>>
+	/** Synchronous upload — server blocks until preprocessing finishes. Kept for backwards compat. */
 	uploadFile(sessionId: string, file: File): Promise<{ uploadId: string; status: 'ready' | 'failed'; extractedContent?: string }>
+	/**
+	 * Async upload — returns as soon as the file lands on disk. Caller listens
+	 * for `uploads.uploadStatusChanged` notifications (or polls
+	 * `uploads.listPending`) to learn when preprocessing finishes.
+	 */
+	uploadFileAsync(sessionId: string, file: File): Promise<{ uploadId: string; status: 'processing' }>
 }
 
 /**
@@ -45,34 +52,45 @@ function createApiClientFromRpc(getClient: () => RpcClient): ApiClient {
 	return {
 		call: (method, input) => getClient().call(method, input),
 		batch: (buildCalls) => getClient().batch(buildCalls),
-		async uploadFile(sessionId, file) {
-			const formData = new FormData()
-			formData.append('file', file)
-
-			const client = getClient()
-			const baseUrl = client.getBaseUrl()
-			const projectId = client.getProjectId()
-			const authToken = client.getAuthToken()
-			let url = `${baseUrl}/sessions/${sessionId}/upload`
-			if (projectId) {
-				url += `?project=${encodeURIComponent(projectId)}`
-			}
-			const headers: Record<string, string> = authToken ? { Authorization: `Bearer ${authToken}` } : {}
-			const response = await fetch(url, {
-				method: 'POST',
-				body: formData,
-				headers,
-				credentials: 'include',
-			})
-
-			if (!response.ok) {
-				const error = await response.json() as { error?: { message?: string } }
-				throw new Error(error.error?.message || 'Upload failed')
-			}
-
-			return response.json()
+		uploadFile(sessionId, file) {
+			return postUpload(getClient(), sessionId, file, 'upload')
+		},
+		uploadFileAsync(sessionId, file) {
+			return postUpload(getClient(), sessionId, file, 'upload-async')
 		},
 	}
+}
+
+async function postUpload<T>(
+	client: RpcClient,
+	sessionId: string,
+	file: File,
+	pathSuffix: 'upload' | 'upload-async',
+): Promise<T> {
+	const formData = new FormData()
+	formData.append('file', file)
+
+	const baseUrl = client.getBaseUrl()
+	const projectId = client.getProjectId()
+	const authToken = client.getAuthToken()
+	let url = `${baseUrl}/sessions/${sessionId}/${pathSuffix}`
+	if (projectId) {
+		url += `?project=${encodeURIComponent(projectId)}`
+	}
+	const headers: Record<string, string> = authToken ? { Authorization: `Bearer ${authToken}` } : {}
+	const response = await fetch(url, {
+		method: 'POST',
+		body: formData,
+		headers,
+		credentials: 'include',
+	})
+
+	if (!response.ok) {
+		const error = await response.json() as { error?: { message?: string } }
+		throw new Error(error.error?.message || 'Upload failed')
+	}
+
+	return response.json()
 }
 
 let rpcClient = new RpcClient('')

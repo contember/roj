@@ -26,7 +26,12 @@ export type QuestionSubmitStatus = 'idle' | 'submitting' | 'success' | 'error'
 export interface PendingAttachment {
 	uploadId: string
 	filename: string
-	status: 'uploading' | 'ready' | 'failed'
+	/**
+	 * - `uploading`: HTTP POST in flight (client→server)
+	 * - `processing`: server received the file and is preprocessing (e.g. vision-LLM annotation)
+	 * - `ready` / `failed`: terminal states from the server
+	 */
+	status: 'uploading' | 'processing' | 'ready' | 'failed'
 	error?: string
 }
 
@@ -150,7 +155,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 				restoredAttachments.set(upload.uploadId, {
 					uploadId: upload.uploadId,
 					filename: upload.filename,
-					status: upload.status === 'ready' ? 'ready' : upload.status === 'failed' ? 'failed' : 'uploading',
+					status: upload.status,
 				})
 			}
 
@@ -265,10 +270,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 		const { sessionId } = get()
 		if (!sessionId) return
 
-		// Generate temporary ID for tracking
+		// Temp ID for the brief window before the server returns its uploadId.
 		const tempId = crypto.randomUUID()
 
-		// Add to pending with uploading status
 		const newAttachments = new Map(get().pendingAttachments)
 		newAttachments.set(tempId, {
 			uploadId: tempId,
@@ -278,21 +282,20 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 		set({ pendingAttachments: newAttachments })
 
 		try {
-			const result = await api.uploadFile(sessionId, file)
+			const result = await api.uploadFileAsync(sessionId, file)
 
-			// Update with real uploadId and status
+			// Server accepted the file; preprocessing continues server-side.
+			// `uploads.uploadStatusChanged` notification will flip status to ready/failed.
 			const updatedAttachments = new Map(get().pendingAttachments)
 			updatedAttachments.delete(tempId)
 			updatedAttachments.set(result.uploadId, {
 				uploadId: result.uploadId,
 				filename: file.name,
-				status: result.status,
-				error: result.status === 'failed' ? 'Processing failed' : undefined,
+				status: 'processing',
 			})
 			set({ pendingAttachments: updatedAttachments })
 		} catch (error) {
 			console.error('Failed to upload file:', error)
-			// Update with error status
 			const updatedAttachments = new Map(get().pendingAttachments)
 			updatedAttachments.set(tempId, {
 				uploadId: tempId,
@@ -313,8 +316,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 		newAttachments.delete(uploadId)
 		set({ pendingAttachments: newAttachments })
 
-		// Delete on server (fire and forget - upload is already removed from UI)
-		if (sessionId && attachment && attachment.status === 'ready') {
+		// Delete on server (fire and forget - upload is already removed from UI).
+		// `processing` is also a server-known state worth deleting; `uploading`
+		// hasn't reached the server yet so there's nothing to call.
+		if (sessionId && attachment && (attachment.status === 'ready' || attachment.status === 'processing')) {
 			api.call('uploads.delete', { sessionId, uploadId }).then(r => unwrap(r)).catch((error: unknown) => {
 				console.error('Failed to delete upload on server:', error)
 			})
@@ -695,6 +700,27 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 				if (typeof p.state === 'object' && p.state !== null) {
 					set({ sessionState: p.state as Record<string, unknown> })
 				}
+				break
+			}
+
+			case 'uploadStatusChanged': {
+				if (typeof payload !== 'object' || payload === null) return
+				const p = payload as Record<string, unknown>
+				if (typeof p.uploadId !== 'string') return
+				if (p.status !== 'processing' && p.status !== 'ready' && p.status !== 'failed') return
+
+				const existing = get().pendingAttachments.get(p.uploadId)
+				if (!existing) return
+
+				const updated = new Map(get().pendingAttachments)
+				updated.set(p.uploadId, {
+					...existing,
+					status: p.status,
+					error: p.status === 'failed'
+						? (typeof p.error === 'string' ? p.error : 'Processing failed')
+						: undefined,
+				})
+				set({ pendingAttachments: updated })
 				break
 			}
 		}

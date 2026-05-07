@@ -2,10 +2,23 @@ import z from 'zod/v4'
 import { ValidationErrors } from '~/core/errors.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
+import { SessionId } from '~/core/sessions/schema.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { PreprocessorRegistry } from './preprocessor.js'
 import { generateUploadId, type MessageAttachment, UploadId, type UploadMetadata } from './schema.js'
 import { type PendingUpload, uploadEvents, type UploadsState } from './state.js'
+
+// ============================================================================
+// Notification schemas
+// ============================================================================
+
+const statusChangedSchema = z.object({
+	sessionId: z.string(),
+	uploadId: z.string(),
+	status: z.enum(['processing', 'ready', 'failed']),
+	extractedContent: z.string().optional(),
+	error: z.string().optional(),
+})
 
 // ============================================================================
 // Constants
@@ -66,6 +79,69 @@ function formatUploadsForLLM(uploads: PendingUpload[], sessionRoot: string): str
 	return blocks.join('\n')
 }
 
+/**
+ * Run preprocessor (with timeout) and persist final upload metadata to disk.
+ * Returns the resolved status + extracted/derived data for the caller to emit.
+ */
+async function runPreprocessAndPersist(args: {
+	uploadId: string
+	sessionId: SessionId
+	uploadStore: FileStore
+	filePath: string
+	filename: string
+	mimeType: string
+	size: number
+	createdAt: number
+	preprocessorRegistry?: PreprocessorRegistry
+}): Promise<{
+	status: 'ready' | 'failed'
+	extractedContent?: string
+	derivedPaths?: string[]
+	error?: string
+}> {
+	const preprocessor = args.preprocessorRegistry?.getForMimeType(args.mimeType)
+
+	let status: 'ready' | 'failed' = 'ready'
+	let extractedContent: string | undefined
+	let derivedPaths: string[] | undefined
+	let errorMessage: string | undefined
+
+	if (preprocessor) {
+		const processPromise = preprocessor.process(args.filePath, args.mimeType, {
+			files: args.uploadStore,
+		})
+		const timeoutPromise = sleep(PROCESSING_TIMEOUT_MS).then(() => ({
+			ok: false as const,
+			error: new Error('Processing timeout'),
+		}))
+		const result = await Promise.race([processPromise, timeoutPromise])
+		if (result.ok) {
+			extractedContent = result.value.extractedContent
+			derivedPaths = result.value.derivedPaths
+		} else {
+			status = 'failed'
+			errorMessage = result.error.message
+		}
+	}
+
+	const metadata: UploadMetadata = {
+		uploadId: UploadId(args.uploadId),
+		sessionId: args.sessionId,
+		filename: args.filename,
+		mimeType: args.mimeType,
+		size: args.size,
+		path: args.filePath,
+		status,
+		extractedContent,
+		derivedPaths,
+		createdAt: args.createdAt,
+		completedAt: Date.now(),
+	}
+	await args.uploadStore.write('meta.json', JSON.stringify(metadata, null, 2))
+
+	return { status, extractedContent, derivedPaths, error: errorMessage }
+}
+
 // ============================================================================
 // Plugin
 // ============================================================================
@@ -73,6 +149,7 @@ function formatUploadsForLLM(uploads: PendingUpload[], sessionRoot: string): str
 export const uploadsPlugin = definePlugin('uploads')
 	.pluginConfig<UploadsPluginConfig>()
 	.events([uploadEvents])
+	.notification('uploadStatusChanged', { schema: statusChangedSchema })
 	.state<UploadsState>({
 		key: 'uploads',
 		initial: (): UploadsState => ({ pending: [] }),
@@ -315,91 +392,179 @@ export const uploadsPlugin = definePlugin('uploads')
 		handler: async (ctx, input) => {
 			const { dataFileStore, preprocessorRegistry } = ctx.pluginConfig
 
-			// Validate
 			if (input.size > MAX_FILE_SIZE) {
 				return Err(ValidationErrors.invalid(`File too large: max ${MAX_FILE_SIZE / (1024 * 1024)}MB`))
 			}
-
 			if (!isAllowedMimeType(input.mimeType)) {
 				return Err(ValidationErrors.invalid(`Unsupported file type: ${input.mimeType}`))
 			}
 
-			// Generate upload ID and scoped store
 			const uploadId = generateUploadId()
 			const uploadStore = dataFileStore.scoped(`sessions/${input.sessionId}/uploads/${uploadId}`)
 
-			// Write file to disk
 			const writeResult = await uploadStore.write(input.filename, input.fileBuffer)
+			if (!writeResult.ok) {
+				return Err(ValidationErrors.invalid('Failed to write file'))
+			}
 
+			const result = await runPreprocessAndPersist({
+				uploadId: String(uploadId),
+				sessionId: ctx.sessionId,
+				uploadStore,
+				filePath: writeResult.value.path,
+				filename: input.filename,
+				mimeType: input.mimeType,
+				size: input.size,
+				createdAt: Date.now(),
+				preprocessorRegistry,
+			})
+
+			await ctx.emitEvent(uploadEvents.create('attachment_uploaded', {
+				uploadId,
+				filename: input.filename,
+				mimeType: input.mimeType,
+				size: input.size,
+				status: result.status,
+				extractedContent: result.extractedContent,
+				derivedPaths: result.derivedPaths,
+				error: result.error,
+			}))
+
+			return Ok({
+				uploadId: String(uploadId),
+				status: result.status,
+				extractedContent: result.extractedContent,
+			})
+		},
+	})
+	.method('uploadAsync', {
+		input: z.object({
+			sessionId: z.string(),
+			filename: z.string(),
+			mimeType: z.string(),
+			size: z.number(),
+			fileBuffer: z.custom<Buffer>(),
+		}),
+		output: z.object({
+			uploadId: z.string(),
+			status: z.enum(['processing']),
+		}),
+		handler: async (ctx, input) => {
+			const { dataFileStore, preprocessorRegistry } = ctx.pluginConfig
+
+			if (input.size > MAX_FILE_SIZE) {
+				return Err(ValidationErrors.invalid(`File too large: max ${MAX_FILE_SIZE / (1024 * 1024)}MB`))
+			}
+			if (!isAllowedMimeType(input.mimeType)) {
+				return Err(ValidationErrors.invalid(`Unsupported file type: ${input.mimeType}`))
+			}
+
+			const uploadId = generateUploadId()
+			const uploadIdStr = String(uploadId)
+			const uploadStore = dataFileStore.scoped(`sessions/${input.sessionId}/uploads/${uploadId}`)
+
+			const writeResult = await uploadStore.write(input.filename, input.fileBuffer)
 			if (!writeResult.ok) {
 				return Err(ValidationErrors.invalid('Failed to write file'))
 			}
 
 			const filePath = writeResult.value.path
+			const createdAt = Date.now()
 
-			// Run preprocessor (with timeout)
-			let processingResult: 'success' | 'failed' | 'skipped' = 'skipped'
-			let extractedContent: string | undefined
-			let derivedPaths: string[] | undefined
-
-			const preprocessor = preprocessorRegistry?.getForMimeType(input.mimeType)
-
-			if (preprocessor) {
-				const processPromise = preprocessor.process(filePath, input.mimeType, {
-					files: uploadStore,
-				})
-
-				const timeoutPromise = sleep(PROCESSING_TIMEOUT_MS).then(() => ({
-					ok: false as const,
-					error: new Error('Processing timeout'),
-				}))
-
-				const result = await Promise.race([processPromise, timeoutPromise])
-
-				if (result.ok) {
-					processingResult = 'success'
-					extractedContent = result.value.extractedContent
-					derivedPaths = result.value.derivedPaths
-				} else {
-					processingResult = 'failed'
-				}
-			}
-
-			// Create upload metadata
-			const now = Date.now()
-			const uploadStatus = processingResult === 'failed' ? 'failed' as const : 'ready' as const
-			const metadata: UploadMetadata = {
+			// Persist initial 'processing' metadata so listPending sees it before preprocessor finishes.
+			const processingMeta: UploadMetadata = {
 				uploadId,
 				sessionId: ctx.sessionId,
 				filename: input.filename,
 				mimeType: input.mimeType,
 				size: input.size,
 				path: filePath,
-				status: uploadStatus,
-				extractedContent,
-				derivedPaths,
-				createdAt: now,
-				completedAt: now,
+				status: 'processing',
+				createdAt,
+				completedAt: createdAt,
 			}
+			await uploadStore.write('meta.json', JSON.stringify(processingMeta, null, 2))
 
-			// Save metadata
-			await uploadStore.write('meta.json', JSON.stringify(metadata, null, 2))
-
-			// Emit event
 			await ctx.emitEvent(uploadEvents.create('attachment_uploaded', {
 				uploadId,
 				filename: input.filename,
 				mimeType: input.mimeType,
 				size: input.size,
-				status: uploadStatus,
-				extractedContent,
-				derivedPaths,
+				status: 'processing',
 			}))
+			ctx.notify('uploadStatusChanged', {
+				sessionId: input.sessionId,
+				uploadId: uploadIdStr,
+				status: 'processing',
+			})
+
+			// Capture refs from ctx before the handler returns — `notify`/`emitEvent`
+			// closures stay valid for the lifetime of the session, which in roj
+			// outlives any single handler call.
+			const { emitEvent, notify, logger } = ctx
+			const sessionId = ctx.sessionId
+
+			void (async () => {
+				try {
+					const result = await runPreprocessAndPersist({
+						uploadId: uploadIdStr,
+						sessionId,
+						uploadStore,
+						filePath,
+						filename: input.filename,
+						mimeType: input.mimeType,
+						size: input.size,
+						createdAt,
+						preprocessorRegistry,
+					})
+
+					await emitEvent(uploadEvents.create('attachment_uploaded', {
+						uploadId,
+						filename: input.filename,
+						mimeType: input.mimeType,
+						size: input.size,
+						status: result.status,
+						extractedContent: result.extractedContent,
+						derivedPaths: result.derivedPaths,
+						error: result.error,
+					}))
+					notify('uploadStatusChanged', {
+						sessionId: input.sessionId,
+						uploadId: uploadIdStr,
+						status: result.status,
+						extractedContent: result.extractedContent,
+						error: result.error,
+					})
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err)
+					logger.error('Async upload processing crashed', err instanceof Error ? err : undefined, {
+						uploadId: uploadIdStr,
+						filename: input.filename,
+					})
+					try {
+						await emitEvent(uploadEvents.create('attachment_uploaded', {
+							uploadId,
+							filename: input.filename,
+							mimeType: input.mimeType,
+							size: input.size,
+							status: 'failed',
+							error: message,
+						}))
+					} catch {
+						// Even event emission failed — best-effort; nothing useful left to do.
+					}
+					notify('uploadStatusChanged', {
+						sessionId: input.sessionId,
+						uploadId: uploadIdStr,
+						status: 'failed',
+						error: message,
+					})
+				}
+			})()
 
 			return Ok({
-				uploadId: String(uploadId),
-				status: uploadStatus,
-				extractedContent,
+				uploadId: uploadIdStr,
+				status: 'processing' as const,
 			})
 		},
 	})
