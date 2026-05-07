@@ -7,6 +7,7 @@
 
 import type { LLMProvider } from '~/core/llm/provider.js'
 import { ModelId } from '~/core/llm/schema.js'
+import type { Semaphore } from '~/lib/utils/concurrency.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { FileSystem } from '~/platform/fs.js'
@@ -28,6 +29,13 @@ export interface ImageClassifierConfig {
 	fs: FileSystem
 	/** Whether to skip vision and just return metadata */
 	skipVision?: boolean
+	/**
+	 * Optional semaphore to bound concurrent vision LLM calls. All callers
+	 * sharing one instance compete for the same set of permits — useful when
+	 * recursive preprocessors (ZIP → docs → images) would otherwise fan out
+	 * into many simultaneous inferences.
+	 */
+	gate?: Semaphore
 }
 
 // ============================================================================
@@ -47,6 +55,7 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 	private readonly logger: Logger
 	private readonly fs: FileSystem
 	private readonly skipVision: boolean
+	private readonly gate: Semaphore | undefined
 
 	constructor(config: ImageClassifierConfig) {
 		this.llmProvider = config.llmProvider
@@ -54,6 +63,7 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 		this.logger = config.logger
 		this.fs = config.fs
 		this.skipVision = config.skipVision ?? false
+		this.gate = config.gate
 	}
 
 	async process(
@@ -124,7 +134,7 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 	): Promise<string | null> {
 		try {
 			// Use file:// URL - resolved to base64 lazily in LLM provider
-			const result = await this.llmProvider.inference({
+			const inferenceCall = () => this.llmProvider.inference({
 				model: this.visionModel,
 				systemPrompt: 'You are an image description assistant. Describe images concisely in 1-2 sentences.',
 				messages: [
@@ -145,6 +155,8 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 				maxTokens: 200,
 				temperature: 0.3,
 			})
+
+			const result = await (this.gate ? this.gate.run(inferenceCall) : inferenceCall())
 
 			if (result.ok && result.value.content) {
 				return result.value.content.trim()

@@ -13,6 +13,7 @@
  */
 
 import { dirname } from 'node:path'
+import { mapWithConcurrency } from '~/lib/utils/concurrency.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { FileSystem } from '~/platform/fs.js'
@@ -22,6 +23,7 @@ import type { Logger } from '../../../lib/logger/logger.js'
 import type { Preprocessor, PreprocessorContext, PreprocessorRegistry, PreprocessorResult } from '../preprocessor.js'
 
 const MAX_IMAGES = 50
+const IMAGE_CLASSIFY_CONCURRENCY = 10
 
 function makeExec(processRunner: ProcessRunner) {
 	return (cmd: string, args: string[]) => processRunner.execFile(cmd, args, { timeout: 60_000, maxBuffer: 50 * 1024 * 1024 })
@@ -228,19 +230,17 @@ export async function classifyExtractedImages(
 	registry: PreprocessorRegistry,
 	logger: Logger,
 ): Promise<Array<{ relativePath: string; description: string }>> {
-	const results: Array<{ relativePath: string; description: string }> = []
-
 	const listResult = await imageStore.list('', { maxDepth: 3 })
-	if (!listResult.ok) return results
+	if (!listResult.ok) return []
 
 	const imageFiles = listResult.value
 		.filter(e => e.type === 'file' && IMAGE_EXT_RE.test(e.name))
 		.sort((a, b) => a.name.localeCompare(b.name))
 		.slice(0, MAX_IMAGES)
 
-	for (const imgFile of imageFiles) {
+	const settled = await mapWithConcurrency(imageFiles, IMAGE_CLASSIFY_CONCURRENCY, async (imgFile) => {
 		const imgPathResult = imageStore.realPath(imgFile.name)
-		if (!imgPathResult.ok) continue
+		if (!imgPathResult.ok) return null
 
 		const imgMime = guessImageMime(imgFile.name)
 		let description = imgMime
@@ -255,8 +255,8 @@ export async function classifyExtractedImages(
 			}
 		}
 
-		results.push({ relativePath: `${relativePrefix}/${imgFile.name}`, description })
-	}
+		return { relativePath: `${relativePrefix}/${imgFile.name}`, description }
+	})
 
-	return results
+	return settled.filter((r): r is { relativePath: string; description: string } => r !== null)
 }

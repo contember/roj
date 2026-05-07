@@ -30,6 +30,9 @@ export interface Config {
 	// LLM Logging
 	llmLoggingEnabled?: boolean
 
+	/** Max concurrent vision LLM calls when classifying uploaded images. Default 10. */
+	imageClassifierConcurrency?: number
+
 	// Logging
 	logLevel: LogLevel
 	logFormat: 'console' | 'json'
@@ -59,6 +62,9 @@ export const loadConfig = (): Config => {
 		defaultModel: process.env.DEFAULT_MODEL ?? 'anthropic/claude-haiku-4.5',
 		thinkingBudget: process.env.THINKING_BUDGET ? parseInt(process.env.THINKING_BUDGET, 10) : undefined,
 		llmLoggingEnabled: process.env.LLM_LOGGING_ENABLED !== 'false',
+		imageClassifierConcurrency: process.env.IMAGE_CLASSIFIER_CONCURRENCY
+			? parseInt(process.env.IMAGE_CLASSIFIER_CONCURRENCY, 10)
+			: undefined,
 		logLevel: (process.env.LOG_LEVEL ?? 'info') as LogLevel,
 		logFormat: (process.env.LOG_FORMAT ?? 'console') as 'console' | 'json',
 		workerUrl: process.env.WORKER_URL,

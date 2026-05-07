@@ -28,6 +28,7 @@ import type { ToolExecutor } from './core/tools/executor.js'
 import { ToolExecutor as ToolExecutorImpl } from './core/tools/executor.js'
 import { ConsoleLogger, JsonLogger } from './lib/logger/index.js'
 import type { Logger } from './lib/logger/logger.js'
+import { Semaphore } from './lib/utils/concurrency.js'
 import { agentStatusPlugin } from './plugins/agent-status/plugin.js'
 import { agentsPlugin } from './plugins/agents/plugin.js'
 import { filesystemPlugin } from './plugins/filesystem/index.js'
@@ -119,7 +120,8 @@ export function bootstrap(config: Config, userConfig: RojConfig, platform: Platf
 	const portPool = new PortPool()
 
 	const preprocessorRegistry = new PreprocessorRegistry()
-	preprocessorRegistry.register(new ImageClassifierPreprocessor({ llmProvider, logger, fs: platform.fs }))
+	const imageClassifierGate = new Semaphore(config.imageClassifierConcurrency ?? 10)
+	preprocessorRegistry.register(new ImageClassifierPreprocessor({ llmProvider, logger, fs: platform.fs, gate: imageClassifierGate }))
 	preprocessorRegistry.register(new MarkitdownPreprocessor({ registry: preprocessorRegistry, logger, fs: platform.fs, process: platform.process }))
 	preprocessorRegistry.register(new ZipPreprocessor({ registry: preprocessorRegistry, logger, process: platform.process }))
 

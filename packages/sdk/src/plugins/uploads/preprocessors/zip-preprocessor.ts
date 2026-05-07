@@ -8,6 +8,7 @@
  */
 
 import { extname } from 'node:path'
+import { mapWithConcurrency } from '~/lib/utils/concurrency.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { ProcessRunner } from '~/platform/process.js'
@@ -17,6 +18,7 @@ import type { Preprocessor, PreprocessorContext, PreprocessorRegistry, Preproces
 const MAX_DEPTH = 3
 const MAX_FILES = 500
 const MAX_TOTAL_SIZE = 100 * 1024 * 1024 // 100MB
+const ZIP_FILE_CONCURRENCY = 10
 
 const MIME_MAP: Record<string, string> = {
 	'.pdf': 'application/pdf',
@@ -116,38 +118,45 @@ export class ZipPreprocessor implements Preprocessor {
 			return Err(new Error('Failed to list extracted files'))
 		}
 
-		const derivedPaths: string[] = []
-		const manifest: string[] = []
-		let fileCount = 0
-		let totalSize = 0
-
 		const files = listResult.value
 			.filter(e => e.type === 'file')
 			.sort((a, b) => a.name.localeCompare(b.name))
 
+		// Pick eligible files first (limits depend on cumulative iteration order, so this stays sequential)
+		const eligible: typeof files = []
+		let totalSize = 0
+		let truncationNotice: string | null = null
+
 		for (const file of files) {
-			if (fileCount >= MAX_FILES) {
-				manifest.push(`... (truncated, ${files.length - fileCount} more files)`)
+			if (eligible.length >= MAX_FILES) {
+				truncationNotice = `... (truncated, ${files.length - eligible.length} more files)`
 				break
 			}
-
 			const fileSize = file.size ?? 0
-			totalSize += fileSize
-			if (totalSize > MAX_TOTAL_SIZE) {
-				manifest.push('... (total size limit reached)')
+			if (totalSize + fileSize > MAX_TOTAL_SIZE) {
+				truncationNotice = '... (total size limit reached)'
 				break
 			}
+			totalSize += fileSize
+			eligible.push(file)
+		}
 
-			fileCount++
+		const fileCount = eligible.length
+
+		// Process eligible files in parallel with bounded concurrency
+		const processed = await mapWithConcurrency(eligible, ZIP_FILE_CONCURRENCY, async (file) => {
+			const collectedPaths: string[] = []
 
 			const fileRealPath = extractStore.realPath(file.name)
 			if (!fileRealPath.ok) {
-				manifest.push(`- ${file.name} (path resolution failed)`)
-				continue
+				return {
+					manifestEntry: `- ${file.name} (path resolution failed)`,
+					derivedPaths: collectedPaths,
+				}
 			}
 
 			const relativePath = `extracted/${file.name}`
-			derivedPaths.push(relativePath)
+			collectedPaths.push(relativePath)
 
 			const mime = getMimeType(file.name)
 			let contentSummary = ''
@@ -171,7 +180,7 @@ export class ZipPreprocessor implements Preprocessor {
 					if (subResult.ok) {
 						if (subResult.value.derivedPaths) {
 							for (const dp of subResult.value.derivedPaths) {
-								derivedPaths.push(`extracted/${file.name}-content/${dp}`)
+								collectedPaths.push(`extracted/${file.name}-content/${dp}`)
 							}
 						}
 						if (subResult.value.extractedContent) {
@@ -186,8 +195,19 @@ export class ZipPreprocessor implements Preprocessor {
 				}
 			}
 
-			manifest.push(`- ${file.name} (${formatSize(fileSize)})${contentSummary}`)
+			return {
+				manifestEntry: `- ${file.name} (${formatSize(file.size ?? 0)})${contentSummary}`,
+				derivedPaths: collectedPaths,
+			}
+		})
+
+		const derivedPaths: string[] = []
+		const manifest: string[] = []
+		for (const item of processed) {
+			derivedPaths.push(...item.derivedPaths)
+			manifest.push(item.manifestEntry)
 		}
+		if (truncationNotice) manifest.push(truncationNotice)
 
 		const fullManifest = `## ZIP Contents (${fileCount} files)\n\n${manifest.join('\n')}`
 
