@@ -106,3 +106,7 @@ Skipped (not relevant to buresh-cloud):
 Skipped:
 - `3b70f0cd` — chore(deps): bumps `@nuasite/nua`, `lopata`, `lucide-react`, `marked` in the upstream client; roj manages package versions independently
 - `1a2c7d8f` — chore: format-only changes to `buresh/CLAUDE.md` (not the roj CLAUDE.md)
+
+## Ad-hoc backports past `96212da4`
+
+- [x] `3859e8a8` — fix(buresh): preserve agent-visible path in `read_file` image_url. Old code stored `file://<realPath>` (resolved disk path); on re-resolution via `imageProcessor.resolveContent` → `fileStore.realPath()` the sandboxed store rejected it, so every later turn referencing the image got `[Image unavailable: …]`. Fix uses `file://${input.path}` so re-resolution succeeds. Other producers (`image-classifier`, debug UI's `fileUrlToProxyUrl`) already handled / produced agent-visible paths; non-sandboxed mode is unaffected. Regression test added in `filesystem.integration.test.ts`.

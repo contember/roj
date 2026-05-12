@@ -158,16 +158,18 @@ export const filesystemPlugin = definePlugin('filesystem')
 						})
 					}
 
-					// Image files → return as multimodal image content
+					// Image files → return as multimodal image content.
+					// Store the agent-visible input.path (not the resolved real path):
+					// the URL survives into conversationHistory and gets re-resolved
+					// via fileStore.realPath() on every subsequent inference. In
+					// sandboxed mode, realPath() rejects already-resolved disk paths
+					// (only accepts the virtual prefix), so storing realPath would
+					// surface as "[Image unavailable: …]" on every later turn.
 					const mimeType = getImageMimeType(input.path)
 					if (mimeType) {
-						const realPathResult = fileStore.realPath(input.path)
-						if (!realPathResult.ok) {
-							return Err({ message: realPathResult.error, recoverable: false })
-						}
 						return Ok([
 							{ type: 'text', text: `Image: ${input.path} (${mimeType}, ${stats.size} bytes)` },
-							{ type: 'image_url', imageUrl: { url: `file://${realPathResult.value}` } },
+							{ type: 'image_url', imageUrl: { url: `file://${input.path}` } },
 						])
 					}
 

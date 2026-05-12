@@ -22,6 +22,14 @@ beforeAll(() => {
 	fs.writeFileSync(path.join(fixtureDir, 'hello.txt'), 'Hello, world!')
 	fs.writeFileSync(path.join(fixtureDir, 'multiline.txt'), Array.from({ length: 20 }, (_, i) => `Line ${i + 1}`).join('\n'))
 
+	// Create a minimal 1x1 PNG for image tests
+	const onePixelPng = Buffer.from(
+		'89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489000000'
+			+ '0a49444154789c6300010000000500010d0a2db40000000049454e44ae426082',
+		'hex',
+	)
+	fs.writeFileSync(path.join(fixtureDir, 'pixel.png'), onePixelPng)
+
 	// Create subdirectory with files
 	fs.mkdirSync(path.join(fixtureDir, 'subdir'), { recursive: true })
 	fs.writeFileSync(path.join(fixtureDir, 'subdir', 'nested.txt'), 'Nested content')
@@ -150,6 +158,42 @@ describe('filesystem plugin', () => {
 			expect(toolMessages).toHaveLength(1)
 			const content = toolMessages[0].content
 			expect(content).toContain('Not found')
+
+			await harness.shutdown()
+		})
+
+		it('read image file → file:// URL uses agent-visible input path, not resolved real path', async () => {
+			// Regression: previously read_file returned file://<realPath>, which the
+			// sandboxed FileStore then rejected when re-resolving on the next inference
+			// (it only accepts agent-visible paths like /home/user/session/...). The URL
+			// must echo input.path so it stays resolvable through fileStore.realPath().
+			const filePath = path.join(fixtureDir, 'pixel.png')
+			const harness = createFsHarness({
+				presets: [createFsPreset()],
+				llmProvider: MockLLMProvider.withSequence([
+					{
+						toolCalls: [{
+							id: ToolCallId('tc1'),
+							name: 'read_file',
+							input: { path: filePath },
+						}],
+					},
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Read image')
+
+			const callHistory = harness.llmProvider.getCallHistory()
+			const toolMessages = callHistory[1].messages.filter((m) => m.role === 'tool')
+			expect(toolMessages).toHaveLength(1)
+			const content = toolMessages[0].content
+			expect(Array.isArray(content)).toBe(true)
+			const blocks = content as Array<{ type: string; text?: string; imageUrl?: { url: string } }>
+			const imageBlock = blocks.find((b) => b.type === 'image_url')
+			expect(imageBlock).toBeDefined()
+			expect(imageBlock?.imageUrl?.url).toBe(`file://${filePath}`)
 
 			await harness.shutdown()
 		})
