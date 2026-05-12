@@ -207,6 +207,7 @@ export const coreReducer = createTypedReducer(
 						pendingToolCalls: toolCalls,
 						pendingMessages: [],
 						pendingToolResults: [],
+						lastInferenceMetrics: event.metrics,
 					}
 				})
 			}

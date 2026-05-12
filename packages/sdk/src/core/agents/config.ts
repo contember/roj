@@ -52,6 +52,13 @@ export interface BaseAgentConfig<TInput = unknown> {
 	services?: ServiceConfig[]
 	/** LLM middleware chain applied per-agent (runs after preset-level middleware) */
 	llmMiddleware?: LLMMiddleware[]
+	/**
+	 * Prompt cache TTL for this agent's inference breakpoints.
+	 * '1h' opts into Anthropic's extended cache tier for long-lived agents
+	 * (e.g. an orchestrator that waits minutes between user turns). Defaults
+	 * to the standard 5-minute tier.
+	 */
+	cacheTtl?: '5m' | '1h'
 }
 
 /**

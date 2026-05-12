@@ -51,6 +51,7 @@ const createTestContext = (): ToolContext => {
 		agentConfig: { systemPrompt: 'test', model: ModelId('test'), spawnableAgents: [] },
 		input: undefined,
 		parentId: null,
+		runAuxiliaryInference: async () => Err({ type: 'invalid_request', message: 'not implemented in test' }),
 	}
 }
 

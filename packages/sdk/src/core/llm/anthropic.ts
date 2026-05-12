@@ -85,10 +85,15 @@ interface AnthropicErrorResponse {
 // Request body types
 // ============================================================================
 
+interface AnthropicCacheControl {
+	type: 'ephemeral'
+	ttl?: '5m' | '1h'
+}
+
 interface AnthropicTextBlockParam {
 	type: 'text'
 	text: string
-	cache_control?: { type: 'ephemeral' }
+	cache_control?: AnthropicCacheControl
 }
 
 interface AnthropicImageBlockParam {
@@ -96,7 +101,7 @@ interface AnthropicImageBlockParam {
 	source:
 		| { type: 'base64'; media_type: string; data: string }
 		| { type: 'url'; url: string }
-	cache_control?: { type: 'ephemeral' }
+	cache_control?: AnthropicCacheControl
 }
 
 interface AnthropicToolUseBlockParam {
@@ -104,7 +109,7 @@ interface AnthropicToolUseBlockParam {
 	id: string
 	name: string
 	input: unknown
-	cache_control?: { type: 'ephemeral' }
+	cache_control?: AnthropicCacheControl
 }
 
 interface AnthropicToolResultBlockParam {
@@ -112,7 +117,7 @@ interface AnthropicToolResultBlockParam {
 	tool_use_id: string
 	content: string | Array<AnthropicTextBlockParam | AnthropicImageBlockParam>
 	is_error?: boolean
-	cache_control?: { type: 'ephemeral' }
+	cache_control?: AnthropicCacheControl
 }
 
 type AnthropicContentBlockParam =
@@ -127,19 +132,19 @@ interface AnthropicMessageParam {
 }
 
 /**
- * Add `cache_control: { type: 'ephemeral' }` to the LAST content block of an
- * AnthropicMessageParam, regardless of block type. Converts string content to
- * a single text block first so the mark has a place to live. Mutates in place
- * so the cache breakpoint survives subsequent `mergeConsecutiveMessages`.
+ * Add `cache_control` to the LAST content block of an AnthropicMessageParam,
+ * regardless of block type. Converts string content to a single text block
+ * first so the mark has a place to live. Mutates in place so the cache
+ * breakpoint survives subsequent `mergeConsecutiveMessages`.
  */
-function applyCacheControlToLastBlock(msg: AnthropicMessageParam): void {
+function applyCacheControlToLastBlock(msg: AnthropicMessageParam, cacheControl: AnthropicCacheControl): void {
 	if (typeof msg.content === 'string') {
-		msg.content = [{ type: 'text', text: msg.content, cache_control: { type: 'ephemeral' } }]
+		msg.content = [{ type: 'text', text: msg.content, cache_control: cacheControl }]
 		return
 	}
 	if (msg.content.length === 0) return
 	const lastIdx = msg.content.length - 1
-	msg.content[lastIdx] = { ...msg.content[lastIdx], cache_control: { type: 'ephemeral' } }
+	msg.content[lastIdx] = { ...msg.content[lastIdx], cache_control: cacheControl }
 }
 
 interface AnthropicToolParam {
@@ -366,7 +371,9 @@ export class AnthropicProvider implements RoutableLLMProvider {
 	private async mapMessage(msg: LLMMessage, context?: InferenceContext): Promise<AnthropicMessageParam> {
 		const mapped = await this.mapMessageContent(msg, context)
 		if (msg.cacheControl) {
-			applyCacheControlToLastBlock(mapped)
+			const cc: AnthropicCacheControl = { type: 'ephemeral' }
+			if (msg.cacheControl.ttl) cc.ttl = msg.cacheControl.ttl
+			applyCacheControlToLastBlock(mapped, cc)
 		}
 		return mapped
 	}

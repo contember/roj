@@ -8,6 +8,7 @@ import { agentIdSchema } from '~/core/agents/schema.js'
 import { createEventsFactory } from '~/core/events/types'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { ChatMessageContentItem } from '~/core/llm/llm-log-types.js'
+import type { LLMMetrics } from '~/core/llm/state.js'
 import type { PendingToolResult, ToolCallId } from '~/core/tools/schema.js'
 import { MessageId } from '../../plugins/mailbox/schema.js'
 
@@ -107,11 +108,15 @@ export type AgentPauseReason = 'limit' | 'handler' | 'manual'
 
 /**
  * Prompt cache breakpoint marker.
- * When set on an LLMMessage, providers place `cache_control: { type: 'ephemeral' }`
- * on the LAST content block of the mapped message (regardless of block type),
- * marking it as a prompt cache checkpoint.
+ * When set on an LLMMessage, providers place `cache_control` on the LAST
+ * content block of the mapped message (regardless of block type), marking it
+ * as a prompt cache checkpoint.
+ *
+ * `ttl: '1h'` opts into Anthropic's 1-hour cache tier (write cost 2× input,
+ * read still 0.1×). Useful for long-lived agents whose prompt cache would
+ * otherwise expire between user turns. Omit for the default 5-minute tier.
  */
-export type LLMMessageCacheControl = { type: 'ephemeral' }
+export type LLMMessageCacheControl = { type: 'ephemeral'; ttl?: '5m' | '1h' }
 
 /**
  * User message - from mailbox or direct input.
@@ -204,6 +209,8 @@ export interface AgentState {
 	pauseReason?: AgentPauseReason
 	/** Human-readable pause message */
 	pauseMessage?: string
+	/** Metrics from the most recent completed inference — used by plugins (e.g. context-compact) to size context against the provider-reported truth. */
+	lastInferenceMetrics?: LLMMetrics
 }
 
 // ============================================================================

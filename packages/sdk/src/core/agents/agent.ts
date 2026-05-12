@@ -81,6 +81,14 @@ export interface AgentConfig<TInput = unknown> {
 	input?: z.ZodType<TInput>
 	/** Per-plugin agent-level configs */
 	plugins?: AgentPluginConfig[]
+	/**
+	 * Prompt cache TTL for breakpoints emitted by this agent's inference calls.
+	 * '1h' opts into Anthropic's extended cache tier (write 2× input, read 0.1×)
+	 * — useful for long-lived agents (e.g. an orchestrator that waits minutes
+	 * between user turns) where the default 5-minute TTL would expire and force
+	 * full re-uploads. Omit (or '5m') for the standard tier.
+	 */
+	cacheTtl?: '5m' | '1h'
 }
 
 /**
@@ -378,6 +386,46 @@ export class Agent {
 		return this.scheduled
 	}
 
+	/**
+	 * Run a one-off LLM call using the agent's current system prompt, tools, and
+	 * conversation prefix, with extra trailing messages appended. Does not emit
+	 * agent inference events and does not mutate conversation history; the call
+	 * is logged via the LLM provider's normal logging pipeline.
+	 *
+	 * Intended for plugins that need a constrained side-channel inference
+	 * leveraging the agent's already-warm prompt cache — e.g. context-compact
+	 * uses this to ask the same model for a summary, paying only the trailing
+	 * uncached portion plus output tokens.
+	 *
+	 * The cache breakpoint is placed so that everything up to (but excluding)
+	 * `extraMessages` is cacheable, matching the previous regular inference.
+	 */
+	async runAuxiliaryInference(extraMessages: LLMMessage[]): Promise<Result<InferenceResponse, LLMError>> {
+		const agentState = this.state
+		if (!agentState) {
+			return Err({ type: 'invalid_request', message: `Agent ${this.id} has no state` })
+		}
+
+		const baseMessages: LLMMessage[] = [...agentState.preamble, ...agentState.conversationHistory]
+		const messages = [...baseMessages, ...extraMessages]
+		const cachedMessages = applyCacheBreakpoint(messages, extraMessages.length, this.config.cacheTtl)
+
+		const request: InferenceRequest = {
+			model: this.config.model,
+			systemPrompt: this.buildSystemPrompt(),
+			messages: cachedMessages,
+			tools: this.tools.size > 0 ? [...this.tools.values()] : undefined,
+		}
+
+		return this.llmProvider.inference(request, {
+			sessionId: this.store.sessionId,
+			agentId: this.id,
+			signal: this.abortController.signal,
+			fileStore: this.fileStore,
+			providers: this.llmProviders,
+		})
+	}
+
 	// ============================================================================
 	// Private methods - Processing
 	// ============================================================================
@@ -485,7 +533,11 @@ export class Agent {
 
 		// Mark cache breakpoint — ephemeral session-context suffix is excluded
 		// so it doesn't invalidate the cache on every inference.
-		const cachedMessages = applyCacheBreakpoint(messages, ephemeralParts.length > 0 ? 1 : 0)
+		const cachedMessages = applyCacheBreakpoint(
+			messages,
+			ephemeralParts.length > 0 ? 1 : 0,
+			this.config.cacheTtl,
+		)
 
 		// 5. LLM inference (with retry)
 		const request: InferenceRequest = {
@@ -866,6 +918,7 @@ export class Agent {
 			agentConfig: this.config,
 			input: agentState.typedInput,
 			parentId: agentState.parentId,
+			runAuxiliaryInference: (extraMessages) => this.runAuxiliaryInference(extraMessages),
 		}
 	}
 

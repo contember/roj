@@ -2,14 +2,24 @@ import type { AgentId } from '~/core/agents/schema.js'
 import type { CompactedConversationMessage, ContextCompactedEvent } from '~/core/context/state.js'
 import { contextEvents } from '~/core/context/state.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
-import type { LLMMessage, LLMProvider } from '~/core/llm/provider.js'
+import type { InferenceResponse, LLMError, LLMMessage } from '~/core/llm/provider.js'
 import type { ModelId } from '~/core/llm/schema.js'
 import { estimateMessagesTokens } from '~/core/llm/tokens.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { Logger } from '../../lib/logger/logger.js'
-import { CONTEXT_SUMMARY_PROMPT, wrapContextSummary } from '../../prompts/index.js'
+import { wrapContextSummary } from '../../prompts/index.js'
+
+/**
+ * Callback used by the compactor to ask the host (an Agent) to run a side-channel
+ * inference reusing its own system prompt, tools, and conversation prefix.
+ *
+ * Implemented in practice by AgentContext.runAuxiliaryInference, which keeps the
+ * agent's prompt cache warm — only the trailing `extraMessages` and the response
+ * tokens are paid for; the rest of the prefix is served from cache.
+ */
+export type RunInferenceFn = (extraMessages: LLMMessage[]) => Promise<Result<InferenceResponse, LLMError>>
 
 // ============================================================================
 // Message formatting for summarization
@@ -76,23 +86,43 @@ function formatToolInput(input: unknown): string {
 // ============================================================================
 
 export interface CompactionConfig {
-	/** Model ID to use for summarization (required) */
-	model: ModelId
-	/** Token threshold to trigger compaction */
+	/**
+	 * @deprecated No longer used. Summarization runs on the agent's own model via
+	 * the auxiliary inference callback so the agent's prompt cache is reused.
+	 * Kept in the interface so existing preset configs continue to type-check.
+	 */
+	model?: ModelId
+	/** Token threshold to trigger compaction. */
 	maxTokens: number
-	/** Number of recent messages to keep uncompacted */
+	/** Number of recent messages to keep uncompacted. */
 	keepRecentMessages: number
-	/** Max tokens for kept recent messages (whichever limit is hit first) */
+	/** Max tokens for kept recent messages (whichever limit is hit first). */
 	keepRecentTokens?: number
-	/** Target token count after compaction (informational) */
+	/** Target token count after compaction (informational). */
 	targetTokens?: number
-	/** System prompt for summarization */
+	/** Optional override for the trailing summarization instruction sent to the model. */
 	summaryPrompt?: string
-	/** Enable history offloading before compaction */
+	/** Enable history offloading before compaction. */
 	offloadHistory?: boolean
-	/** Path prefix for offloaded history (default: /session/.history/) */
+	/** Path prefix for offloaded history (default: /session/.history/). */
 	historyPathPrefix?: string
 }
+
+/**
+ * Trailing user-message instruction appended to the agent's full prefix when
+ * requesting a summary. The model sees its real system prompt, tools and full
+ * conversation, then this instruction last. Phrased to discourage tool calls
+ * — Sonnet-class models reliably emit a plain text response under this prompt.
+ */
+export const DEFAULT_SUMMARY_INSTRUCTION =
+	'[CONTEXT COMPACTION REQUEST]\n'
+	+ 'The conversation above is approaching the context budget. Produce a concise '
+	+ 'summary (under 600 words) of everything discussed and decided so far. Cover: '
+	+ 'completed tasks and their outcomes, key decisions and rationale, current state '
+	+ 'of any in-progress work, important file paths or identifiers, and outstanding '
+	+ 'questions.\n\n'
+	+ 'Reply with plain text only. Do NOT call any tools. Do NOT acknowledge this '
+	+ 'request — just emit the summary directly.'
 
 // ============================================================================
 // Compaction Result
@@ -141,7 +171,6 @@ export interface HistoryOffloader {
 
 export class ContextCompactor {
 	constructor(
-		private readonly llmProvider: LLMProvider,
 		private readonly logger: Logger,
 		private readonly config: CompactionConfig,
 		private readonly historyOffloader?: HistoryOffloader,
@@ -179,10 +208,17 @@ export class ContextCompactor {
 	}
 
 	/**
-	 * Check if compaction is needed based on token count.
+	 * Check if compaction is needed.
+	 *
+	 * Prefers the provider-reported prompt token count from the previous turn
+	 * (authoritative — comes straight from the model's tokenizer). Falls back
+	 * to the in-process estimator when no previous metrics exist (first turn).
+	 *
+	 * The estimator under-counts JSON-heavy tool-result history by ~2x, so
+	 * relying on it alone causes the trigger to never fire in long sessions.
 	 */
-	needsCompaction(messages: LLMMessage[]): boolean {
-		const tokens = estimateMessagesTokens(messages)
+	needsCompaction(messages: LLMMessage[], lastActualPromptTokens?: number): boolean {
+		const tokens = lastActualPromptTokens ?? estimateMessagesTokens(messages)
 		return tokens > this.config.maxTokens
 	}
 
@@ -194,33 +230,42 @@ export class ContextCompactor {
 		sessionId: SessionId,
 		agentId: AgentId,
 		messages: LLMMessage[],
+		runInference: RunInferenceFn,
+		lastActualPromptTokens?: number,
 	): Promise<Result<CompactionResult | null, Error>> {
-		if (!this.needsCompaction(messages)) {
+		if (!this.needsCompaction(messages, lastActualPromptTokens)) {
 			return Ok(null)
 		}
 
-		return this.compact(sessionId, agentId, messages)
+		return this.compact(sessionId, agentId, messages, runInference, lastActualPromptTokens)
 	}
 
 	/**
-	 * Compact conversation history by summarizing older messages.
+	 * Compact conversation history by asking the agent's own model to summarize
+	 * the older portion. The summarization call reuses the agent's existing
+	 * prompt cache via `runInference`, paying only for the trailing instruction
+	 * (a few hundred tokens) and the summary output — not the whole conversation
+	 * a second time.
 	 */
 	async compact(
 		sessionId: SessionId,
 		agentId: AgentId,
 		messages: LLMMessage[],
+		runInference: RunInferenceFn,
+		lastActualPromptTokens?: number,
 	): Promise<Result<CompactionResult, Error>> {
-		const originalTokens = estimateMessagesTokens(messages)
+		const originalTokens = lastActualPromptTokens ?? estimateMessagesTokens(messages)
 
 		this.logger.info('Starting context compaction', {
 			sessionId,
 			agentId,
 			messageCount: messages.length,
-			estimatedTokens: originalTokens,
+			originalTokens,
+			actualTokensReported: lastActualPromptTokens !== undefined,
 		})
 
-		// Split messages: keep recent, compact older
-		// Respect both count limit and token budget (whichever is hit first)
+		// Split messages: keep recent, compact older.
+		// Respect both count limit and token budget (whichever is hit first).
 		const keepCount = this.computeKeepCount(messages)
 		const toCompact = messages.slice(0, messages.length - keepCount)
 		const toKeep = messages.slice(messages.length - keepCount)
@@ -236,20 +281,16 @@ export class ContextCompactor {
 			})
 		}
 
-		// Format messages for summarization
-		const conversationText = toCompact
-			.map(formatMessageForSummary)
-			.join('\n\n')
-
-		// Offload history if enabled
+		// Offload the dropped messages to disk for forensics / replay.
+		// Best-effort; failures are logged but don't block compaction.
 		let historyPath: string | undefined
 		if (this.config.offloadHistory && this.historyOffloader) {
 			try {
+				const conversationText = toCompact.map(formatMessageForSummary).join('\n\n')
 				const pathPrefix = this.config.historyPathPrefix ?? DEFAULT_HISTORY_PATH_PREFIX
 				historyPath = await this.historyOffloader.offload(agentId, conversationText, pathPrefix)
 				this.logger.info('History offloaded', { sessionId, agentId, historyPath })
 			} catch (error) {
-				// History offloading is best-effort, log and continue
 				this.logger.warn('Failed to offload history', {
 					sessionId,
 					agentId,
@@ -258,18 +299,14 @@ export class ContextCompactor {
 			}
 		}
 
-		// Generate summary using LLM
-		const summaryResult = await this.llmProvider.inference({
-			model: this.config.model,
-			systemPrompt: this.config.summaryPrompt ?? CONTEXT_SUMMARY_PROMPT,
-			messages: [
-				{
-					role: 'user',
-					content: `Please summarize this conversation:\n\n${conversationText}`,
-				},
-			],
-			tools: [],
-		})
+		// Inline summarization: append the instruction as a trailing user message
+		// and let the host run inference with the agent's full live prefix. The
+		// agent's prompt cache from the previous turn covers everything up to
+		// (but not including) this instruction.
+		const summaryInstruction = this.config.summaryPrompt ?? DEFAULT_SUMMARY_INSTRUCTION
+		const summaryResult = await runInference([
+			{ role: 'user', content: summaryInstruction },
+		])
 
 		if (!summaryResult.ok) {
 			const llmError = summaryResult.error
@@ -283,9 +320,17 @@ export class ContextCompactor {
 
 		const summary = summaryResult.value.content ?? ''
 
-		// Create summary message (with history reference if offloaded)
+		if (!summary.trim()) {
+			this.logger.warn('Summarization returned empty content', { sessionId, agentId })
+			return Err(new Error('Compaction failed: model returned empty summary'))
+		}
+
+		// Replace the compacted portion with a single user-role summary message.
+		// Using `user` role (not `system`) so the wrap reads as part of the
+		// conversation flow — Anthropic recommends user-role for arbitrary
+		// mid-conversation context blocks.
 		const summaryMessage: LLMMessage = {
-			role: 'system',
+			role: 'user',
 			content: wrapContextSummary(summary, historyPath),
 		}
 

@@ -795,6 +795,7 @@ export class Session {
 				checkIntervalMs: orch.checkIntervalMs,
 				input: orch.input,
 				plugins: withServicePluginConfig(orch),
+				cacheTtl: orch.cacheTtl,
 			}
 		}
 
@@ -810,6 +811,7 @@ export class Session {
 				checkIntervalMs: comm.checkIntervalMs,
 				input: comm.input,
 				plugins: withServicePluginConfig(comm),
+				cacheTtl: comm.cacheTtl,
 			}
 		}
 
@@ -828,6 +830,7 @@ export class Session {
 			checkIntervalMs: agentDef.checkIntervalMs,
 			input: agentDef.input,
 			plugins: withServicePluginConfig(agentDef),
+			cacheTtl: agentDef.cacheTtl,
 		}
 	}
 }

@@ -1,16 +1,15 @@
 import { beforeEach, describe, expect, it } from 'bun:test'
 import type { AgentId } from '~/core/agents/schema.js'
 import { generateTestAgentId } from '~/core/agents/schema.js'
-import type { InferenceRequest, InferenceResponse, LLMError, LLMMessage, LLMProvider } from '~/core/llm/provider.js'
+import type { InferenceResponse, LLMMessage } from '~/core/llm/provider.js'
 import { ModelId } from '~/core/llm/schema.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import { generateSessionId } from '~/core/sessions/schema.js'
 import { generateToolCallId } from '~/core/tools/schema.js'
 import { Err, Ok } from '~/lib/utils/result.js'
-import type { Result } from '~/lib/utils/result.js'
 import { silentLogger } from '../../lib/logger/logger.js'
 import { ContextCompactor, createContextCompactedEvent, formatMessageForSummary } from './context-compactor.js'
-import type { CompactionConfig, CompactionResult } from './context-compactor.js'
+import type { CompactionConfig, CompactionResult, RunInferenceFn } from './context-compactor.js'
 
 // ============================================================================
 // Test Constants
@@ -19,24 +18,25 @@ import type { CompactionConfig, CompactionResult } from './context-compactor.js'
 const TEST_MODEL_ID: ModelId = ModelId('test/model')
 
 // ============================================================================
-// Mock LLM Provider
+// Mock runInference callback
 // ============================================================================
 
-class MockLLMProvider implements LLMProvider {
-	readonly name = 'mock'
+interface InferenceMockCall {
+	extraMessages: LLMMessage[]
+}
+
+class InferenceMock {
 	private responses: InferenceResponse[] = []
 	private responseIndex = 0
-	calls: InferenceRequest[] = []
+	calls: InferenceMockCall[] = []
 
 	setResponses(responses: InferenceResponse[]): void {
 		this.responses = responses
 		this.responseIndex = 0
 	}
 
-	async inference(
-		request: InferenceRequest,
-	): Promise<Result<InferenceResponse, LLMError>> {
-		this.calls.push(request)
+	readonly run: RunInferenceFn = async (extraMessages) => {
+		this.calls.push({ extraMessages })
 		if (this.responseIndex >= this.responses.length) {
 			return Err({ type: 'server_error', message: 'No more mock responses' })
 		}
@@ -49,12 +49,12 @@ class MockLLMProvider implements LLMProvider {
 // ============================================================================
 
 describe('ContextCompactor.needsCompaction', () => {
-	let mockLLM: MockLLMProvider
+	let inference: InferenceMock
 	let compactor: ContextCompactor
 
 	beforeEach(() => {
-		mockLLM = new MockLLMProvider()
-		compactor = new ContextCompactor(mockLLM, silentLogger, {
+		inference = new InferenceMock()
+		compactor = new ContextCompactor(silentLogger, {
 			model: TEST_MODEL_ID,
 			maxTokens: 100,
 			keepRecentMessages: 2,
@@ -82,14 +82,14 @@ describe('ContextCompactor.needsCompaction', () => {
 // ============================================================================
 
 describe('ContextCompactor.compact', () => {
-	let mockLLM: MockLLMProvider
+	let inference: InferenceMock
 	let compactor: ContextCompactor
 	let sessionId: SessionId
 	let agentId: AgentId
 
 	beforeEach(() => {
-		mockLLM = new MockLLMProvider()
-		compactor = new ContextCompactor(mockLLM, silentLogger, {
+		inference = new InferenceMock()
+		compactor = new ContextCompactor(silentLogger, {
 			model: TEST_MODEL_ID,
 			maxTokens: 100,
 			keepRecentMessages: 2,
@@ -105,7 +105,7 @@ describe('ContextCompactor.compact', () => {
 			{ role: 'assistant', content: 'message 2' },
 		]
 
-		const result = await compactor.compact(sessionId, agentId, messages)
+		const result = await compactor.compact(sessionId, agentId, messages, inference.run)
 		expect(result.ok).toBe(true)
 		if (!result.ok) return
 
@@ -115,7 +115,7 @@ describe('ContextCompactor.compact', () => {
 	})
 
 	it('compacts old messages and keeps recent ones', async () => {
-		mockLLM.setResponses([
+		inference.setResponses([
 			{
 				content: 'Summary of the conversation',
 				toolCalls: [],
@@ -138,7 +138,7 @@ describe('ContextCompactor.compact', () => {
 			{ role: 'assistant', content: 'recent message 2' },
 		]
 
-		const result = await compactor.compact(sessionId, agentId, messages)
+		const result = await compactor.compact(sessionId, agentId, messages, inference.run)
 		expect(result.ok).toBe(true)
 		if (!result.ok) return
 
@@ -146,8 +146,8 @@ describe('ContextCompactor.compact', () => {
 		expect(result.value.messagesRemoved).toBe(3)
 		expect(result.value.compactedMessages.length).toBe(3) // summary + 2 recent
 
-		// First message is summary
-		expect(result.value.compactedMessages[0].role).toBe('system')
+		// First message is the summary (user-role so it cleanly fits into chat history)
+		expect(result.value.compactedMessages[0].role).toBe('user')
 		expect(result.value.compactedMessages[0].content).toContain(
 			'[CONVERSATION SUMMARY]',
 		)
@@ -160,8 +160,8 @@ describe('ContextCompactor.compact', () => {
 		expect(result.value.compactedMessages[2].content).toBe('recent message 2')
 	})
 
-	it('calls LLM with formatted conversation and configured model', async () => {
-		mockLLM.setResponses([
+	it('calls runInference with a single trailing summarize-instruction message', async () => {
+		inference.setResponses([
 			{
 				content: 'Summary',
 				toolCalls: [],
@@ -183,17 +183,16 @@ describe('ContextCompactor.compact', () => {
 			{ role: 'assistant', content: 'recent too' },
 		]
 
-		await compactor.compact(sessionId, agentId, messages)
+		await compactor.compact(sessionId, agentId, messages, inference.run)
 
-		expect(mockLLM.calls.length).toBe(1)
-		const request = mockLLM.calls[0]
-		// Verify model from config is used
-		expect(request.model).toBe(TEST_MODEL_ID)
-		expect(request.messages[0].role).toBe('user')
-		expect(request.messages[0].content).toContain('User: user message')
-		expect(request.messages[0].content).toContain('Agent: assistant message')
-		// Recent messages should not be in the summarization request
-		expect(request.messages[0].content).not.toContain('recent')
+		expect(inference.calls.length).toBe(1)
+		const call = inference.calls[0]
+		// Inline summarization sends ONE trailing user message — the host (agent)
+		// is responsible for the full prefix (preamble + history); the compactor
+		// only contributes the instruction.
+		expect(call.extraMessages.length).toBe(1)
+		expect(call.extraMessages[0].role).toBe('user')
+		expect(typeof call.extraMessages[0].content).toBe('string')
 	})
 
 	it('returns error when LLM fails', async () => {
@@ -207,7 +206,7 @@ describe('ContextCompactor.compact', () => {
 			{ role: 'assistant', content: 'recent 2' },
 		]
 
-		const result = await compactor.compact(sessionId, agentId, messages)
+		const result = await compactor.compact(sessionId, agentId, messages, inference.run)
 		expect(result.ok).toBe(false)
 		if (result.ok) return
 
@@ -220,14 +219,14 @@ describe('ContextCompactor.compact', () => {
 // ============================================================================
 
 describe('ContextCompactor.compactIfNeeded', () => {
-	let mockLLM: MockLLMProvider
+	let inference: InferenceMock
 	let compactor: ContextCompactor
 	let sessionId: SessionId
 	let agentId: AgentId
 
 	beforeEach(() => {
-		mockLLM = new MockLLMProvider()
-		compactor = new ContextCompactor(mockLLM, silentLogger, {
+		inference = new InferenceMock()
+		compactor = new ContextCompactor(silentLogger, {
 			model: TEST_MODEL_ID,
 			maxTokens: 50,
 			keepRecentMessages: 1,
@@ -239,16 +238,16 @@ describe('ContextCompactor.compactIfNeeded', () => {
 	it('returns null when compaction not needed', async () => {
 		const messages: LLMMessage[] = [{ role: 'user', content: 'short' }]
 
-		const result = await compactor.compactIfNeeded(sessionId, agentId, messages)
+		const result = await compactor.compactIfNeeded(sessionId, agentId, messages, inference.run)
 		expect(result.ok).toBe(true)
 		if (!result.ok) return
 
 		expect(result.value).toBeNull()
-		expect(mockLLM.calls.length).toBe(0)
+		expect(inference.calls.length).toBe(0)
 	})
 
 	it('compacts when needed', async () => {
-		mockLLM.setResponses([
+		inference.setResponses([
 			{
 				content: 'Summary',
 				toolCalls: [],
@@ -270,7 +269,7 @@ describe('ContextCompactor.compactIfNeeded', () => {
 			{ role: 'user', content: 'c'.repeat(100) },
 		]
 
-		const result = await compactor.compactIfNeeded(sessionId, agentId, messages)
+		const result = await compactor.compactIfNeeded(sessionId, agentId, messages, inference.run)
 		expect(result.ok).toBe(true)
 		if (!result.ok) return
 
@@ -338,13 +337,13 @@ describe('createContextCompactedEvent', () => {
 
 describe('ContextCompactor with custom config', () => {
 	it('respects custom maxTokens', () => {
-		const mockLLM = new MockLLMProvider()
+		const inference = new InferenceMock()
 		const config: CompactionConfig = {
 			model: TEST_MODEL_ID,
 			maxTokens: 20,
 			keepRecentMessages: 1,
 		}
-		const compactor = new ContextCompactor(mockLLM, silentLogger, config)
+		const compactor = new ContextCompactor(silentLogger, config)
 
 		const smallMessages: LLMMessage[] = [{ role: 'user', content: 'hi' }]
 		expect(compactor.needsCompaction(smallMessages)).toBe(false)
@@ -356,8 +355,8 @@ describe('ContextCompactor with custom config', () => {
 	})
 
 	it('respects custom keepRecentMessages', async () => {
-		const mockLLM = new MockLLMProvider()
-		mockLLM.setResponses([
+		const inference = new InferenceMock()
+		inference.setResponses([
 			{
 				content: 'Summary',
 				toolCalls: [],
@@ -377,7 +376,7 @@ describe('ContextCompactor with custom config', () => {
 			maxTokens: 10,
 			keepRecentMessages: 3,
 		}
-		const compactor = new ContextCompactor(mockLLM, silentLogger, config)
+		const compactor = new ContextCompactor(silentLogger, config)
 
 		const messages: LLMMessage[] = [
 			{ role: 'user', content: 'old 1' },
@@ -391,6 +390,7 @@ describe('ContextCompactor with custom config', () => {
 			generateSessionId(),
 			generateTestAgentId(),
 			messages,
+			inference.run,
 		)
 
 		expect(result.ok).toBe(true)
@@ -402,8 +402,8 @@ describe('ContextCompactor with custom config', () => {
 	})
 
 	it('uses custom summaryPrompt', async () => {
-		const mockLLM = new MockLLMProvider()
-		mockLLM.setResponses([
+		const inference = new InferenceMock()
+		inference.setResponses([
 			{
 				content: 'Summary',
 				toolCalls: [],
@@ -425,17 +425,18 @@ describe('ContextCompactor with custom config', () => {
 			keepRecentMessages: 1,
 			summaryPrompt: customPrompt,
 		}
-		const compactor = new ContextCompactor(mockLLM, silentLogger, config)
+		const compactor = new ContextCompactor(silentLogger, config)
 
 		const messages: LLMMessage[] = [
 			{ role: 'user', content: 'old' },
 			{ role: 'user', content: 'recent' },
 		]
 
-		await compactor.compact(generateSessionId(), generateTestAgentId(), messages)
+		await compactor.compact(generateSessionId(), generateTestAgentId(), messages, inference.run)
 
-		expect(mockLLM.calls.length).toBe(1)
-		expect(mockLLM.calls[0].systemPrompt).toBe(customPrompt)
+		expect(inference.calls.length).toBe(1)
+		// Custom prompt is sent as the content of the trailing user-role instruction.
+		expect(inference.calls[0].extraMessages[0].content).toBe(customPrompt)
 	})
 })
 
@@ -557,14 +558,14 @@ describe('formatMessageForSummary', () => {
 // ============================================================================
 
 describe('ContextCompactor with tool calls', () => {
-	let mockLLM: MockLLMProvider
+	let inference: InferenceMock
 	let compactor: ContextCompactor
 	let sessionId: SessionId
 	let agentId: AgentId
 
 	beforeEach(() => {
-		mockLLM = new MockLLMProvider()
-		compactor = new ContextCompactor(mockLLM, silentLogger, {
+		inference = new InferenceMock()
+		compactor = new ContextCompactor(silentLogger, {
 			model: TEST_MODEL_ID,
 			maxTokens: 100,
 			keepRecentMessages: 1,
@@ -574,7 +575,7 @@ describe('ContextCompactor with tool calls', () => {
 	})
 
 	it('does not leave orphaned tool results at the start of kept messages', async () => {
-		mockLLM.setResponses([
+		inference.setResponses([
 			{
 				content: 'Summary',
 				toolCalls: [],
@@ -597,7 +598,7 @@ describe('ContextCompactor with tool calls', () => {
 			{ role: 'tool', content: 'export const foo = 1', toolCallId, toolName: 'read' },
 		]
 
-		const result = await compactor.compact(sessionId, agentId, messages)
+		const result = await compactor.compact(sessionId, agentId, messages, inference.run)
 		expect(result.ok).toBe(true)
 		if (!result.ok) return
 
@@ -609,41 +610,6 @@ describe('ContextCompactor with tool calls', () => {
 		// All 5 original messages should be compacted (none kept except summary)
 		expect(result.value.messagesRemoved).toBe(5)
 	})
-
-	it('includes tool calls in summarization request', async () => {
-		mockLLM.setResponses([
-			{
-				content: 'Summary',
-				toolCalls: [],
-				finishReason: 'stop',
-				metrics: { promptTokens: 50, completionTokens: 20, totalTokens: 70, latencyMs: 100, model: 'mock' },
-			},
-		])
-
-		const toolCallId = generateToolCallId()
-		const messages: LLMMessage[] = [
-			{ role: 'user', content: 'Read the file' },
-			{
-				role: 'assistant',
-				content: '',
-				toolCalls: [{ id: toolCallId, name: 'read', input: { path: '/src/index.ts' } }],
-			},
-			{ role: 'tool', content: 'export const foo = 1', toolCallId, toolName: 'read' },
-			{ role: 'user', content: 'recent message' },
-		]
-
-		await compactor.compact(sessionId, agentId, messages)
-
-		expect(mockLLM.calls.length).toBe(1)
-		const request = mockLLM.calls[0]
-		const summaryContent = request.messages[0].content as string
-
-		// Verify tool call is included
-		expect(summaryContent).toContain('[Called tools: read(path)]')
-		// Verify tool result includes tool name
-		expect(summaryContent).toContain('Tool(read):')
-		expect(summaryContent).toContain('export const foo = 1')
-	})
 })
 
 // ============================================================================
@@ -651,12 +617,12 @@ describe('ContextCompactor with tool calls', () => {
 // ============================================================================
 
 describe('ContextCompactor with history offloading', () => {
-	let mockLLM: MockLLMProvider
+	let inference: InferenceMock
 	let sessionId: SessionId
 	let agentId: AgentId
 
 	beforeEach(() => {
-		mockLLM = new MockLLMProvider()
+		inference = new InferenceMock()
 		sessionId = generateSessionId()
 		agentId = generateTestAgentId()
 	})
@@ -670,7 +636,7 @@ describe('ContextCompactor with history offloading', () => {
 			},
 		}
 
-		mockLLM.setResponses([
+		inference.setResponses([
 			{
 				content: 'Summary',
 				toolCalls: [],
@@ -680,7 +646,6 @@ describe('ContextCompactor with history offloading', () => {
 		])
 
 		const compactor = new ContextCompactor(
-			mockLLM,
 			silentLogger,
 			{
 				model: TEST_MODEL_ID,
@@ -697,7 +662,7 @@ describe('ContextCompactor with history offloading', () => {
 			{ role: 'user', content: 'recent message' },
 		]
 
-		const result = await compactor.compact(sessionId, agentId, messages)
+		const result = await compactor.compact(sessionId, agentId, messages, inference.run)
 
 		expect(result.ok).toBe(true)
 		if (!result.ok) return
@@ -723,7 +688,7 @@ describe('ContextCompactor with history offloading', () => {
 			},
 		}
 
-		mockLLM.setResponses([
+		inference.setResponses([
 			{
 				content: 'Summary',
 				toolCalls: [],
@@ -733,7 +698,6 @@ describe('ContextCompactor with history offloading', () => {
 		])
 
 		const compactor = new ContextCompactor(
-			mockLLM,
 			silentLogger,
 			{
 				model: TEST_MODEL_ID,
@@ -749,7 +713,7 @@ describe('ContextCompactor with history offloading', () => {
 			{ role: 'user', content: 'recent' },
 		]
 
-		const result = await compactor.compact(sessionId, agentId, messages)
+		const result = await compactor.compact(sessionId, agentId, messages, inference.run)
 
 		expect(result.ok).toBe(true)
 		if (!result.ok) return
@@ -759,7 +723,7 @@ describe('ContextCompactor with history offloading', () => {
 	})
 
 	it('does not offload history when offloader is not provided', async () => {
-		mockLLM.setResponses([
+		inference.setResponses([
 			{
 				content: 'Summary',
 				toolCalls: [],
@@ -769,7 +733,6 @@ describe('ContextCompactor with history offloading', () => {
 		])
 
 		const compactor = new ContextCompactor(
-			mockLLM,
 			silentLogger,
 			{
 				model: TEST_MODEL_ID,
@@ -785,7 +748,7 @@ describe('ContextCompactor with history offloading', () => {
 			{ role: 'user', content: 'recent' },
 		]
 
-		const result = await compactor.compact(sessionId, agentId, messages)
+		const result = await compactor.compact(sessionId, agentId, messages, inference.run)
 
 		expect(result.ok).toBe(true)
 		if (!result.ok) return
@@ -802,7 +765,7 @@ describe('ContextCompactor with history offloading', () => {
 			},
 		}
 
-		mockLLM.setResponses([
+		inference.setResponses([
 			{
 				content: 'Summary',
 				toolCalls: [],
@@ -812,7 +775,6 @@ describe('ContextCompactor with history offloading', () => {
 		])
 
 		const compactor = new ContextCompactor(
-			mockLLM,
 			silentLogger,
 			{
 				model: TEST_MODEL_ID,
@@ -829,7 +791,7 @@ describe('ContextCompactor with history offloading', () => {
 			{ role: 'user', content: 'recent' },
 		]
 
-		await compactor.compact(sessionId, agentId, messages)
+		await compactor.compact(sessionId, agentId, messages, inference.run)
 
 		expect(offloadedPaths.length).toBe(1)
 		expect(offloadedPaths[0].pathPrefix).toBe('/session/.custom-history/')
@@ -842,7 +804,7 @@ describe('ContextCompactor with history offloading', () => {
 			},
 		}
 
-		mockLLM.setResponses([
+		inference.setResponses([
 			{
 				content: 'Summary despite offload failure',
 				toolCalls: [],
@@ -852,7 +814,6 @@ describe('ContextCompactor with history offloading', () => {
 		])
 
 		const compactor = new ContextCompactor(
-			mockLLM,
 			silentLogger,
 			{
 				model: TEST_MODEL_ID,
@@ -868,7 +829,7 @@ describe('ContextCompactor with history offloading', () => {
 			{ role: 'user', content: 'recent' },
 		]
 
-		const result = await compactor.compact(sessionId, agentId, messages)
+		const result = await compactor.compact(sessionId, agentId, messages, inference.run)
 
 		// Compaction should succeed despite offload failure
 		expect(result.ok).toBe(true)

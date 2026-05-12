@@ -1,9 +1,22 @@
 import { describe, expect, it } from 'bun:test'
 import { contextEvents } from '~/core/context/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import type { InferenceRequest } from '~/core/llm/provider.js'
 import { ModelId } from '~/core/llm/schema.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 import { contextCompactPlugin } from './index.js'
+
+/**
+ * Inline compaction sends the agent's regular systemPrompt and full conversation
+ * to the LLM, with a trailing user message containing the summarization
+ * instruction. We detect compaction calls by looking at that trailing message.
+ */
+function isSummarizationRequest(request: InferenceRequest): boolean {
+	const last = request.messages[request.messages.length - 1]
+	if (!last || last.role !== 'user') return false
+	const content = typeof last.content === 'string' ? last.content : JSON.stringify(last.content)
+	return content.includes('[CONTEXT COMPACTION REQUEST]')
+}
 
 // ============================================================================
 // Helpers
@@ -50,7 +63,7 @@ describe('context-compact plugin', () => {
 				presets: [createCompactPreset(10)],
 				mockHandler: (request) => {
 					// Compaction requests use CONTEXT_SUMMARY_PROMPT which contains "summarizer".
-					if (request.systemPrompt.includes('summary') || request.systemPrompt.includes('Summarize')) {
+					if (isSummarizationRequest(request)) {
 						return {
 							content: 'Summary of conversation so far.',
 							toolCalls: [],
@@ -119,7 +132,7 @@ describe('context-compact plugin', () => {
 					inferenceCallCount++
 
 					// Summarization requests (from context-compact plugin)
-					if (request.systemPrompt.includes('summary') || request.systemPrompt.includes('Summarize')) {
+					if (isSummarizationRequest(request)) {
 						return {
 							content: 'Conversation summary.',
 							toolCalls: [],
@@ -170,7 +183,7 @@ describe('context-compact plugin', () => {
 				mockHandler: (request) => {
 					// Summarization requests — throw to simulate LLM failure.
 					// MockLLMProvider only returns Err() when the handler throws.
-					if (request.systemPrompt.includes('summary') || request.systemPrompt.includes('Summarize')) {
+					if (isSummarizationRequest(request)) {
 						throw { type: 'server_error', message: 'LLM summarization failed' }
 					}
 
