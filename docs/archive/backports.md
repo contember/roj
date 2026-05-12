@@ -82,3 +82,27 @@ Skipped (not relevant to buresh-cloud):
 ## Ad-hoc backports past `50a00b44`
 
 - [x] `41bab476` — always skip `node_modules` in `list_directory` and load `.gitignore` from the workspace/session root containing the listed path (filesystem helpers + plugin)
+
+## 2026-05-12 sync (to `96212da4`)
+
+- [x] `20610be3` — fix(buresh-client): hide system message bodies from user chat view; show a generic "AI is updating your project" chip with `SparklesIcon` (client-react `UserMessage.tsx`)
+- [x] `26bfe1da` — feat(buresh): track `lastInferenceMetrics: LLMMetrics` on `AgentState` and populate it from the `inference_completed` event reducer
+- [x] `708f4ba4` — fix(buresh): use provider-reported `promptTokens` for the compaction trigger; `ContextCompactor.needsCompaction`/`compactIfNeeded` accept an optional `lastActualPromptTokens`, plumbed from `ctx.agentState.lastInferenceMetrics?.promptTokens` in the plugin's `beforeInference` hook
+- [x] `77b915a6` — feat(buresh): inline summarization via the agent's own model
+  - new `Agent.runAuxiliaryInference(extraMessages)` reusing system prompt, tools, and full prefix (cache-aware `applyCacheBreakpoint`)
+  - exposed on `AgentContext` as `runAuxiliaryInference`
+  - `ContextCompactor` constructor no longer takes an `LLMProvider`; `compact`/`compactIfNeeded` take a `RunInferenceFn` callback; the agent's prompt cache covers everything but the trailing summarize instruction
+  - summary message role flipped `system → user` so it threads into chat history naturally
+  - `CompactionConfig.model` marked `@deprecated` (kept for preset type-compat)
+  - integration test detects summarization by the trailing `[CONTEXT COMPACTION REQUEST]` user message
+- [x] `6e5eadd0` — feat(buresh): per-agent compaction config overrides via `.agentConfig<ContextCompactAgentConfig>()`; compactor is built per `beforeInference` from merged session + agent config
+- [x] `c19279bc` — feat(buresh): support Anthropic 1h prompt cache TTL per agent
+  - `LLMMessageCacheControl.ttl?: '5m' | '1h'`
+  - `applyCacheBreakpoint(messages, suffix, ttl?)` propagates `ttl` into the marker
+  - Anthropic provider maps the marker into `cache_control.ttl` on the last content block
+- [x] `96212da4` (SDK part) — expose `cacheTtl?: '5m' | '1h'` on `BaseAgentConfig` and runtime `AgentConfig`; propagated in `Session.buildAgentConfig` for orchestrator / communicator / agent; both `applyCacheBreakpoint` call sites in `agent.ts` pass `this.config.cacheTtl`
+  - skipped: `packages/agent/src/presets/redo.ts` (preset lives in roj-platform; if needed there it's a separate backport)
+
+Skipped:
+- `3b70f0cd` — chore(deps): bumps `@nuasite/nua`, `lopata`, `lucide-react`, `marked` in the upstream client; roj manages package versions independently
+- `1a2c7d8f` — chore: format-only changes to `buresh/CLAUDE.md` (not the roj CLAUDE.md)

@@ -70,13 +70,13 @@ bootstrap, already done).
 ## Upstream Sync (webmaster → roj)
 
 - **Upstream repo:** `~/projects/contember/webmaster` (still uses `buresh` naming — kept verbatim in paths below)
-- **Last synced commit:** `50a00b44` (2026-04-17)
+- **Last synced commit:** `96212da4` (2026-05-12)
 - **Completed backports:** archived in `docs/archive/backports.md`
 
 ```bash
 # Check for new upstream changes
 cd ~/projects/contember/webmaster
-git log --oneline --after="2026-04-17" -- \
+git log --oneline --after="2026-05-12" -- \
   buresh/ \
   packages/worker/src/model/buresh/ \
   packages/worker/src/routes/buresh/
