@@ -55,15 +55,16 @@ export const agentStatusPlugin = definePlugin('agent-status')
 		return null
 	})
 	.hook('onError', async (ctx) => {
-		if (ctx.parentId !== null) {
-			ctx.notify('agentStatus', {
-				sessionId: ctx.sessionId,
-				agentId: ctx.agentId,
-				status: 'idle',
-				definitionName: ctx.agentState.definitionName,
-				timestamp: Date.now(),
-			})
-		}
+		// Emit idle for both entry and sub-agents — without this the client's
+		// `activeAgents` map keeps the agent flagged thinking until reconnect,
+		// since the session-store no longer clears it on chat_message/ask_user.
+		ctx.notify('agentStatus', {
+			sessionId: ctx.sessionId,
+			agentId: ctx.agentId,
+			status: 'idle',
+			definitionName: ctx.agentState.definitionName,
+			timestamp: Date.now(),
+		})
 		return null
 	})
 	.build()
