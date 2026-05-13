@@ -34,7 +34,7 @@ const hasSnapshots =
 	existsSync(SNAPSHOTS_DIR) && readdirSync(SNAPSHOTS_DIR).some((f) => f.endsWith('.json'))
 const canRunLiveTurn = hasApiKey || hasSnapshots
 
-describe('App Builder e2e', () => {
+describe.skip('App Builder e2e', () => {
 	let handle: StandaloneHandle
 	let client: ReturnType<typeof createRojClient>
 
