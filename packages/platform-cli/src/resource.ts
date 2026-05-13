@@ -27,7 +27,9 @@ export async function uploadResource(pathOrDir: string, options: {
 		filePath = join(tempDir, filename)
 		mimeType = 'application/zip'
 		console.log(`Zipping directory: ${resolved}`)
-		execSync(`zip -r ${JSON.stringify(filePath)} .`, { cwd: resolved, stdio: 'pipe' })
+		// Exclude `.git` — bundling it would clobber the session worktree's gitdir
+		// pointer when the resource is unzipped on the sandbox.
+		execSync(`zip -r ${JSON.stringify(filePath)} . -x '.git/*' '.git'`, { cwd: resolved, stdio: 'pipe' })
 	} else {
 		filePath = resolved
 		filename = basename(resolved)

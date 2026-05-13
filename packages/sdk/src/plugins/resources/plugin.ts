@@ -112,7 +112,10 @@ export const resourcesPlugin = definePlugin('resources')
 				await fs.writeFile(tempPath, input.fileBuffer)
 
 				try {
-					await exec('unzip', ['-o', '-q', tempPath, '-d', targetDir])
+					// `-x .git .git/*` so a stray .git entry in the ZIP can't overwrite the
+					// worktree's gitdir pointer (which silently breaks every subsequent git
+					// command in the workspace).
+					await exec('unzip', ['-o', '-q', tempPath, '-d', targetDir, '-x', '.git', '.git/*'])
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error)
 					// unzip returns exit code 1 for warnings — still usable
