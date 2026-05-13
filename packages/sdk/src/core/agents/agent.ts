@@ -607,6 +607,22 @@ export class Agent {
 					agentId: this.id,
 					attempts: emptyAttempts + 1,
 				})
+				// Empty-response exhaustion is a terminal failure: the LLM accepted the
+				// user message but couldn't produce output 3× in a row. Mark the dequeued
+				// plugin tokens consumed here so the failure path's resume_from_error
+				// doesn't re-deliver the same message forever. Real provider errors
+				// (rate_limit / server_error from the API) reach `if (!llmResponse.ok)
+				// break` above instead, where the rollback semantics from the
+				// "stop duplicating tool results across inference failures" fix apply.
+				const errorAgentState = this.state
+				if (errorAgentState) {
+					const errorCtx = this.buildAgentContext(errorAgentState)
+					for (const dequeued of pluginDequeued) {
+						if (!dequeued.plugin.dequeue) continue
+						const pluginCtx = this.buildPluginHookContext(dequeued.plugin, errorCtx)
+						await dequeued.plugin.dequeue.markConsumed(pluginCtx, dequeued.token)
+					}
+				}
 				llmResponse = Err({
 					type: 'server_error',
 					message: `LLM returned empty response (no content, no tool calls) after ${emptyAttempts + 1} attempts`,
