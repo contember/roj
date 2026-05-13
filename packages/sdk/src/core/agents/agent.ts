@@ -406,7 +406,19 @@ export class Agent {
 			return Err({ type: 'invalid_request', message: `Agent ${this.id} has no state` })
 		}
 
-		const baseMessages: LLMMessage[] = [...agentState.preamble, ...agentState.conversationHistory]
+		// pendingToolResults aren't in conversationHistory yet (they get committed
+		// by the next inference_completed), but the assistant tool_use that
+		// demands them IS at the tail of history. Without these inlined, an
+		// aux call placed mid-tool-turn (e.g. by the context-compact plugin's
+		// beforeInference hook) lands as `[…, assistant(tool_use), extraMessages]`
+		// and Anthropic rejects with "tool_use blocks must be followed by
+		// tool_result blocks".
+		const pendingToolResultMessages = this.buildPendingMessages(agentState)
+		const baseMessages: LLMMessage[] = [
+			...agentState.preamble,
+			...agentState.conversationHistory,
+			...pendingToolResultMessages,
+		]
 		const messages = [...baseMessages, ...extraMessages]
 		const cachedMessages = applyCacheBreakpoint(messages, extraMessages.length, this.config.cacheTtl)
 

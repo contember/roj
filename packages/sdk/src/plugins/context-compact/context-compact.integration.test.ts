@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'bun:test'
+import z from 'zod/v4'
 import { contextEvents } from '~/core/context/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import type { InferenceRequest } from '~/core/llm/provider.js'
 import { ModelId } from '~/core/llm/schema.js'
+import type { Preset } from '~/core/preset/index.js'
+import { createTool } from '~/core/tools/definition.js'
+import { ToolCallId } from '~/core/tools/schema.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 import { contextCompactPlugin } from './index.js'
 
@@ -165,6 +169,121 @@ describe('context-compact plugin', () => {
 			// After compaction, the conversation history should be shorter
 			const compactedEvents = await session.getEventsByType(contextEvents, 'context_compacted')
 			expect(compactedEvents.length).toBeGreaterThanOrEqual(1)
+
+			await harness.shutdown()
+		})
+	})
+
+	// =========================================================================
+	// Pending tool results regression
+	// =========================================================================
+
+	describe('pending tool results', () => {
+		it('aux inference after a tool turn includes the tool_result before the summary instruction', async () => {
+			// Regression for the bug where context-compact's auxiliary inference call
+			// runs at a moment where `conversationHistory` ends with an assistant
+			// `tool_use` block but the corresponding tool_result is still in
+			// `pendingToolResults` (not yet committed to history). Sending
+			// `[..., assistant(tool_use), user(summary)]` to Anthropic 400s with
+			// "tool_use blocks must be followed by tool_result blocks".
+
+			const myTool = createTool({
+				name: 'my_tool',
+				description: 'returns a fixed value',
+				input: z.object({}),
+				execute: async () => ({ ok: true, value: 'tool result content' }),
+			})
+
+			const preset: Preset = {
+				id: 'test',
+				name: 'Tool Compaction Test',
+				orchestrator: {
+					system: 'You are a test agent.',
+					model: ModelId('mock'),
+					tools: [myTool],
+					agents: [],
+					debounceMs: 0,
+				},
+				agents: [],
+				plugins: [
+					contextCompactPlugin.configure({
+						compaction: {
+							model: ModelId('mock'),
+							maxTokens: 10,
+							// 1 so that after the tool turn, [user, assistant(tool_use)]
+							// splits into toCompact=[user], toKeep=[assistant(tool_use)] —
+							// the aux call actually runs and gets the buggy prefix.
+							keepRecentMessages: 1,
+						},
+					}),
+				],
+			}
+
+			let capturedAuxRequest: InferenceRequest | undefined
+
+			const harness = new TestHarness({
+				systemPlugins: [contextCompactPlugin],
+				presets: [preset],
+				mockHandler: (request) => {
+					if (isSummarizationRequest(request)) {
+						capturedAuxRequest = request
+						return {
+							content: 'Summary of conversation.',
+							toolCalls: [],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					// First inference (no tool messages in history yet) → emit a tool call.
+					const hasToolMessages = request.messages.some((m) => m.role === 'tool')
+					if (!hasToolMessages) {
+						return {
+							content: '',
+							toolCalls: [{ id: ToolCallId('tc1'), name: 'my_tool', input: {} }],
+							finishReason: 'tool_calls',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return {
+						content: 'Done.',
+						toolCalls: [],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetrics(),
+					}
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Please call my_tool')
+
+			expect(capturedAuxRequest).toBeDefined()
+
+			// Every assistant message with toolCalls must be followed by a contiguous
+			// run of tool messages covering each tool_use id before any further
+			// user/assistant message. This mirrors Anthropic's API contract.
+			const msgs = capturedAuxRequest!.messages
+			for (let i = 0; i < msgs.length; i++) {
+				const m = msgs[i]
+				if (m.role !== 'assistant' || !m.toolCalls?.length) continue
+
+				const expected = new Set(m.toolCalls.map((tc) => tc.id))
+				const seen = new Set<string>()
+				for (let j = i + 1; j < msgs.length; j++) {
+					const next = msgs[j]
+					if (next.role !== 'tool') break
+					seen.add(next.toolCallId)
+				}
+				for (const id of expected) {
+					expect(seen.has(id)).toBe(true)
+				}
+			}
+
+			// Compaction must have actually succeeded — pre-fix it would Err-out
+			// in production (mock accepts it but the assertion above already
+			// catches the malformed-prefix case).
+			const compactedEvents = await session.getEventsByType(contextEvents, 'context_compacted')
+			const actualCompactions = compactedEvents.filter((e) => e.messagesRemoved > 0)
+			expect(actualCompactions.length).toBeGreaterThanOrEqual(1)
 
 			await harness.shutdown()
 		})
