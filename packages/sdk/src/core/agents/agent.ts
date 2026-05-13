@@ -54,7 +54,7 @@ import type { SessionState } from '../sessions/state.js'
 import type { SessionEnvironment, ToolExecutor } from '../tools/index.js'
 import type { AgentContext } from './context.js'
 import { sanitizeLLMResponse } from './response-sanitizer.js'
-import { withLLMRetry } from './retry.js'
+import { isRetryableLLMError, withLLMRetry } from './retry.js'
 
 // ============================================================================
 // Types
@@ -644,6 +644,28 @@ export class Agent {
 		}
 
 		if (!llmResponse.ok) {
+			// Aborted (shutdown / interruption): bail silently. Emitting inference_failed
+			// would leave the agent in 'errored' with unconsumed plugin tokens — decide()
+			// would then loop resume_from_error ↔ infer forever (each retry re-aborts).
+			if (llmResponse.error.type === 'aborted') return
+
+			// Non-retryable failures (invalid_request, context_length) will fail the same
+			// way on every retry. Mark plugin tokens consumed before emitting
+			// inference_failed so decide()'s resume_from_error path doesn't re-feed the
+			// same message into a doomed retry loop. Retryable errors (rate_limit,
+			// server_error, network_error, timeout) keep the preserve-for-retry semantics.
+			if (!isRetryableLLMError(llmResponse.error)) {
+				const errorAgentState = this.state
+				if (errorAgentState) {
+					const errorCtx = this.buildAgentContext(errorAgentState)
+					for (const dequeued of pluginDequeued) {
+						if (!dequeued.plugin.dequeue) continue
+						const pluginCtx = this.buildPluginHookContext(dequeued.plugin, errorCtx)
+						await dequeued.plugin.dequeue.markConsumed(pluginCtx, dequeued.token)
+					}
+				}
+			}
+
 			// 4a. Inference failed — emit inference_failed without marking plugin messages
 			// consumed. The reducer leaves pendingToolResults / mailbox tokens intact so the
 			// next inference rebuilds the same turn; marking consumed here would drop the
