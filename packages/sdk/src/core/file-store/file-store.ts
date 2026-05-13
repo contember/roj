@@ -92,32 +92,52 @@ export class SessionFileStore implements FileStore {
 		}
 	}
 
-	async list(path: string): Promise<Result<FileEntry[], string>> {
+	async list(
+		path: string,
+		options?: { maxDepth?: number; gitIgnore?: boolean },
+	): Promise<Result<FileEntry[], string>> {
 		const resolved = this.resolvePath(path)
 		if (!resolved.ok) return resolved
 
+		const maxDepth = options?.maxDepth ?? 1
+		if (maxDepth < 1) return Ok([])
+
 		try {
-			const items = await this.fs.readdir(resolved.value, { withFileTypes: true })
 			const entries: FileEntry[] = []
-			for (const item of items) {
-				let type: FileEntry['type']
-				let size: number | undefined
-				if (item.isFile()) {
-					type = 'file'
-					const s = await this.fs.stat(join(resolved.value, item.name))
-					size = s.size
-				} else if (item.isDirectory()) {
-					type = 'directory'
-				} else if (item.isSymbolicLink()) {
-					type = 'symlink'
-				} else {
-					type = 'other'
-				}
-				entries.push({ name: item.name, type, size })
-			}
+			await this.walkInto(resolved.value, '', maxDepth, entries)
 			return Ok(entries)
 		} catch {
 			return Err(`Directory not found: ${path}`)
+		}
+	}
+
+	private async walkInto(
+		absDir: string,
+		relPrefix: string,
+		remainingDepth: number,
+		out: FileEntry[],
+	): Promise<void> {
+		const items = await this.fs.readdir(absDir, { withFileTypes: true })
+		for (const item of items) {
+			const relName = relPrefix ? `${relPrefix}/${item.name}` : item.name
+			let type: FileEntry['type']
+			let size: number | undefined
+			if (item.isFile()) {
+				type = 'file'
+				const s = await this.fs.stat(join(absDir, item.name))
+				size = s.size
+			} else if (item.isDirectory()) {
+				type = 'directory'
+			} else if (item.isSymbolicLink()) {
+				type = 'symlink'
+			} else {
+				type = 'other'
+			}
+			out.push({ name: relName, type, size })
+
+			if (type === 'directory' && remainingDepth > 1) {
+				await this.walkInto(join(absDir, item.name), relName, remainingDepth - 1, out)
+			}
 		}
 	}
 
