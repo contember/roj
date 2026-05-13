@@ -581,7 +581,7 @@ describe('mailbox plugin', () => {
 			await harness.shutdown()
 		})
 
-		it('empty-stop LLM response → agent retries; persistent empty → onError reports to parent', async () => {
+		it('empty-stop LLM response → agent retries; persistent empty → coalesces to WAITING, no error', async () => {
 			let workerCalls = 0
 			let orchestratorCalls = 0
 
@@ -603,31 +603,25 @@ describe('mailbox plugin', () => {
 						return { content: 'Done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
 					}
 					workerCalls++
-					// Always empty-stop → triggers retry until exhausted, then onError
+					// Always empty-stop → triggers retry until exhausted, then coalesces to WAITING
 					return { content: null, toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
 				},
 			})
 
 			const session = await harness.createSession('test')
-			await session.sendMessage('Start')
-
-			// Worker ends up errored (not idle); poll for the error message to parent.
-			const deadline = Date.now() + 5000
-			let errMsg: { message: { content: string; from: unknown } } | undefined
-			while (Date.now() < deadline) {
-				const events = await session.getEventsByType(mailboxEvents, 'mailbox_message')
-				errMsg = events.find(e =>
-					e.message.from === AgentId('worker_1')
-					&& typeof e.message.content === 'string'
-					&& e.message.content.startsWith('Agent encountered an error:'),
-				)
-				if (errMsg) break
-				await new Promise((r) => setTimeout(r, 50))
-			}
+			await session.sendAndWaitForIdle('Start')
 
 			// Initial + 2 retries = 3 worker LLM calls
 			expect(workerCalls).toBe(3)
-			expect(errMsg).toBeDefined()
+
+			// No error message to parent — exhaustion coalesces to WAITING, not failure
+			const events = await session.getEventsByType(mailboxEvents, 'mailbox_message')
+			const errMsg = events.find(e =>
+				e.message.from === AgentId('worker_1')
+				&& typeof e.message.content === 'string'
+				&& e.message.content.startsWith('Agent encountered an error:'),
+			)
+			expect(errMsg).toBeUndefined()
 
 			await harness.shutdown()
 		})
