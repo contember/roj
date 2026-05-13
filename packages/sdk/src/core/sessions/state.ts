@@ -213,10 +213,13 @@ export const coreReducer = createTypedReducer(
 			}
 
 			case 'inference_failed':
+				// Failure is a clean rollback: pendingMessages are dropped (not promoted to history)
+				// and pendingToolResults / mailbox tokens stay intact so the next inference
+				// rebuilds the same turn. Runtime must skip markConsumed on failure to preserve
+				// mailbox tokens — see runInference().
 				return updateAgent(state, event.agentId, (agent) => ({
 					...agent,
 					status: 'errored',
-					conversationHistory: [...agent.conversationHistory, ...agent.pendingMessages],
 					pendingMessages: [],
 				}))
 

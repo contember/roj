@@ -619,22 +619,11 @@ export class Agent {
 			})
 		}
 
-		// Mark plugin messages as consumed (regardless of inference outcome —
-		// messages are already appended to conversationHistory via inference_started)
-		{
-			const currentAgentState = this.state
-			if (currentAgentState) {
-				const ctx = this.buildAgentContext(currentAgentState)
-				for (const dequeued of pluginDequeued) {
-					if (!dequeued.plugin.dequeue) continue
-					const pluginCtx = this.buildPluginHookContext(dequeued.plugin, ctx)
-					await dequeued.plugin.dequeue.markConsumed(pluginCtx, dequeued.token)
-				}
-			}
-		}
-
 		if (!llmResponse.ok) {
-			// 4a. Inference failed
+			// 4a. Inference failed — emit inference_failed without marking plugin messages
+			// consumed. The reducer leaves pendingToolResults / mailbox tokens intact so the
+			// next inference rebuilds the same turn; marking consumed here would drop the
+			// mailbox tokens and the retry would be missing the user message.
 			await this.store.emit(withSessionId(
 				this.store.sessionId,
 				llmEvents.create('inference_failed', {
@@ -649,6 +638,20 @@ export class Agent {
 				await this.executeOnError(errorState, llmResponse.error.message)
 			}
 			return
+		}
+
+		// Mark plugin messages as consumed only after successful inference. They've been
+		// appended to conversationHistory via the inference_completed reducer below.
+		{
+			const currentAgentState = this.state
+			if (currentAgentState) {
+				const ctx = this.buildAgentContext(currentAgentState)
+				for (const dequeued of pluginDequeued) {
+					if (!dequeued.plugin.dequeue) continue
+					const pluginCtx = this.buildPluginHookContext(dequeued.plugin, ctx)
+					await dequeued.plugin.dequeue.markConsumed(pluginCtx, dequeued.token)
+				}
+			}
 		}
 
 		// 4c. Sanitize response to prevent hallucination

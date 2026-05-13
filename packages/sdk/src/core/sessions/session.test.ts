@@ -712,6 +712,8 @@ describe('applyEvent', () => {
 			expect(session.agents.get(agentId)!.pendingMessages).toHaveLength(2)
 			expect(session.agents.get(agentId)!.status).toBe('inferring')
 
+			const historyLenBeforeFailure = session.agents.get(agentId)!.conversationHistory.length
+
 			// 6. Inference fails
 			session = applyEvent(
 				session,
@@ -735,6 +737,10 @@ describe('applyEvent', () => {
 			expect(getAgentMailbox(selectMailboxState(session), agentId)[0].consumed).toBe(false)
 			// status is errored
 			expect(agent.status).toBe('errored')
+			// conversationHistory NOT extended — pendingMessages are dropped, not promoted.
+			// Otherwise tool results would appear both in history and in pendingToolResults,
+			// duplicating them on the next inference (Bedrock-style provider rejects 400).
+			expect(agent.conversationHistory).toHaveLength(historyLenBeforeFailure)
 		})
 	})
 
