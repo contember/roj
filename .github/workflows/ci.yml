@@ -30,3 +30,6 @@ jobs:
 
       - name: Run TypeScript build
         run: bun run ts:build
+
+      - name: Run tests
+        run: bun run test

@@ -6,7 +6,8 @@
 		"ts:clean": "tsc --build --clean",
 		"ts:watch": "tsc --build --watch",
 		"lint": "biome lint .",
-		"lint:fix": "biome lint . --write"
+		"lint:fix": "biome lint . --write",
+		"test": "bun test packages/*/src packages/*/tests"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "catalog:build",
