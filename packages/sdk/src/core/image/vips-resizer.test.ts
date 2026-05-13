@@ -1,25 +1,36 @@
-import { afterEach, describe, expect, it, mock, spyOn } from 'bun:test'
-import * as childProcess from 'node:child_process'
+import { afterEach, describe, expect, it, spyOn } from 'bun:test'
+import { tmpdir } from 'node:os'
+import { VipsImageResizer } from './vips-resizer.js'
+import { createNodeFileSystem } from '~/testing/node-platform.js'
+import type { ExecFileResult, ProcessRunner } from '~/platform/process.js'
 
 type ExecFileCallback = (error: Error | null, stdout: string, stderr: string) => void
 let execFileImpl: (cmd: string, args: string[], opts: unknown, cb: ExecFileCallback) => void = () => {}
 
-mock.module('node:child_process', () => ({
-	...childProcess,
-	execFile: (cmd: string, args: string[], opts: unknown, cb: ExecFileCallback) => execFileImpl(cmd, args, opts, cb),
-}))
+// Fake ProcessRunner — wires execFile calls through the test-controlled
+// `execFileImpl`. Avoids `mock.module('node:child_process')` because
+// node-platform.ts promisifies execFile at module-load and other test files
+// may load it first, freezing the binding to the real implementation.
+function createFakeProcessRunner(): ProcessRunner {
+	return {
+		execFile: (file, args, options) =>
+			new Promise<ExecFileResult>((resolve, reject) => {
+				execFileImpl(file, args, options ?? {}, (err, stdout, stderr) => {
+					if (err) reject(err)
+					else resolve({ stdout: stdout ?? '', stderr: stderr ?? '' })
+				})
+			}),
+		spawn: () => {
+			throw new Error('spawn not implemented in test fake')
+		},
+	}
+}
 
-const { VipsImageResizer } = await import('./vips-resizer.js')
-const { createNodePlatform } = await import('~/testing/node-platform.js')
-
-// Test-scoped helper — routes through createNodePlatform so the module-level
-// node:child_process mock still intercepts execFile calls made by ProcessRunner.
 function createResizer(maxDimension?: number): InstanceType<typeof VipsImageResizer> {
-	const platform = createNodePlatform()
 	return new VipsImageResizer({
-		fs: platform.fs,
-		process: platform.process,
-		tmpDir: platform.tmpDir,
+		fs: createNodeFileSystem(),
+		process: createFakeProcessRunner(),
+		tmpDir: tmpdir(),
 		maxDimension,
 	})
 }
