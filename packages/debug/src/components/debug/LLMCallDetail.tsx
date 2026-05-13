@@ -7,6 +7,14 @@ function isLLMCallLogEntry(data: unknown): data is LLMCallLogEntry {
 	return typeof data === 'object' && data !== null && 'id' in data && 'status' in data && 'request' in data
 }
 
+function formatResponseBody(body: string): string {
+	try {
+		return JSON.stringify(JSON.parse(body), null, 2)
+	} catch {
+		return body
+	}
+}
+
 interface LLMCallDetailProps {
 	sessionId: string
 	callId: string
@@ -83,13 +91,30 @@ export function LLMCallDetail({ sessionId, callId, onClose }: LLMCallDetailProps
 			{/* Error */}
 			{call.error && (
 				<div className="bg-red-50 border border-red-200 rounded-md p-4">
-					<h3 className="font-semibold text-red-800 mb-2">Error</h3>
+					<div className="flex items-center gap-2 mb-2">
+						<h3 className="font-semibold text-red-800">Error</h3>
+						{call.error.statusCode !== undefined && (
+							<span className="text-xs font-mono font-semibold bg-red-100 text-red-700 px-2 py-0.5 rounded">
+								{call.error.statusCode}
+							</span>
+						)}
+					</div>
 					<div className="font-medium text-red-700">{call.error.type}</div>
 					<div className="text-red-600">{call.error.message}</div>
 					{call.error.retryAfterMs !== undefined && (
 						<div className="text-red-500 text-xs mt-1">
 							Retry after: {call.error.retryAfterMs}ms
 						</div>
+					)}
+					{call.error.responseBody !== undefined && call.error.responseBody.length > 0 && (
+						<details className="mt-3 bg-white rounded border border-red-200">
+							<summary className="px-3 py-2 cursor-pointer hover:bg-red-50 text-xs font-medium text-red-700">
+								Provider response body
+							</summary>
+							<pre className="px-3 py-2 border-t border-red-200 text-xs font-mono text-slate-700 whitespace-pre-wrap break-words max-h-96 overflow-y-auto">
+								{formatResponseBody(call.error.responseBody)}
+							</pre>
+						</details>
 					)}
 				</div>
 			)}
