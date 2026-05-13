@@ -88,6 +88,7 @@ buzola.gen.ts
 # Roj local dev data
 .roj/
 .lopata/
+/data/
 
 # jj
 .jj/
