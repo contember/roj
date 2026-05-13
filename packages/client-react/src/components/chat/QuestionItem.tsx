@@ -1,6 +1,6 @@
 import type { AskUserInputType } from '@roj-ai/shared'
-import { useState } from 'react'
-import type { QuestionSubmitStatus } from '../../stores/session-store.js'
+import { useRef, useState } from 'react'
+import { type QuestionSubmitStatus, useSessionStore } from '../../stores/session-store.js'
 import { Confirm } from './inputs/Confirm.js'
 import { MultiChoice } from './inputs/MultiChoice.js'
 import { Rating } from './inputs/Rating.js'
@@ -149,15 +149,20 @@ function renderInput(
 ) {
 	const type = inputType?.type ?? 'text'
 	switch (type) {
-		case 'text':
+		case 'text': {
+			const allowAttachments = inputType?.type === 'text' && inputType.allowAttachments === true
 			return (
-				<TextInput
-					placeholder={inputType?.type === 'text' ? inputType.placeholder : undefined}
-					value={(currentValue as string) ?? ''}
-					onChange={(val) => onChange(val)}
-					showSubmitButton={false}
-				/>
+				<div className="space-y-2">
+					<TextInput
+						placeholder={inputType?.type === 'text' ? inputType.placeholder : undefined}
+						value={(currentValue as string) ?? ''}
+						onChange={(val) => onChange(val)}
+						showSubmitButton={false}
+					/>
+					{allowAttachments && <QuestionAttachments />}
+				</div>
 			)
+		}
 
 		case 'single_choice':
 			return (
@@ -199,4 +204,104 @@ function renderInput(
 				/>
 			)
 	}
+}
+
+// Inline upload control rendered next to a text answer when the agent set
+// `allowAttachments: true` on the ask_user input. Reuses the session-level
+// `pendingAttachments` pool, so dropped files are submitted to the session
+// (and surfaced to the agent) automatically when the user submits the
+// questionnaire. The pool is shared across all questions/messages — staging
+// a file here is equivalent to dropping it into the main chat composer.
+function QuestionAttachments() {
+	const pendingAttachments = useSessionStore((s) => s.pendingAttachments)
+	const uploadFile = useSessionStore((s) => s.uploadFile)
+	const removeAttachment = useSessionStore((s) => s.removeAttachment)
+	const fileInputRef = useRef<HTMLInputElement>(null)
+	const [dragging, setDragging] = useState(false)
+
+	const attachments = Array.from(pendingAttachments.values())
+
+	const handleFiles = async (files: FileList | null) => {
+		if (!files) return
+		for (const file of Array.from(files)) {
+			await uploadFile(file)
+		}
+	}
+
+	return (
+		<div
+			onDragOver={(e) => {
+				e.preventDefault()
+				setDragging(true)
+			}}
+			onDragLeave={() => setDragging(false)}
+			onDrop={(e) => {
+				e.preventDefault()
+				setDragging(false)
+				handleFiles(e.dataTransfer.files)
+			}}
+			className={`rounded-lg border border-dashed px-3 py-2 transition-colors ${
+				dragging
+					? 'border-violet-400 bg-violet-50/60'
+					: 'border-border bg-background hover:bg-accent/30'
+			}`}
+		>
+			<div className="flex items-center justify-between gap-2">
+				<button
+					type="button"
+					onClick={() => fileInputRef.current?.click()}
+					className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+				>
+					<svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+						<path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+					</svg>
+					<span>Attach file (or drop here)</span>
+				</button>
+				{attachments.length > 0 && (
+					<span className="text-[10px] text-muted-foreground/70 tabular-nums">
+						{attachments.filter((a) => a.status === 'ready').length}/{attachments.length} ready
+					</span>
+				)}
+			</div>
+			<input
+				ref={fileInputRef}
+				type="file"
+				multiple
+				onChange={(e) => {
+					handleFiles(e.target.files)
+					e.target.value = ''
+				}}
+				className="hidden"
+			/>
+			{attachments.length > 0 && (
+				<ul className="mt-2 space-y-1">
+					{attachments.map((a) => (
+						<li key={a.uploadId} className="flex items-center gap-2 text-xs">
+							<span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+								a.status === 'ready'
+									? 'bg-emerald-400'
+									: a.status === 'failed'
+									? 'bg-red-400'
+									: 'bg-amber-400 animate-pulse'
+							}`} />
+							<span className="truncate flex-1">{a.filename}</span>
+							<span className="text-[10px] text-muted-foreground/60 shrink-0">
+								{a.status === 'ready' ? 'ready' : a.status === 'failed' ? (a.error ?? 'failed') : a.status}
+							</span>
+							<button
+								type="button"
+								onClick={() => removeAttachment(a.uploadId)}
+								className="text-muted-foreground/60 hover:text-foreground transition-colors"
+								aria-label={`Remove ${a.filename}`}
+							>
+								<svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+									<path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+								</svg>
+							</button>
+						</li>
+					))}
+				</ul>
+			)}
+		</div>
+	)
 }

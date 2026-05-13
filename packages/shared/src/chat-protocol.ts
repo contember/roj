@@ -39,7 +39,7 @@ export type AskUserOption = {
 }
 
 export type AskUserInputType =
-	| { type: 'text'; placeholder?: string; multiline?: boolean }
+	| { type: 'text'; placeholder?: string; multiline?: boolean; allowAttachments?: boolean }
 	| { type: 'single_choice'; options: AskUserOption[] }
 	| { type: 'multi_choice'; options: AskUserOption[]; minSelect?: number; maxSelect?: number }
 	| { type: 'rating'; min: number; max: number; labels?: { min?: string; max?: string } }

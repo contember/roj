@@ -19,9 +19,17 @@ export type AskUserOption = {
 
 /**
  * Input type for ask_user tool - defines how the user should respond.
+ *
+ * `text.allowAttachments` opts the question into an inline file-attach control
+ * next to the text field — used when the agent needs the answer to come with a
+ * file (logo, brand PDF, supporting docs). Attachments piggy-back on the
+ * existing pending-attachments machinery: clients reuse `uploadFile()` /
+ * `pendingAttachments`, so the answer payload itself stays a plain string and
+ * the agent sees uploaded files via the normal `<attachment>` blocks in its
+ * inbox alongside the question answer.
  */
 export type AskUserInputType =
-	| { type: 'text'; placeholder?: string; multiline?: boolean }
+	| { type: 'text'; placeholder?: string; multiline?: boolean; allowAttachments?: boolean }
 	| { type: 'single_choice'; options: AskUserOption[] }
 	| {
 		type: 'multi_choice'
@@ -47,6 +55,7 @@ export const askUserInputTypeSchema = z.discriminatedUnion('type', [
 		type: z.literal('text'),
 		placeholder: z.string().optional(),
 		multiline: z.boolean().optional(),
+		allowAttachments: z.boolean().optional(),
 	}),
 	z.object({
 		type: z.literal('single_choice'),

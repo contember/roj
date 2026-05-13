@@ -208,6 +208,12 @@ const askUserFlatInputSchema = z.object({
 		.optional()
 		.describe("Placeholder text for text input"),
 	multiline: z.boolean().optional().describe("Allow multiline text input"),
+	allowAttachments: z
+		.boolean()
+		.optional()
+		.describe(
+			"Render a file-attach control alongside the text field (text inputType only). Use when the answer needs to come with a file the user already has on hand — logo, brand PDF, source docs, supporting screenshots. Uploaded files reach you the same way as drag-drop attachments in plain chat.",
+		),
 	// rating options
 	min: z
 		.number()
@@ -248,6 +254,7 @@ function transformToAskUserInputType(
 				type: "text",
 				placeholder: input.placeholder,
 				multiline: input.multiline,
+				allowAttachments: input.allowAttachments,
 			};
 		case "confirm":
 			return {

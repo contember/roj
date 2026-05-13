@@ -436,6 +436,17 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 			questionSubmitStatus: successStatus,
 			draftAnswers: newDrafts,
 		})
+
+		// If the user staged any files (via ask_user `allowAttachments` or the
+		// plain chat composer) while answering, drop them from the local
+		// pending pool now. The files are already on the server (uploadFile
+		// emitted `attachment_uploaded` on upload, and the uploads plugin
+		// dequeues `<attachment>` blocks into the agent's inbox automatically
+		// on the next inference). Keeping them in UI state would leave them
+		// dangling as "ready" indefinitely.
+		if (get().pendingAttachments.size > 0) {
+			set({ pendingAttachments: new Map() })
+		}
 	},
 
 	setMessageContext: (context) => {
