@@ -38,28 +38,20 @@ export const agentStatusPlugin = definePlugin('agent-status')
 				sessionId: ctx.sessionId,
 				agentId: ctx.agentId,
 				status: 'thinking',
+				definitionName: ctx.agentState.definitionName,
 				timestamp: Date.now(),
 			})
 		}
 		return null
 	})
 	.hook('onComplete', async (ctx) => {
-		if (ctx.parentId !== null) {
-			ctx.notify('agentStatus', {
-				sessionId: ctx.sessionId,
-				agentId: ctx.agentId,
-				status: 'idle',
-				definitionName: ctx.agentState.definitionName,
-				timestamp: Date.now(),
-			})
-		} else {
-			ctx.notify('agentStatus', {
-				sessionId: ctx.sessionId,
-				agentId: ctx.agentId,
-				status: 'idle',
-				timestamp: Date.now(),
-			})
-		}
+		ctx.notify('agentStatus', {
+			sessionId: ctx.sessionId,
+			agentId: ctx.agentId,
+			status: 'idle',
+			definitionName: ctx.agentState.definitionName,
+			timestamp: Date.now(),
+		})
 		return null
 	})
 	.hook('onError', async (ctx) => {

@@ -56,11 +56,13 @@ interface SessionState {
 	isAgentConnected: boolean
 	error: string | null
 
-	// Set of agentIds currently in the 'thinking' state. The SDK fires
+	// Map of agentIds currently in the 'thinking' state to the agent's
+	// definitionName (e.g. 'orchestrator', 'content-planner'). The SDK fires
 	// `agentStatus` per agent (entry + sub-agents), so a single boolean would
 	// flip-flop when sub-agents finish before the entry agent. `isAgentTyping`
-	// is derived from `activeAgents.size > 0`.
-	activeAgents: Set<string>
+	// is derived from `activeAgents.size > 0`. The value carries the human-
+	// readable agent name so the UI can show "content-planner is thinking".
+	activeAgents: Map<string, string>
 
 	// Optimistic messages (before server ack)
 	pendingMessages: Map<string, PendingMessageData>
@@ -114,7 +116,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 	isAgentTyping: false,
 	isAgentConnected: false,
 	error: null,
-	activeAgents: new Set(),
+	activeAgents: new Map(),
 	pendingMessages: new Map(),
 	pendingAttachments: new Map(),
 	messageContext: null,
@@ -473,7 +475,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 			isAgentTyping: false,
 			isAgentConnected: false,
 			error: null,
-			activeAgents: new Set(),
+			activeAgents: new Map(),
 			pendingMessages: new Map(),
 			pendingAttachments: new Map(),
 			messageContext: null,
@@ -542,6 +544,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 				if (typeof payload !== 'object' || payload === null) return
 				const p = payload as Record<string, unknown>
 				if (typeof p.content !== 'string' || typeof p.timestamp !== 'number') return
+				// Keep `activeAgents` intact — a chat message from the entry agent
+				// doesn't imply the whole turn is done; sub-agents may still be
+				// running, and entry agent will itself emit `agentStatus(idle)` via
+				// the agent-status plugin when its run actually completes.
 				set({
 					messages: [
 						...get().messages,
@@ -553,8 +559,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 							timestamp: p.timestamp,
 						},
 					],
-					isAgentTyping: false,
-					activeAgents: new Set(),
 				})
 				break
 			}
@@ -563,6 +567,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 				if (typeof payload !== 'object' || payload === null) return
 				const p = payload as Record<string, unknown>
 				if (typeof p.questionId !== 'string' || typeof p.question !== 'string' || typeof p.timestamp !== 'number') return
+				// Don't wipe `activeAgents` here — only the entry agent could be
+				// waiting on a user answer, and the agent-status plugin will emit
+				// its `idle` once the run truly pauses. Sub-agents that happen to
+				// be running stay visible until they emit `idle` themselves.
 				set({
 					messages: [
 						...get().messages,
@@ -584,8 +592,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 							timestamp: p.timestamp,
 						},
 					],
-					isAgentTyping: false,
-					activeAgents: new Set(),
 				})
 				break
 			}
@@ -596,10 +602,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 				const agentId = typeof p.agentId === 'string' ? p.agentId : null
 				const status = typeof p.status === 'string' ? p.status : null
 				if (!agentId || !status) return
+				const definitionName = typeof p.definitionName === 'string' ? p.definitionName : agentId
 
-				const next = new Set(get().activeAgents)
+				const next = new Map(get().activeAgents)
 				if (status === 'thinking') {
-					next.add(agentId)
+					next.set(agentId, definitionName)
 				} else {
 					next.delete(agentId)
 					// Entry agent reaching `idle` means the whole conversation turn is
@@ -762,7 +769,7 @@ export function useSessionMessageHandler(): void {
 					const { sessionId, fetchAllServiceUrls } = useSessionStore.getState()
 					if (sessionId) {
 						// Drop stale agent activity — we may have missed `idle` events while disconnected.
-						useSessionStore.setState({ activeAgents: new Set(), isAgentTyping: false })
+						useSessionStore.setState({ activeAgents: new Map(), isAgentTyping: false })
 						fetchAllServiceUrls(sessionId)
 						// Refetch session state
 						api.call('sessionState.get', { sessionId })

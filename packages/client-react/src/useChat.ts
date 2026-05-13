@@ -1,5 +1,5 @@
 import type { SessionId } from '@roj-ai/shared'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { configureApiBaseUrl, configureAuthToken } from '@roj-ai/client'
 import { buildApiBaseUrl, buildWsUrl } from '@roj-ai/client/platform'
 import { useConnectionStore, configureConnectionUrl } from './stores/connection-store.js'
@@ -52,6 +52,11 @@ export interface ChatState {
 	messages: ReturnType<typeof useSessionStore.getState>['messages']
 	pendingQuestions: ReturnType<typeof useSessionStore.getState>['pendingQuestions']
 	isAgentTyping: boolean
+	/** Agents currently in the `thinking` state, in arrival order, with their
+	 * human-readable definition name (e.g. `'orchestrator'`, `'content-planner'`).
+	 * Empty when no agent is working. Hosts can use this to show "X is thinking"
+	 * with the active sub-agent's name. */
+	activeAgents: Array<{ agentId: string; definitionName: string }>
 	isAgentConnected: boolean
 	error: string | null
 
@@ -179,6 +184,7 @@ export function useChat(options: UseChatOptions): ChatState {
 	const messages = useSessionStore((s) => s.messages)
 	const pendingQuestions = useSessionStore((s) => s.pendingQuestions)
 	const isAgentTyping = useSessionStore((s) => s.isAgentTyping)
+	const activeAgentsMap = useSessionStore((s) => s.activeAgents)
 	const isAgentConnected = useSessionStore((s) => s.isAgentConnected)
 	const error = useSessionStore((s) => s.error)
 	const pendingAttachments = useSessionStore((s) => s.pendingAttachments)
@@ -289,12 +295,18 @@ export function useChat(options: UseChatOptions): ChatState {
 		return () => removeMessageHandler(handlerId)
 	}, [sessionId, combinedHandler, addMessageHandler, removeMessageHandler])
 
+	const activeAgents = useMemo(
+		() => Array.from(activeAgentsMap, ([agentId, definitionName]) => ({ agentId, definitionName })),
+		[activeAgentsMap],
+	)
+
 	return {
 		connectionStatus,
 		isConnected: connectionStatus === 'connected',
 		messages,
 		pendingQuestions,
 		isAgentTyping,
+		activeAgents,
 		isAgentConnected,
 		error,
 		pendingAttachments,
