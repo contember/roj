@@ -565,6 +565,105 @@ describe('user-chat plugin', () => {
 	})
 
 	// =========================================================================
+	// Unicode escape decoding (defensive fix for models that double-escape
+	// non-ASCII in tool argument JSON — see plugin.ts decodeUnicodeEscapes).
+	// =========================================================================
+
+	describe('unicode escape decoding in user-facing fields', () => {
+		it('ask_user (text) → literal \\uXXXX in question/placeholder is decoded', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withSequence([
+					{
+						toolCalls: [{
+							id: ToolCallId('tc1'),
+							name: 'ask_user',
+							input: {
+								question: 'Pro\\u010d ne?',
+								inputType: 'text',
+								placeholder: 'Nap\\u0159. ano',
+							},
+						}],
+					},
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Hi')
+
+			const askNotifications = harness.notifications.getByType('user-chat', 'askUser')
+			expect(askNotifications[0].payload).toMatchObject({
+				question: 'Proč ne?',
+				inputType: { type: 'text', placeholder: 'Např. ano' },
+			})
+
+			await harness.shutdown()
+		})
+
+		it('ask_user (single_choice) → option labels decoded, values left intact', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withSequence([
+					{
+						toolCalls: [{
+							id: ToolCallId('tc1'),
+							name: 'ask_user',
+							input: {
+								question: 'Pick',
+								inputType: 'single_choice',
+								options: [
+									{ value: 'kun_ze_\\u0159adu', label: 'K\\u016f\\u0148 ze \\u0159adu' },
+								],
+							},
+						}],
+					},
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Hi')
+
+			const askNotifications = harness.notifications.getByType('user-chat', 'askUser')
+			expect(askNotifications[0].payload).toMatchObject({
+				inputType: {
+					type: 'single_choice',
+					// Value preserved verbatim so answer round-trip stays consistent
+					// with what the LLM emitted.
+					options: [{ value: 'kun_ze_\\u0159adu', label: 'Kůň ze řadu' }],
+				},
+			})
+
+			await harness.shutdown()
+		})
+
+		it('tell_user → literal \\uXXXX in message is decoded', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withSequence([
+					{
+						toolCalls: [{
+							id: ToolCallId('tc1'),
+							name: 'tell_user',
+							input: { message: 'Ahoj sv\\u011bte' },
+						}],
+					},
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Hi')
+
+			const msgs = harness.notifications.getByType('user-chat', 'agentMessage')
+			expect(msgs[0].payload).toMatchObject({ content: 'Ahoj světe' })
+
+			await harness.shutdown()
+		})
+	})
+
+	// =========================================================================
 	// XML mode
 	// =========================================================================
 

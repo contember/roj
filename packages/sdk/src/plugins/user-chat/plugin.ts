@@ -303,6 +303,56 @@ function formatPendingForLLM(pending: PendingInboundMessage[]): string {
 	return parts.join("\n");
 }
 
+// Some models (notably routed through OpenRouter — Gemini/Llama/Qwen) emit
+// non-ASCII tool argument strings as double-escaped JSON: the wire form is
+// `"\\u0159"`, which JSON.parse turns into a literal 6-char `ř` instead
+// of `ř`. The user then sees raw escape sequences in their UI. Applied only
+// to user-facing display fields (question, placeholder, labels, message body)
+// — never to identifiers like `option.value` (must round-trip back to the LLM
+// unchanged) or to code-bearing inputs of other tools.
+function decodeUnicodeEscapes(value: string): string;
+function decodeUnicodeEscapes(value: string | undefined): string | undefined;
+function decodeUnicodeEscapes(value: string | undefined): string | undefined {
+	if (value === undefined) return undefined;
+	if (!value.includes("\\u")) return value;
+	return value.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
+		String.fromCharCode(parseInt(hex, 16)),
+	);
+}
+
+function decodeAskUserDisplayStrings(input: AskUserInputType): AskUserInputType {
+	switch (input.type) {
+		case "text":
+			return { ...input, placeholder: decodeUnicodeEscapes(input.placeholder) };
+		case "single_choice":
+		case "multi_choice":
+			return {
+				...input,
+				options: input.options.map((o) => ({
+					...o,
+					label: decodeUnicodeEscapes(o.label),
+					description: decodeUnicodeEscapes(o.description),
+				})),
+			};
+		case "confirm":
+			return {
+				...input,
+				confirmLabel: decodeUnicodeEscapes(input.confirmLabel),
+				cancelLabel: decodeUnicodeEscapes(input.cancelLabel),
+			};
+		case "rating":
+			return input.labels
+				? {
+					...input,
+					labels: {
+						min: decodeUnicodeEscapes(input.labels.min),
+						max: decodeUnicodeEscapes(input.labels.max),
+					},
+				}
+				: input;
+	}
+}
+
 // ============================================================================
 // Plugin
 // ============================================================================
@@ -687,7 +737,7 @@ export const userChatPlugin = definePlugin("user-chat")
 					const format = input.format ?? "text";
 					const result = await ctx.self.tellUser({
 						agentId: context.agentId,
-						message: input.message,
+						message: decodeUnicodeEscapes(input.message),
 						format,
 					});
 					if (!result.ok)
@@ -710,8 +760,8 @@ export const userChatPlugin = definePlugin("user-chat")
 					const inputType = transformToAskUserInputType(input);
 					const result = await ctx.self.askQuestion({
 						agentId: context.agentId,
-						question: input.question,
-						inputType,
+						question: decodeUnicodeEscapes(input.question),
+						inputType: decodeAskUserDisplayStrings(inputType),
 					});
 					if (!result.ok)
 						return Err({ message: result.error.message, recoverable: false });
