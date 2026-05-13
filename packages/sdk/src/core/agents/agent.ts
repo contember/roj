@@ -577,6 +577,7 @@ export class Agent {
 		// can notify the parent.
 		let llmResponse: Result<InferenceResponse, LLMError>
 		let emptyAttempts = 0
+		let nudgeInjected = false
 		while (true) {
 			llmResponse = await withLLMRetry(
 				() =>
@@ -617,6 +618,22 @@ export class Agent {
 				agentId: this.id,
 				attempt: emptyAttempts,
 			})
+
+			// Inject a one-shot nudge after the first empty response. Appended after the
+			// existing cache breakpoint, so the cached prefix still hits — only the new
+			// tail is uncached. Uses the canonical "WAITING" literal so the response is
+			// recognized by the sanitizer and limits-guard plugin.
+			if (!nudgeInjected) {
+				request.messages.push({
+					role: 'user',
+					content:
+						'<system-nudge>Your previous response was empty (no text and no tool calls). '
+						+ 'Either produce a meaningful response — text or tool calls — or, if you '
+						+ 'have nothing to do, output only the word WAITING on its own line per the '
+						+ 'waiting protocol.</system-nudge>',
+				})
+				nudgeInjected = true
+			}
 		}
 
 		if (!llmResponse.ok) {
