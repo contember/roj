@@ -25,8 +25,16 @@ import type { Preprocessor, PreprocessorContext, PreprocessorRegistry, Preproces
 const MAX_IMAGES = 50
 const IMAGE_CLASSIFY_CONCURRENCY = 10
 
+// markitdown converts a text-only document; even large PDFs finish in seconds.
+const MARKITDOWN_TIMEOUT_MS = 60_000
+// Image extractors (pdfimages, pandoc --extract-media) scale with image count
+// and resolution. Real-world large brand PDFs (40 pages, 5MB images) can take
+// 60–90s. Upload preprocessing is async/background, so allow generous headroom.
+const IMAGE_EXTRACT_TIMEOUT_MS = 5 * 60_000
+
 function makeExec(processRunner: ProcessRunner) {
-	return (cmd: string, args: string[]) => processRunner.execFile(cmd, args, { timeout: 60_000, maxBuffer: 50 * 1024 * 1024 })
+	return (cmd: string, args: string[], timeoutMs: number = MARKITDOWN_TIMEOUT_MS) =>
+		processRunner.execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 50 * 1024 * 1024 })
 }
 
 /** MIME types where markitdown converts to markdown (non-ZIP, non-image) */
@@ -78,7 +86,7 @@ export class MarkitdownPreprocessor implements Preprocessor {
 	private readonly registry: PreprocessorRegistry
 	private readonly logger: Logger
 	private readonly fs: FileSystem
-	private readonly exec: (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string }>
+	private readonly exec: (cmd: string, args: string[], timeoutMs?: number) => Promise<{ stdout: string; stderr: string }>
 
 	constructor(config: MarkitdownPreprocessorConfig) {
 		this.registry = config.registry
@@ -183,35 +191,35 @@ export class MarkitdownPreprocessor implements Preprocessor {
 		if (!format) return []
 
 		const pandocStart = Date.now()
+		let extractSucceeded = true
 		try {
-			await this.exec('pandoc', [
-				'-f',
-				format,
-				'-t',
-				'gfm',
-				filePath,
-				'-o',
-				'/dev/null',
-				`--extract-media=${mediaDirResult.value}`,
-			])
-		} catch {
-			this.logger.warn('pandoc --extract-media failed', {
+			await this.exec(
+				'pandoc',
+				['-f', format, '-t', 'gfm', filePath, '-o', '/dev/null', `--extract-media=${mediaDirResult.value}`],
+				IMAGE_EXTRACT_TIMEOUT_MS,
+			)
+		} catch (error) {
+			extractSucceeded = false
+			this.logger.warn('pandoc --extract-media failed (will classify any partial output)', {
 				filePath,
 				durationMs: Date.now() - pandocStart,
+				error: error instanceof Error ? error.message : String(error),
 			})
-			return []
 		}
-		this.logger.info('pandoc --extract-media complete', {
-			filePath,
-			format,
-			durationMs: Date.now() - pandocStart,
-		})
+		if (extractSucceeded) {
+			this.logger.info('pandoc --extract-media complete', {
+				filePath,
+				format,
+				durationMs: Date.now() - pandocStart,
+			})
+		}
 
 		const classifyStart = Date.now()
 		const images = await classifyExtractedImages(mediaStore, 'media', ctx, this.registry, this.logger)
 		this.logger.info('Image classification complete', {
 			source: 'pandoc',
 			count: images.length,
+			partial: !extractSucceeded,
 			durationMs: Date.now() - classifyStart,
 		})
 		return images
@@ -226,26 +234,35 @@ export class MarkitdownPreprocessor implements Preprocessor {
 		if (!imagesDirResult.ok) return []
 
 		const pdfimagesStart = Date.now()
+		let extractSucceeded = true
 		try {
 			await this.fs.mkdir(imagesDirResult.value, { recursive: true })
-			await this.exec('pdfimages', ['-png', filePath, `${imagesDirResult.value}/img`])
-		} catch {
-			this.logger.warn('pdfimages failed', {
+			await this.exec(
+				'pdfimages',
+				['-png', filePath, `${imagesDirResult.value}/img`],
+				IMAGE_EXTRACT_TIMEOUT_MS,
+			)
+		} catch (error) {
+			extractSucceeded = false
+			this.logger.warn('pdfimages failed (will classify any partial output)', {
+				filePath,
+				durationMs: Date.now() - pdfimagesStart,
+				error: error instanceof Error ? error.message : String(error),
+			})
+		}
+		if (extractSucceeded) {
+			this.logger.info('pdfimages complete', {
 				filePath,
 				durationMs: Date.now() - pdfimagesStart,
 			})
-			return []
 		}
-		this.logger.info('pdfimages complete', {
-			filePath,
-			durationMs: Date.now() - pdfimagesStart,
-		})
 
 		const classifyStart = Date.now()
 		const images = await classifyExtractedImages(imageStore, 'images', ctx, this.registry, this.logger)
 		this.logger.info('Image classification complete', {
 			source: 'pdfimages',
 			count: images.length,
+			partial: !extractSucceeded,
 			durationMs: Date.now() - classifyStart,
 		})
 		return images
