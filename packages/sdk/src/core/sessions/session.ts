@@ -494,6 +494,15 @@ export class Session {
 		}
 
 		const result = await methodDef.handler(ctx, parsed.data)
+
+		// Plugin methods can mutate dequeue state (uploads.upload adds to pending,
+		// resources.inject can too) without explicitly calling ctx.scheduleAgent.
+		// Schedule every agent — scheduleProcessing is idempotent + debounced, and
+		// decide() shortcircuits to idle/complete when no work is actually pending.
+		for (const agent of this.agents.values()) {
+			agent.scheduleProcessing()
+		}
+
 		return result
 	}
 
