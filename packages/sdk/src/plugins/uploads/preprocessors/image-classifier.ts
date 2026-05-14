@@ -71,6 +71,7 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 		mimeType: string,
 		ctx: PreprocessorContext,
 	): Promise<Result<PreprocessorResult, Error>> {
+		const totalStart = Date.now()
 		try {
 			// Check + stat image file
 			if (!(await this.fs.exists(filePath))) {
@@ -88,15 +89,21 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 			}
 
 			// Try vision inference
+			const inferenceStart = Date.now()
 			const description = await this.describeImage(filePath, mimeType)
+			const inferenceDurationMs = Date.now() - inferenceStart
 
 			if (description) {
 				// Save description to file
 				const writeResult = await ctx.files.write('description.txt', description)
 
-				this.logger.debug('Image described successfully', {
+				this.logger.info('Image described successfully', {
 					filename,
+					mimeType,
+					sizeBytes: size,
 					descriptionLength: description.length,
+					inferenceDurationMs,
+					totalDurationMs: Date.now() - totalStart,
 				})
 
 				return Ok({
@@ -106,6 +113,12 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 			}
 
 			// Fallback to basic metadata
+			this.logger.warn('Image description unavailable, falling back to metadata', {
+				filename,
+				mimeType,
+				sizeBytes: size,
+				inferenceDurationMs,
+			})
 			return Ok({
 				extractedContent: `[Image: ${filename}, ${this.formatSize(size)}, ${mimeType}]`,
 			})
@@ -113,7 +126,7 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 			this.logger.error(
 				'Image classification failed',
 				error instanceof Error ? error : undefined,
-				{ filePath },
+				{ filePath, durationMs: Date.now() - totalStart },
 			)
 
 			// Return basic info on error instead of failing
