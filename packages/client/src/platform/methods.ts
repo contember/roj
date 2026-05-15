@@ -61,6 +61,15 @@ export interface GetInstanceStatusOutput {
 		state: SandboxState
 		e2bId?: string
 		lastActivityAt?: string
+		/**
+		 * Versions reported by the agent via /status (cached on the DO sandbox
+		 * row, refreshed by the alarm health-check). Surface in debug UI so
+		 * "what's actually running" is visible even when the sandbox is paused.
+		 */
+		versions?: {
+			sdk: string
+			runtime: { name: string; version: string } | null
+		}
 	} | null
 	sessions: Array<{
 		id: string

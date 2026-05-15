@@ -6,6 +6,7 @@
 
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { SDK_VERSION } from '~/info.js'
 import type { PreprocessorRegistry } from '~/plugins/uploads/preprocessor.js'
 import type { Services } from '../../bootstrap.js'
 import type { SessionManager } from '../../core/sessions/session-manager.js'
@@ -79,11 +80,15 @@ export function createApp(services: AppServices): Hono<AppEnv> {
 	// Activity status for DO polling (protected)
 	// Returns lastActivityAt timestamp for the caller to determine if agent is active
 	app.get('/status', bearerAuth, async (c) => {
-		const { sessionRuntime } = getServices(c)
+		const { sessionRuntime, config } = getServices(c)
 		const stats = await sessionRuntime.getStats()
 
 		return c.json({
 			lastActivityAt: stats.lastActivityAt,
+			versions: {
+				sdk: SDK_VERSION,
+				runtime: config.agentRuntime ?? null,
+			},
 			stats: {
 				sessionCount: stats.sessionCount,
 				pendingAgents: stats.pendingAgents,

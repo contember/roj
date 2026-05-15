@@ -33,6 +33,19 @@ export interface Config {
 	/** Max concurrent vision LLM calls when classifying uploaded images. Default 10. */
 	imageClassifierConcurrency?: number
 
+	/**
+	 * Identity of the application embedding this SDK. Reported via `/status`
+	 * so platform health-checks can surface "what's actually running" in debug
+	 * tooling alongside the SDK's own version.
+	 *
+	 * sandbox-runtime sets this from its own package.json; other embedders
+	 * (e.g. standalone-server, custom bundles) can supply their own.
+	 */
+	agentRuntime?: {
+		name: string
+		version: string
+	}
+
 	// Logging
 	logLevel: LogLevel
 	logFormat: 'console' | 'json'

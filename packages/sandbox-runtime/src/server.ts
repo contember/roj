@@ -12,6 +12,7 @@ import { createAgentTransport, type IAgentTransport, ServerAdapter } from '@roj-
 import { bunWebSocketFactory, createBunWebSocketHandlers } from '@roj-ai/transport/bun'
 import type { Hono } from 'hono'
 import { createBunPlatform } from '@roj-ai/sdk/bun-platform'
+import { SANDBOX_RUNTIME_NAME, SANDBOX_RUNTIME_VERSION } from './info.js'
 
 // ============================================================================
 // Public types
@@ -40,6 +41,7 @@ export async function startServer(options: StartServerOptions): Promise<ServerHa
 	// Load config from env and merge overrides
 	const envConfig = loadConfig()
 	const config: Config = options.config ? { ...envConfig, ...options.config } : envConfig
+	config.agentRuntime ??= { name: SANDBOX_RUNTIME_NAME, version: SANDBOX_RUNTIME_VERSION }
 
 	const errors = validateConfig(config)
 	if (errors.length > 0) {
