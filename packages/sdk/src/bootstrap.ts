@@ -18,7 +18,7 @@ import type { RoutableLLMProvider } from '~/core/llm/routing-provider.js'
 import type { Preset } from '~/core/preset/index.js'
 import type { Platform } from '~/platform/index.js'
 import { PreprocessorRegistry } from '~/plugins/uploads/preprocessor.js'
-import { ImageClassifierPreprocessor, MarkitdownPreprocessor, ZipPreprocessor } from '~/plugins/uploads/preprocessors/index.js'
+import { ImageClassifierPreprocessor, MarkitdownPreprocessor, PdfPreprocessor, ZipPreprocessor } from '~/plugins/uploads/preprocessors/index.js'
 import type { Config } from './config.js'
 import { SessionFileStore } from './core/file-store/file-store.js'
 import type { SessionManager } from './core/sessions/session-manager.js'
@@ -121,7 +121,17 @@ export function bootstrap(config: Config, userConfig: RojConfig, platform: Platf
 
 	const preprocessorRegistry = new PreprocessorRegistry()
 	const imageClassifierGate = new Semaphore(config.imageClassifierConcurrency ?? 10)
-	preprocessorRegistry.register(new ImageClassifierPreprocessor({ llmProvider, logger, fs: platform.fs, gate: imageClassifierGate }))
+	// Dedicated resizer for the classification path: separate from the LLM
+	// provider's general-purpose ImageProcessor (which keeps a higher
+	// maxDimension for agent file-inspection tool calls). The classifier
+	// hands each image to the resizer with its own 1024px override.
+	const classifierImageResizer = new VipsImageResizer({ fs: platform.fs, process: platform.process, tmpDir: platform.tmpDir })
+	preprocessorRegistry.register(new ImageClassifierPreprocessor({ llmProvider, logger, fs: platform.fs, gate: imageClassifierGate, imageResizer: classifierImageResizer }))
+	// PdfPreprocessor must come before MarkitdownPreprocessor — both could
+	// match `application/pdf` in principle, but the registry uses first-hit
+	// and PdfPreprocessor's `pdftotext + pdfimages -all + streaming` pipeline
+	// is dramatically faster than markitdown's pdfminer.six backend.
+	preprocessorRegistry.register(new PdfPreprocessor({ registry: preprocessorRegistry, logger, fs: platform.fs, process: platform.process }))
 	preprocessorRegistry.register(new MarkitdownPreprocessor({ registry: preprocessorRegistry, logger, fs: platform.fs, process: platform.process }))
 	preprocessorRegistry.register(new ZipPreprocessor({ registry: preprocessorRegistry, logger, process: platform.process }))
 

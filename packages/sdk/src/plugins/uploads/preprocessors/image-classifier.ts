@@ -5,6 +5,7 @@
  * Falls back to basic metadata if vision is not available.
  */
 
+import type { ImageResizer } from '~/core/image/types.js'
 import type { LLMProvider } from '~/core/llm/provider.js'
 import { ModelId } from '~/core/llm/schema.js'
 import type { Semaphore } from '~/lib/utils/concurrency.js'
@@ -13,6 +14,15 @@ import { Err, Ok } from '~/lib/utils/result.js'
 import type { FileSystem } from '~/platform/fs.js'
 import type { Logger } from '../../../lib/logger/logger.js'
 import type { Preprocessor, PreprocessorContext, PreprocessorResult } from '../preprocessor.js'
+
+/**
+ * Anthropic vision API internally downsamples images to ~1568px long side.
+ * Anything larger just wastes bandwidth and LLM tokens. For 1–2 sentence
+ * descriptions, 1024px is more than enough detail.
+ */
+const CLASSIFY_MAX_DIMENSION = 1024
+/** Hard cap to keep base64 payloads small (LLM still accepts up to 5MB). */
+const CLASSIFY_MAX_FILE_SIZE_BYTES = 1 * 1024 * 1024
 
 // ============================================================================
 // Configuration
@@ -27,6 +37,14 @@ export interface ImageClassifierConfig {
 	logger: Logger
 	/** FileSystem adapter (for checking + reading image files) */
 	fs: FileSystem
+	/**
+	 * Optional resizer. When provided, classifier downscales images to
+	 * ~1024px before sending to the vision LLM. Skipping this is fine for
+	 * tests; in production it dramatically cuts payload size and token cost
+	 * (brand PDFs embed 2000–3000px JPEGs the model would otherwise see at
+	 * full resolution).
+	 */
+	imageResizer?: ImageResizer
 	/** Whether to skip vision and just return metadata */
 	skipVision?: boolean
 	/**
@@ -54,6 +72,7 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 	private readonly visionModel: ModelId
 	private readonly logger: Logger
 	private readonly fs: FileSystem
+	private readonly imageResizer: ImageResizer | undefined
 	private readonly skipVision: boolean
 	private readonly gate: Semaphore | undefined
 
@@ -62,6 +81,7 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 		this.visionModel = config.visionModel ? ModelId(config.visionModel) : ModelId('anthropic/claude-haiku-4.5')
 		this.logger = config.logger
 		this.fs = config.fs
+		this.imageResizer = config.imageResizer
 		this.skipVision = config.skipVision ?? false
 		this.gate = config.gate
 	}
@@ -146,41 +166,87 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 		mimeType: string,
 	): Promise<string | null> {
 		try {
-			// Use file:// URL - resolved to base64 lazily in LLM provider
-			const inferenceCall = () => this.llmProvider.inference({
-				model: this.visionModel,
-				systemPrompt: 'You are an image description assistant. Describe images concisely in 1-2 sentences.',
-				messages: [
-					{
-						role: 'user',
-						content: [
-							{
-								type: 'text',
-								text: 'Please describe this image concisely in 1-2 sentences. Focus on the main subject and any text visible.',
-							},
-							{
-								type: 'image_url',
-								imageUrl: { url: `file://${filePath}` },
-							},
-						],
-					},
-				],
-				maxTokens: 200,
-				temperature: 0.3,
-			})
+			const { url: imageUrl, cleanup } = await this.prepareImageUrl(filePath, mimeType)
 
-			const result = await (this.gate ? this.gate.run(inferenceCall) : inferenceCall())
+			try {
+				const inferenceCall = () => this.llmProvider.inference({
+					model: this.visionModel,
+					systemPrompt: 'You are an image description assistant. Describe images concisely in 1-2 sentences.',
+					messages: [
+						{
+							role: 'user',
+							content: [
+								{
+									type: 'text',
+									text: 'Please describe this image concisely in 1-2 sentences. Focus on the main subject and any text visible.',
+								},
+								{
+									type: 'image_url',
+									imageUrl: { url: imageUrl },
+								},
+							],
+						},
+					],
+					maxTokens: 200,
+					temperature: 0.3,
+				})
 
-			if (result.ok && result.value.content) {
-				return result.value.content.trim()
+				const result = await (this.gate ? this.gate.run(inferenceCall) : inferenceCall())
+
+				if (result.ok && result.value.content) {
+					return result.value.content.trim()
+				}
+
+				return null
+			} finally {
+				await cleanup()
 			}
-
-			return null
 		} catch (error) {
 			this.logger.warn('Vision inference failed', {
 				error: error instanceof Error ? error.message : String(error),
 			})
 			return null
+		}
+	}
+
+	/**
+	 * Pre-resize the image for vision classification.
+	 *
+	 * Returns either a `data:` URL with the resized JPEG (when a resizer is
+	 * available) or a `file://` URL fallback (LLM provider will resolve it via
+	 * the global ImageProcessor, with its bigger maxDimension default).
+	 *
+	 * Cleanup removes any temp file produced by the resizer.
+	 */
+	private async prepareImageUrl(
+		filePath: string,
+		mimeType: string,
+	): Promise<{ url: string; cleanup: () => Promise<void> }> {
+		if (!this.imageResizer) {
+			return { url: `file://${filePath}`, cleanup: async () => {} }
+		}
+
+		try {
+			const resized = await this.imageResizer.resize(filePath, mimeType, {
+				maxDimension: CLASSIFY_MAX_DIMENSION,
+				maxFileSizeBytes: CLASSIFY_MAX_FILE_SIZE_BYTES,
+			})
+			const buffer = await this.fs.readFile(resized.path)
+			const base64 = buffer.toString('base64')
+			return {
+				url: `data:${resized.mimeType};base64,${base64}`,
+				cleanup: async () => {
+					if (resized.tempFile) {
+						await this.fs.unlink(resized.tempFile).catch(() => {})
+					}
+				},
+			}
+		} catch (error) {
+			this.logger.warn('Pre-resize for classification failed, falling back to file:// URL', {
+				filePath,
+				error: error instanceof Error ? error.message : String(error),
+			})
+			return { url: `file://${filePath}`, cleanup: async () => {} }
 		}
 	}
 

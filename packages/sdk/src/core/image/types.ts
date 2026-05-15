@@ -3,6 +3,8 @@ import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 
 export interface ImageResizeOptions {
 	maxFileSizeBytes?: number
+	/** Override the resizer's default max dimension (long side, px). */
+	maxDimension?: number
 }
 
 export interface ImageResizer {

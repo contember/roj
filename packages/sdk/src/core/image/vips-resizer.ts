@@ -24,9 +24,10 @@ export class VipsImageResizer implements ImageResizer {
 	}
 
 	async resize(filePath: string, mimeType: string, options?: ImageResizeOptions): Promise<ImageResizeResult> {
+		const effectiveMaxDimension = options?.maxDimension ?? this.maxDimension
 		try {
 			// Step 1: Dimension resize if needed
-			const result = await this.dimensionResize(filePath, mimeType)
+			const result = await this.dimensionResize(filePath, mimeType, effectiveMaxDimension)
 
 			// Step 2: If no size constraint, done
 			if (!options?.maxFileSizeBytes) return result
@@ -40,7 +41,7 @@ export class VipsImageResizer implements ImageResizer {
 				await this.fs.unlink(result.tempFile).catch(() => {})
 			}
 
-			return await this.compressToFit(filePath, options.maxFileSizeBytes)
+			return await this.compressToFit(filePath, options.maxFileSizeBytes, effectiveMaxDimension)
 		} catch (e) {
 			console.warn('[image-resize] failed, using original image:', e instanceof Error ? e.message : e)
 			return { path: filePath, mimeType }
@@ -57,9 +58,9 @@ export class VipsImageResizer implements ImageResizer {
 		return { width, height }
 	}
 
-	private async dimensionResize(filePath: string, mimeType: string): Promise<ImageResizeResult> {
+	private async dimensionResize(filePath: string, mimeType: string, maxDimension: number): Promise<ImageResizeResult> {
 		const dims = await this.getImageDimensions(filePath)
-		const needsResize = dims !== null && (dims.width > this.maxDimension || dims.height > this.maxDimension)
+		const needsResize = dims !== null && (dims.width > maxDimension || dims.height > maxDimension)
 
 		// JPEGs within dimension limits pass through unchanged
 		if (mimeType === 'image/jpeg' && !needsResize) {
@@ -73,20 +74,20 @@ export class VipsImageResizer implements ImageResizer {
 		await this.process.execFile('vipsthumbnail', [
 			filePath,
 			'--size',
-			`${this.maxDimension}x${this.maxDimension}`,
+			`${maxDimension}x${maxDimension}`,
 			'-o',
 			outputPath,
 		], { timeout: 30_000 })
 		return { path: outputPath, mimeType: 'image/jpeg', tempFile: outputPath }
 	}
 
-	private async compressToFit(filePath: string, maxFileSizeBytes: number): Promise<ImageResizeResult> {
-		const halfDim = Math.floor(this.maxDimension / 2)
+	private async compressToFit(filePath: string, maxFileSizeBytes: number, maxDimension: number): Promise<ImageResizeResult> {
+		const halfDim = Math.floor(maxDimension / 2)
 		const attempts = [
-			{ dimension: this.maxDimension, quality: 85 },
-			{ dimension: this.maxDimension, quality: 70 },
-			{ dimension: this.maxDimension, quality: 50 },
-			{ dimension: this.maxDimension, quality: 30 },
+			{ dimension: maxDimension, quality: 85 },
+			{ dimension: maxDimension, quality: 70 },
+			{ dimension: maxDimension, quality: 50 },
+			{ dimension: maxDimension, quality: 30 },
 			{ dimension: halfDim, quality: 70 },
 			{ dimension: halfDim, quality: 50 },
 			{ dimension: halfDim, quality: 30 },
