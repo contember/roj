@@ -39,6 +39,8 @@ export type OnErrorResult =
 	| null
 	| { action: 'pause'; reason?: string }
 
+export type OnPauseResult = null
+
 export type HandlerName =
 	| 'onStart'
 	| 'beforeInference'
@@ -47,3 +49,4 @@ export type HandlerName =
 	| 'afterToolCall'
 	| 'onComplete'
 	| 'onError'
+	| 'onPause'

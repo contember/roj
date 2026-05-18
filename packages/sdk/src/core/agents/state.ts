@@ -46,11 +46,11 @@ export const agentEvents = createEventsFactory({
 		}),
 		handler_started: z4.object({
 			agentId: agentIdSchema,
-			handlerName: z4.enum(['onStart', 'beforeInference', 'afterInference', 'beforeToolCall', 'afterToolCall', 'onComplete', 'onError']),
+			handlerName: z4.enum(['onStart', 'beforeInference', 'afterInference', 'beforeToolCall', 'afterToolCall', 'onComplete', 'onError', 'onPause']),
 		}),
 		handler_completed: z4.object({
 			agentId: agentIdSchema,
-			handlerName: z4.enum(['onStart', 'beforeInference', 'afterInference', 'beforeToolCall', 'afterToolCall', 'onComplete', 'onError']),
+			handlerName: z4.enum(['onStart', 'beforeInference', 'afterInference', 'beforeToolCall', 'afterToolCall', 'onComplete', 'onError', 'onPause']),
 			result: z4.unknown(), // HandlerResult - too complex for Zod
 		}),
 		preamble_added: z4.object({

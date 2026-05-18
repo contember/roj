@@ -310,6 +310,8 @@ export class Session {
 			}),
 		))
 
+		await agent.notifyPaused(message)
+
 		this.logger.info('Agent paused', { sessionId: this.id, agentId })
 		return Ok(undefined)
 	}

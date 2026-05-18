@@ -30,6 +30,7 @@ import type {
 	BeforeToolCallResult,
 	OnCompleteResult,
 	OnErrorResult,
+	OnPauseResult,
 	OnStartResult,
 } from './hook-types.js'
 import type { PluginDequeueHook, PluginPendingMessages } from './index.js'
@@ -230,6 +231,7 @@ type HookMap<TCtx> = {
 	afterToolCall: (ctx: TCtx & { toolCall: ToolCall; result: { isError: boolean; content: ToolResultContent } }) => Promise<AfterToolCallResult>
 	onComplete: (ctx: TCtx) => Promise<OnCompleteResult>
 	onError: (ctx: TCtx & { error: string }) => Promise<OnErrorResult>
+	onPause: (ctx: TCtx & { reason?: string }) => Promise<OnPauseResult>
 }
 
 type SessionHookMap<TCtx> = {
@@ -300,6 +302,7 @@ type ErasedAgentHookMap = {
 	) => Promise<AfterToolCallResult>
 	onComplete: (ctx: BasePluginHookContext) => Promise<OnCompleteResult>
 	onError: (ctx: BasePluginHookContext & { error: string }) => Promise<OnErrorResult>
+	onPause: (ctx: BasePluginHookContext & { reason?: string }) => Promise<OnPauseResult>
 }
 
 /**

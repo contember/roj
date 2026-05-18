@@ -942,7 +942,7 @@ export class Agent {
 	// ============================================================================
 
 	/**
-	 * Emit agent_paused event with reason 'handler'.
+	 * Emit agent_paused event with reason 'handler', then run onPause plugin hooks.
 	 */
 	private async emitHandlerPause(message?: string): Promise<void> {
 		await this.store.emit(withSessionId(
@@ -953,6 +953,15 @@ export class Agent {
 				message,
 			}),
 		))
+		await this.executeOnPause(message)
+	}
+
+	/**
+	 * Run onPause plugin hooks. Called from Session.pauseAgent (manual pause) —
+	 * handler-triggered pauses go through emitHandlerPause which calls this itself.
+	 */
+	async notifyPaused(message?: string): Promise<void> {
+		await this.executeOnPause(message)
 	}
 
 	/**
@@ -1381,6 +1390,35 @@ export class Agent {
 		}
 
 		await this.emitHandlerCompleted('onError', null)
+	}
+
+	/**
+	 * Execute onPause handler — fires after agent_paused is emitted (handler-triggered
+	 * or manual via Session.pauseAgent). Plugins can react to pause; return value is
+	 * null-only (no actions), since the agent is already paused.
+	 */
+	private async executeOnPause(reason?: string): Promise<void> {
+		this.logger.debug('Executing onPause handlers', { agentId: this.id })
+
+		const agentState = this.state
+		if (!agentState) return
+
+		const agentContext = this.buildAgentContext(agentState)
+
+		for (const plugin of this.plugins) {
+			if (!plugin.agentHooks?.onPause) continue
+			try {
+				const ctx = this.buildPluginHookContext(plugin, agentContext)
+				await plugin.agentHooks.onPause({ ...ctx, reason })
+			} catch (error) {
+				this.logger.error(`Plugin '${plugin.name}' onPause hook failed`, error instanceof Error ? error : undefined, {
+					agentId: this.id,
+					plugin: plugin.name,
+				})
+			}
+		}
+
+		await this.emitHandlerCompleted('onPause', null)
 	}
 
 	// ============================================================================
