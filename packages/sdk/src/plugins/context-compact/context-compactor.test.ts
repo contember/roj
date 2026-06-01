@@ -291,6 +291,7 @@ describe('createContextCompactedEvent', () => {
 				{ role: 'system', content: 'summary' },
 				{ role: 'user', content: 'recent' },
 			],
+			originalMessages: [{ role: 'user', content: 'old message' }],
 			summary: 'The summary',
 			originalTokens: 1000,
 			compactedTokens: 200,
@@ -309,6 +310,8 @@ describe('createContextCompactedEvent', () => {
 		expect(event.newConversationHistory.length).toBe(2)
 		expect(event.newConversationHistory[0].role).toBe('system')
 		expect(event.newConversationHistory[0].content).toBe('summary')
+		expect(event.originalMessages?.length).toBe(1)
+		expect(event.originalMessages?.[0].content).toBe('old message')
 		expect(event.timestamp).toBeDefined()
 	})
 
@@ -318,6 +321,7 @@ describe('createContextCompactedEvent', () => {
 		const toolCallId = generateToolCallId()
 		const result: CompactionResult = {
 			compactedMessages: [{ role: 'tool', content: 'tool result', toolCallId }],
+			originalMessages: [],
 			summary: '',
 			originalTokens: 100,
 			compactedTokens: 50,
@@ -852,6 +856,7 @@ describe('createContextCompactedEvent with historyPath', () => {
 			compactedMessages: [
 				{ role: 'system', content: 'summary' },
 			],
+			originalMessages: [],
 			summary: 'The summary',
 			originalTokens: 1000,
 			compactedTokens: 200,
@@ -871,6 +876,7 @@ describe('createContextCompactedEvent with historyPath', () => {
 			compactedMessages: [
 				{ role: 'system', content: 'summary' },
 			],
+			originalMessages: [],
 			summary: 'The summary',
 			originalTokens: 1000,
 			compactedTokens: 200,

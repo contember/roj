@@ -59,6 +59,7 @@ export type {
 	AgentTreeProjectionState,
 	AssistantConversationMessageView,
 	ChatDebugState,
+	CompactionMessage,
 	ConversationMessageView,
 	DebugChatMessage,
 	GetAgentDetailResponse,

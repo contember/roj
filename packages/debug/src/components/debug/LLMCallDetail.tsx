@@ -278,7 +278,7 @@ export function LLMCallDetail({ sessionId, callId, onClose }: LLMCallDetailProps
 // Collapsible Content Component
 // ============================================================================
 
-function CollapsibleContent({ children, maxLines = 10 }: { children: string; maxLines?: number }) {
+export function CollapsibleContent({ children, maxLines = 10 }: { children: string; maxLines?: number }) {
 	const [isExpanded, setIsExpanded] = useState(false)
 
 	const { lines, shouldCollapse, tokenCount } = useMemo(() => {
@@ -327,7 +327,7 @@ function CollapsibleContent({ children, maxLines = 10 }: { children: string; max
 // Helper Components
 // ============================================================================
 
-function CollapsibleSection({
+export function CollapsibleSection({
 	title,
 	defaultOpen,
 	children,
@@ -563,7 +563,7 @@ function CacheBadge({ status }: { status: 'hit' | 'miss' | 'none' }) {
 	)
 }
 
-function RoleBadge({ role }: { role: string }) {
+export function RoleBadge({ role }: { role: string }) {
 	const colors: Record<string, string> = {
 		user: 'bg-blue-100 text-blue-700',
 		assistant: 'bg-green-100 text-green-700',

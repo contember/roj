@@ -175,6 +175,9 @@ export function applyEventToTimeline(
 				originalTokens: event.originalTokens,
 				compactedTokens: event.compactedTokens,
 				messagesRemoved: event.messagesRemoved,
+				compactionOriginalMessages: event.originalMessages,
+				compactedContent: event.compactedContent,
+				compactionNewHistory: event.newConversationHistory,
 			}
 
 			return {

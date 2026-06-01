@@ -131,6 +131,8 @@ export const DEFAULT_SUMMARY_INSTRUCTION =
 export interface CompactionResult {
 	/** New messages to use (summary + kept messages) */
 	compactedMessages: LLMMessage[]
+	/** The older messages that were summarized away (the compaction input) */
+	originalMessages: LLMMessage[]
 	/** Generated summary text */
 	summary: string
 	/** Token count before compaction */
@@ -274,6 +276,7 @@ export class ContextCompactor {
 			this.logger.warn('No messages to compact', { sessionId, agentId })
 			return Ok({
 				compactedMessages: messages,
+				originalMessages: [],
 				summary: '',
 				originalTokens,
 				compactedTokens: originalTokens,
@@ -349,6 +352,7 @@ export class ContextCompactor {
 
 		return Ok({
 			compactedMessages,
+			originalMessages: toCompact,
 			summary,
 			originalTokens,
 			compactedTokens,
@@ -378,6 +382,7 @@ export function createContextCompactedEvent(
 		contextEvents.create('context_compacted', {
 			agentId,
 			compactedContent: result.summary,
+			originalMessages: result.originalMessages.map(toDisplayMessage),
 			newConversationHistory,
 			originalTokens: result.originalTokens,
 			compactedTokens: result.compactedTokens,
@@ -385,4 +390,30 @@ export function createContextCompactedEvent(
 			historyPath: result.historyPath,
 		}),
 	)
+}
+
+/**
+ * Convert an LLM message into a display-only conversation message, preserving
+ * tool-call and tool-result detail in the rendered content. Used for the
+ * compaction "input" snapshot shown in the debug UI — not for reconstruction.
+ */
+function toDisplayMessage(msg: LLMMessage): CompactedConversationMessage {
+	if (msg.role === 'assistant') {
+		const parts: string[] = []
+		if (msg.content) parts.push(msg.content)
+		if (msg.toolCalls?.length) {
+			for (const tc of msg.toolCalls) {
+				parts.push(`[tool call: ${tc.name}(${JSON.stringify(tc.input)})]`)
+			}
+		}
+		return { role: 'assistant', content: parts.join('\n') }
+	}
+	if (msg.role === 'tool') {
+		const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
+		return { role: 'system', content: `[tool result${msg.toolName ? `: ${msg.toolName}` : ''}]\n${content}` }
+	}
+	return {
+		role: msg.role,
+		content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+	}
 }

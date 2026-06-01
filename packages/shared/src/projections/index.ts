@@ -5,6 +5,7 @@ export type { ProjectionEvent } from './events.js'
 export type {
 	AgentTreeNode,
 	AssistantConversationMessageView,
+	CompactionMessage,
 	ConversationMessageView,
 	DebugChatMessage,
 	GetAgentDetailResponse,

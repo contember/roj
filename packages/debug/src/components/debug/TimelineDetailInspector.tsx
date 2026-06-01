@@ -1,5 +1,5 @@
-import type { TimelineItem } from '@roj-ai/shared'
-import { LLMCallDetail } from './LLMCallDetail.js'
+import type { CompactionMessage, TimelineItem } from '@roj-ai/shared'
+import { CollapsibleContent, CollapsibleSection, LLMCallDetail, RoleBadge } from './LLMCallDetail.js'
 
 export function TimelineDetailInspector({
 	sessionId,
@@ -164,6 +164,35 @@ export function TimelineDetailInspector({
 					</div>
 				)}
 
+				{/* Input: the messages that were summarized away */}
+				{item.compactionOriginalMessages && item.compactionOriginalMessages.length > 0 && (
+					<CollapsibleSection
+						title={`Input — Compacted Messages (${item.compactionOriginalMessages.length})`}
+						defaultOpen={false}
+					>
+						<MessageList messages={item.compactionOriginalMessages} />
+					</CollapsibleSection>
+				)}
+
+				{/* Output: the generated summary */}
+				{item.compactedContent && (
+					<CollapsibleSection title="Output — Summary" defaultOpen={true}>
+						<div className="bg-green-50 border border-green-200 rounded-md p-3">
+							<CollapsibleContent maxLines={20}>{item.compactedContent}</CollapsibleContent>
+						</div>
+					</CollapsibleSection>
+				)}
+
+				{/* Output: the resulting conversation history (summary + kept messages) */}
+				{item.compactionNewHistory && item.compactionNewHistory.length > 0 && (
+					<CollapsibleSection
+						title={`Output — Resulting History (${item.compactionNewHistory.length})`}
+						defaultOpen={false}
+					>
+						<MessageList messages={item.compactionNewHistory} />
+					</CollapsibleSection>
+				)}
+
 				<div className="text-xs text-slate-500">
 					Compacted at: {new Date(item.startedAt).toLocaleString()}
 				</div>
@@ -192,6 +221,30 @@ function TypeBadge({ type }: { type: TimelineItem['type'] }) {
 		compaction: 'Compact',
 	}
 	return <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${config[type]}`}>{labels[type]}</span>
+}
+
+function MessageList({ messages }: { messages: CompactionMessage[] }) {
+	const roleColors: Record<string, string> = {
+		user: 'bg-blue-50 border-blue-200',
+		assistant: 'bg-green-50 border-green-200',
+		system: 'bg-yellow-50 border-yellow-200',
+	}
+	return (
+		<div className="space-y-3">
+			{messages.map((msg, idx) => (
+				<div
+					key={idx}
+					className={`p-3 rounded-md border ${roleColors[msg.role] ?? 'bg-slate-50 border-slate-200'}`}
+				>
+					<div className="flex items-center gap-2 mb-2">
+						<RoleBadge role={msg.role} />
+						<span className="text-xs text-slate-500 font-mono">#{idx + 1}</span>
+					</div>
+					<CollapsibleContent maxLines={10}>{msg.content}</CollapsibleContent>
+				</div>
+			))}
+		</div>
+	)
 }
 
 function MetricCard({ label, children }: { label: string; children: React.ReactNode }) {

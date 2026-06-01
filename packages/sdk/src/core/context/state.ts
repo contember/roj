@@ -23,6 +23,16 @@ export const contextEvents = createEventsFactory({
 		context_compacted: z4.object({
 			agentId: agentIdSchema,
 			compactedContent: z4.string(),
+			/**
+			 * Display-only snapshot of the messages that were summarized away (the
+			 * "input" of the compaction). Not used for conversation reconstruction —
+			 * that's driven by {@link newConversationHistory}. Optional for backward
+			 * compatibility with events emitted before this field existed.
+			 */
+			originalMessages: z4.array(z4.object({
+				role: z4.enum(['user', 'assistant', 'system']),
+				content: z4.string(),
+			})).optional(),
 			newConversationHistory: z4.array(z4.object({
 				role: z4.enum(['user', 'assistant', 'system']),
 				content: z4.string(),

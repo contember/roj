@@ -185,8 +185,20 @@ export interface TimelineItem {
 	originalTokens?: number
 	compactedTokens?: number
 	messagesRemoved?: number
+	/** Messages that were summarized away (compaction input). */
+	compactionOriginalMessages?: CompactionMessage[]
+	/** Generated summary text (compaction output). */
+	compactedContent?: string
+	/** Conversation history after compaction (summary + kept messages). */
+	compactionNewHistory?: CompactionMessage[]
 	// Error
 	error?: string
+}
+
+/** A single conversation message captured on a compaction timeline item. */
+export interface CompactionMessage {
+	role: 'user' | 'assistant' | 'system'
+	content: string
 }
 
 // ============================================================================
