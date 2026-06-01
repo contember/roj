@@ -6,7 +6,7 @@ import { selectPluginState } from '~/core/sessions/reducer.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { createMultiAgentPreset, createTestPreset, TestHarness } from '~/testing/index.js'
 import type { AgentCounters } from './plugin.js'
-import { limitsGuardPlugin } from './plugin.js'
+import { limitsEvents, limitsGuardPlugin } from './plugin.js'
 
 function createLimitsHarness(options: Omit<ConstructorParameters<typeof TestHarness>[0], 'systemPlugins'>) {
 	return new TestHarness({ ...options, systemPlugins: [limitsGuardPlugin] })
@@ -430,6 +430,89 @@ describe('limits-guard plugin', () => {
 
 			const resumedEvents = await session.getEventsByType(agentEvents, 'agent_resumed')
 			expect(resumedEvents.filter(e => e.agentId === entryAgentId)).toHaveLength(1)
+
+			await harness.shutdown()
+		})
+	})
+
+	// =========================================================================
+	// budgets (cost / tokens)
+	// =========================================================================
+
+	describe('budgets', () => {
+		it('agent exceeding cost budget → paused with budget_exceeded event', async () => {
+			let n = 0
+			const harness = createLimitsHarness({
+				presets: [createTestPreset({
+					orchestratorSystem: 'Test agent.',
+					// $0.50 per call, $1.00 budget → pauses before the 3rd call.
+					orchestratorPlugins: [limitsGuardPlugin.configureAgent({ limits: { maxCost: 1.0, maxTurns: 100 } })],
+				})],
+				mockHandler: () => {
+					n++
+					return {
+						content: null,
+						toolCalls: [{ id: ToolCallId(`tc${n}`), name: 'tell_user', input: { message: `Turn ${n}` } }],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetricsWithCost(0.5),
+					}
+				},
+			})
+
+			const session = await harness.createSession('test')
+			const entryAgentId = session.getEntryAgentId()!
+			await session.sendMessage('Start')
+			await waitForAgentPaused(session, entryAgentId)
+
+			expect(session.state.agents.get(entryAgentId)!.status).toBe('paused')
+
+			const counters = selectPluginState<Map<AgentId, AgentCounters>>(session.state, 'agentLimits')?.get(entryAgentId)
+			expect(counters!.costSpent).toBeGreaterThanOrEqual(1.0)
+
+			const budgetEvents = await session.getEventsByType(limitsEvents, 'budget_exceeded')
+			const evt = budgetEvents.find(e => e.agentId === entryAgentId)
+			expect(evt).toBeDefined()
+			expect(evt!.scope).toBe('agent')
+			expect(evt!.limitName).toBe('maxCost')
+
+			await harness.shutdown()
+		})
+
+		it('costSpent is preserved across resume — budget cannot be bypassed by pausing', async () => {
+			let n = 0
+			const harness = createLimitsHarness({
+				presets: [createTestPreset({
+					orchestratorSystem: 'Test agent.',
+					orchestratorPlugins: [limitsGuardPlugin.configureAgent({ limits: { maxCost: 1.0, maxTurns: 100 } })],
+				})],
+				mockHandler: () => {
+					n++
+					return {
+						content: null,
+						toolCalls: [{ id: ToolCallId(`tc${n}`), name: 'tell_user', input: { message: `Turn ${n}` } }],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetricsWithCost(0.5),
+					}
+				},
+			})
+
+			const session = await harness.createSession('test')
+			const entryAgentId = session.getEntryAgentId()!
+			await session.sendMessage('Start')
+			await waitForAgentPaused(session, entryAgentId)
+
+			const before = selectPluginState<Map<AgentId, AgentCounters>>(session.state, 'agentLimits')?.get(entryAgentId)!
+			expect(before.costSpent).toBeGreaterThanOrEqual(1.0)
+
+			await session.callPluginMethod('agents.resume', { agentId: String(entryAgentId) })
+			// Budget is still exhausted → agent pauses again immediately without inferring.
+			await waitForAgentPaused(session, entryAgentId)
+
+			const after = selectPluginState<Map<AgentId, AgentCounters>>(session.state, 'agentLimits')?.get(entryAgentId)!
+			// Anti-looping counter reset…
+			expect(after.inferenceCount).toBe(0)
+			// …but spend preserved, so the cap is not bypassable.
+			expect(after.costSpent).toBeGreaterThanOrEqual(before.costSpent)
 
 			await harness.shutdown()
 		})

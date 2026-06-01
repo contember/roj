@@ -127,6 +127,11 @@ function buildChildrenStatus(sessionAgents: Map<AgentId, AgentState>, parentId: 
 		const last = previewLastAssistant(c)
 
 		const parts: string[] = [c.id, c.status]
+		// Surface why a child paused (e.g. budget/limit exhaustion) so the parent can
+		// react — bump the budget and resume, reassign the work, or stop.
+		if (c.status === 'paused' && c.pauseMessage) {
+			parts.push(`reason: ${c.pauseMessage.replaceAll('"', "'")}`)
+		}
 		parts.push(`${tools} tools`)
 		parts.push(`${llm} llm`)
 		if (subs > 0) parts.push(`${subs} sub${subs === 1 ? '' : 's'}`)

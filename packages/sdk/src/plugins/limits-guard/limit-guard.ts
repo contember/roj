@@ -4,7 +4,7 @@
  * Returns the worst result: hard_limit > soft_warning > ok.
  */
 
-import type { AgentLimits } from '~/plugins/limits-guard/config.js'
+import type { AgentLimits, LimitsSessionConfig } from '~/plugins/limits-guard/config.js'
 import type { AgentCounters } from './plugin.js'
 
 // ============================================================================
@@ -20,6 +20,9 @@ export interface ResolvedAgentLimits {
 	softLimitRatio: number
 	maxRepeatedToolCalls: number
 	maxRepeatedResponses: number
+	maxCost: number
+	maxTokens: number
+	maxCompactions: number
 }
 
 const DEFAULTS: ResolvedAgentLimits = {
@@ -31,6 +34,10 @@ const DEFAULTS: ResolvedAgentLimits = {
 	softLimitRatio: 0.8,
 	maxRepeatedToolCalls: 3,
 	maxRepeatedResponses: 3,
+	// Budgets and the compaction cap are opt-in: unset means unlimited.
+	maxCost: Number.POSITIVE_INFINITY,
+	maxTokens: Number.POSITIVE_INFINITY,
+	maxCompactions: Number.POSITIVE_INFINITY,
 }
 
 export function resolveAgentLimits(config?: AgentLimits): ResolvedAgentLimits {
@@ -44,7 +51,96 @@ export function resolveAgentLimits(config?: AgentLimits): ResolvedAgentLimits {
 		softLimitRatio: config.softLimitRatio ?? DEFAULTS.softLimitRatio,
 		maxRepeatedToolCalls: config.maxRepeatedToolCalls ?? DEFAULTS.maxRepeatedToolCalls,
 		maxRepeatedResponses: config.maxRepeatedResponses ?? DEFAULTS.maxRepeatedResponses,
+		maxCost: config.maxCost ?? DEFAULTS.maxCost,
+		maxTokens: config.maxTokens ?? DEFAULTS.maxTokens,
+		maxCompactions: config.maxCompactions ?? DEFAULTS.maxCompactions,
 	}
+}
+
+// ============================================================================
+// Session budget
+// ============================================================================
+
+export interface ResolvedSessionLimits {
+	maxSessionCost: number
+	maxSessionTokens: number
+	softLimitRatio: number
+}
+
+const SESSION_DEFAULTS: ResolvedSessionLimits = {
+	maxSessionCost: Number.POSITIVE_INFINITY,
+	maxSessionTokens: Number.POSITIVE_INFINITY,
+	softLimitRatio: 0.8,
+}
+
+export function resolveSessionLimits(config?: LimitsSessionConfig): ResolvedSessionLimits {
+	if (!config) return SESSION_DEFAULTS
+	return {
+		maxSessionCost: config.maxSessionCost ?? SESSION_DEFAULTS.maxSessionCost,
+		maxSessionTokens: config.maxSessionTokens ?? SESSION_DEFAULTS.maxSessionTokens,
+		softLimitRatio: config.softLimitRatio ?? SESSION_DEFAULTS.softLimitRatio,
+	}
+}
+
+/** Cumulative spend, either for a single agent or summed across the session. */
+export interface BudgetSpend {
+	costSpent: number
+	tokensUsed: number
+}
+
+/**
+ * Budget check (cost + tokens) shared by per-agent and session-wide budgets.
+ *
+ * Kept separate from {@link checkLimits} so it can run in `beforeInference` —
+ * blocking the *next* call once the budget is exhausted — without also tripping
+ * the counter/pattern limits (those are enforced in `afterInference`). Uses
+ * float-aware comparisons (no flooring) so sub-dollar budgets behave correctly.
+ */
+export function checkBudget(
+	spend: BudgetSpend,
+	costLimit: number,
+	tokenLimit: number,
+	softLimitRatio: number,
+	names: { cost: string; tokens: string },
+): LimitCheckResult {
+	const checks: Array<{ name: string; current: number; max: number }> = [
+		{ name: names.cost, current: spend.costSpent, max: costLimit },
+		{ name: names.tokens, current: spend.tokensUsed, max: tokenLimit },
+	]
+
+	// Hard limits
+	for (const check of checks) {
+		if (check.current >= check.max) {
+			return {
+				status: 'hard_limit',
+				limitName: check.name,
+				currentValue: check.current,
+				hardLimit: check.max,
+				reason: `${check.name} reached: ${formatBudget(check.current)}/${formatBudget(check.max)}`,
+			}
+		}
+	}
+
+	// Soft warnings
+	for (const check of checks) {
+		if (check.max !== Number.POSITIVE_INFINITY && check.current >= check.max * softLimitRatio) {
+			return {
+				status: 'soft_warning',
+				limitName: check.name,
+				currentValue: check.current,
+				hardLimit: check.max,
+				message: `Approaching ${check.name} limit: ${formatBudget(check.current)}/${formatBudget(check.max)}`,
+			}
+		}
+	}
+
+	return { status: 'ok' }
+}
+
+/** Format a budget value compactly — 4 decimals for fractional (cost), integer otherwise. */
+function formatBudget(value: number): string {
+	if (value === Number.POSITIVE_INFINITY) return '∞'
+	return Number.isInteger(value) ? String(value) : value.toFixed(4)
 }
 
 // ============================================================================
@@ -68,6 +164,7 @@ export function checkLimits(counters: AgentCounters, limits: ResolvedAgentLimits
 		{ name: 'maxToolCalls', current: counters.toolCallCount, max: limits.maxToolCalls },
 		{ name: 'maxSpawnedAgents', current: counters.spawnedAgentCount, max: limits.maxSpawnedAgents },
 		{ name: 'maxMessagesSent', current: counters.messagesSentCount, max: limits.maxMessagesSent },
+		{ name: 'maxCompactions', current: counters.compactionCount, max: limits.maxCompactions },
 	]
 
 	for (const check of hardChecks) {

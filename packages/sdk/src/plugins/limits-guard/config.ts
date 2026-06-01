@@ -23,4 +23,39 @@ export interface AgentLimits {
 	maxRepeatedToolCalls?: number
 	/** Maximum consecutive identical text-only responses. Default: 3 */
 	maxRepeatedResponses?: number
+	/**
+	 * Maximum cumulative LLM cost (USD) this agent may spend before it is paused.
+	 * Spend is summed from `inference_completed` metrics and, unlike the counter
+	 * limits, is NOT reset on resume. Default: unlimited.
+	 */
+	maxCost?: number
+	/**
+	 * Maximum cumulative total tokens (prompt + completion) this agent may consume
+	 * before it is paused. Useful as a fallback when providers don't report cost.
+	 * Not reset on resume. Default: unlimited.
+	 */
+	maxTokens?: number
+	/**
+	 * Maximum number of context compaction events for this agent before it is paused.
+	 * Guards against pathological compaction loops. Reset on resume. Default: unlimited.
+	 */
+	maxCompactions?: number
+}
+
+// ============================================================================
+// Session Limits (budget across all agents)
+// ============================================================================
+
+/**
+ * Session-wide budget, summed across every agent in the session. Configured via
+ * the plugin's session-level config (`pluginConfig`), independent of per-agent
+ * limits. All fields optional - defaults applied via resolveSessionLimits().
+ */
+export interface LimitsSessionConfig {
+	/** Maximum cumulative LLM cost (USD) across all agents. Default: unlimited */
+	maxSessionCost?: number
+	/** Maximum cumulative total tokens across all agents. Default: unlimited */
+	maxSessionTokens?: number
+	/** Ratio of the session budget at which a soft warning is emitted. Default: 0.8 */
+	softLimitRatio?: number
 }

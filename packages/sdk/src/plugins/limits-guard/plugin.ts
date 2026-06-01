@@ -1,5 +1,6 @@
 import type { AgentId } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
+import { contextEvents } from '~/core/context/state.js'
 import { llmEvents } from '~/core/llm/state.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
@@ -7,8 +8,15 @@ import type { SessionState } from '~/core/sessions/state.js'
 import { toolEvents } from '~/core/tools/state.js'
 import { responseFingerprint, toolCallFingerprint } from '~/lib/utils/hash.js'
 import { mailboxEvents } from '~/plugins/mailbox/state.js'
-import type { AgentLimits } from './config.js'
-import { checkLimits, countConsecutiveTailDuplicates, resolveAgentLimits } from './limit-guard.js'
+import type { AgentLimits, LimitsSessionConfig } from './config.js'
+import {
+	type BudgetSpend,
+	checkBudget,
+	checkLimits,
+	countConsecutiveTailDuplicates,
+	resolveAgentLimits,
+	resolveSessionLimits,
+} from './limit-guard.js'
 
 // ============================================================================
 // Agent counters (state)
@@ -19,6 +27,12 @@ export interface AgentCounters {
 	toolCallCount: number
 	spawnedAgentCount: number
 	messagesSentCount: number
+	/** Number of context compaction events for this agent. */
+	compactionCount: number
+	/** Cumulative LLM cost (USD) summed from inference metrics. NOT reset on resume. */
+	costSpent: number
+	/** Cumulative total tokens (prompt + completion). NOT reset on resume. */
+	tokensUsed: number
 	/** Tool name → consecutive failure count + last error message. Reset on success. */
 	consecutiveToolFailures: Record<string, { count: number; lastError: string }>
 	/** Ring buffer of last 20 tool call fingerprints ("toolName:inputHash") */
@@ -32,10 +46,24 @@ export const createAgentCounters = (): AgentCounters => ({
 	toolCallCount: 0,
 	spawnedAgentCount: 0,
 	messagesSentCount: 0,
+	compactionCount: 0,
+	costSpent: 0,
+	tokensUsed: 0,
 	consecutiveToolFailures: {},
 	recentToolCallHashes: [],
 	recentResponseHashes: [],
 })
+
+/** Sum cost + tokens across all agents in the session (for the session-wide budget). */
+export function sumSessionSpend(limits: Map<AgentId, AgentCounters>): BudgetSpend {
+	let costSpent = 0
+	let tokensUsed = 0
+	for (const counters of limits.values()) {
+		costSpent += counters.costSpent
+		tokensUsed += counters.tokensUsed
+	}
+	return { costSpent, tokensUsed }
+}
 
 /**
  * Extract agent counters from session state (for external consumers).
@@ -61,10 +89,21 @@ export const limitsEvents = createEventsFactory({
 			hardLimit: z.number(),
 			message: z.string(),
 		}),
+		budget_exceeded: z.object({
+			agentId: agentIdSchema,
+			/** Whether the per-agent or the session-wide budget was hit. */
+			scope: z.enum(['agent', 'session']),
+			/** Which limit tripped: maxCost / maxTokens / maxSessionCost / maxSessionTokens. */
+			limitName: z.string(),
+			spent: z.number(),
+			limit: z.number(),
+			message: z.string(),
+		}),
 	},
 })
 
 export type LimitWarningEvent = (typeof limitsEvents)['Events']['limit_warning']
+export type BudgetExceededEvent = (typeof limitsEvents)['Events']['budget_exceeded']
 
 // ============================================================================
 // Helper
@@ -95,7 +134,8 @@ export interface LimitsAgentConfig {
 }
 
 export const limitsGuardPlugin = definePlugin('limits-guard')
-	.events([agentEvents, llmEvents, toolEvents, mailboxEvents])
+	.events([agentEvents, llmEvents, toolEvents, mailboxEvents, contextEvents, limitsEvents])
+	.pluginConfig<LimitsSessionConfig>()
 	.state({
 		key: 'agentLimits',
 		initial: (): Map<AgentId, AgentCounters> => new Map(),
@@ -156,7 +196,21 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 					newLimits.set(event.agentId, {
 						...counters,
 						inferenceCount: counters.inferenceCount + 1,
+						costSpent: counters.costSpent + (event.metrics.cost ?? 0),
+						tokensUsed: counters.tokensUsed + (event.metrics.totalTokens ?? 0),
 						recentResponseHashes: newRecentResponseHashes,
+					})
+					return newLimits
+				}
+
+				case 'context_compacted': {
+					const counters = limits.get(event.agentId)
+					if (!counters) return limits
+
+					const newLimits = new Map(limits)
+					newLimits.set(event.agentId, {
+						...counters,
+						compactionCount: counters.compactionCount + 1,
 					})
 					return newLimits
 				}
@@ -214,6 +268,11 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 					const counters = limits.get(event.agentId)
 					if (!counters) return limits
 
+					// Reset the anti-looping counters so the agent can make progress
+					// again. Budget spend (costSpent/tokensUsed) is deliberately NOT
+					// reset — otherwise a per-agent or session cost cap could be bypassed
+					// by repeatedly pausing and resuming. To grant more budget, raise the
+					// configured limit instead.
 					const newLimits = new Map(limits)
 					newLimits.set(event.agentId, {
 						...counters,
@@ -221,6 +280,7 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 						toolCallCount: 0,
 						spawnedAgentCount: 0,
 						messagesSentCount: 0,
+						compactionCount: 0,
 						consecutiveToolFailures: {},
 						recentToolCallHashes: [],
 						recentResponseHashes: [],
@@ -234,6 +294,56 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 		},
 	})
 	.agentConfig<LimitsAgentConfig>()
+	.hook('beforeInference', async (ctx) => {
+		// Budgets are enforced here (before the call) so an exhausted agent is
+		// paused before spending more — cost/tokens of a call aren't known until
+		// after it returns, so we stop the *next* call once the threshold is hit.
+		const counters = ctx.pluginState.get(ctx.agentId)
+		if (!counters) return null
+
+		const agentLimits = resolveAgentLimits(ctx.pluginAgentConfig?.limits)
+		const agentCheck = checkBudget(
+			counters,
+			agentLimits.maxCost,
+			agentLimits.maxTokens,
+			agentLimits.softLimitRatio,
+			{ cost: 'maxCost', tokens: 'maxTokens' },
+		)
+		if (agentCheck.status === 'hard_limit') {
+			await ctx.emitEvent(limitsEvents.create('budget_exceeded', {
+				agentId: ctx.agentId,
+				scope: 'agent',
+				limitName: agentCheck.limitName,
+				spent: agentCheck.currentValue,
+				limit: agentCheck.hardLimit,
+				message: agentCheck.reason,
+			}))
+			return { action: 'pause', reason: `Agent budget exceeded — ${agentCheck.reason}` }
+		}
+
+		const sessionLimits = resolveSessionLimits(ctx.pluginConfig)
+		const sessionSpend = sumSessionSpend(ctx.pluginState)
+		const sessionCheck = checkBudget(
+			sessionSpend,
+			sessionLimits.maxSessionCost,
+			sessionLimits.maxSessionTokens,
+			sessionLimits.softLimitRatio,
+			{ cost: 'maxSessionCost', tokens: 'maxSessionTokens' },
+		)
+		if (sessionCheck.status === 'hard_limit') {
+			await ctx.emitEvent(limitsEvents.create('budget_exceeded', {
+				agentId: ctx.agentId,
+				scope: 'session',
+				limitName: sessionCheck.limitName,
+				spent: sessionCheck.currentValue,
+				limit: sessionCheck.hardLimit,
+				message: sessionCheck.reason,
+			}))
+			return { action: 'pause', reason: `Session budget exceeded — ${sessionCheck.reason}` }
+		}
+
+		return null
+	})
 	.hook('afterInference', async (ctx) => {
 		const resolvedLimits = resolveAgentLimits(ctx.pluginAgentConfig?.limits)
 		const counters = ctx.pluginState.get(ctx.agentId)
@@ -299,6 +409,30 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 				`⚠️ Approaching ${limitCheck.limitName} limit: ${limitCheck.currentValue}/${limitCheck.hardLimit}. `
 					+ `Wrap up your current task or you will be stopped.`,
 			)
+		}
+
+		// Budget soft warnings — per-agent spend, then the session-wide budget.
+		const agentBudget = checkBudget(
+			counters,
+			resolvedLimits.maxCost,
+			resolvedLimits.maxTokens,
+			resolvedLimits.softLimitRatio,
+			{ cost: 'maxCost', tokens: 'maxTokens' },
+		)
+		if (agentBudget.status === 'soft_warning') {
+			parts.push(`⚠️ ${agentBudget.message}. You will be paused when the budget is reached — wrap up.`)
+		}
+
+		const sessionLimits = resolveSessionLimits(ctx.pluginConfig)
+		const sessionBudget = checkBudget(
+			sumSessionSpend(ctx.pluginState),
+			sessionLimits.maxSessionCost,
+			sessionLimits.maxSessionTokens,
+			sessionLimits.softLimitRatio,
+			{ cost: 'maxSessionCost', tokens: 'maxSessionTokens' },
+		)
+		if (sessionBudget.status === 'soft_warning') {
+			parts.push(`⚠️ Session-wide ${sessionBudget.message}.`)
 		}
 
 		return parts.length > 0 ? parts.join('\n\n') : null
