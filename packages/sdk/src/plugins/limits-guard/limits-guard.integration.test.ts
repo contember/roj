@@ -4,6 +4,7 @@ import { agentEvents } from '~/core/agents/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import { ToolCallId } from '~/core/tools/schema.js'
+import { mailboxEvents } from '~/plugins/mailbox/state.js'
 import { createMultiAgentPreset, createTestPreset, TestHarness } from '~/testing/index.js'
 import type { AgentCounters } from './plugin.js'
 import { limitsEvents, limitsGuardPlugin } from './plugin.js'
@@ -513,6 +514,73 @@ describe('limits-guard plugin', () => {
 			expect(after.inferenceCount).toBe(0)
 			// …but spend preserved, so the cap is not bypassable.
 			expect(after.costSpent).toBeGreaterThanOrEqual(before.costSpent)
+
+			await harness.shutdown()
+		})
+
+		it('child pausing on budget → parent is notified via a child-paused message', async () => {
+			let orchestratorCalls = 0
+			let workerCalls = 0
+			const harness = createLimitsHarness({
+				presets: [createTestPreset({
+					orchestratorSystem: 'Orchestrator agent.',
+					agents: [{
+						name: 'worker',
+						system: 'Worker agent.',
+						tools: [],
+						agents: [],
+						// $0.50 per call, $0.50 budget → pauses at the 2nd inference's
+						// beforeInference (after one completed call spent the budget).
+						plugins: [limitsGuardPlugin.configureAgent({ limits: { maxCost: 0.5, maxTurns: 100 } })],
+					}],
+				})],
+				mockHandler: (request) => {
+					// Worker: keep spending until the budget pauses it.
+					if (request.systemPrompt.includes('Worker agent.')) {
+						workerCalls++
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId(`w${workerCalls}`), name: 'tell_user', input: { message: `Work ${workerCalls}` } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetricsWithCost(0.5),
+						}
+					}
+					// Orchestrator: spawn the worker exactly once, then idle.
+					orchestratorCalls++
+					if (orchestratorCalls === 1) {
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('spawn'), name: 'start_worker', input: { message: 'Do work' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return { content: 'Waiting', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendMessage('Start')
+			await waitForAgentPaused(session, AgentId('worker_1'))
+
+			const orchestratorId = session.getEntryAgentId()!
+			// The mailbox plugin's onPause hook reports the pause to the parent.
+			// onPause runs *after* the agent_paused event (which flips status to
+			// 'paused'), so poll for the notification.
+			const findNotice = async () =>
+				(await session.getEventsByType(mailboxEvents, 'mailbox_message')).find(m =>
+					m.toAgentId === orchestratorId
+					&& m.message.from === AgentId('worker_1')
+					&& m.message.content.includes('<child-paused')
+					&& m.message.content.includes('worker_1'),
+				)
+			let notice = await findNotice()
+			const deadline = Date.now() + 5000
+			while (!notice && Date.now() < deadline) {
+				await new Promise(r => setTimeout(r, 20))
+				notice = await findNotice()
+			}
+			expect(notice).toBeDefined()
 
 			await harness.shutdown()
 		})

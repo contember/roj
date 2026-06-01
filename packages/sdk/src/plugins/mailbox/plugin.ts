@@ -228,6 +228,24 @@ export const mailboxPlugin = definePlugin("mailbox")
 		});
 		return null;
 	})
+	.hook("onPause", async (ctx) => {
+		// Notify the parent immediately when a child pauses (budget/limit exhaustion,
+		// manual pause, …) so it can react: resume after addressing the cause,
+		// reassign the work, or stop. Lives here (not in the agents plugin) because
+		// the agents plugin is disabled on leaf agents that can't spawn — but those
+		// are exactly the agents that pause and need to report upward. mailbox is
+		// enabled on every agent, and self.send wakes the parent. Root agents
+		// (no parent) have no one to notify.
+		const parentId = ctx.agentState.parentId;
+		if (!parentId || !ctx.sessionState.agents.has(parentId)) return null;
+
+		await ctx.self.send({
+			fromAgentId: ctx.agentId,
+			toAgentId: parentId,
+			content: `<child-paused agent="${ctx.agentId}">${ctx.reason ?? "no reason given"}</child-paused>`,
+		});
+		return null;
+	})
 	.systemPrompt((ctx) => {
 		const role = getAgentRole(ctx.agentState, ctx.sessionState);
 		switch (role) {

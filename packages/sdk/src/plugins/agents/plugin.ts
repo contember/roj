@@ -419,7 +419,8 @@ export const agentsPlugin = definePlugin('agents')
 
 - **New task** → spawn a new agent using \`start_<agent_name>\`. You will receive the agent's ID in the result — use it with \`send_message\` for follow-up communication.
 - **Follow-up on an existing task** → send a message to the existing agent via \`send_message\` with the agent's ID. Do NOT spawn a new agent for feedback, corrections, or additional instructions on a task already assigned.
-- Spawned agents communicate back to you via \`send_message\`. Check your incoming messages for their results and progress updates.`
+- Spawned agents communicate back to you via \`send_message\`. Check your incoming messages for their results and progress updates.
+- If a child pauses early it sends you a \`<child-paused agent="…">reason</child-paused>\` message (e.g. it hit a cost/limit budget). Decide what to do: resume it (after addressing the cause), reassign or drop the work, or stop.`
 
 		// Only include supervision instructions if supervision is actually enabled
 		// for this session — otherwise the section is misleading bloat.
