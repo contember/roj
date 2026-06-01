@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'bun:test'
 import z from 'zod/v4'
 import { contextEvents } from '~/core/context/state.js'
+import { llmEvents } from '~/core/llm/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import type { InferenceRequest } from '~/core/llm/provider.js'
 import { ModelId } from '~/core/llm/schema.js'
 import type { Preset } from '~/core/preset/index.js'
 import { createTool } from '~/core/tools/definition.js'
 import { ToolCallId } from '~/core/tools/schema.js'
+import { selectSessionStats, sessionStatsPlugin } from '~/plugins/session-stats/index.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 import { contextCompactPlugin } from './index.js'
 
@@ -332,6 +334,66 @@ describe('context-compact plugin', () => {
 
 			// But the agent should still have responded (graceful degradation)
 			expect(regularCallCount).toBeGreaterThanOrEqual(3)
+
+			await harness.shutdown()
+		})
+	})
+
+	// =========================================================================
+	// Cost accounting — the compaction summarization call is a real, billed LLM
+	// call. Its tokens/cost must land in session stats, not vanish. (Regression:
+	// runAuxiliaryInference used to skip emitting any stats event.)
+	// =========================================================================
+
+	describe('compaction cost accounting', () => {
+		it('summarization call cost is counted in session stats', async () => {
+			const REGULAR_COST = 0.01
+			const SUMMARY_COST = 0.05
+
+			const harness = new TestHarness({
+				systemPlugins: [contextCompactPlugin, sessionStatsPlugin],
+				presets: [createCompactPreset(10)],
+				mockHandler: (request) => {
+					if (isSummarizationRequest(request)) {
+						return {
+							content: 'Summary of conversation so far.',
+							toolCalls: [],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetricsWithCost(SUMMARY_COST),
+						}
+					}
+					return {
+						content: 'Agent response with some content to increase token count.',
+						toolCalls: [],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetricsWithCost(REGULAR_COST),
+					}
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('First message')
+			await session.sendAndWaitForIdle('Second message')
+			await session.sendAndWaitForIdle('Third message to trigger actual compaction')
+
+			// Compaction actually ran and made a billed summarization call.
+			const auxEvents = await session.getEventsByType(llmEvents, 'auxiliary_inference_completed')
+			expect(auxEvents.length).toBeGreaterThanOrEqual(1)
+			expect(auxEvents.some((e) => e.metrics.cost === SUMMARY_COST)).toBe(true)
+
+			// Session stats must include both the regular turns AND the summarization
+			// call — in count, tokens, and cost.
+			const inferEvents = await session.getEventsByType(llmEvents, 'inference_completed')
+			const allLlmEvents = [...inferEvents, ...auxEvents]
+			const expectedCost = allLlmEvents.reduce((sum, e) => sum + (e.metrics.cost ?? 0), 0)
+			const expectedTokens = allLlmEvents.reduce((sum, e) => sum + e.metrics.totalTokens, 0)
+
+			const stats = selectSessionStats(session.state)
+			expect(stats.llmCalls).toBe(allLlmEvents.length)
+			expect(stats.totalCost).toBeCloseTo(expectedCost, 10)
+			expect(stats.totalTokens).toBe(expectedTokens)
+			// And the summarization cost is genuinely part of the total (not zero).
+			expect(stats.totalCost).toBeGreaterThanOrEqual(SUMMARY_COST)
 
 			await harness.shutdown()
 		})

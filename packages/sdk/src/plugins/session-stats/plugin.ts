@@ -79,7 +79,11 @@ export const sessionStatsPlugin = definePlugin('session-stats')
 				case 'agent_spawned':
 					return withTimestamp({ agentCount: stats.agentCount + 1 })
 
-				case 'inference_completed': {
+				// inference_completed = main agent turns; auxiliary_inference_completed =
+				// side-channel calls (e.g. context compaction). Both are billed LLM
+				// calls, so both feed the same usage/cost accounting.
+				case 'inference_completed':
+				case 'auxiliary_inference_completed': {
 					const provider = event.metrics.provider
 					const byProvider = provider
 						? {

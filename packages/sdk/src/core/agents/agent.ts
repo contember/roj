@@ -429,13 +429,28 @@ export class Agent {
 			tools: this.tools.size > 0 ? [...this.tools.values()] : undefined,
 		}
 
-		return this.llmProvider.inference(request, {
+		const result = await this.llmProvider.inference(request, {
 			sessionId: this.store.sessionId,
 			agentId: this.id,
 			signal: this.abortController.signal,
 			fileStore: this.fileStore,
 			providers: this.llmProviders,
 		})
+
+		// Auxiliary calls don't go through emitInferenceCompleted (that event mutates
+		// conversation state), so without this their tokens/cost would be billed but
+		// never show up in session stats or metadata. Emit a stats-only event instead.
+		if (result.ok) {
+			await this.store.emit(withSessionId(
+				this.store.sessionId,
+				llmEvents.create('auxiliary_inference_completed', {
+					agentId: this.id,
+					metrics: result.value.metrics,
+				}),
+			))
+		}
+
+		return result
 	}
 
 	// ============================================================================

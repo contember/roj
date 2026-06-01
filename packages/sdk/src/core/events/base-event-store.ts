@@ -198,7 +198,9 @@ export abstract class BaseEventStore implements EventStore {
 					metrics.totalEvents += 1
 					break
 
+				// Both normal turns and side-channel calls (e.g. compaction) are billed.
 				case 'inference_completed':
+				case 'auxiliary_inference_completed':
 					if (event.metrics) {
 						metrics.totalTokens += event.metrics.totalTokens ?? 0
 						metrics.inputTokens = (metrics.inputTokens ?? 0) + (event.metrics.promptTokens ?? 0)

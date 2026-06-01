@@ -36,7 +36,9 @@ export function computeMetricsFromEvents(events: DomainEvent[]): SessionMetadata
 				metrics.totalAgents++
 				break
 
+			// Both normal turns and side-channel calls (e.g. compaction) are billed.
 			case 'inference_completed':
+			case 'auxiliary_inference_completed':
 				if (event.metrics) {
 					metrics.totalLLMCalls++
 					metrics.totalTokens += event.metrics.totalTokens ?? 0

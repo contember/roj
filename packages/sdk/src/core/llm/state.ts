@@ -48,6 +48,18 @@ export type LLMMetrics = {
 // LLM events
 // ============================================================================
 
+const llmMetricsSchema = z4.object({
+	promptTokens: z4.number(),
+	completionTokens: z4.number(),
+	totalTokens: z4.number(),
+	latencyMs: z4.number(),
+	model: z4.string(),
+	provider: z4.string().optional(),
+	cost: z4.number().optional(),
+	cachedTokens: z4.number().optional(),
+	cacheWriteTokens: z4.number().optional(),
+})
+
 export const llmEvents = createEventsFactory({
 	events: {
 		inference_started: z4.object({
@@ -66,18 +78,19 @@ export const llmEvents = createEventsFactory({
 					input: z4.unknown(),
 				})),
 			}),
-			metrics: z4.object({
-				promptTokens: z4.number(),
-				completionTokens: z4.number(),
-				totalTokens: z4.number(),
-				latencyMs: z4.number(),
-				model: z4.string(),
-				provider: z4.string().optional(),
-				cost: z4.number().optional(),
-				cachedTokens: z4.number().optional(),
-				cacheWriteTokens: z4.number().optional(),
-			}),
+			metrics: llmMetricsSchema,
 			llmCallId: llmCallIdSchema.optional(),
+		}),
+		/**
+		 * A side-channel ("auxiliary") inference completed — e.g. the context-compact
+		 * plugin asking the model for a summary. Unlike `inference_completed`, this
+		 * does NOT touch conversation state; it exists purely so the call's token
+		 * usage and cost are still accounted in session stats and metadata. Without
+		 * it, compaction (and any other auxiliary call) would be billed but invisible.
+		 */
+		auxiliary_inference_completed: z4.object({
+			agentId: agentIdSchema,
+			metrics: llmMetricsSchema,
 		}),
 		inference_failed: z4.object({
 			agentId: agentIdSchema,
@@ -89,4 +102,5 @@ export const llmEvents = createEventsFactory({
 
 export type InferenceStartedEvent = (typeof llmEvents)['Events']['inference_started']
 export type InferenceCompletedEvent = (typeof llmEvents)['Events']['inference_completed']
+export type AuxiliaryInferenceCompletedEvent = (typeof llmEvents)['Events']['auxiliary_inference_completed']
 export type InferenceFailedEvent = (typeof llmEvents)['Events']['inference_failed']

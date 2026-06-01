@@ -45,7 +45,11 @@ export function applyEventToMetrics(state: MetricsState, event: ProjectionEvent)
 	const lastEventTimestamp = event.timestamp
 
 	switch (event.type) {
-		case 'inference_completed': {
+		// inference_completed = main agent turns; auxiliary_inference_completed =
+		// side-channel calls (e.g. context compaction). Both are billed, so both
+		// count toward token usage and cost.
+		case 'inference_completed':
+		case 'auxiliary_inference_completed': {
 			const provider = event.metrics.provider
 			const byProvider = provider
 				? {
