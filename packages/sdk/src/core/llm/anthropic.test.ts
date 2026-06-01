@@ -400,6 +400,40 @@ describe('AnthropicProvider buildHttpRequest cache placement', () => {
 		expect(last.content[1].cache_control).toBeUndefined()
 	})
 
+	test('stable prefix + tail: TWO cache_control blocks survive into the HTTP body', async () => {
+		// Mirrors the agent flow: an immutable preamble followed by a churning
+		// conversation tail. applyCacheBreakpoint with cachedPrefixCount marks
+		// BOTH the last preamble message and the tail — both must reach the wire.
+		// Roles alternate so mergeConsecutiveMessages doesn't fold them together.
+		const messages = applyCacheBreakpoint(
+			[
+				{ role: 'user', content: 'preamble part A' },
+				{ role: 'assistant', content: 'preamble part B' }, // last preamble msg → prefix breakpoint
+				{ role: 'user', content: 'conversation turn' },
+				{ role: 'assistant', content: 'tail reply' }, // tail breakpoint
+			],
+			0, // no uncached suffix → tailIdx = 3
+			undefined,
+			2, // cachedPrefixCount → prefixIdx = 1
+		)
+
+		const http = await createProvider().buildHttpRequest(buildRequest(messages))
+		const msgs = getBodyMessages(http.body)
+
+		expect(msgs.length).toBe(4)
+		// Prefix breakpoint on the last preamble message
+		const prefix = msgs[1]
+		expect(prefix.role).toBe('assistant')
+		expect(prefix.content[prefix.content.length - 1].cache_control).toEqual({ type: 'ephemeral' })
+		// Tail breakpoint on the final message
+		const tail = msgs[3]
+		expect(tail.role).toBe('assistant')
+		expect(tail.content[tail.content.length - 1].cache_control).toEqual({ type: 'ephemeral' })
+		// Messages between the two breakpoints stay uncached
+		expect(msgs[0].content[msgs[0].content.length - 1].cache_control).toBeUndefined()
+		expect(msgs[2].content[msgs[2].content.length - 1].cache_control).toBeUndefined()
+	})
+
 	test('no flag on any message: only system prompt has cache_control', async () => {
 		const http = await createProvider().buildHttpRequest(buildRequest([
 			{ role: 'user', content: 'What is 2+2?' },

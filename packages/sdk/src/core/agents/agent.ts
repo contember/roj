@@ -420,7 +420,7 @@ export class Agent {
 			...pendingToolResultMessages,
 		]
 		const messages = [...baseMessages, ...extraMessages]
-		const cachedMessages = applyCacheBreakpoint(messages, extraMessages.length, this.config.cacheTtl)
+		const cachedMessages = applyCacheBreakpoint(messages, extraMessages.length, this.config.cacheTtl, agentState.preamble.length)
 
 		const request: InferenceRequest = {
 			model: this.config.model,
@@ -564,6 +564,7 @@ export class Agent {
 			messages,
 			ephemeralParts.length > 0 ? 1 : 0,
 			this.config.cacheTtl,
+			agentState.preamble.length,
 		)
 
 		// 5. LLM inference (with retry)
