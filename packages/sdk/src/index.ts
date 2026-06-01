@@ -82,7 +82,8 @@ export type { BuiltinEvent } from './builtin-events.js'
 export type { AgentChatMessage, AskUserChatMessage, ChatMessage, UserChatMessage } from '~/plugins/user-chat/index.js'
 
 // Plugins
-export { agentStatusPlugin } from '~/plugins/agent-status/plugin.js'
+export { agentStatusPlugin, agentStoppedNotificationSchema } from '~/plugins/agent-status/plugin.js'
+export type { AgentStoppedNotification } from '~/plugins/agent-status/plugin.js'
 export { agentsPlugin } from '~/plugins/agents/plugin.js'
 export type { AgentsPluginConfig } from '~/plugins/agents/plugin.js'
 export { contextCompactPlugin } from '~/plugins/context-compact/plugin.js'
