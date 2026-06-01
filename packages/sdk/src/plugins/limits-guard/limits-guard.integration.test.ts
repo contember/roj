@@ -2,8 +2,13 @@ import { describe, expect, it } from 'bun:test'
 import { AgentId } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import type { InferenceRequest } from '~/core/llm/provider.js'
+import { ModelId } from '~/core/llm/schema.js'
+import { llmEvents } from '~/core/llm/state.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import { ToolCallId } from '~/core/tools/schema.js'
+import { contextCompactPlugin } from '~/plugins/context-compact/index.js'
+import { getAgentMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
 import { mailboxEvents } from '~/plugins/mailbox/state.js'
 import { createMultiAgentPreset, createTestPreset, TestHarness } from '~/testing/index.js'
 import type { AgentCounters } from './plugin.js'
@@ -502,18 +507,20 @@ describe('limits-guard plugin', () => {
 			await session.sendMessage('Start')
 			await waitForAgentPaused(session, entryAgentId)
 
-			const before = selectPluginState<Map<AgentId, AgentCounters>>(session.state, 'agentLimits')?.get(entryAgentId)!
-			expect(before.costSpent).toBeGreaterThanOrEqual(1.0)
+			const before = selectPluginState<Map<AgentId, AgentCounters>>(session.state, 'agentLimits')?.get(entryAgentId)
+			expect(before).toBeDefined()
+			expect(before!.costSpent).toBeGreaterThanOrEqual(1.0)
 
 			await session.callPluginMethod('agents.resume', { agentId: String(entryAgentId) })
 			// Budget is still exhausted → agent pauses again immediately without inferring.
 			await waitForAgentPaused(session, entryAgentId)
 
-			const after = selectPluginState<Map<AgentId, AgentCounters>>(session.state, 'agentLimits')?.get(entryAgentId)!
+			const after = selectPluginState<Map<AgentId, AgentCounters>>(session.state, 'agentLimits')?.get(entryAgentId)
+			expect(after).toBeDefined()
 			// Anti-looping counter reset…
-			expect(after.inferenceCount).toBe(0)
+			expect(after!.inferenceCount).toBe(0)
 			// …but spend preserved, so the cap is not bypassable.
-			expect(after.costSpent).toBeGreaterThanOrEqual(before.costSpent)
+			expect(after!.costSpent).toBeGreaterThanOrEqual(before!.costSpent)
 
 			await harness.shutdown()
 		})
@@ -581,6 +588,178 @@ describe('limits-guard plugin', () => {
 				notice = await findNotice()
 			}
 			expect(notice).toBeDefined()
+
+			await harness.shutdown()
+		})
+
+		it('child-paused notice is actually consumed by a parent that already went idle', async () => {
+			// Regression guard for the lifecycle: a parent that finished its work is
+			// NOT in a terminal "complete" state — it's persisted as `pending` with an
+			// empty mailbox. When the child pauses and delivers <child-paused>, the
+			// dequeue check flips the parent's decide() from "complete" back to "infer",
+			// so the parent wakes and reads the message rather than leaving it unconsumed.
+			let workerCalls = 0
+			let orchestratorSawChildPaused = false
+
+			const requestHasChildPaused = (request: InferenceRequest): boolean =>
+				request.messages.some((m) => {
+					const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+					return c.includes('<child-paused')
+				})
+
+			const harness = createLimitsHarness({
+				presets: [createTestPreset({
+					orchestratorSystem: 'Orchestrator agent.',
+					agents: [{
+						name: 'worker',
+						system: 'Worker agent.',
+						tools: [],
+						agents: [],
+						plugins: [limitsGuardPlugin.configureAgent({ limits: { maxCost: 0.5, maxTurns: 100 } })],
+					}],
+				})],
+				mockHandler: (request) => {
+					if (request.systemPrompt.includes('Worker agent.')) {
+						workerCalls++
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId(`w${workerCalls}`), name: 'tell_user', input: { message: `Work ${workerCalls}` } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetricsWithCost(0.5),
+						}
+					}
+					// Orchestrator: spawn the worker once, then go idle. Any later wake-up
+					// is driven by an incoming message — record if it carried the notice.
+					if (requestHasChildPaused(request)) orchestratorSawChildPaused = true
+					if (workerCalls === 0) {
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('spawn'), name: 'start_worker', input: { message: 'Do work' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return { content: 'Acknowledged', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendMessage('Start')
+			await waitForAgentPaused(session, AgentId('worker_1'))
+
+			// The parent should wake from idle and run an inference that includes the
+			// <child-paused> message — proving the notice is consumed, not orphaned.
+			const deadline = Date.now() + 5000
+			while (!orchestratorSawChildPaused && Date.now() < deadline) {
+				await new Promise(r => setTimeout(r, 20))
+			}
+			expect(orchestratorSawChildPaused).toBe(true)
+
+			// And the message is marked consumed in the parent's mailbox.
+			const orchestratorId = session.getEntryAgentId()!
+			const mailbox = getAgentMailbox(selectMailboxState(session.state), orchestratorId)
+			const childPausedMsg = mailbox.find((m) => m.content.includes('<child-paused'))
+			expect(childPausedMsg).toBeDefined()
+			expect(childPausedMsg!.consumed).toBe(true)
+
+			await harness.shutdown()
+		})
+
+		it('compaction (auxiliary inference) cost counts toward the budget', async () => {
+			// The compaction summarization is a real, billed LLM call routed through
+			// runAuxiliaryInference → auxiliary_inference_completed. It must be charged
+			// against the cost budget, otherwise an agent could spend unboundedly on
+			// compaction without ever tripping its cap.
+			const REGULAR_COST = 0.1
+			const SUMMARY_COST = 5.0
+
+			// Compaction request detection: inline compaction appends a trailing user
+			// message containing the summarization marker.
+			const isSummarizationRequest = (request: InferenceRequest): boolean => {
+				const last = request.messages[request.messages.length - 1]
+				if (!last || last.role !== 'user') return false
+				const content = typeof last.content === 'string' ? last.content : JSON.stringify(last.content)
+				return content.includes('[CONTEXT COMPACTION REQUEST]')
+			}
+
+			const harness = new TestHarness({
+				systemPlugins: [contextCompactPlugin, limitsGuardPlugin],
+				presets: [createTestPreset({
+					orchestratorSystem: 'Test agent.',
+					plugins: [
+						contextCompactPlugin.configure({
+							compaction: { model: ModelId('mock'), maxTokens: 10, keepRecentMessages: 2 },
+						}),
+					],
+					// Budget large enough to survive the cheap regular turns but small
+					// enough that one expensive summarization call blows past it.
+					orchestratorPlugins: [
+						limitsGuardPlugin.configureAgent({ limits: { maxCost: 2.0, maxTurns: 100 } }),
+					],
+				})],
+				mockHandler: (request) => {
+					if (isSummarizationRequest(request)) {
+						return {
+							content: 'Summary of conversation so far.',
+							toolCalls: [],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetricsWithCost(SUMMARY_COST),
+						}
+					}
+					return {
+						content: 'Agent response with some content to increase token count.',
+						toolCalls: [],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetricsWithCost(REGULAR_COST),
+					}
+				},
+			})
+
+			const session = await harness.createSession('test')
+			const entryAgentId = session.getEntryAgentId()!
+
+			// Returns once the agent is either idle or paused — used because we don't
+			// know up front whether the compaction cost trips the budget on the same
+			// turn (depends on beforeInference hook ordering) or on the next one.
+			const waitForIdleOrPaused = async (timeoutMs = 10000): Promise<'idle' | 'paused'> => {
+				const deadline = Date.now() + timeoutMs
+				while (Date.now() < deadline) {
+					const st = session.state.agents.get(entryAgentId)
+					if (st?.status === 'paused') return 'paused'
+					if (st?.status === 'pending' && st.pendingToolCalls.length === 0 && st.pendingToolResults.length === 0) {
+						return 'idle'
+					}
+					await new Promise(r => setTimeout(r, 10))
+				}
+				throw new Error('waitForIdleOrPaused timed out')
+			}
+
+			await session.sendAndWaitForIdle('First message')
+			await session.sendAndWaitForIdle('Second message')
+			// Third message triggers compaction (the expensive summarization call).
+			// It may pause on this turn or settle idle and pause on the next one.
+			await session.sendMessage('Third message to trigger compaction')
+			if (await waitForIdleOrPaused() === 'idle') {
+				await session.sendMessage('Fourth message')
+			}
+			await waitForAgentPaused(session, entryAgentId)
+
+			// Compaction genuinely ran and was billed.
+			const auxEvents = await session.getEventsByType(llmEvents, 'auxiliary_inference_completed')
+			expect(auxEvents.some((e) => e.metrics.cost === SUMMARY_COST)).toBe(true)
+
+			// The summarization cost is reflected in the agent's tracked spend…
+			const counters = selectPluginState<Map<AgentId, AgentCounters>>(session.state, 'agentLimits')?.get(entryAgentId)
+			expect(counters).toBeDefined()
+			expect(counters!.costSpent).toBeGreaterThanOrEqual(SUMMARY_COST)
+
+			// …and it tripped the cost budget (the regular turns alone, at 0.1 each,
+			// could never reach the 2.0 cap on their own here).
+			const budgetEvents = await session.getEventsByType(limitsEvents, 'budget_exceeded')
+			const evt = budgetEvents.find((e) => e.agentId === entryAgentId)
+			expect(evt).toBeDefined()
+			expect(evt!.scope).toBe('agent')
+			expect(evt!.limitName).toBe('maxCost')
 
 			await harness.shutdown()
 		})

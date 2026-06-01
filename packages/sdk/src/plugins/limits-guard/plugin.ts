@@ -203,6 +203,22 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 					return newLimits
 				}
 
+				case 'auxiliary_inference_completed': {
+					// Side-channel calls (e.g. context compaction) are billed but don't
+					// touch conversation state, so they count toward cost/token budgets
+					// but NOT toward inferenceCount or the anti-looping response hashes.
+					const counters = limits.get(event.agentId)
+					if (!counters) return limits
+
+					const newLimits = new Map(limits)
+					newLimits.set(event.agentId, {
+						...counters,
+						costSpent: counters.costSpent + (event.metrics.cost ?? 0),
+						tokensUsed: counters.tokensUsed + (event.metrics.totalTokens ?? 0),
+					})
+					return newLimits
+				}
+
 				case 'context_compacted': {
 					const counters = limits.get(event.agentId)
 					if (!counters) return limits
