@@ -59,6 +59,17 @@ interface RunningService {
 	logs: RingBuffer
 }
 
+/** Matches a port bind-conflict across the Node and Bun runtimes. */
+const PORT_CONFLICT_PATTERN = /EADDRINUSE|address already in use/i
+
+/**
+ * How many times {@link ServiceExecutor.start} will silently re-allocate a fresh
+ * port and retry when the chosen port is already held by a foreign process
+ * (EADDRINUSE). Bounded so a service that is genuinely unstartable still ends up
+ * `failed` instead of looping forever.
+ */
+const MAX_PORT_CONFLICT_RETRIES = 3
+
 // ============================================================================
 // ServiceExecutor
 // ============================================================================
@@ -72,6 +83,10 @@ export class ServiceExecutor {
 	private readonly services = new Map<string, RunningService>()
 	private readonly allocatedPorts = new Map<string, number>()
 	private readonly waiters = new Map<string, Array<{ resolve: (result: Result<void, ToolError>) => void; timer: ReturnType<typeof setTimeout> }>>()
+	/** Per-type lock collapsing concurrent start() calls onto a single in-flight start. */
+	private readonly startInFlight = new Map<string, Promise<Result<void, ToolError>>>()
+	/** Per-type counter bounding automatic EADDRINUSE port re-allocation retries. */
+	private readonly portConflictRetries = new Map<string, number>()
 	private readonly logger: Logger
 	private readonly portPool: PortPool
 	private readonly fs: FileSystem
@@ -158,8 +173,36 @@ export class ServiceExecutor {
 
 	/**
 	 * Start a service. Idempotent — returns Ok if already running or starting.
+	 *
+	 * Concurrent calls for the same service type are collapsed onto a single
+	 * in-flight start. The executor mutates its per-type state (`services` /
+	 * `allocatedPorts`) only between awaits, so without this guard two overlapping
+	 * starts could both pass the "already running" check and spawn two processes
+	 * on the same allocated port: one wins the port, the other dies with
+	 * EADDRINUSE, and — because state is keyed by service type — the loser's
+	 * `failed` event overwrites the winner's `ready`, leaving a healthy-but-
+	 * untracked listener while the control plane believes the service failed.
+	 * Deduping here guarantees exactly one process per type.
 	 */
 	async start(
+		config: ServiceConfig,
+		sessionId: SessionId,
+		workspaceDir?: string,
+		preferredPort?: number,
+	): Promise<Result<void, ToolError>> {
+		const inFlight = this.startInFlight.get(config.type)
+		if (inFlight) return inFlight
+
+		const promise = this.startInternal(config, sessionId, workspaceDir, preferredPort)
+		this.startInFlight.set(config.type, promise)
+		try {
+			return await promise
+		} finally {
+			this.startInFlight.delete(config.type)
+		}
+	}
+
+	private async startInternal(
 		config: ServiceConfig,
 		sessionId: SessionId,
 		workspaceDir?: string,
@@ -227,6 +270,9 @@ export class ServiceExecutor {
 
 		const logs = new RingBuffer(logBufferSize)
 		const startTime = Date.now()
+		// Set when the child reports a port bind-conflict; read by the close handler
+		// to decide between a fresh-port retry and a terminal failure.
+		let portConflictDetected = false
 
 		const entry: RunningService = {
 			config,
@@ -240,6 +286,9 @@ export class ServiceExecutor {
 
 		const processLine = (line: string) => {
 			logs.push(line)
+			if (PORT_CONFLICT_PATTERN.test(line)) {
+				portConflictDetected = true
+			}
 			const current = this.services.get(config.type)
 			if (!current || current.process !== child) return
 
@@ -252,6 +301,7 @@ export class ServiceExecutor {
 				if (readyRegex.test(line)) {
 					current.status = 'ready'
 					if (startupTimer) clearTimeout(startupTimer)
+					this.portConflictRetries.delete(config.type)
 					const startupDurationMs = Date.now() - startTime
 					this.notifyStatusChanged(sessionId, config.type, 'ready', current.port)
 					this.logger.info('Service ready', {
@@ -327,6 +377,28 @@ export class ServiceExecutor {
 				current.status = 'stopped'
 				this.notifyStatusChanged(sessionId, config.type, 'stopped')
 			} else if (current.status === 'starting' || current.status === 'ready') {
+				const retries = this.portConflictRetries.get(config.type) ?? 0
+				if (portConflictDetected && retries < MAX_PORT_CONFLICT_RETRIES) {
+					// The chosen port is held by a foreign process (e.g. a service
+					// leaked from another session, or a survivor of a previous boot).
+					// Re-allocate a fresh port and retry so the service recovers on a
+					// different port instead of wedging on the occupied one. The
+					// conflicted port stays reserved in the pool — it is physically in
+					// use, so releasing it would let a later allocation hand it out and
+					// collide again — while we drop only our type→port pin so the retry
+					// picks a new one.
+					this.portConflictRetries.set(config.type, retries + 1)
+					this.logger.warn('Service port in use — re-allocating to a fresh port', {
+						serviceType: config.type,
+						conflictedPort: current.port,
+						attempt: retries + 1,
+					})
+					this.allocatedPorts.delete(config.type)
+					this.services.delete(config.type)
+					void this.start(config, sessionId, workspaceDir)
+					return
+				}
+
 				// Unexpected exit
 				current.status = 'failed'
 				const errorMsg = `Process exited unexpectedly with code ${code}`
@@ -335,6 +407,7 @@ export class ServiceExecutor {
 					serviceType: config.type,
 					code,
 				})
+				this.portConflictRetries.delete(config.type)
 			}
 		})
 

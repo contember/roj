@@ -1,13 +1,20 @@
 import { afterEach, describe, expect, it } from 'bun:test'
+import { readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { MemoryEventStore } from '~/core/events/memory.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
+import { SessionId } from '~/core/sessions/schema.js'
 import { ToolCallId } from '~/core/tools/schema.js'
+import { silentLogger } from '~/lib/logger/logger.js'
+import { createNodePlatform } from '~/testing/node-platform.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 import { serviceEvents, servicePlugin } from './plugin.js'
 import type { ServiceAgentConfig, ServicePluginConfig } from './plugin.js'
 import { PortPool } from './port-pool.js'
-import type { ServiceConfig, ServiceEntry } from './schema.js'
+import type { ServiceConfig, ServiceEntry, ServiceStatus } from './schema.js'
+import { ServiceExecutor } from './service.js'
 
 // ============================================================================
 // Test Service Configs
@@ -590,6 +597,89 @@ describe('services plugin', () => {
 			const events = await session.getEventsByType(serviceEvents, 'service_status_changed')
 			const stoppedEvent = events.find((e) => e.serviceType === 'quick' && e.toStatus === 'stopped')
 			expect(stoppedEvent).toBeDefined()
+		})
+	})
+
+	// =========================================================================
+	// Port conflict recovery + concurrent start (ServiceExecutor unit-level)
+	// =========================================================================
+
+	describe('port conflict recovery and concurrent start', () => {
+		const waitUntil = async (predicate: () => boolean, timeoutMs = 8000): Promise<void> => {
+			const deadline = Date.now() + timeoutMs
+			while (Date.now() < deadline) {
+				if (predicate()) return
+				await new Promise((r) => setTimeout(r, 20))
+			}
+		}
+
+		it('collapses concurrent start() calls onto a single process', async () => {
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: platform.process })
+			const marker = join(tmpdir(), `roj-svc-mutex-${Date.now()}-${Math.floor(Math.random() * 1e6)}`)
+			const config: ServiceConfig = {
+				type: 'concurrent',
+				description: 'appends one line per spawned process',
+				command: `echo spawned >> ${marker} && sleep 30`,
+			}
+
+			try {
+				const [r1, r2] = await Promise.all([
+					executor.start(config, SessionId('s-concurrent')),
+					executor.start(config, SessionId('s-concurrent')),
+				])
+				expect(r1.ok).toBe(true)
+				expect(r2.ok).toBe(true)
+
+				// Let the shell flush its append.
+				await new Promise((r) => setTimeout(r, 400))
+				const lines = (await readFile(marker, 'utf-8')).split('\n').filter((l) => l.length > 0)
+				// Without the in-flight lock both starts spawn and the file gets two lines.
+				expect(lines.length).toBe(1)
+			} finally {
+				await executor.shutdown()
+				await rm(marker, { force: true })
+			}
+		})
+
+		it('recovers on a fresh port when the chosen port is in use (EADDRINUSE)', async () => {
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: platform.process })
+			const marker = join(tmpdir(), `roj-svc-eaddr-${Date.now()}-${Math.floor(Math.random() * 1e6)}`)
+			// First spawn fails with an EADDRINUSE-style message; the marker makes the
+			// retry (a fresh process) succeed and match the ready pattern.
+			const config: ServiceConfig = {
+				type: 'flaky-port',
+				description: 'EADDRINUSE on first attempt, ready on retry',
+				command:
+					`if [ -f ${marker} ]; then echo "listening READY"; sleep 30; else touch ${marker}; echo "error: listen EADDRINUSE: address already in use" 1>&2; exit 1; fi`,
+				readyPattern: 'READY',
+				startupTimeoutMs: 5000,
+			}
+
+			const observed: Array<{ status: ServiceStatus; port?: number }> = []
+			executor.onStatusChanged = (_sessionId, _serviceType, status, port) => {
+				observed.push({ status, port })
+			}
+
+			try {
+				const result = await executor.start(config, SessionId('s-flaky'))
+				expect(result.ok).toBe(true)
+
+				await waitUntil(() => executor.getStatus('flaky-port') === 'ready')
+				expect(executor.getStatus('flaky-port')).toBe('ready')
+
+				// Two 'starting' events: the conflicted port, then a fresh, different one.
+				const startingPorts = observed.filter((e) => e.status === 'starting').map((e) => e.port)
+				expect(startingPorts.length).toBe(2)
+				expect(startingPorts[0]).not.toBe(startingPorts[1])
+
+				// The transient EADDRINUSE must NOT surface as a terminal failure.
+				expect(observed.some((e) => e.status === 'failed')).toBe(false)
+			} finally {
+				await executor.shutdown()
+				await rm(marker, { force: true })
+			}
 		})
 	})
 })
