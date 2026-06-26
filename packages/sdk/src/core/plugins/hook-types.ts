@@ -41,6 +41,15 @@ export type OnErrorResult =
 
 export type OnPauseResult = null
 
+/**
+ * Result of a `beforeMethod` session hook — lets a plugin veto a plugin-method
+ * call before its handler runs (e.g. a budget guard blocking new user messages
+ * while allowing internal agent-to-agent calls).
+ */
+export type BeforeMethodResult =
+	| null
+	| { action: 'deny'; reason: string }
+
 export type HandlerName =
 	| 'onStart'
 	| 'beforeInference'

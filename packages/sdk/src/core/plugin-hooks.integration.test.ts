@@ -4,7 +4,9 @@ import { MockLLMProvider } from '~/core/llm/mock.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { toolEvents } from '~/core/tools/state.js'
+import { Ok } from '~/lib/utils/result.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
+import z from 'zod/v4'
 
 describe('core: plugin hooks', () => {
 	// =========================================================================
@@ -372,6 +374,80 @@ describe('core: plugin hooks', () => {
 			expect(calls).toContain('onSessionClose')
 
 			await harness.shutdown()
+		})
+
+		describe('beforeMethod', () => {
+			it('returning { action: "deny" } → method call rejected and handler not run', async () => {
+				let handlerCalls = 0
+				const seenMethods: string[] = []
+
+				const gatedPlugin = definePlugin('gated')
+					.method('blocked', {
+						input: z.object({}),
+						output: z.object({ ok: z.boolean() }),
+						handler: async () => {
+							handlerCalls++
+							return Ok({ ok: true })
+						},
+					})
+					.sessionHook('beforeMethod', async (ctx) => {
+						seenMethods.push(ctx.method)
+						if (ctx.method === 'gated.blocked') {
+							return { action: 'deny', reason: 'blocked by test' }
+						}
+						return null
+					})
+					.build()
+
+				const harness = new TestHarness({
+					presets: [createTestPreset()],
+					llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+					systemPlugins: [gatedPlugin],
+				})
+
+				const session = await harness.createSession('test')
+				const result = await session.callPluginMethod('gated.blocked', {})
+
+				expect(result.ok).toBe(false)
+				if (!result.ok) {
+					expect(result.error.type).toBe('method_denied')
+					expect(result.error.message).toBe('blocked by test')
+				}
+				expect(handlerCalls).toBe(0)
+				expect(seenMethods).toContain('gated.blocked')
+
+				await harness.shutdown()
+			})
+
+			it('returning null → method call proceeds to the handler', async () => {
+				let handlerCalls = 0
+
+				const gatedPlugin = definePlugin('gated')
+					.method('allowed', {
+						input: z.object({}),
+						output: z.object({ ok: z.boolean() }),
+						handler: async () => {
+							handlerCalls++
+							return Ok({ ok: true })
+						},
+					})
+					.sessionHook('beforeMethod', async () => null)
+					.build()
+
+				const harness = new TestHarness({
+					presets: [createTestPreset()],
+					llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+					systemPlugins: [gatedPlugin],
+				})
+
+				const session = await harness.createSession('test')
+				const result = await session.callPluginMethod('gated.allowed', {})
+
+				expect(result.ok).toBe(true)
+				expect(handlerCalls).toBe(1)
+
+				await harness.shutdown()
+			})
 		})
 	})
 

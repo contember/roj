@@ -12,7 +12,7 @@ import { COMMUNICATOR_ROLE, ORCHESTRATOR_ROLE } from '~/core/agents/agent-roles.
 import { AgentId, generateAgentId } from '~/core/agents/schema.js'
 import type { AgentState } from '~/core/agents/state.js'
 import { agentEvents, getChildren } from '~/core/agents/state.js'
-import { AgentErrors, type DomainError, SessionErrors, ValidationErrors } from '~/core/errors.js'
+import { AgentErrors, type DomainError, MethodErrors, SessionErrors, ValidationErrors } from '~/core/errors.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import type { LLMLogger } from '~/core/llm/logger.js'
@@ -476,6 +476,29 @@ export class Session {
 		const parsed = methodDef.input.safeParse(input)
 		if (!parsed.success) {
 			return Err(ValidationErrors.invalid(`Invalid input for ${method}: ${parsed.error.message}`))
+		}
+
+		// beforeMethod gate — any plugin may veto this call before the handler runs
+		// (e.g. a budget guard blocking new user input). The hook receives `caller`,
+		// so a gate can allow internal AGENT_CALLER traffic (agent-to-agent) while
+		// denying external/user-originated calls. First deny wins.
+		for (const gatePlugin of this.plugins) {
+			if (!gatePlugin.sessionHooks?.beforeMethod) continue
+			try {
+				const gateCtx = {
+					...this.buildSessionHookContext(gatePlugin),
+					caller: caller ?? DEFAULT_CALLER,
+					method,
+					input: parsed.data,
+					agentId,
+				}
+				const gate = await gatePlugin.sessionHooks.beforeMethod(gateCtx)
+				if (gate?.action === 'deny') {
+					return Err(MethodErrors.denied(gate.reason))
+				}
+			} catch (err) {
+				this.logger.error(`Plugin '${gatePlugin.name}' beforeMethod hook failed`, err instanceof Error ? err : undefined, { method })
+			}
 		}
 
 		// Build MethodHandlerContext with plugin state, context, scheduleAgent, notify, and deps

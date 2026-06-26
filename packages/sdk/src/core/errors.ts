@@ -53,3 +53,8 @@ export const PresetErrors = {
 export const ValidationErrors = {
 	invalid: (message: string) => createDomainError('validation_error', message, 400),
 }
+
+export const MethodErrors = {
+	/** A `beforeMethod` plugin hook denied the call (e.g. a budget guard blocking new user input). */
+	denied: (message: string) => createDomainError('method_denied', message, 403),
+}

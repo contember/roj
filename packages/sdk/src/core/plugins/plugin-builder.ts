@@ -27,6 +27,7 @@ import type {
 	AfterInferenceResult,
 	AfterToolCallResult,
 	BeforeInferenceResult,
+	BeforeMethodResult,
 	BeforeToolCallResult,
 	OnCompleteResult,
 	OnErrorResult,
@@ -237,6 +238,7 @@ type HookMap<TCtx> = {
 type SessionHookMap<TCtx> = {
 	onSessionReady: (ctx: TCtx) => Promise<void>
 	onSessionClose: (ctx: TCtx) => Promise<void>
+	beforeMethod: (ctx: TCtx & { method: string; input: unknown; agentId?: AgentId }) => Promise<BeforeMethodResult>
 }
 
 // ============================================================================
@@ -311,6 +313,7 @@ type ErasedAgentHookMap = {
 type ErasedSessionHookMap = {
 	onSessionReady: (ctx: BaseSessionHookContext) => Promise<void>
 	onSessionClose: (ctx: BaseSessionHookContext) => Promise<void>
+	beforeMethod: (ctx: BaseSessionHookContext & { method: string; input: unknown; agentId?: AgentId }) => Promise<BeforeMethodResult>
 }
 
 // ============================================================================
@@ -811,11 +814,13 @@ function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): Confi
 		) as Partial<ErasedAgentHookMap>
 		: undefined
 
-	const sessionHookEntries = Object.entries(cfg.sessionHooks)
+	const sessionHookEntries = Object.entries(cfg.sessionHooks) as [string, (ctx: BaseSessionHookContext) => Promise<unknown>][]
 	const sessionHooks: Partial<ErasedSessionHookMap> | undefined = sessionHookEntries.length > 0
 		? Object.fromEntries(
 			sessionHookEntries.map(([name, fn]) => [
 				name,
+				// Session.ts provides the full context with extra fields (method, input,
+				// agentId for beforeMethod) — this wrapper just injects pluginConfig.
 				(ctx: BaseSessionHookContext) => fn({ ...ctx, pluginConfig }),
 			]),
 		) as Partial<ErasedSessionHookMap>
