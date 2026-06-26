@@ -501,4 +501,68 @@ describe('core: plugin hooks', () => {
 			await harness.shutdown()
 		})
 	})
+
+	// =========================================================================
+	// beforeDequeue gate
+	// =========================================================================
+
+	describe('beforeDequeue', () => {
+		it('holding a source → messages do not wake the agent, and are re-delivered (not dropped) once released', async () => {
+			let holding = true
+
+			const gatePlugin = definePlugin('budget-gate')
+				.beforeDequeue((ctx) => {
+					if (holding && ctx.sourcePlugin === 'user-chat') {
+						return { action: 'hold' }
+					}
+					return null
+				})
+				.build()
+
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				systemPlugins: [gatePlugin],
+			})
+
+			const session = await harness.createSession('test')
+
+			// Held: the user message is queued but must not trigger an inference.
+			await session.sendMessage('first')
+			await new Promise((r) => setTimeout(r, 50))
+			expect(harness.llmProvider.getLastRequest()).toBeUndefined()
+
+			// Released: a new message wakes the agent; the held 'first' must be
+			// re-delivered alongside 'second' (held, not dropped).
+			holding = false
+			await session.sendAndWaitForIdle('second')
+
+			const req = harness.llmProvider.getLastRequest()
+			expect(req).toBeDefined()
+			const serialized = JSON.stringify(req!.messages)
+			expect(serialized).toContain('first')
+			expect(serialized).toContain('second')
+
+			await harness.shutdown()
+		})
+
+		it('returning null → messages flow through normally', async () => {
+			const gatePlugin = definePlugin('budget-gate')
+				.beforeDequeue(() => null)
+				.build()
+
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				systemPlugins: [gatePlugin],
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('hello')
+
+			expect(harness.llmProvider.getLastRequest()).toBeDefined()
+
+			await harness.shutdown()
+		})
+	})
 })

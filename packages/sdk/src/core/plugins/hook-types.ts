@@ -50,6 +50,17 @@ export type BeforeMethodResult =
 	| null
 	| { action: 'deny'; reason: string }
 
+/**
+ * Result of a `beforeDequeue` hook — lets a plugin HOLD (not deliver) the
+ * pending messages of a given source plugin for the current cycle. Held
+ * messages stay queued (not consumed) and are re-delivered on a later cycle —
+ * e.g. a budget guard holding new user/upload input while letting inter-agent
+ * mailbox traffic through so running agents can finish.
+ */
+export type BeforeDequeueResult =
+	| null
+	| { action: 'hold' }
+
 export type HandlerName =
 	| 'onStart'
 	| 'beforeInference'

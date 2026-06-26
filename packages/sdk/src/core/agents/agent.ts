@@ -1606,7 +1606,25 @@ export class Agent {
 		for (const plugin of this.plugins) {
 			if (!plugin.dequeue) continue
 			const ctx = this.buildPluginHookContext(plugin, agentContext)
-			if (plugin.dequeue.hasPendingMessages(ctx)) return true
+			if (!plugin.dequeue.hasPendingMessages(ctx)) continue
+			// A beforeDequeue gate may hold this source's messages — held messages
+			// must not count as work, or the agent would wake with nothing to do.
+			if (this.isDequeueHeld(plugin.name, agentContext)) continue
+			return true
+		}
+		return false
+	}
+
+	/**
+	 * Run all plugins' beforeDequeue gates for a source plugin's pending messages.
+	 * Returns true if any gate holds them — held messages stay queued (not
+	 * consumed) and are re-delivered on a later cycle.
+	 */
+	private isDequeueHeld(sourcePlugin: string, agentContext: AgentContext): boolean {
+		for (const plugin of this.plugins) {
+			if (!plugin.beforeDequeue) continue
+			const ctx = { ...this.buildPluginHookContext(plugin, agentContext), sourcePlugin }
+			if (plugin.beforeDequeue(ctx)?.action === 'hold') return true
 		}
 		return false
 	}
@@ -1632,6 +1650,9 @@ export class Agent {
 
 		for (const plugin of this.plugins) {
 			if (!plugin.dequeue) continue
+			// Skip sources held by a beforeDequeue gate — not collected means not
+			// consumed, so the messages stay queued for a later cycle.
+			if (this.isDequeueHeld(plugin.name, agentContext)) continue
 			const ctx = this.buildPluginHookContext(plugin, agentContext)
 			const result = plugin.dequeue.getPendingMessages(ctx)
 			if (result) {

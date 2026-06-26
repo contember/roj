@@ -26,6 +26,7 @@ import type { ToolCall } from '../tools/schema.js'
 import type {
 	AfterInferenceResult,
 	AfterToolCallResult,
+	BeforeDequeueResult,
 	BeforeInferenceResult,
 	BeforeMethodResult,
 	BeforeToolCallResult,
@@ -354,6 +355,8 @@ export interface ConfiguredPlugin {
 		getPendingMessages: (ctx: BasePluginHookContext) => PluginPendingMessages | null
 		markConsumed: (ctx: BasePluginHookContext, token: unknown) => Promise<void>
 	}
+	/** Gate run before delivering another plugin's dequeued messages — return 'hold' to keep them queued this cycle. */
+	beforeDequeue?: (ctx: BasePluginHookContext & { sourcePlugin: string }) => BeforeDequeueResult
 	slice?: StateSlice
 	isEnabled?: (ctx: { pluginConfig: unknown; pluginAgentConfig: unknown; agentConfig: AgentConfig }) => boolean
 	isSessionEnabled?: (ctx: { pluginConfig: unknown }) => boolean
@@ -446,6 +449,7 @@ interface BuilderConfig {
 		getPendingMessages: (ctx: BasePluginHookContext) => PluginPendingMessages | null
 		markConsumed: (ctx: BasePluginHookContext, token: unknown) => Promise<void>
 	} | undefined
+	beforeDequeueFn: ((ctx: BasePluginHookContext & { sourcePlugin: string }) => BeforeDequeueResult) | undefined
 }
 
 // ============================================================================
@@ -489,6 +493,7 @@ export class PluginBuilder<
 			sessionHooks: {},
 			isEnabledFn: undefined,
 			dequeueHook: undefined,
+			beforeDequeueFn: undefined,
 		}
 	}
 
@@ -751,6 +756,20 @@ export class PluginBuilder<
 		return this
 	}
 
+	/**
+	 * Gate the delivery of OTHER plugins' dequeued messages. Runs once per source
+	 * plugin that has pending messages, before they wake the agent; return
+	 * `{ action: 'hold' }` to keep that source's messages queued this cycle
+	 * (re-delivered later). `ctx.sourcePlugin` is the name of the plugin whose
+	 * messages are being considered.
+	 */
+	beforeDequeue(
+		fn: (ctx: PluginHookContext<TConfig, TMethods, TAgentConfig, TContext, TState, TNotifications, TDeps> & { sourcePlugin: string }) => BeforeDequeueResult,
+	): this {
+		this._cfg.beforeDequeueFn = fn as BuilderConfig['beforeDequeueFn']
+		return this
+	}
+
 	// --- Build ---
 
 	build(): PluginDefinition<TName, TConfig, TAgentConfig, TManagerMethods, TMethods> {
@@ -877,6 +896,11 @@ function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): Confi
 		}
 		: undefined
 
+	const beforeDequeueFn = cfg.beforeDequeueFn
+	const wrappedBeforeDequeue = beforeDequeueFn
+		? (ctx: BasePluginHookContext & { sourcePlugin: string }) => beforeDequeueFn({ ...ctx, pluginConfig })
+		: undefined
+
 	// Wrap isEnabled to pass pluginConfig
 	const wrappedIsEnabled = cfg.isEnabledFn
 		? (ctx: { pluginConfig: unknown; pluginAgentConfig: unknown; agentConfig: AgentConfig }) => {
@@ -921,6 +945,7 @@ function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): Confi
 		getStatus: wrappedStatus,
 		getSystemPrompt: wrappedSystemPrompt,
 		dequeue: wrappedDequeue,
+		beforeDequeue: wrappedBeforeDequeue,
 		slice,
 		isEnabled: wrappedIsEnabled,
 		isSessionEnabled: wrappedIsSessionEnabled,
