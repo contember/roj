@@ -12,6 +12,8 @@ import type {
 	CreateSessionInput,
 	CreateSessionOutput,
 	ListSessionsOutput,
+	SessionUsageInput,
+	SessionUsageOutput,
 	PublishSessionInput,
 	PublishSessionOutput,
 	CreateInstanceTokenInput,
@@ -58,6 +60,12 @@ export interface RojClient {
 	sessions: {
 		create(input: CreateSessionInput): Promise<CreateSessionOutput>
 		list(instanceId: string): Promise<ListSessionsOutput>
+		/**
+		 * Poll cumulative cost/usage for the caller's own sessions. All filters are
+		 * optional and scoped to the API key's organization. Reads the platform's
+		 * `session_stats` rollup (~30s freshness).
+		 */
+		usage(input: SessionUsageInput): Promise<SessionUsageOutput>
 		publish(input: PublishSessionInput): Promise<PublishSessionOutput>
 		/**
 		 * Call a plugin/session RPC method on a running session.
@@ -182,6 +190,7 @@ export function createRojClient(options: RojClientOptions): RojClient {
 		sessions: {
 			create: (input) => call('sessions.create', input),
 			list: (instanceId) => call('sessions.list', { instanceId }),
+			usage: (input) => call('sessions.usage', input),
 			publish: (input) => call('sessions.publish', input),
 			rpc: (input) => callSessionRpc(input),
 		},

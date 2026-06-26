@@ -158,6 +158,36 @@ export interface PublishSessionOutput {
 	error?: string
 }
 
+/**
+ * Cumulative cost/usage poll for the caller's own sessions. Read straight from
+ * the platform's `session_stats` rollup (refreshed by the DO alarm tick, ~30s
+ * freshness). All filters are optional and intersect; results are always scoped
+ * to the caller's organization, so a session id from another org is never
+ * returned even if passed in `sessionIds`.
+ */
+export interface SessionUsageInput {
+	/** Restrict to these session ids. */
+	sessionIds?: string[]
+	/** Restrict to these instance (project) ids. */
+	instanceIds?: string[]
+	/** Restrict to a single session status (e.g. `active`). */
+	status?: string
+	/** Epoch-ms lower bound on `updatedAt` — only sessions touched at or after this are returned. */
+	since?: number
+}
+
+export interface SessionUsageOutput {
+	usage: Array<{
+		sessionId: string
+		instanceId: string
+		status: string
+		totalCostUsd: number
+		totalTokens: number
+		updatedAt: number
+		createdAt: number
+	}>
+}
+
 // ============================================================================
 // Token methods
 // ============================================================================
@@ -373,6 +403,7 @@ export const platformMethods = defineMethods({
 	// Sessions
 	'sessions.create': method<CreateSessionInput, CreateSessionOutput>(),
 	'sessions.list': method<ListSessionsInput, ListSessionsOutput>(),
+	'sessions.usage': method<SessionUsageInput, SessionUsageOutput>(),
 	'sessions.publish': method<PublishSessionInput, PublishSessionOutput>(),
 
 	// Tokens
