@@ -27,6 +27,16 @@ export interface ServiceCommandArgs {
 }
 
 /**
+ * Arguments passed to a `cwd` resolver callback. Resolved lazily at service
+ * start, so the callback can inspect the (by-then-populated) workspace — e.g.
+ * to locate the web app inside a monorepo before launching the dev server.
+ */
+export interface ServiceCwdArgs {
+	/** Absolute path of the session workspace directory. */
+	workspaceDir: string
+}
+
+/**
  * Service configuration declared inline in presets.
  * Defines how to spawn and monitor a background process.
  */
@@ -37,8 +47,16 @@ export interface ServiceConfig {
 	description: string
 	/** Shell command to run, or a callback receiving allocated port */
 	command: string | ((args: ServiceCommandArgs) => string)
-	/** Working directory (defaults to workspace dir) */
-	cwd?: string
+	/**
+	 * Working directory (defaults to the workspace dir).
+	 *
+	 * A string is resolved relative to the workspace dir (absolute paths are
+	 * used as-is). A callback is invoked at service start with the workspace
+	 * dir, so the directory can be detected lazily once the workspace is
+	 * populated (e.g. the web package inside a monorepo); its return value is
+	 * resolved the same way.
+	 */
+	cwd?: string | ((args: ServiceCwdArgs) => string | Promise<string>)
 	/** Additional environment variables */
 	env?: Record<string, string>
 	/** Start automatically with session (default: false) */

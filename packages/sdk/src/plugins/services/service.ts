@@ -6,6 +6,7 @@
  * Ports are allocated from a global PortPool and injected via PORT env var.
  */
 
+import { resolve } from 'node:path'
 import type { SessionId } from '~/core/sessions/schema.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
@@ -224,7 +225,17 @@ export class ServiceExecutor {
 			this.allocatedPorts.set(config.type, port)
 		}
 
-		const cwd = config.cwd ?? workspaceDir
+		// Resolve cwd: a callback is invoked lazily at start (the workspace is
+		// populated by now), a string is used directly. Either result is resolved
+		// against the workspace dir so a relative path (e.g. 'packages/web' for a
+		// monorepo) lands inside this session's worktree; absolute paths pass through.
+		let cwd = workspaceDir
+		if (config.cwd !== undefined) {
+			const raw = typeof config.cwd === 'function'
+				? await config.cwd({ workspaceDir: workspaceDir ?? process.cwd() })
+				: config.cwd
+			cwd = workspaceDir ? resolve(workspaceDir, raw) : resolve(raw)
+		}
 		const logBufferSize = config.logBufferSize ?? 200
 		const startupTimeoutMs = config.startupTimeoutMs ?? 30_000
 
