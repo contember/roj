@@ -7,8 +7,9 @@ import type { LLMLogger } from '~/core/llm/logger.js'
 import { LoggingLLMProvider } from '~/core/llm/logging-provider.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import type { MockInferenceHandler } from '~/core/llm/mock.js'
-import type { PluginDefinition, PluginNotification } from '~/core/plugins/plugin-builder.js'
+import type { CallerContext, PluginDefinition, PluginNotification } from '~/core/plugins/plugin-builder.js'
 import type { Preset } from '~/core/preset/index.js'
+import { selectPluginState } from '~/core/sessions/reducer.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import { SessionManager } from '~/core/sessions/session-manager.js'
 import type { Session } from '~/core/sessions/session.js'
@@ -17,12 +18,18 @@ import { ToolExecutor } from '~/core/tools/executor.js'
 import { silentLogger } from '~/lib/logger/logger.js'
 import { createNodePlatform } from './node-platform.js'
 import type { Result } from '~/lib/utils/result.js'
+import { agentStatusPlugin } from '~/plugins/agent-status/plugin.js'
 import { agentsPlugin } from '~/plugins/agents/plugin.js'
 import { filesystemPlugin } from '~/plugins/filesystem/index.js'
+import { gitStatusPlugin } from '~/plugins/git-status/index.js'
 import { llmDebugPlugin } from '~/plugins/llm-debug/plugin.js'
 import { logsPlugin } from '~/plugins/logs/index.js'
 import { mailboxPlugin } from '~/plugins/mailbox/plugin.js'
+import { resourcesPlugin } from '~/plugins/resources/plugin.js'
+import { servicePlugin } from '~/plugins/services/plugin.js'
 import { presetsPlugin, sessionLifecyclePlugin } from '~/plugins/session-lifecycle/index.js'
+import { sessionStatsPlugin } from '~/plugins/session-stats/index.js'
+import { sessionStatePlugin } from '~/plugins/session-state/plugin.js'
 import { uploadsPlugin } from '~/plugins/uploads/plugin.js'
 import { userChatPlugin } from '~/plugins/user-chat/plugin.js'
 import { NotificationCollector } from './notification-collector.js'
@@ -36,12 +43,27 @@ const defaultSystemPlugins: readonly PluginDefinition<string, any, any, any, any
 	presetsPlugin,
 	mailboxPlugin,
 	agentsPlugin,
+	agentStatusPlugin,
 	userChatPlugin,
 	uploadsPlugin,
+	resourcesPlugin,
 	llmDebugPlugin,
+	servicePlugin,
 	filesystemPlugin,
 	logsPlugin,
+	sessionStatsPlugin,
+	sessionStatePlugin,
+	gitStatusPlugin,
 ]
+
+const mergeSystemPlugins = <TPlugin extends { name: string }>(plugins: readonly TPlugin[]): TPlugin[] => {
+	const seen = new Set<string>()
+	return plugins.filter(plugin => {
+		if (seen.has(plugin.name)) return false
+		seen.add(plugin.name)
+		return true
+	})
+}
 
 /**
  * TestHarness — boots a real SessionManager with MemoryEventStore,
@@ -116,7 +138,7 @@ export class TestHarness {
 			onUserOutput: (n: PluginNotification) => this.notifications.push(n),
 			llmLogger: options.llmLogger,
 			platform,
-			systemPlugins: [...defaultSystemPlugins, ...(options.systemPlugins ?? [])],
+			systemPlugins: mergeSystemPlugins([...defaultSystemPlugins, ...(options.systemPlugins ?? [])]),
 		})
 	}
 
@@ -233,6 +255,13 @@ export class TestSession {
 	}
 
 	/**
+	 * Read a plugin-owned state slice from the live session state.
+	 */
+	getPluginState<TState = unknown>(key: string): TState | undefined {
+		return selectPluginState<TState>(this.session.state, key)
+	}
+
+	/**
 	 * Get the current session state.
 	 */
 	get state(): SessionState {
@@ -259,8 +288,12 @@ export class TestSession {
 	/**
 	 * Call a plugin method on the underlying session.
 	 */
-	async callPluginMethod(method: string, input: unknown): Promise<Result<unknown, DomainError>> {
-		return this.session.callPluginMethod(method, input)
+	async callPluginMethod(
+		method: string,
+		input: unknown,
+		options?: { agentId?: AgentId; caller?: CallerContext },
+	): Promise<Result<unknown, DomainError>> {
+		return this.session.callPluginMethod(method, input, options?.agentId, options?.caller)
 	}
 
 	/**
