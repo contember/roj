@@ -109,7 +109,7 @@ export type { LoadedSkill } from '~/plugins/skills/schema.js'
 export { todoPlugin } from '~/plugins/todo/plugin.js'
 export type { TodoAgentConfig, TodoPresetConfig } from '~/plugins/todo/plugin.js'
 export { resourcesPlugin } from '~/plugins/resources/plugin.js'
-export type { ResourcesPluginConfig } from '~/plugins/resources/plugin.js'
+export type { ResourcesPluginConfig, ResourcesTargetDir, ResourcesTargetDirArgs } from '~/plugins/resources/plugin.js'
 export { postInjectRules } from '~/plugins/resources/post-inject.js'
 export type {
 	PostInjectContext,
@@ -147,7 +147,13 @@ export type { FileEntry, FileStore } from '~/core/file-store/types.js'
 
 // Service config
 export { PortPool } from '~/plugins/services/port-pool.js'
-export type { ServiceCommandArgs, ServiceConfig } from '~/plugins/services/schema.js'
+export type {
+	ServiceAvailabilityArgs,
+	ServiceCommandArgs,
+	ServiceConfig,
+	ServiceCwdArgs,
+	ServiceStartArgs,
+} from '~/plugins/services/schema.js'
 
 // Session environment
 export type { SessionEnvironment } from '~/core/sessions/session-environment.js'

@@ -42,6 +42,9 @@ export function buildServiceStatusMessage(
 		if (entry?.error) {
 			line += ` (error: ${entry.error})`
 		}
+		if (entry?.cwd) {
+			line += ` (cwd: ${entry.cwd})`
+		}
 
 		lines.push(line)
 	}

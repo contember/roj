@@ -24,6 +24,12 @@ export type ServiceStatus = 'stopped' | 'starting' | 'ready' | 'stopping' | 'fai
  */
 export interface ServiceCommandArgs {
 	port: number
+	/** Session id of the service owner. */
+	sessionId: string
+	/** Absolute path of the session workspace directory, when configured. */
+	workspaceDir?: string
+	/** Resolved working directory that will be passed to the child process. */
+	cwd?: string
 }
 
 /**
@@ -32,8 +38,28 @@ export interface ServiceCommandArgs {
  * to locate the web app inside a monorepo before launching the dev server.
  */
 export interface ServiceCwdArgs {
+	/** Session id of the service owner. */
+	sessionId: string
 	/** Absolute path of the session workspace directory. */
 	workspaceDir: string
+}
+
+/**
+ * Arguments passed to service environment and readiness callbacks.
+ */
+export interface ServiceStartArgs extends ServiceCommandArgs {
+	/** Recently captured service output lines. Empty before the process writes. */
+	logs: readonly string[]
+}
+
+/**
+ * Arguments passed to `availableWhen` before a service is started.
+ */
+export interface ServiceAvailabilityArgs {
+	/** Session id of the service owner. */
+	sessionId: string
+	/** Absolute path of the session workspace directory, when configured. */
+	workspaceDir?: string
 }
 
 /**
@@ -45,8 +71,8 @@ export interface ServiceConfig {
 	type: string
 	/** Human-readable description */
 	description: string
-	/** Shell command to run, or a callback receiving allocated port */
-	command: string | ((args: ServiceCommandArgs) => string)
+	/** Shell command to run, or a callback receiving runtime start context */
+	command: string | ((args: ServiceCommandArgs) => string | Promise<string>)
 	/**
 	 * Working directory (defaults to the workspace dir).
 	 *
@@ -57,12 +83,18 @@ export interface ServiceConfig {
 	 * resolved the same way.
 	 */
 	cwd?: string | ((args: ServiceCwdArgs) => string | Promise<string>)
-	/** Additional environment variables */
-	env?: Record<string, string>
+	/** Additional environment variables, resolved after cwd and before spawn */
+	env?: Record<string, string> | ((args: ServiceCommandArgs) => Record<string, string> | Promise<Record<string, string>>)
+	/** Return false to make start/autoStart skip this service for the current workspace. */
+	availableWhen?: (args: ServiceAvailabilityArgs) => boolean | Promise<boolean>
 	/** Start automatically with session (default: false) */
 	autoStart?: boolean
 	/** Regex pattern to detect "ready" in stdout */
 	readyPattern?: string
+	/** Callback polled until it reports that the service is ready. */
+	readyWhen?: (args: ServiceStartArgs) => boolean | Promise<boolean>
+	/** Poll interval for readyWhen in ms (default: 250) */
+	readyCheckIntervalMs?: number
 	/** SIGTERM→SIGKILL timeout in ms (default: 5000) */
 	gracefulStopMs?: number
 	/** Ring buffer size for log lines (default: 200) */
@@ -86,6 +118,10 @@ export interface ServiceEntry {
 	status: ServiceStatus
 	port?: number
 	error?: string
+	/** Resolved working directory used for the current/last start. */
+	cwd?: string
+	/** Resolved command used for the current/last start. */
+	command?: string
 	startedAt?: number
 	readyAt?: number
 	stoppedAt?: number

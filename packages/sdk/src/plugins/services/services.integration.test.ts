@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test'
-import { readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MemoryEventStore } from '~/core/events/memory.js'
@@ -13,7 +13,7 @@ import { createTestPreset, TestHarness } from '~/testing/index.js'
 import { serviceEvents, servicePlugin } from './plugin.js'
 import type { ServiceAgentConfig, ServicePluginConfig } from './plugin.js'
 import { PortPool } from './port-pool.js'
-import type { ServiceConfig, ServiceEntry, ServiceStatus } from './schema.js'
+import type { ServiceCommandArgs, ServiceConfig, ServiceCwdArgs, ServiceEntry, ServiceStatus } from './schema.js'
 import { ServiceExecutor } from './service.js'
 
 // ============================================================================
@@ -278,6 +278,84 @@ describe('services plugin', () => {
 			const serviceState = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('callback-service')
 			expect(serviceState!.port).toBeGreaterThanOrEqual(10000)
 		})
+
+		it('resolves cwd, command, and env callbacks with runtime context', async () => {
+			const workspaceDir = await mkdtemp(join(tmpdir(), 'roj-svc-runtime-'))
+			const webDir = join(workspaceDir, 'packages', 'web')
+			await mkdir(webDir, { recursive: true })
+
+			let cwdArgs: ServiceCwdArgs | undefined
+			let commandArgs: ServiceCommandArgs | undefined
+			let envArgs: ServiceCommandArgs | undefined
+
+			const runtimeService: ServiceConfig = {
+				type: 'runtime',
+				description: 'Service with runtime resolvers',
+				cwd: (args) => {
+					cwdArgs = args
+					return 'packages/web'
+				},
+				command: async (args) => {
+					commandArgs = args
+					return `printf "%s" "$RUNTIME_MARKER" > marker.txt && echo "READY ${args.port}" && sleep 60`
+				},
+				env: (args) => {
+					envArgs = args
+					return {
+						RUNTIME_MARKER: `${args.sessionId}|${args.workspaceDir}|${args.cwd}|${args.port}`,
+					}
+				},
+				readyPattern: 'READY',
+			}
+
+			try {
+				const portPool = new PortPool()
+				const harness = createServicesHarness({
+					presets: [createServicesPreset([runtimeService], ['runtime'], portPool, { workspaceDir })],
+					llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				})
+
+				const session = await harness.createSession('test')
+				const entryAgentId = session.getEntryAgentId()!
+				const startResult = await session.callPluginMethod('services.start', {
+					sessionId: String(session.sessionId),
+					agentId: String(entryAgentId),
+					serviceType: 'runtime',
+				})
+				expect(startResult.ok).toBe(true)
+				await waitForServiceStatus(session, 'runtime', 'ready')
+
+				const serviceState = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('runtime')
+				expect(cwdArgs?.workspaceDir).toBe(workspaceDir)
+				expect(cwdArgs?.sessionId).toBe(String(session.sessionId))
+				expect(commandArgs?.cwd).toBe(webDir)
+				expect(commandArgs?.workspaceDir).toBe(workspaceDir)
+				expect(envArgs?.cwd).toBe(webDir)
+				expect(serviceState?.cwd).toBe(webDir)
+				expect(serviceState?.command).toContain('RUNTIME_MARKER')
+
+				const marker = await readFile(join(webDir, 'marker.txt'), 'utf-8')
+				expect(marker).toContain(String(session.sessionId))
+				expect(marker).toContain(workspaceDir)
+				expect(marker).toContain(webDir)
+
+				const statusResult = await session.callPluginMethod('services.status', {
+					sessionId: String(session.sessionId),
+					agentId: String(entryAgentId),
+					serviceType: 'runtime',
+				})
+				expect(statusResult).toMatchObject({
+					ok: true,
+					value: {
+						status: 'ready',
+						cwd: webDir,
+						command: serviceState?.command,
+					},
+				})
+			} finally {
+				await rm(workspaceDir, { recursive: true, force: true })
+			}
+		})
 	})
 
 	// =========================================================================
@@ -379,6 +457,35 @@ describe('services plugin', () => {
 			const autoEvents = events.filter((e) => e.serviceType === 'auto-start')
 			expect(autoEvents.length).toBeGreaterThanOrEqual(1)
 		})
+
+		it('availableWhen false skips auto-start and explicit start returns an error', async () => {
+			const unavailableService: ServiceConfig = {
+				type: 'unavailable',
+				description: 'Unavailable service',
+				command: 'sleep 60',
+				autoStart: true,
+				availableWhen: () => false,
+			}
+			const portPool = new PortPool()
+			const harness = createServicesHarness({
+				presets: [createServicesPreset([unavailableService], ['unavailable'], portPool)],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			await new Promise((resolve) => setTimeout(resolve, 100))
+
+			const events = await session.getEventsByType(serviceEvents, 'service_status_changed')
+			expect(events.some((event) => event.serviceType === 'unavailable')).toBe(false)
+
+			const entryAgentId = session.getEntryAgentId()!
+			const result = await session.callPluginMethod('services.start', {
+				sessionId: String(session.sessionId),
+				agentId: String(entryAgentId),
+				serviceType: 'unavailable',
+			})
+			expect(result.ok).toBe(false)
+		})
 	})
 
 	// =========================================================================
@@ -438,6 +545,38 @@ describe('services plugin', () => {
 
 			const serviceState = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('ready-service')
 			expect(serviceState!.status).toBe('ready')
+		})
+
+		it('readyWhen can mark a service ready without output pattern', async () => {
+			let checks = 0
+			const readyWhenService: ServiceConfig = {
+				type: 'ready-when',
+				description: 'Service with callback readiness',
+				command: 'sleep 60',
+				readyWhen: () => {
+					checks += 1
+					return checks > 1
+				},
+				readyCheckIntervalMs: 20,
+				startupTimeoutMs: 1000,
+			}
+			const portPool = new PortPool()
+			const harness = createServicesHarness({
+				presets: [createServicesPreset([readyWhenService], ['ready-when'], portPool)],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			const entryAgentId = session.getEntryAgentId()!
+			const result = await session.callPluginMethod('services.start', {
+				sessionId: String(session.sessionId),
+				agentId: String(entryAgentId),
+				serviceType: 'ready-when',
+			})
+			expect(result.ok).toBe(true)
+
+			await waitForServiceStatus(session, 'ready-when', 'ready')
+			expect(checks).toBeGreaterThan(1)
 		})
 	})
 
@@ -658,8 +797,8 @@ describe('services plugin', () => {
 			}
 
 			const observed: Array<{ status: ServiceStatus; port?: number }> = []
-			executor.onStatusChanged = (_sessionId, _serviceType, status, port) => {
-				observed.push({ status, port })
+			executor.onStatusChanged = (_sessionId, _serviceType, status, details) => {
+				observed.push({ status, port: details.port })
 			}
 
 			try {

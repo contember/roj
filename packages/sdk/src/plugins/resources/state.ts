@@ -10,6 +10,7 @@ export const resourceEvents = createEventsFactory({
 			filename: z4.string(),
 			mimeType: z4.string(),
 			paths: z4.array(z4.string()),
+			targetDir: z4.string().optional(),
 			injectedAt: z4.number(),
 		}),
 	},
@@ -22,6 +23,7 @@ export interface InjectedResource {
 	filename: string
 	mimeType: string
 	paths: string[]
+	targetDir?: string
 	injectedAt: number
 }
 

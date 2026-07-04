@@ -13,7 +13,7 @@ import { Err, Ok } from '~/lib/utils/result.js'
 import type { FileSystem } from '~/platform/fs.js'
 import type { ChildProcess, ProcessRunner } from '~/platform/process.js'
 import type { PortPool } from '~/plugins/services/port-pool.js'
-import type { ServiceConfig, ServiceStatus } from '~/plugins/services/schema.js'
+import type { ServiceConfig, ServiceStartArgs, ServiceStatus } from '~/plugins/services/schema.js'
 import type { ToolError } from '../../core/tools/executor.js'
 import type { Logger } from '../../lib/logger/logger.js'
 import { RingBuffer } from '../../lib/logger/ring-buffer.js'
@@ -57,7 +57,18 @@ interface RunningService {
 	pid: number
 	status: ServiceStatus
 	port: number
+	cwd?: string
+	command: string
 	logs: RingBuffer
+}
+
+export interface ServiceStatusChangeDetails {
+	port?: number
+	error?: string
+	pid?: number
+	pidStartTime?: number
+	cwd?: string
+	command?: string
 }
 
 /** Matches a port bind-conflict across the Node and Bun runtimes. */
@@ -98,10 +109,7 @@ export class ServiceExecutor {
 		sessionId: string,
 		serviceType: string,
 		status: ServiceStatus,
-		port?: number,
-		error?: string,
-		pid?: number,
-		pidStartTime?: number,
+		details: ServiceStatusChangeDetails,
 	) => void
 
 	constructor(logger: Logger, portPool: PortPool, deps: ServiceExecutorDeps) {
@@ -115,14 +123,46 @@ export class ServiceExecutor {
 		sessionId: string,
 		serviceType: string,
 		status: ServiceStatus,
-		port?: number,
-		error?: string,
-		pid?: number,
-		pidStartTime?: number,
+		details: ServiceStatusChangeDetails = {},
 	): void {
-		this.onStatusChanged?.(sessionId, serviceType, status, port, error, pid, pidStartTime)
+		this.onStatusChanged?.(sessionId, serviceType, status, details)
 		if (status === 'ready' || status === 'failed' || status === 'stopped') {
-			this.resolveWaiters(serviceType, status, error)
+			this.resolveWaiters(serviceType, status, details.error)
+		}
+	}
+
+	private async isAvailable(config: ServiceConfig, sessionId: SessionId, workspaceDir?: string): Promise<Result<boolean, ToolError>> {
+		if (!config.availableWhen) return Ok(true)
+
+		try {
+			return Ok(await config.availableWhen({ sessionId: String(sessionId), workspaceDir }))
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error)
+			return Err({ message: `Service '${config.type}' availability check failed: ${message}`, recoverable: true })
+		}
+	}
+
+	private async resolveCwd(config: ServiceConfig, sessionId: SessionId, workspaceDir?: string): Promise<Result<string | undefined, ToolError>> {
+		try {
+			if (typeof config.cwd === 'function') {
+				if (!workspaceDir) {
+					return Err({
+						message: `Service '${config.type}' cwd resolver requires a workspaceDir`,
+						recoverable: true,
+					})
+				}
+				const raw = await config.cwd({ sessionId: String(sessionId), workspaceDir })
+				return Ok(resolve(workspaceDir, raw))
+			}
+
+			if (config.cwd !== undefined) {
+				return Ok(workspaceDir ? resolve(workspaceDir, config.cwd) : resolve(config.cwd))
+			}
+
+			return Ok(workspaceDir)
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error)
+			return Err({ message: `Service '${config.type}' cwd resolver failed: ${message}`, recoverable: true })
 		}
 	}
 
@@ -214,44 +254,74 @@ export class ServiceExecutor {
 			return Ok(undefined)
 		}
 
+		const availability = await this.isAvailable(config, sessionId, workspaceDir)
+		if (!availability.ok) return availability
+		if (!availability.value) {
+			return Err({ message: `Service '${config.type}' is not available in this workspace`, recoverable: true })
+		}
+
 		// Allocate port: reuse session-level allocation, then try preferred, then random
 		let port = this.allocatedPorts.get(config.type)
+		let allocatedNow = false
 		if (port === undefined) {
 			port = this.portPool.allocatePreferred(preferredPort) ?? undefined
 			if (port === undefined) {
-				this.notifyStatusChanged(sessionId, config.type, 'failed', undefined, 'No ports available in pool')
+				this.notifyStatusChanged(sessionId, config.type, 'failed', { error: 'No ports available in pool' })
 				return Err({ message: 'No ports available in pool', recoverable: true })
 			}
 			this.allocatedPorts.set(config.type, port)
+			allocatedNow = true
 		}
 
-		// Resolve cwd: a callback is invoked lazily at start (the workspace is
-		// populated by now), a string is used directly. Either result is resolved
-		// against the workspace dir so a relative path (e.g. 'packages/web' for a
-		// monorepo) lands inside this session's worktree; absolute paths pass through.
-		let cwd = workspaceDir
-		if (config.cwd !== undefined) {
-			const raw = typeof config.cwd === 'function'
-				? await config.cwd({ workspaceDir: workspaceDir ?? process.cwd() })
-				: config.cwd
-			cwd = workspaceDir ? resolve(workspaceDir, raw) : resolve(raw)
+		const cwdResult = await this.resolveCwd(config, sessionId, workspaceDir)
+		if (!cwdResult.ok) {
+			if (allocatedNow) {
+				this.allocatedPorts.delete(config.type)
+				this.portPool.release(port)
+			}
+			this.notifyStatusChanged(sessionId, config.type, 'failed', { port, error: cwdResult.error.message })
+			return cwdResult
 		}
+
+		const cwd = cwdResult.value
 		const logBufferSize = config.logBufferSize ?? 200
 		const startupTimeoutMs = config.startupTimeoutMs ?? 30_000
 
 		const readyRegex = config.readyPattern ? new RegExp(config.readyPattern) : undefined
 
-		// Resolve command: callback gets port, string used as-is
-		const command = typeof config.command === 'function'
-			? config.command({ port })
-			: config.command
+		const startArgs = {
+			port,
+			sessionId: String(sessionId),
+			workspaceDir,
+			cwd,
+		}
+
+		let command: string
+		let serviceEnv: Record<string, string> | undefined
+		try {
+			command = typeof config.command === 'function'
+				? await config.command(startArgs)
+				: config.command
+			serviceEnv = typeof config.env === 'function'
+				? await config.env(startArgs)
+				: config.env
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error)
+			const errorMessage = `Service '${config.type}' start resolver failed: ${message}`
+			if (allocatedNow) {
+				this.allocatedPorts.delete(config.type)
+				this.portPool.release(port)
+			}
+			this.notifyStatusChanged(sessionId, config.type, 'failed', { port, cwd, error: errorMessage })
+			return Err({ message: errorMessage, recoverable: true })
+		}
 
 		const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh'
 		const shellFlag = process.platform === 'win32' ? '/c' : '-c'
 
 		const child = this.processRunner.spawn(shell, [shellFlag, command], {
 			cwd,
-			env: { ...process.env, ...config.env, PORT: String(port) },
+			env: { ...process.env, ...serviceEnv, PORT: String(port) },
 			detached: true,
 			stdio: ['ignore', 'pipe', 'pipe'],
 		})
@@ -263,12 +333,20 @@ export class ServiceExecutor {
 			const current = this.services.get(config.type)
 			if (current && current.process === child && current.status !== 'stopped' && current.status !== 'failed') {
 				current.status = 'failed'
-				this.notifyStatusChanged(sessionId, config.type, 'failed', undefined, error.message)
+				this.notifyStatusChanged(sessionId, config.type, 'failed', {
+					error: error.message,
+					cwd,
+					command,
+				})
 			}
 		})
 
 		if (!child.pid) {
-			this.notifyStatusChanged(sessionId, config.type, 'failed', undefined, 'Failed to spawn process')
+			if (allocatedNow) {
+				this.allocatedPorts.delete(config.type)
+				this.portPool.release(port)
+			}
+			this.notifyStatusChanged(sessionId, config.type, 'failed', { port, cwd, command, error: 'Failed to spawn process' })
 			return Err({ message: 'Failed to spawn service process', recoverable: true })
 		}
 
@@ -276,8 +354,8 @@ export class ServiceExecutor {
 		// "our process" from "an unrelated process that grabbed this PID after ours died"
 		const pidStartTime = await getProcessStartTime(this.fs, child.pid)
 
-		// Emit starting event with PID, port (port is known at allocation time), and start time
-		this.notifyStatusChanged(sessionId, config.type, 'starting', port, undefined, child.pid, pidStartTime)
+		// Emit starting event with PID, port, resolved cwd/command, and start time.
+		this.notifyStatusChanged(sessionId, config.type, 'starting', { port, pid: child.pid, pidStartTime, cwd, command })
 
 		const logs = new RingBuffer(logBufferSize)
 		const startTime = Date.now()
@@ -291,9 +369,69 @@ export class ServiceExecutor {
 			pid: child.pid,
 			status: 'starting',
 			port,
+			cwd,
+			command,
 			logs,
 		}
 		this.services.set(config.type, entry)
+
+		let startupTimer: ReturnType<typeof setTimeout> | undefined
+		let readyCheckTimer: ReturnType<typeof setInterval> | undefined
+		let readyCheckInFlight = false
+
+		const clearReadinessTimers = () => {
+			if (startupTimer) {
+				clearTimeout(startupTimer)
+				startupTimer = undefined
+			}
+			if (readyCheckTimer) {
+				clearInterval(readyCheckTimer)
+				readyCheckTimer = undefined
+			}
+		}
+
+		const markReady = (matchedLine?: string) => {
+			const current = this.services.get(config.type)
+			if (!current || current.process !== child || current.status !== 'starting') return
+
+			current.status = 'ready'
+			clearReadinessTimers()
+			this.portConflictRetries.delete(config.type)
+			const startupDurationMs = Date.now() - startTime
+			this.notifyStatusChanged(sessionId, config.type, 'ready', {
+				port: current.port,
+				cwd: current.cwd,
+				command: current.command,
+			})
+			this.logger.info('Service ready', {
+				serviceType: config.type,
+				port: current.port,
+				startupDurationMs,
+				matchedLine,
+			})
+		}
+
+		const readyArgs = (): ServiceStartArgs => ({
+			...startArgs,
+			logs: logs.toArray(),
+		})
+
+		const checkReadyWhen = async () => {
+			if (!config.readyWhen || readyCheckInFlight) return
+			const current = this.services.get(config.type)
+			if (!current || current.process !== child || current.status !== 'starting') return
+
+			readyCheckInFlight = true
+			try {
+				if (await config.readyWhen(readyArgs())) {
+					markReady()
+				}
+			} catch {
+				// The service may not be reachable yet; keep polling until timeout.
+			} finally {
+				readyCheckInFlight = false
+			}
+		}
 
 		const processLine = (line: string) => {
 			logs.push(line)
@@ -307,27 +445,17 @@ export class ServiceExecutor {
 				this.logger.debug('Service output', { serviceType: config.type, line })
 			}
 
-			// Check for ready pattern
 			if (readyRegex && current.status === 'starting') {
 				if (readyRegex.test(line)) {
-					current.status = 'ready'
-					if (startupTimer) clearTimeout(startupTimer)
-					this.portConflictRetries.delete(config.type)
-					const startupDurationMs = Date.now() - startTime
-					this.notifyStatusChanged(sessionId, config.type, 'ready', current.port)
-					this.logger.info('Service ready', {
-						serviceType: config.type,
-						port: current.port,
-						startupDurationMs,
-						matchedLine: line,
-					})
+					markReady(line)
 				}
 			}
+
+			void checkReadyWhen()
 		}
 
 		// Startup timeout — mark as failed if not ready in time
-		let startupTimer: ReturnType<typeof setTimeout> | undefined
-		if (readyRegex) {
+		if (readyRegex || config.readyWhen) {
 			startupTimer = setTimeout(() => {
 				const current = this.services.get(config.type)
 				if (!current || current.process !== child || current.status !== 'starting') return
@@ -335,7 +463,13 @@ export class ServiceExecutor {
 				current.status = 'failed'
 				const errorMsg = `Service startup timed out after ${startupTimeoutMs}ms`
 				this.logger.error(errorMsg, undefined, { serviceType: config.type })
-				this.notifyStatusChanged(sessionId, config.type, 'failed', undefined, errorMsg)
+				clearReadinessTimers()
+				this.notifyStatusChanged(sessionId, config.type, 'failed', {
+					port: current.port,
+					cwd: current.cwd,
+					command: current.command,
+					error: errorMsg,
+				})
 
 				// Kill the timed-out process
 				try {
@@ -344,6 +478,14 @@ export class ServiceExecutor {
 					// Already gone
 				}
 			}, startupTimeoutMs)
+		}
+
+		if (config.readyWhen) {
+			const intervalMs = config.readyCheckIntervalMs ?? 250
+			readyCheckTimer = setInterval(() => {
+				void checkReadyWhen()
+			}, intervalMs)
+			void checkReadyWhen()
 		}
 
 		// Pipe stdout/stderr line by line
@@ -369,7 +511,7 @@ export class ServiceExecutor {
 
 		// Handle unexpected exit
 		child.on('close', (code) => {
-			if (startupTimer) clearTimeout(startupTimer)
+			clearReadinessTimers()
 			// Flush remaining partial lines
 			if (stdoutPartial) {
 				processLine(stdoutPartial)
@@ -413,7 +555,12 @@ export class ServiceExecutor {
 				// Unexpected exit
 				current.status = 'failed'
 				const errorMsg = `Process exited unexpectedly with code ${code}`
-				this.notifyStatusChanged(sessionId, config.type, 'failed', undefined, errorMsg)
+				this.notifyStatusChanged(sessionId, config.type, 'failed', {
+					port: current.port,
+					cwd: current.cwd,
+					command: current.command,
+					error: errorMsg,
+				})
 				this.logger.warn('Service process exited unexpectedly', {
 					serviceType: config.type,
 					code,
@@ -433,9 +580,8 @@ export class ServiceExecutor {
 		})
 
 		// If no ready pattern, immediately mark as ready
-		if (!readyRegex) {
-			entry.status = 'ready'
-			this.notifyStatusChanged(sessionId, config.type, 'ready', port)
+		if (!readyRegex && !config.readyWhen) {
+			markReady()
 		}
 
 		return Ok(undefined)
@@ -564,7 +710,11 @@ export class ServiceExecutor {
 		}
 
 		entry.status = 'ready'
-		this.notifyStatusChanged(sessionId, config.type, 'ready', entry.port)
+		this.notifyStatusChanged(sessionId, config.type, 'ready', {
+			port: entry.port,
+			cwd: entry.cwd,
+			command: entry.command,
+		})
 
 		this.logger.info('Service resumed', { serviceType: config.type })
 		return Ok(undefined)

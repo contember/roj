@@ -1,4 +1,4 @@
-import { join, relative } from 'node:path'
+import { join, relative, resolve } from 'node:path'
 import z from 'zod/v4'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { Ok } from '~/lib/utils/result.js'
@@ -15,8 +15,16 @@ import { type InjectedResource, resourceEvents, type ResourcesState } from './st
 
 const MAX_LISTED_PATHS = 100
 
+export interface ResourcesTargetDirArgs {
+	sessionId: string
+	sessionDir: string
+	workspaceDir?: string
+}
+
+export type ResourcesTargetDir = string | ((args: ResourcesTargetDirArgs) => string | Promise<string>)
+
 export interface ResourcesPluginConfig {
-	targetDir?: string
+	targetDir?: ResourcesTargetDir
 	/**
 	 * Called after a resource is written/extracted into `targetDir`, before the
 	 * `resource_injected` event is emitted. Use `postInjectRules` for a declarative
@@ -61,6 +69,16 @@ async function listFiles(fs: FileSystem, dir: string, maxEntries: number): Promi
 	return results
 }
 
+async function resolveTargetDir(targetDir: ResourcesTargetDir | undefined, args: ResourcesTargetDirArgs): Promise<string> {
+	const baseDir = args.workspaceDir ?? args.sessionDir
+	if (targetDir === undefined) return baseDir
+
+	const raw = typeof targetDir === 'function'
+		? await targetDir(args)
+		: targetDir
+	return resolve(baseDir, raw)
+}
+
 export const resourcesPlugin = definePlugin('resources')
 	.pluginConfig<ResourcesPluginConfig>()
 	.events([resourceEvents])
@@ -76,6 +94,7 @@ export const resourcesPlugin = definePlugin('resources')
 					filename: event.filename,
 					mimeType: event.mimeType,
 					paths: event.paths,
+					targetDir: event.targetDir,
 					injectedAt: event.injectedAt,
 				}
 				return { resources: [...state.resources, resource] }
@@ -102,7 +121,12 @@ export const resourcesPlugin = definePlugin('resources')
 		handler: async (ctx, input) => {
 			const fs = ctx.platform.fs
 			const exec = makeExec(ctx.platform.process)
-			const targetDir = ctx.pluginConfig?.targetDir ?? ctx.environment.workspaceDir ?? ctx.environment.sessionDir
+			const targetDir = await resolveTargetDir(ctx.pluginConfig?.targetDir, {
+				sessionId: String(ctx.sessionId),
+				sessionDir: ctx.environment.sessionDir,
+				workspaceDir: ctx.environment.workspaceDir,
+			})
+			await fs.mkdir(targetDir, { recursive: true })
 			const resourceId = crypto.randomUUID()
 			let paths: string[]
 
@@ -183,6 +207,7 @@ export const resourcesPlugin = definePlugin('resources')
 				filename: input.filename,
 				mimeType: input.mimeType,
 				paths,
+				targetDir,
 				injectedAt: Date.now(),
 			}))
 
@@ -193,12 +218,16 @@ export const resourcesPlugin = definePlugin('resources')
 		const { resources } = ctx.pluginState
 		if (resources.length === 0) return null
 
-		const targetDir = ctx.pluginConfig?.targetDir ?? ctx.environment.workspaceDir ?? ctx.environment.sessionDir
 		const lines = resources.map(r => {
 			const label = r.name ?? r.slug ?? r.filename
-			return `- **${label}** (${r.filename}): ${r.paths.length} files`
+			const target = r.targetDir ? ` in \`${r.targetDir}\`` : ''
+			return `- **${label}** (${r.filename}): ${r.paths.length} files${target}`
 		})
+		const targetDirs = [...new Set(resources.flatMap((r) => r.targetDir ? [r.targetDir] : []))]
+		const targetSummary = targetDirs.length === 1
+			? `\`${targetDirs[0]}\``
+			: targetDirs.length > 1 ? 'multiple target directories' : 'the configured target directory'
 
-		return `## Injected Resources\n\nThe following resources have been extracted into your workspace (\`${targetDir}\`):\n${lines.join('\n')}\n\nThese files are ready to use. Explore them with the filesystem tools.`
+		return `## Injected Resources\n\nThe following resources have been extracted into your workspace (${targetSummary}):\n${lines.join('\n')}\n\nThese files are ready to use. Explore them with the filesystem tools.`
 	})
 	.build()

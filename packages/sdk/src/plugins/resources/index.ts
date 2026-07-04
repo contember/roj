@@ -1,5 +1,5 @@
 export { resourcesPlugin } from './plugin.js'
-export type { ResourcesPluginConfig } from './plugin.js'
+export type { ResourcesPluginConfig, ResourcesTargetDir, ResourcesTargetDirArgs } from './plugin.js'
 export { postInjectRules } from './post-inject.js'
 export type {
 	PostInjectContext,

@@ -17,6 +17,8 @@ export const serviceEvents = createEventsFactory({
 			toStatus: z.enum(['stopped', 'starting', 'ready', 'stopping', 'failed', 'paused']),
 			port: z.number().optional(),
 			error: z.string().optional(),
+			cwd: z.string().optional(),
+			command: z.string().optional(),
 			pid: z.number().optional(),
 			pidStartTime: z.number().optional(),
 		}),
@@ -58,6 +60,8 @@ export const servicePlugin = definePlugin('services')
 							serviceType: event.serviceType,
 							status: event.toStatus,
 							port: event.port,
+							cwd: event.cwd,
+							command: event.command,
 							startedAt: event.timestamp,
 							pid: event.pid,
 							pidStartTime: event.pidStartTime,
@@ -71,6 +75,8 @@ export const servicePlugin = definePlugin('services')
 							updated.startedAt = event.timestamp
 							updated.error = undefined
 							updated.port = event.port
+							updated.cwd = event.cwd
+							updated.command = event.command
 							updated.pid = event.pid
 							updated.pidStartTime = event.pidStartTime
 						}
@@ -78,6 +84,12 @@ export const servicePlugin = definePlugin('services')
 							updated.readyAt = event.timestamp
 							if (event.port !== undefined) {
 								updated.port = event.port
+							}
+							if (event.cwd !== undefined) {
+								updated.cwd = event.cwd
+							}
+							if (event.command !== undefined) {
+								updated.command = event.command
 							}
 						}
 						if (event.toStatus === 'failed' && event.error) {
@@ -122,17 +134,19 @@ export const servicePlugin = definePlugin('services')
 	})
 	.context(async (ctx, pluginConfig) => {
 		const executor = new ServiceExecutor(ctx.logger, pluginConfig.portPool, { fs: ctx.platform.fs, process: ctx.platform.process })
-		executor.onStatusChanged = (sessionId, serviceType, status, port, error, pid, pidStartTime) => {
+		executor.onStatusChanged = (sessionId, serviceType, status, details) => {
 			void ctx.emitEvent(serviceEvents.create('service_status_changed', {
 				serviceType,
 				toStatus: status,
-				port,
-				error,
-				pid,
-				pidStartTime,
+				port: details.port,
+				error: details.error,
+				cwd: details.cwd,
+				command: details.command,
+				pid: details.pid,
+				pidStartTime: details.pidStartTime,
 			}))
 			// Broadcast service status to connected clients (DO → SPA) via WS
-			ctx.notify('serviceStatus', { sessionId: String(sessionId), serviceType, status, port })
+			ctx.notify('serviceStatus', { sessionId: String(sessionId), serviceType, status, port: details.port })
 		}
 		return { executor }
 	})
@@ -160,7 +174,8 @@ export const servicePlugin = definePlugin('services')
 				}
 
 				const preferredPort = ctx.pluginState.get(input.serviceType)?.port
-				await ctx.pluginContext.executor.start(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, preferredPort)
+				const startResult = await ctx.pluginContext.executor.start(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, preferredPort)
+				if (!startResult.ok) return Err(ValidationErrors.invalid(startResult.error.message))
 				started.push(input.serviceType)
 			} else {
 				for (const svcConfig of ctx.pluginConfig.services) {
@@ -174,7 +189,8 @@ export const servicePlugin = definePlugin('services')
 							}
 						} else {
 							const preferredPort = ctx.pluginState.get(svcConfig.type)?.port
-							await ctx.pluginContext.executor.start(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, preferredPort)
+							const startResult = await ctx.pluginContext.executor.start(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, preferredPort)
+							if (!startResult.ok) return Err(ValidationErrors.invalid(startResult.error.message))
 							started.push(svcConfig.type)
 						}
 					}
@@ -250,6 +266,8 @@ export const servicePlugin = definePlugin('services')
 			serviceType: z.string(),
 			status: z.string(),
 			port: z.number().optional(),
+			cwd: z.string().optional(),
+			command: z.string().optional(),
 			error: z.string().optional(),
 			recentLogs: z.array(z.string()),
 		}),
@@ -262,6 +280,8 @@ export const servicePlugin = definePlugin('services')
 				serviceType: input.serviceType,
 				status: status ?? 'stopped',
 				port: stateEntry?.port,
+				cwd: stateEntry?.cwd,
+				command: stateEntry?.command,
 				error: stateEntry?.error,
 				recentLogs: logsResult.ok ? logsResult.value : [],
 			})
@@ -340,7 +360,10 @@ export const servicePlugin = definePlugin('services')
 				const status = ctx.pluginContext.executor.getStatus(svcConfig.type)
 				if (status !== 'ready' && status !== 'starting') {
 					const preferredPort = ctx.pluginState.get(svcConfig.type)?.port
-					await ctx.pluginContext.executor.start(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, preferredPort)
+					const startResult = await ctx.pluginContext.executor.start(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, preferredPort)
+					if (!startResult.ok) {
+						ctx.logger.debug('Auto-start service skipped', { serviceType: svcConfig.type, error: startResult.error.message })
+					}
 				}
 			}
 		}

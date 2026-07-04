@@ -12,6 +12,7 @@ export type TestAgentDefinition<TInput = unknown> = Omit<AgentDefinition<TInput>
  */
 export function createTestPreset(overrides?: {
 	id?: string
+	workspaceDir?: string
 	orchestratorSystem?: string
 	agents?: TestAgentDefinition[]
 	plugins?: SessionPluginConfig[]
@@ -22,6 +23,7 @@ export function createTestPreset(overrides?: {
 	return {
 		id: overrides?.id ?? 'test',
 		name: 'Test Preset',
+		workspaceDir: overrides?.workspaceDir,
 		orchestrator: {
 			system: overrides?.orchestratorSystem ?? 'You are a test agent.',
 			model: ModelId('mock'),
