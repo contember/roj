@@ -78,10 +78,7 @@ export class ClientConnection<TReceive extends ProtocolDef, TSend extends Protoc
 		this.ws = null
 		this.setState('disconnected')
 
-		if (this.connectReject) {
-			this.connectReject(new Error('Disconnected'))
-			this.clearConnectPromise()
-		}
+		this.rejectConnect(new Error('Disconnected'))
 	}
 
 	getReconnectAttempts(): number {
@@ -120,15 +117,15 @@ export class ClientConnection<TReceive extends ProtocolDef, TSend extends Protoc
 			return
 		}
 
-		if (this.connectReject) {
-			this.connectReject(new Error(`Connection closed: ${code} ${reason}`))
-			this.clearConnectPromise()
-		}
-
-		this.handleConnectionLost()
+		// Don't reject the pending connect() here. With reconnect enabled the initial
+		// connect must stay pending across failed attempts and settle only on open
+		// (resolve) or give-up (reject) — see handleConnectionLost. Rejecting on the
+		// first pre-open close crashed callers that await connect() under an
+		// infinite-reconnect policy.
+		this.handleConnectionLost(new Error(`Connection closed: ${code} ${reason}`))
 	}
 
-	protected override handleConnectionLost(): void {
+	protected override handleConnectionLost(cause?: Error): void {
 		this.cleanup()
 
 		if (this.intentionalDisconnect) {
@@ -138,12 +135,14 @@ export class ClientConnection<TReceive extends ProtocolDef, TSend extends Protoc
 
 		if (!this.reconnectOptions || this.reconnectStopped) {
 			this.setState('disconnected')
+			this.rejectConnect(cause ?? new Error('Connection lost'))
 			return
 		}
 
 		if (this.reconnectAttempts >= this.reconnectOptions.maxAttempts) {
 			this.emit('error', new Error('Max reconnection attempts reached'))
 			this.setState('disconnected')
+			this.rejectConnect(cause ?? new Error('Max reconnection attempts reached'))
 			return
 		}
 
@@ -168,11 +167,7 @@ export class ClientConnection<TReceive extends ProtocolDef, TSend extends Protoc
 			this.setupWebSocket(ws)
 			ws.onopen = () => this.handleOpen()
 		} catch (error) {
-			if (this.connectReject) {
-				this.connectReject(error instanceof Error ? error : new Error('Connection failed'))
-				this.clearConnectPromise()
-			}
-			this.handleConnectionLost()
+			this.handleConnectionLost(error instanceof Error ? error : new Error('Connection failed'))
 		}
 	}
 
@@ -190,6 +185,13 @@ export class ClientConnection<TReceive extends ProtocolDef, TSend extends Protoc
 		if (this.reconnectTimer) {
 			clearTimeout(this.reconnectTimer)
 			this.reconnectTimer = null
+		}
+	}
+
+	private rejectConnect(error: Error): void {
+		if (this.connectReject) {
+			this.connectReject(error)
+			this.clearConnectPromise()
 		}
 	}
 
