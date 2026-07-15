@@ -211,6 +211,10 @@ export interface AgentState {
 	pauseMessage?: string
 	/** Metrics from the most recent completed inference — used by plugins (e.g. context-compact) to size context against the provider-reported truth. */
 	lastInferenceMetrics?: LLMMetrics
+	/** Consecutive inference_failed count since the last committed turn — drives the outer error-resume backoff. */
+	consecutiveInferenceFailures?: number
+	/** Timestamp of the most recent inference_failed — drives the outer error-resume backoff. */
+	lastInferenceFailureAt?: number
 }
 
 // ============================================================================
