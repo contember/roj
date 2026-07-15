@@ -59,6 +59,12 @@ export interface BaseAgentConfig<TInput = unknown> {
 	 * to the standard 5-minute tier.
 	 */
 	cacheTtl?: '5m' | '1h'
+	/**
+	 * Outer backoff between error-resume cycles after an inference exhausts its
+	 * LLM retries on a retryable error (the message stays queued and is retried).
+	 * Defaults: baseDelayMs 5000, maxDelayMs 60000.
+	 */
+	errorResumeBackoff?: { baseDelayMs?: number; maxDelayMs?: number }
 }
 
 /**

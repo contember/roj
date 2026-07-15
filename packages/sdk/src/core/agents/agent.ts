@@ -89,6 +89,8 @@ export interface AgentConfig<TInput = unknown> {
 	 * full re-uploads. Omit (or '5m') for the standard tier.
 	 */
 	cacheTtl?: '5m' | '1h'
+	/** Outer backoff between error-resume cycles (see BaseAgentConfig.errorResumeBackoff). */
+	errorResumeBackoff?: { baseDelayMs?: number; maxDelayMs?: number }
 }
 
 /**
@@ -154,6 +156,7 @@ export class Agent {
 
 	// Scheduler state (embedded)
 	private debounceTimer?: ReturnType<typeof setTimeout>
+	private errorRetryTimer?: ReturnType<typeof setTimeout>
 	private processing = false
 	private scheduled = false
 	private pendingReschedule = false
@@ -241,18 +244,34 @@ export class Agent {
 						})
 						for (const toolCall of agentState.pendingToolCalls) {
 							await this.executeToolCall(toolCall)
+							// A tool hook may have paused the agent — stop the turn here instead of
+							// running the remaining tools (they stay pending and run after resume).
+							const currentState = this.state
+							if (!currentState || currentState.status === 'paused') return
+							if (this.abortController.signal.aborted) return
 						}
 						// Schedule re-entry via debounce after tool execution
 						// (allows debounce callback to wait for child responses, etc.)
 						this.scheduleProcessing()
 						return
 
-					case 'resume_from_error':
+					case 'resume_from_error': {
+						// Outer backoff between error-resume cycles: after an inference exhausts
+						// its LLM retries on a retryable error, the dequeue token stays unconsumed
+						// (preserve-for-retry), so decide() would re-enter infer immediately and
+						// spin without limit during a provider outage. Yield instead and come back
+						// when the backoff elapses; a session restart resets the episode.
+						const backoffRemainingMs = this.errorResumeDelayMs(agentState)
+						if (backoffRemainingMs > 0) {
+							this.scheduleErrorRetry(backoffRemainingMs)
+							return
+						}
 						await this.store.emit(withSessionId(
 							this.store.sessionId,
 							agentEvents.create('agent_resumed', { agentId: this.id }),
 						))
 						continue
+					}
 
 					case 'infer':
 						await this.runInference(agentState)
@@ -377,6 +396,10 @@ export class Agent {
 			// AbortError may be thrown synchronously by abort signal listeners
 		}
 		this.cancelSchedule()
+		if (this.errorRetryTimer) {
+			clearTimeout(this.errorRetryTimer)
+			this.errorRetryTimer = undefined
+		}
 	}
 
 	/**
@@ -475,6 +498,39 @@ export class Agent {
 			return 'complete'
 		}
 		return 'idle'
+	}
+
+	private static readonly DEFAULT_ERROR_RESUME_BASE_DELAY_MS = 5_000
+	private static readonly DEFAULT_ERROR_RESUME_MAX_DELAY_MS = 60_000
+
+	/**
+	 * Remaining wait before an errored agent may resume. Exponential in the number
+	 * of consecutive failures, measured from the last failure; 0 = resume now.
+	 * Capped rather than ceilinged: the preserved message keeps retrying at the max
+	 * delay until the provider recovers — dropping it would lose user work.
+	 */
+	private errorResumeDelayMs(state: AgentState): number {
+		const failures = state.consecutiveInferenceFailures ?? 0
+		const lastFailureAt = state.lastInferenceFailureAt
+		if (failures === 0 || lastFailureAt === undefined) return 0
+		const base = this.config.errorResumeBackoff?.baseDelayMs ?? Agent.DEFAULT_ERROR_RESUME_BASE_DELAY_MS
+		const max = this.config.errorResumeBackoff?.maxDelayMs ?? Agent.DEFAULT_ERROR_RESUME_MAX_DELAY_MS
+		const delay = Math.min(base * 2 ** (failures - 1), max)
+		return Math.max(0, lastFailureAt + delay - Date.now())
+	}
+
+	/**
+	 * Re-run continue() once the error-resume backoff elapses. A concurrent
+	 * scheduleProcessing() (new message) is harmless — continue() re-checks the
+	 * remaining backoff and re-arms if it hasn't elapsed yet.
+	 */
+	private scheduleErrorRetry(delayMs: number): void {
+		if (this.errorRetryTimer) return
+		if (this.store.isClosed()) return
+		this.errorRetryTimer = setTimeout(() => {
+			this.errorRetryTimer = undefined
+			this.scheduleProcessing()
+		}, delayMs)
 	}
 
 	private static readonly MAX_INFERENCE_RETRIES = 3
@@ -671,15 +727,7 @@ export class Agent {
 			// same message into a doomed retry loop. Retryable errors (rate_limit,
 			// server_error, network_error, timeout) keep the preserve-for-retry semantics.
 			if (!isRetryableLLMError(llmResponse.error)) {
-				const errorAgentState = this.state
-				if (errorAgentState) {
-					const errorCtx = this.buildAgentContext(errorAgentState)
-					for (const dequeued of pluginDequeued) {
-						if (!dequeued.plugin.dequeue) continue
-						const pluginCtx = this.buildPluginHookContext(dequeued.plugin, errorCtx)
-						await dequeued.plugin.dequeue.markConsumed(pluginCtx, dequeued.token)
-					}
-				}
+				await this.consumeDequeuedTokens(pluginDequeued)
 			}
 
 			// 4a. Inference failed — emit inference_failed without marking plugin messages
@@ -694,27 +742,22 @@ export class Agent {
 					llmCallId,
 				}),
 			))
-			// Notify plugins (e.g. mailbox sends error message to parent)
+			// Notify plugins (e.g. mailbox sends error message to parent). For retryable
+			// errors, notify only on the first failure of an episode — the preserved
+			// token means each error-resume cycle re-fails here, and one parent
+			// notification per cycle would flood the parent during a provider outage.
 			const errorState = this.state
-			if (errorState) {
+			const isRepeatRetryableFailure = isRetryableLLMError(llmResponse.error)
+				&& (errorState?.consecutiveInferenceFailures ?? 1) > 1
+			if (errorState && !isRepeatRetryableFailure) {
 				await this.executeOnError(errorState, llmResponse.error.message)
 			}
 			return
 		}
 
-		// Mark plugin messages as consumed only after successful inference. They've been
-		// appended to conversationHistory via the inference_completed reducer below.
-		{
-			const currentAgentState = this.state
-			if (currentAgentState) {
-				const ctx = this.buildAgentContext(currentAgentState)
-				for (const dequeued of pluginDequeued) {
-					if (!dequeued.plugin.dequeue) continue
-					const pluginCtx = this.buildPluginHookContext(dequeued.plugin, ctx)
-					await dequeued.plugin.dequeue.markConsumed(pluginCtx, dequeued.token)
-				}
-			}
-		}
+		// Consumption of dequeue tokens is deferred to the commit points below — after
+		// the afterInference retry decision is final. Consuming here would strand the
+		// message if a hook requests a retry (the recursion could no longer re-collect it).
 
 		// 4c. Sanitize response to prevent hallucination
 		const sanitized = sanitizeLLMResponse(llmResponse.value.content)
@@ -745,9 +788,9 @@ export class Agent {
 		const afterResult = await this.executeAfterInference(agentState, response)
 		if (afterResult !== null) {
 			if (afterResult.action === 'pause') {
-				// Inference completed and messages were consumed — commit the turn
-				// before pausing so pendingMessages move to conversationHistory.
+				// Commit the turn before pausing so pendingMessages move to conversationHistory.
 				await this.emitInferenceCompleted(response, llmCallId, llmResponse.value.metrics)
+				await this.consumeDequeuedTokens(pluginDequeued)
 				await this.emitHandlerPause(afterResult.reason)
 				return
 			}
@@ -758,6 +801,14 @@ export class Agent {
 						retryCount,
 					})
 				} else {
+					// Roll back the staged turn (clears pendingMessages appended by
+					// inference_started) so the retry's inference_started doesn't
+					// double-append. Tokens are still unconsumed, so the recursion
+					// re-collects the same messages — nothing is lost or duplicated.
+					await this.store.emit(withSessionId(
+						this.store.sessionId,
+						llmEvents.create('inference_retried', { agentId: this.id }),
+					))
 					// Retry inference - decrement turn number and recursively call with fresh state
 					this.turnNumber--
 					const freshState = this.state
@@ -773,6 +824,11 @@ export class Agent {
 		// 4d. Inference completed
 		// Tool calls will be executed in the next continue() cycle
 		await this.emitInferenceCompleted(response, llmCallId, llmResponse.value.metrics)
+
+		// Consume dequeue tokens after the commit: a crash in the gap re-delivers the
+		// message on restart (at-least-once) instead of dropping it (consume-first
+		// would lose the message — session_restarted wipes the staged pendingMessages).
+		await this.consumeDequeuedTokens(pluginDequeued)
 	}
 
 	/**
@@ -913,17 +969,18 @@ export class Agent {
 			? { isError: false, content: result.value }
 			: { isError: true, content: result.error.message }
 
-		// afterToolCall handler - can modify result or pause
+		// afterToolCall handler - can modify result or pause.
+		// On 'pause' the agent_paused event was already emitted by the hook dispatch;
+		// still fall through to emit the result event below — the tool's side effects
+		// already ran, so the committed tool_use must get its tool_result (otherwise
+		// the call would re-execute on resume and the history would carry an unpaired
+		// tool_use). The tool_completed/tool_failed reducers preserve the paused
+		// status, and the tool_exec loop stops before the next tool.
 		const currentAgentState = this.state
 		if (currentAgentState) {
 			const afterResult = await this.executeAfterToolCall(currentAgentState, effectiveToolCall, toolResult)
-			if (afterResult !== null) {
-				if (afterResult.action === 'pause') {
-					return
-				}
-				if (afterResult.action === 'modify') {
-					toolResult = afterResult.result
-				}
+			if (afterResult !== null && afterResult.action === 'modify') {
+				toolResult = afterResult.result
 			}
 		}
 
@@ -1665,6 +1722,25 @@ export class Agent {
 		}
 
 		return collected
+	}
+
+	/**
+	 * Mark dequeued plugin tokens consumed. Called at turn commit (after
+	 * inference_completed, so a crash in the gap re-delivers instead of losing
+	 * the message) and to intentionally drop a doomed message on non-retryable
+	 * failures.
+	 */
+	private async consumeDequeuedTokens(
+		pluginDequeued: Array<{ plugin: ConfiguredPlugin; messages: LLMMessage[]; token: unknown }>,
+	): Promise<void> {
+		const currentAgentState = this.state
+		if (!currentAgentState) return
+		const ctx = this.buildAgentContext(currentAgentState)
+		for (const dequeued of pluginDequeued) {
+			if (!dequeued.plugin.dequeue) continue
+			const pluginCtx = this.buildPluginHookContext(dequeued.plugin, ctx)
+			await dequeued.plugin.dequeue.markConsumed(pluginCtx, dequeued.token)
+		}
 	}
 }
 

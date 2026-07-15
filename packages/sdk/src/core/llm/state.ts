@@ -97,6 +97,15 @@ export const llmEvents = createEventsFactory({
 			error: z4.string(),
 			llmCallId: llmCallIdSchema.optional(),
 		}),
+		/**
+		 * A plugin's afterInference hook requested a retry of the turn. Rolls back
+		 * the staged turn (pendingMessages from inference_started) so the retried
+		 * inference can restage the same messages without double-appending; dequeue
+		 * tokens stay unconsumed until the turn actually commits.
+		 */
+		inference_retried: z4.object({
+			agentId: agentIdSchema,
+		}),
 	},
 })
 
@@ -104,3 +113,4 @@ export type InferenceStartedEvent = (typeof llmEvents)['Events']['inference_star
 export type InferenceCompletedEvent = (typeof llmEvents)['Events']['inference_completed']
 export type AuxiliaryInferenceCompletedEvent = (typeof llmEvents)['Events']['auxiliary_inference_completed']
 export type InferenceFailedEvent = (typeof llmEvents)['Events']['inference_failed']
+export type InferenceRetriedEvent = (typeof llmEvents)['Events']['inference_retried']

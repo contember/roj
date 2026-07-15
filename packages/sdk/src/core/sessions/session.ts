@@ -826,6 +826,7 @@ export class Session {
 				input: orch.input,
 				plugins: withServicePluginConfig(orch),
 				cacheTtl: orch.cacheTtl,
+				errorResumeBackoff: orch.errorResumeBackoff,
 			}
 		}
 
@@ -842,6 +843,7 @@ export class Session {
 				input: comm.input,
 				plugins: withServicePluginConfig(comm),
 				cacheTtl: comm.cacheTtl,
+				errorResumeBackoff: comm.errorResumeBackoff,
 			}
 		}
 
@@ -861,6 +863,7 @@ export class Session {
 			input: agentDef.input,
 			plugins: withServicePluginConfig(agentDef),
 			cacheTtl: agentDef.cacheTtl,
+			errorResumeBackoff: agentDef.errorResumeBackoff,
 		}
 	}
 }

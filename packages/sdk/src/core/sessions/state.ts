@@ -202,12 +202,16 @@ export const coreReducer = createTypedReducer(
 
 					return {
 						...agent,
-						status: hasToolCalls ? 'tool_exec' : 'pending',
+						// Preserve a pause that landed during the in-flight inference — the pause
+						// defers (tool calls stay pending until resume) instead of being clobbered.
+						status: agent.status === 'paused' ? 'paused' : hasToolCalls ? 'tool_exec' : 'pending',
 						conversationHistory: [...agent.conversationHistory, ...agent.pendingMessages, assistantMessage],
 						pendingToolCalls: toolCalls,
 						pendingMessages: [],
 						pendingToolResults: [],
 						lastInferenceMetrics: event.metrics,
+						consecutiveInferenceFailures: 0,
+						lastInferenceFailureAt: undefined,
 					}
 				})
 			}
@@ -220,6 +224,19 @@ export const coreReducer = createTypedReducer(
 				return updateAgent(state, event.agentId, (agent) => ({
 					...agent,
 					status: 'errored',
+					pendingMessages: [],
+					consecutiveInferenceFailures: (agent.consecutiveInferenceFailures ?? 0) + 1,
+					lastInferenceFailureAt: event.timestamp,
+				}))
+
+			case 'inference_retried':
+				// Plugin-requested retry: roll back the staged turn (like inference_failed)
+				// so the retried inference_started doesn't double-append pendingMessages.
+				// Dequeue tokens are still unconsumed (consumption happens at commit), so
+				// the retry re-collects the same messages.
+				return updateAgent(state, event.agentId, (agent) => ({
+					...agent,
+					status: agent.status === 'paused' ? 'paused' : 'pending',
 					pendingMessages: [],
 				}))
 
@@ -242,7 +259,9 @@ export const coreReducer = createTypedReducer(
 						...agent,
 						pendingToolCalls: remaining,
 						pendingToolResults: [...agent.pendingToolResults, pendingToolResult],
-						status: remaining.length === 0 ? 'pending' : 'tool_exec',
+						// Preserve a pause raised by a tool hook — recomputing the status here
+						// would silently un-pause the agent mid-turn.
+						status: agent.status === 'paused' ? 'paused' : remaining.length === 0 ? 'pending' : 'tool_exec',
 						executingToolCall: undefined,
 					}
 				})
@@ -267,7 +286,7 @@ export const coreReducer = createTypedReducer(
 						...agent,
 						pendingToolCalls: remaining,
 						pendingToolResults: [...agent.pendingToolResults, pendingToolResult],
-						status: remaining.length === 0 ? 'pending' : 'tool_exec',
+						status: agent.status === 'paused' ? 'paused' : remaining.length === 0 ? 'pending' : 'tool_exec',
 						executingToolCall: undefined,
 					}
 				})
@@ -320,6 +339,10 @@ export const coreReducer = createTypedReducer(
 							...updated,
 							status: 'pending' as const,
 							pendingMessages: [],
+							// Restart is an explicit external trigger — start a fresh error episode
+							// so the outer error-resume backoff doesn't delay the first attempt.
+							consecutiveInferenceFailures: 0,
+							lastInferenceFailureAt: undefined,
 						}
 						changed = true
 					}
@@ -403,7 +426,9 @@ export const coreReducer = createTypedReducer(
 			case 'agent_resumed':
 				return updateAgent(state, event.agentId, (agent) => ({
 					...agent,
-					status: 'pending',
+					// Resume into tool_exec when the pause interrupted a tool turn — going to
+					// 'pending' would run inference with unresolved tool calls (unpaired tool_use).
+					status: agent.pendingToolCalls.length > 0 ? 'tool_exec' : 'pending',
 					pauseReason: undefined,
 					pauseMessage: undefined,
 				}))

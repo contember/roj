@@ -276,6 +276,26 @@ export class TestSession {
 	}
 
 	/**
+	 * Pause an agent (the manual-pause API).
+	 */
+	async pauseAgent(agentId: AgentId, message?: string): Promise<void> {
+		const result = await this.session.pauseAgent(agentId, message)
+		if (!result.ok) {
+			throw new Error(`pauseAgent failed: ${result.error.type} — ${result.error.message}`)
+		}
+	}
+
+	/**
+	 * Resume a paused (or errored) agent.
+	 */
+	async resumeAgent(agentId: AgentId): Promise<void> {
+		const result = await this.session.resumeAgent(agentId)
+		if (!result.ok) {
+			throw new Error(`resumeAgent failed: ${result.error.type} — ${result.error.message}`)
+		}
+	}
+
+	/**
 	 * Close the session.
 	 */
 	async close(): Promise<void> {
