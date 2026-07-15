@@ -7,6 +7,8 @@
 
 import type { AgentCounters, AgentId, AgentPauseReason, LLMCallId, MessageId, ToolCallId } from '@roj-ai/sdk'
 import { contentToString } from '../lib/domain-utils.js'
+import type { InternalAgentStatus } from './agent-status.js'
+import { statusAfterInferenceCompleted, statusAfterInferenceRetried, statusAfterResume, statusAfterToolResult } from './agent-status.js'
 import type { ProjectionEvent } from './events.js'
 import { toProtocolStatus } from './protocol-status.js'
 import type { ConversationMessageView, GetAgentDetailResponse, MailboxMessageView, ToolCallView } from './types.js'
@@ -47,7 +49,7 @@ interface PendingToolResult {
 interface AgentViewModel {
 	id: AgentId
 	definitionName: string
-	status: 'pending' | 'inferring' | 'tool_exec' | 'errored' | 'paused'
+	status: InternalAgentStatus
 	parentId: AgentId | null
 	conversationHistory: LLMMessage[]
 	pendingToolCalls: ToolCall[]
@@ -190,12 +192,10 @@ export function applyEventToAgentDetail(state: AgentDetailProjectionState, event
 				cacheWriteTokens: event.metrics.cacheWriteTokens ?? undefined,
 			}
 
-			const hasToolCalls = toolCalls.length > 0
-
 			const newAgents = new Map(state.agents)
 			newAgents.set(event.agentId, {
 				...agent,
-				status: hasToolCalls ? 'tool_exec' : 'pending',
+				status: statusAfterInferenceCompleted(agent.status, toolCalls.length),
 				conversationHistory: [...agent.conversationHistory, ...agent.pendingMessages, assistantMessage],
 				pendingToolCalls: toolCalls,
 				pendingMessages: [],
@@ -224,6 +224,18 @@ export function applyEventToAgentDetail(state: AgentDetailProjectionState, event
 			newAgents.set(event.agentId, {
 				...agent,
 				status: 'errored',
+				pendingMessages: [],
+			})
+			return { ...state, agents: newAgents }
+		}
+
+		case 'inference_retried': {
+			const agent = state.agents.get(event.agentId)
+			if (!agent) return state
+			const newAgents = new Map(state.agents)
+			newAgents.set(event.agentId, {
+				...agent,
+				status: statusAfterInferenceRetried(agent.status),
 				pendingMessages: [],
 			})
 			return { ...state, agents: newAgents }
@@ -277,7 +289,7 @@ export function applyEventToAgentDetail(state: AgentDetailProjectionState, event
 				...agent,
 				pendingToolCalls: remaining,
 				pendingToolResults: [...agent.pendingToolResults, pendingToolResult],
-				status: remaining.length === 0 ? 'pending' : 'tool_exec',
+				status: statusAfterToolResult(agent.status, remaining.length),
 				executingToolCall: undefined,
 			})
 
@@ -317,7 +329,7 @@ export function applyEventToAgentDetail(state: AgentDetailProjectionState, event
 				...agent,
 				pendingToolCalls: remaining,
 				pendingToolResults: [...agent.pendingToolResults, pendingToolResult],
-				status: remaining.length === 0 ? 'pending' : 'tool_exec',
+				status: statusAfterToolResult(agent.status, remaining.length),
 				executingToolCall: undefined,
 			})
 
@@ -372,7 +384,7 @@ export function applyEventToAgentDetail(state: AgentDetailProjectionState, event
 			const newAgents = new Map(state.agents)
 			newAgents.set(event.agentId, {
 				...agent,
-				status: 'pending',
+				status: statusAfterResume(agent.pendingToolCalls.length),
 				pauseReason: undefined,
 				pauseMessage: undefined,
 			})
@@ -403,7 +415,7 @@ export function applyEventToAgentDetail(state: AgentDetailProjectionState, event
 				let updated = agent
 				let changed = false
 
-				if (agent.status === 'inferring') {
+				if (agent.status === 'inferring' || agent.status === 'errored') {
 					updated = { ...updated, status: 'pending' as const, pendingMessages: [] }
 					changed = true
 				}

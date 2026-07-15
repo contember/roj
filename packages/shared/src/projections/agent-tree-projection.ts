@@ -6,6 +6,8 @@
  */
 
 import type { AgentId } from '@roj-ai/sdk'
+import type { InternalAgentStatus } from './agent-status.js'
+import { statusAfterInferenceCompleted, statusAfterInferenceRetried, statusAfterResume, statusAfterToolResult } from './agent-status.js'
 import type { ProjectionEvent } from './events.js'
 import { toProtocolStatus } from './protocol-status.js'
 import type { AgentTreeNode } from './types.js'
@@ -17,7 +19,7 @@ import type { AgentTreeNode } from './types.js'
 interface AgentTreeEntry {
 	id: AgentId
 	definitionName: string
-	status: 'pending' | 'inferring' | 'tool_exec' | 'errored' | 'paused'
+	status: InternalAgentStatus
 	parentId: AgentId | null
 	pendingToolCallCount: number
 	isExecuting: boolean
@@ -84,7 +86,7 @@ export function applyEventToAgentTree(state: AgentTreeProjectionState, event: Pr
 
 			agents.set(event.agentId, {
 				...agent,
-				status: toolCallCount > 0 ? 'tool_exec' : 'pending',
+				status: statusAfterInferenceCompleted(agent.status, toolCallCount),
 				pendingToolCallCount: toolCallCount,
 				isExecuting: false,
 				cost: agent.cost + (event.metrics.cost ?? 0),
@@ -98,6 +100,14 @@ export function applyEventToAgentTree(state: AgentTreeProjectionState, event: Pr
 			if (!agent) return state
 			const newAgents = new Map(state.agents)
 			newAgents.set(event.agentId, { ...agent, status: 'errored' })
+			return { ...state, agents: newAgents }
+		}
+
+		case 'inference_retried': {
+			const agent = state.agents.get(event.agentId)
+			if (!agent) return state
+			const newAgents = new Map(state.agents)
+			newAgents.set(event.agentId, { ...agent, status: statusAfterInferenceRetried(agent.status) })
 			return { ...state, agents: newAgents }
 		}
 
@@ -119,7 +129,7 @@ export function applyEventToAgentTree(state: AgentTreeProjectionState, event: Pr
 				...agent,
 				pendingToolCallCount: remaining,
 				isExecuting: false,
-				status: remaining === 0 ? 'pending' : 'tool_exec',
+				status: statusAfterToolResult(agent.status, remaining),
 			})
 			return { ...state, agents: newAgents }
 		}
@@ -136,7 +146,7 @@ export function applyEventToAgentTree(state: AgentTreeProjectionState, event: Pr
 			const agent = state.agents.get(event.agentId)
 			if (!agent) return state
 			const newAgents = new Map(state.agents)
-			newAgents.set(event.agentId, { ...agent, status: 'pending' })
+			newAgents.set(event.agentId, { ...agent, status: statusAfterResume(agent.pendingToolCallCount) })
 			return { ...state, agents: newAgents }
 		}
 
@@ -146,7 +156,7 @@ export function applyEventToAgentTree(state: AgentTreeProjectionState, event: Pr
 				let updated = agent
 				let changed = false
 
-				if (agent.status === 'inferring') {
+				if (agent.status === 'inferring' || agent.status === 'errored') {
 					updated = { ...updated, status: 'pending' as const }
 					changed = true
 				}
