@@ -103,6 +103,14 @@ export interface ServiceConfig {
 	startupTimeoutMs?: number
 	/** Auto-pause configuration (interface prepared, not yet implemented) */
 	autoPause?: { inactivityMs: number }
+	/**
+	 * When false, the service is hidden from the owning agent: excluded from its
+	 * service_* tools and the session-context status block. It still runs at the
+	 * session level and stays fully controllable via the services.* methods —
+	 * for infrastructure services (e.g. a CMS sidecar) driven by the platform,
+	 * not by agents. Default: true.
+	 */
+	agentVisible?: boolean
 }
 
 // ============================================================================
