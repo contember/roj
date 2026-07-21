@@ -468,7 +468,10 @@ export const servicePlugin = definePlugin('services')
 					})
 					if (!result.ok) return Err({ message: result.error.message, recoverable: false })
 
-					return Ok(JSON.stringify(result.value))
+					// Strip cwd: a real host path, meaningless (and misleading) inside
+					// the agent's virtual-root namespace.
+					const { cwd: _cwd, ...agentSafe } = result.value
+					return Ok(JSON.stringify(agentSafe))
 				},
 			}),
 			createTool({

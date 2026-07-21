@@ -13,6 +13,7 @@ import { createTestPreset, TestHarness } from '~/testing/index.js'
 import { serviceEvents, servicePlugin } from './plugin.js'
 import type { ServiceAgentConfig, ServicePluginConfig } from './plugin.js'
 import { PortPool } from './port-pool.js'
+import { buildServiceStatusMessage } from './prompt.js'
 import type { ServiceCommandArgs, ServiceConfig, ServiceCwdArgs, ServiceEntry, ServiceStatus } from './schema.js'
 import { ServiceExecutor } from './service.js'
 
@@ -819,6 +820,134 @@ describe('services plugin', () => {
 				await executor.shutdown()
 				await rm(marker, { force: true })
 			}
+		})
+	})
+
+	// =========================================================================
+	// agentVisible: false — infrastructure services hidden from agents
+	// =========================================================================
+
+	describe('agentVisible: false services', () => {
+		const hiddenService: ServiceConfig = {
+			type: 'hidden-svc',
+			description: 'Infra service driven by the platform, not agents',
+			command: 'sleep 60',
+			agentVisible: false,
+		}
+
+		it('auto-wired agent visibility excludes it: no tool mention, no status line, still method-controllable', async () => {
+			const portPool = new PortPool()
+			const base = createTestPreset({
+				plugins: [servicePlugin.configure({ services: [quickService, hiddenService], portPool })],
+			})
+			// Services attached on the agent definition (defineAgent-style auto-wiring),
+			// NOT via explicit configureAgent — exercises the getAgentConfig filter.
+			const preset = { ...base, orchestrator: { ...base.orchestrator, services: [quickService, hiddenService] } }
+			const harness = createServicesHarness({
+				presets: [preset],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Hi')
+
+			// Service tools exist (quick is visible) but never mention the hidden service
+			const lastRequest = harness.llmProvider.getLastRequest()
+			const serviceStart = lastRequest?.tools?.find((t) => t.name === 'service_start')
+			expect(serviceStart).toBeDefined()
+			expect(serviceStart?.description).toContain('quick')
+			expect(serviceStart?.description).not.toContain('hidden-svc')
+
+			// The session-context status block skips it too
+			const serialized = JSON.stringify(lastRequest?.messages ?? [])
+			expect(serialized).not.toContain('hidden-svc')
+
+			// Still fully controllable at the session level via services.* methods
+			const entryAgentId = session.getEntryAgentId()!
+			const startResult = await session.callPluginMethod('services.start', {
+				sessionId: String(session.sessionId),
+				agentId: String(entryAgentId),
+				serviceType: 'hidden-svc',
+			})
+			expect(startResult).toMatchObject({ ok: true })
+			await waitForServiceStatus(session, 'hidden-svc', 'ready')
+
+			const statusResult = await session.callPluginMethod('services.status', {
+				sessionId: String(session.sessionId),
+				agentId: String(entryAgentId),
+				serviceType: 'hidden-svc',
+			})
+			expect(statusResult).toMatchObject({ ok: true, value: { status: 'ready' } })
+		})
+	})
+
+	// =========================================================================
+	// Real host paths must not leak into agent-facing surfaces
+	// =========================================================================
+
+	describe('host path hygiene', () => {
+		it('status block omits cwd even when the entry tracks one', () => {
+			const message = buildServiceStatusMessage(
+				[{
+					serviceType: 'quick',
+					status: 'ready',
+					port: 4321,
+					cwd: '/home/user/sessions/0000-real-host-path/packages/web',
+				}],
+				[quickService],
+			)
+			expect(message).toContain('quick')
+			expect(message).toContain('port 4321')
+			expect(message).not.toContain('real-host-path')
+			expect(message).not.toContain('cwd')
+		})
+
+		it('service_status tool output strips cwd', async () => {
+			const portPool = new PortPool()
+			// Absolute cwd so the tracked entry actually carries a host path to leak.
+			const cwdService: ServiceConfig = {
+				type: 'cwd-svc',
+				description: 'Service with a resolved host cwd',
+				command: 'sleep 60',
+				cwd: tmpdir(),
+			}
+			const harness = createServicesHarness({
+				presets: [createServicesPreset([cwdService], ['cwd-svc'], portPool)],
+				llmProvider: MockLLMProvider.withSequence([
+					{
+						toolCalls: [{
+							id: ToolCallId('tc-start'),
+							name: 'service_start',
+							input: { serviceType: 'cwd-svc' },
+						}],
+					},
+					{
+						toolCalls: [{
+							id: ToolCallId('tc-status'),
+							name: 'service_status',
+							input: { serviceType: 'cwd-svc' },
+						}],
+					},
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Check the service')
+			await waitForServiceStatus(session, 'cwd-svc', 'ready')
+
+			// The service_status tool result (fed back as a message) must not carry cwd,
+			// while the session-level method keeps returning it for platform callers.
+			const serialized = JSON.stringify(harness.llmProvider.getLastRequest()?.messages ?? [])
+			expect(serialized).not.toContain('"cwd"')
+
+			const entryAgentId = session.getEntryAgentId()!
+			const statusResult = await session.callPluginMethod('services.status', {
+				sessionId: String(session.sessionId),
+				agentId: String(entryAgentId),
+				serviceType: 'cwd-svc',
+			})
+			expect(statusResult).toMatchObject({ ok: true, value: { cwd: expect.any(String) } })
 		})
 	})
 })

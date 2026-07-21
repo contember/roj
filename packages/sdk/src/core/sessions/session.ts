@@ -800,13 +800,17 @@ export class Session {
 	 */
 	private getAgentConfig(definitionName: string): AgentConfig {
 		const withServicePluginConfig = (
-			config: { services?: { type: string }[]; plugins?: AgentPluginConfig[] },
+			config: { services?: { type: string; agentVisible?: boolean }[]; plugins?: AgentPluginConfig[] },
 		): AgentPluginConfig[] | undefined => {
 			const base = config.plugins ?? []
-			if (!config.services || config.services.length === 0) return base.length > 0 ? base : undefined
+			// agentVisible: false services stay registered at the session level (SessionManager
+			// collects them from agent definitions) but are excluded from the agent's own
+			// visibility list — no service_* tools, no session-context status line.
+			const visible = (config.services ?? []).filter(s => s.agentVisible !== false)
+			if (visible.length === 0) return base.length > 0 ? base : undefined
 			// Merge services config into plugins array (if not already present)
 			if (base.some(c => c.pluginName === 'services')) return base
-			return [...base, { pluginName: 'services', config: { services: config.services.map(s => s.type) } }]
+			return [...base, { pluginName: 'services', config: { services: visible.map(s => s.type) } }]
 		}
 
 		if (definitionName === ORCHESTRATOR_ROLE) {
