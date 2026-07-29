@@ -14,6 +14,7 @@ describe('resolveAgentLimits', () => {
 		expect(limits.softLimitRatio).toBe(0.8)
 		expect(limits.maxRepeatedToolCalls).toBe(3)
 		expect(limits.maxRepeatedResponses).toBe(3)
+		expect(limits.maxConsecutiveNoProgressTurns).toBe(3)
 		// Budgets and compaction cap are opt-in (unlimited by default)
 		expect(limits.maxCost).toBe(Number.POSITIVE_INFINITY)
 		expect(limits.maxTokens).toBe(Number.POSITIVE_INFINITY)
@@ -109,6 +110,18 @@ describe('checkLimits', () => {
 		expect(result.status).toBe('hard_limit')
 		if (result.status === 'hard_limit') {
 			expect(result.limitName).toBe('maxRepeatedResponses')
+		}
+	})
+
+	it('detects consecutive no-progress turns', () => {
+		const result = checkLimits(
+			makeCounters({ consecutiveNoProgressTurns: 3 }),
+			defaultLimits,
+		)
+		expect(result.status).toBe('hard_limit')
+		if (result.status === 'hard_limit') {
+			expect(result.limitName).toBe('maxConsecutiveNoProgressTurns')
+			expect(result.reason).toContain('used only outbound communication')
 		}
 	})
 

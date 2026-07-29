@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test'
+import z from 'zod/v4'
 import { AgentId } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
@@ -6,7 +7,10 @@ import type { InferenceRequest } from '~/core/llm/provider.js'
 import { ModelId } from '~/core/llm/schema.js'
 import { llmEvents } from '~/core/llm/state.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
+import { createTool } from '~/core/tools/definition.js'
 import { ToolCallId } from '~/core/tools/schema.js'
+import { toolEvents } from '~/core/tools/state.js'
+import { Ok } from '~/lib/utils/result.js'
 import { contextCompactPlugin } from '~/plugins/context-compact/index.js'
 import { getAgentMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
 import { mailboxEvents } from '~/plugins/mailbox/state.js'
@@ -179,6 +183,150 @@ describe('limits-guard plugin', () => {
 
 			await harness.shutdown()
 		})
+
+		it('reworded communication-only loop → agent pauses within the no-progress limit', async () => {
+			let inferenceCount = 0
+
+			const harness = createLimitsHarness({
+				presets: [createTestPreset({
+					orchestratorSystem: 'Test agent.',
+					orchestratorPlugins: [limitsGuardPlugin.configureAgent({
+						limits: { maxConsecutiveNoProgressTurns: 3, maxTurns: 100 },
+					})],
+				})],
+				mockHandler: () => {
+					inferenceCount++
+					return {
+						content: null,
+						toolCalls: [{
+							id: ToolCallId(`tc${inferenceCount}`),
+							name: 'tell_user',
+							input: { message: `Still waiting, update ${inferenceCount}` },
+						}],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetrics(),
+					}
+				},
+			})
+
+			const session = await harness.createSession('test')
+			const entryAgentId = session.getEntryAgentId()!
+			await session.sendMessage('Start')
+			await waitForAgentPaused(session, entryAgentId)
+
+			expect(inferenceCount).toBe(3)
+			const toolStarted = await session.getEventsByType(toolEvents, 'tool_started')
+			expect(toolStarted).toHaveLength(2)
+
+			const pauseEvents = await session.getEventsByType(agentEvents, 'agent_paused')
+			const pauseEvent = pauseEvents.find((event) => event.agentId === entryAgentId)
+			expect(pauseEvent?.message).toContain('3 consecutive turns used only outbound communication')
+
+			await harness.shutdown()
+		})
+
+		it('send_message followed by non-communication work does not trip the no-progress limit', async () => {
+			let workerInferenceCount = 0
+			let workCount = 0
+
+			const recordWork = createTool({
+				name: 'record_work',
+				description: 'Record one unit of real work.',
+				input: z.object({}),
+				execute: async () => {
+					workCount++
+					return Ok('work recorded')
+				},
+			})
+
+			const harness = createLimitsHarness({
+				presets: [createMultiAgentPreset([
+					{
+						name: 'worker',
+						system: 'Worker agent.',
+						tools: [recordWork],
+						agents: [],
+						plugins: [limitsGuardPlugin.configureAgent({
+							limits: { maxConsecutiveNoProgressTurns: 2, maxTurns: 100 },
+						})],
+					},
+				], { orchestratorSystem: 'Orchestrator agent.' })],
+				mockHandler: (request) => {
+					if (request.systemPrompt.endsWith('Orchestrator agent.')) {
+						const hasStartedWorker = request.messages.some((message) =>
+							message.role === 'assistant'
+							&& message.toolCalls?.some((toolCall) => toolCall.name === 'start_worker')
+						)
+						if (!hasStartedWorker) {
+							return {
+								content: null,
+								toolCalls: [{ id: ToolCallId('start-worker'), name: 'start_worker', input: { message: 'Do the work' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						}
+						return {
+							content: 'Orchestration complete',
+							toolCalls: [],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+
+					workerInferenceCount++
+					switch (workerInferenceCount) {
+						case 1:
+							return {
+								content: null,
+								toolCalls: [{
+									id: ToolCallId('worker-progress'),
+									name: 'send_message',
+									input: { to: 'parent', message: 'Starting real work' },
+								}],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						case 2:
+							return {
+								content: null,
+								toolCalls: [{ id: ToolCallId('worker-work'), name: 'record_work', input: {} }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						case 3:
+							return {
+								content: null,
+								toolCalls: [{
+									id: ToolCallId('worker-result'),
+									name: 'send_message',
+									input: { to: 'parent', message: 'Real work complete' },
+								}],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						default:
+							return {
+								content: 'WAITING',
+								toolCalls: [],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+					}
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Start', { timeoutMs: 10_000 })
+
+			expect(workCount).toBe(1)
+			expect(workerInferenceCount).toBe(4)
+			expect(session.state.agents.get(AgentId('worker_1'))?.status).toBe('pending')
+
+			const pauseEvents = await session.getEventsByType(agentEvents, 'agent_paused')
+			expect(pauseEvents.some((event) => event.agentId === AgentId('worker_1'))).toBe(false)
+
+			await harness.shutdown()
+		})
 	})
 
 	// =========================================================================
@@ -193,7 +341,9 @@ describe('limits-guard plugin', () => {
 			const harness = createLimitsHarness({
 				presets: [createTestPreset({
 					orchestratorSystem: 'Test agent.',
-					orchestratorPlugins: [limitsGuardPlugin.configureAgent({ limits: { maxTurns: 5 } })],
+					orchestratorPlugins: [limitsGuardPlugin.configureAgent({
+						limits: { maxTurns: 5, maxConsecutiveNoProgressTurns: 100 },
+					})],
 				})],
 				mockHandler: (request) => {
 					inferenceCount++
