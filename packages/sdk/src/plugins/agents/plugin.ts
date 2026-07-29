@@ -420,7 +420,7 @@ export const agentsPlugin = definePlugin('agents')
 - **New task** → spawn a new agent using \`start_<agent_name>\`. You will receive the agent's ID in the result — use it with \`send_message\` for follow-up communication.
 - **Follow-up on an existing task** → send a message to the existing agent via \`send_message\` with the agent's ID. Do NOT spawn a new agent for feedback, corrections, or additional instructions on a task already assigned.
 - Spawned agents communicate back to you via \`send_message\`. Check your incoming messages for their results and progress updates.
-- If a child pauses early it sends you a \`<child-paused agent="…">reason</child-paused>\` message (e.g. it hit a cost/limit budget). Decide what to do: resume it (after addressing the cause), reassign or drop the work, or stop.`
+- If a child pauses early it sends you a \`<child-paused agent="…">reason</child-paused>\` message (e.g. it hit a cost/limit budget). Decide what to do: resume it with \`resume_agent\` **after addressing the cause**, reassign or drop the work, or stop. Resuming does not grant more budget — a child that hit a cost or token limit will stop again immediately, so don't retry it in a loop.`
 
 		// Only include supervision instructions if supervision is actually enabled
 		// for this session — otherwise the section is misleading bloat.
@@ -438,7 +438,41 @@ Do NOT act on a supervision tick unless something is genuinely wrong (a child ha
 		const spawnableAgents = ctx.agentConfig.spawnableAgents
 		const agentDefs = ctx.pluginConfig.agentDefinitions
 
-		return spawnableAgents.map((agentName) => {
+		// The parent is told (see the `<child-paused>` line in the system prompt above) that it
+		// may resume a paused child. Without this tool that instruction had nothing behind it:
+		// `resume` existed only as a plugin method, reachable from outside the session via
+		// `agents.resume`, so a child that paused stayed paused until something external
+		// intervened. Only offered to agents that can actually have children.
+		const resumeTool = createTool({
+			name: 'resume_agent',
+			description:
+				'Resume one of your own child agents after it paused (you receive a <child-paused> message when that happens). '
+				+ 'Address the cause first — resuming does not grant more budget, so a child that hit a cost or token limit '
+				+ 'will stop again immediately unless the limit itself is raised.',
+			input: z.object({
+				agentId: agentIdSchema.describe('ID of the paused child agent, as given in the <child-paused> message'),
+			}),
+			execute: async (input, context) => {
+				const target = context.sessionState.agents.get(input.agentId)
+				if (!target) {
+					return Err({ message: `No agent "${input.agentId}" in this session.`, recoverable: false })
+				}
+				if (target.parentId !== context.agentId) {
+					return Err({ message: `Agent "${input.agentId}" is not your child — you can only resume agents you spawned.`, recoverable: false })
+				}
+				if (target.status !== 'paused' && target.status !== 'errored') {
+					return Err({ message: `Agent "${input.agentId}" is ${target.status}, not paused — nothing to resume.`, recoverable: false })
+				}
+
+				const result = await ctx.self.resume({ agentId: input.agentId })
+				if (!result.ok) {
+					return Err({ message: result.error.message, recoverable: false })
+				}
+				return Ok(`Agent "${input.agentId}" resumed.`)
+			},
+		})
+
+		const startTools = spawnableAgents.map((agentName) => {
 			const agentInfo = agentDefs.get(agentName) ?? { name: agentName }
 			const toolName = `start_${agentInfo.name}`
 			const description = agentInfo.description
@@ -469,5 +503,8 @@ Do NOT act on a supervision tick unless something is genuinely wrong (a child ha
 				},
 			})
 		})
+
+		// An agent with nothing to spawn has no children to resume either.
+		return spawnableAgents.length > 0 ? [...startTools, resumeTool] : []
 	})
 	.build()
