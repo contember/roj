@@ -295,23 +295,37 @@ export const coreReducer = createTypedReducer(
 			case 'context_compacted':
 				return updateAgent(state, event.agentId, (agent) => ({
 					...agent,
-					conversationHistory: event.newConversationHistory.map((m) => {
+					conversationHistory: event.newConversationHistory.map((m): LLMMessage => {
 						switch (m.role) {
 							case 'user':
 								return {
-									role: 'user' as const,
+									role: 'user',
 									content: m.content,
-									sourceMessageIds: [],
+									sourceMessageIds: m.sourceMessageIds ?? [],
+									cacheControl: m.cacheControl,
 								}
 							case 'assistant':
 								return {
-									role: 'assistant' as const,
+									role: 'assistant',
 									content: m.content,
+									toolCalls: m.toolCalls,
+									cacheControl: m.cacheControl,
+								}
+							case 'tool':
+								return {
+									role: 'tool',
+									content: m.content,
+									toolCallId: m.toolCallId,
+									toolName: m.toolName,
+									isError: m.isError,
+									timestamp: m.timestamp,
+									cacheControl: m.cacheControl,
 								}
 							case 'system':
 								return {
-									role: 'system' as const,
+									role: 'system',
 									content: m.content,
+									cacheControl: m.cacheControl,
 								}
 						}
 					}),

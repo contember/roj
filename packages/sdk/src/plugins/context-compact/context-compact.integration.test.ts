@@ -3,7 +3,7 @@ import z from 'zod/v4'
 import { contextEvents } from '~/core/context/state.js'
 import { llmEvents } from '~/core/llm/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
-import type { InferenceRequest } from '~/core/llm/provider.js'
+import type { InferenceRequest, LLMMessage } from '~/core/llm/provider.js'
 import { ModelId } from '~/core/llm/schema.js'
 import type { Preset } from '~/core/preset/index.js'
 import { createTool } from '~/core/tools/definition.js'
@@ -46,6 +46,33 @@ function createCompactPreset(maxTokens: number, overrides?: Parameters<typeof cr
 
 function createCompactHarness(options: Omit<ConstructorParameters<typeof TestHarness>[0], 'systemPlugins'>) {
 	return new TestHarness({ ...options, systemPlugins: [contextCompactPlugin] })
+}
+
+function expectToolPairing(messages: LLMMessage[]): void {
+	const declaredToolCallIds = new Set<string>()
+
+	for (let i = 0; i < messages.length; i++) {
+		const message = messages[i]
+		if (message.role === 'assistant' && message.toolCalls?.length) {
+			const expected = new Set(message.toolCalls.map((toolCall) => toolCall.id))
+			const seen = new Set<string>()
+			for (const toolCall of message.toolCalls) {
+				declaredToolCallIds.add(toolCall.id)
+			}
+			for (let j = i + 1; j < messages.length; j++) {
+				const next = messages[j]
+				if (next.role !== 'tool') break
+				seen.add(next.toolCallId)
+			}
+			for (const id of expected) {
+				expect(seen.has(id)).toBe(true)
+			}
+		}
+
+		if (message.role === 'tool') {
+			expect(declaredToolCallIds.has(message.toolCallId)).toBe(true)
+		}
+	}
 }
 
 // ============================================================================
@@ -222,6 +249,7 @@ describe('context-compact plugin', () => {
 			}
 
 			let capturedAuxRequest: InferenceRequest | undefined
+			let capturedToolResultRequest: InferenceRequest | undefined
 
 			const harness = new TestHarness({
 				systemPlugins: [contextCompactPlugin],
@@ -246,6 +274,7 @@ describe('context-compact plugin', () => {
 							metrics: MockLLMProvider.defaultMetrics(),
 						}
 					}
+					capturedToolResultRequest = request
 					return {
 						content: 'Done.',
 						toolCalls: [],
@@ -259,26 +288,14 @@ describe('context-compact plugin', () => {
 			await session.sendAndWaitForIdle('Please call my_tool')
 
 			expect(capturedAuxRequest).toBeDefined()
+			if (!capturedAuxRequest) return
+			expectToolPairing(capturedAuxRequest.messages)
 
-			// Every assistant message with toolCalls must be followed by a contiguous
-			// run of tool messages covering each tool_use id before any further
-			// user/assistant message. This mirrors Anthropic's API contract.
-			const msgs = capturedAuxRequest!.messages
-			for (let i = 0; i < msgs.length; i++) {
-				const m = msgs[i]
-				if (m.role !== 'assistant' || !m.toolCalls?.length) continue
-
-				const expected = new Set(m.toolCalls.map((tc) => tc.id))
-				const seen = new Set<string>()
-				for (let j = i + 1; j < msgs.length; j++) {
-					const next = msgs[j]
-					if (next.role !== 'tool') break
-					seen.add(next.toolCallId)
-				}
-				for (const id of expected) {
-					expect(seen.has(id)).toBe(true)
-				}
-			}
+			// The event reducer runs before pending tool results are appended to the
+			// regular inference request. Pairing must survive that reconstruction.
+			expect(capturedToolResultRequest).toBeDefined()
+			if (!capturedToolResultRequest) return
+			expectToolPairing(capturedToolResultRequest.messages)
 
 			// Compaction must have actually succeeded — pre-fix it would Err-out
 			// in production (mock accepts it but the assertion above already

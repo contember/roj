@@ -194,7 +194,7 @@ export class ContextCompactor {
 			count = 0
 			let tokens = 0
 			for (let i = messages.length - 1; i >= 0 && count < maxCount; i--) {
-				const msgTokens = estimateMessagesTokens([messages[i]])
+				const msgTokens = estimateConversationTokens([messages[i]])
 				if (tokens + msgTokens > tokenBudget) break
 				tokens += msgTokens
 				count++
@@ -204,6 +204,13 @@ export class ContextCompactor {
 		// Move split point forward to avoid orphaned tool results at the start of kept messages
 		while (count > 0 && messages[messages.length - count].role === 'tool') {
 			count--
+		}
+
+		// An incomplete tool turn at the tail has pending results outside history.
+		// Keep its assistant declaration even if count/token limits would drop it.
+		const openToolTurnStart = findOpenToolTurnStart(messages)
+		if (openToolTurnStart !== undefined) {
+			count = Math.max(count, messages.length - openToolTurnStart)
 		}
 
 		return count
@@ -220,7 +227,7 @@ export class ContextCompactor {
 	 * relying on it alone causes the trigger to never fire in long sessions.
 	 */
 	needsCompaction(messages: LLMMessage[], lastActualPromptTokens?: number): boolean {
-		const tokens = lastActualPromptTokens ?? estimateMessagesTokens(messages)
+		const tokens = lastActualPromptTokens ?? estimateConversationTokens(messages)
 		return tokens > this.config.maxTokens
 	}
 
@@ -256,7 +263,7 @@ export class ContextCompactor {
 		runInference: RunInferenceFn,
 		lastActualPromptTokens?: number,
 	): Promise<Result<CompactionResult, Error>> {
-		const originalTokens = lastActualPromptTokens ?? estimateMessagesTokens(messages)
+		const originalTokens = lastActualPromptTokens ?? estimateConversationTokens(messages)
 
 		this.logger.info('Starting context compaction', {
 			sessionId,
@@ -338,7 +345,7 @@ export class ContextCompactor {
 		}
 
 		const compactedMessages = [summaryMessage, ...toKeep]
-		const compactedTokens = estimateMessagesTokens(compactedMessages)
+		const compactedTokens = estimateConversationTokens(compactedMessages)
 
 		this.logger.info('Context compaction complete', {
 			sessionId,
@@ -362,6 +369,54 @@ export class ContextCompactor {
 	}
 }
 
+function findOpenToolTurnStart(messages: LLMMessage[]): number | undefined {
+	let assistantIndex = messages.length - 1
+	while (assistantIndex >= 0 && messages[assistantIndex].role === 'tool') {
+		assistantIndex--
+	}
+
+	const assistant = messages[assistantIndex]
+	if (assistant?.role !== 'assistant' || !assistant.toolCalls?.length) {
+		return undefined
+	}
+
+	const completedToolCallIds = new Set<string>()
+	for (let i = assistantIndex + 1; i < messages.length; i++) {
+		const message = messages[i]
+		if (message.role === 'tool') {
+			completedToolCallIds.add(message.toolCallId)
+		}
+	}
+	return assistant.toolCalls.some((toolCall) => !completedToolCallIds.has(toolCall.id))
+		? assistantIndex
+		: undefined
+}
+
+function estimateConversationTokens(messages: LLMMessage[]): number {
+	return estimateMessagesTokens(messages.map((message) => ({
+		role: message.role,
+		content: tokenEstimationContent(message),
+	})))
+}
+
+function tokenEstimationContent(message: LLMMessage): unknown {
+	switch (message.role) {
+		case 'assistant':
+			return message.toolCalls?.length
+				? { content: message.content, toolCalls: message.toolCalls }
+				: message.content
+		case 'tool':
+			return {
+				content: message.content,
+				toolCallId: message.toolCallId,
+				isError: message.isError,
+			}
+		case 'user':
+		case 'system':
+			return message.content
+	}
+}
+
 // ============================================================================
 // Event creation helper
 // ============================================================================
@@ -371,11 +426,7 @@ export function createContextCompactedEvent(
 	agentId: AgentId,
 	result: CompactionResult,
 ): ContextCompactedEvent {
-	// Convert LLMMessage[] to CompactedConversationMessage[]
-	const newConversationHistory: CompactedConversationMessage[] = result.compactedMessages.map((msg) => ({
-		role: msg.role === 'tool' ? 'system' : msg.role,
-		content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
-	}))
+	const newConversationHistory: CompactedConversationMessage[] = result.compactedMessages
 
 	return withSessionId(
 		sessionId,
@@ -397,7 +448,10 @@ export function createContextCompactedEvent(
  * tool-call and tool-result detail in the rendered content. Used for the
  * compaction "input" snapshot shown in the debug UI — not for reconstruction.
  */
-function toDisplayMessage(msg: LLMMessage): CompactedConversationMessage {
+function toDisplayMessage(msg: LLMMessage): {
+	role: 'user' | 'assistant' | 'system'
+	content: string
+} {
 	if (msg.role === 'assistant') {
 		const parts: string[] = []
 		if (msg.content) parts.push(msg.content)
