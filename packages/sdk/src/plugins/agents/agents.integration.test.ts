@@ -805,4 +805,172 @@ describe('agents plugin', () => {
 			await harness.shutdown()
 		})
 	})
+
+	// =========================================================================
+	// resume_agent tool
+	// =========================================================================
+
+	describe('resume_agent tool', () => {
+		// A paused child never becomes idle, so waitForAllAgentsIdle can't be used here —
+		// wait for the effect instead.
+		const waitFor = async (predicate: () => boolean, timeoutMs = 5000): Promise<void> => {
+			const deadline = Date.now() + timeoutMs
+			while (Date.now() < deadline) {
+				if (predicate()) return
+				await new Promise(resolve => setTimeout(resolve, 10))
+			}
+			throw new Error('waitFor timed out')
+		}
+
+		const workerPreset = () => createMultiAgentPreset([
+			{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+		], { orchestratorSystem: 'Orchestrator agent.' })
+
+		it('is offered to an agent that can spawn, and not to a leaf', async () => {
+			const toolNames = new Map<string, string[]>()
+
+			const harness = new TestHarness({
+				presets: [workerPreset()],
+				mockHandler: (request) => {
+					const role = request.systemPrompt.includes('Orchestrator') ? 'orchestrator' : 'worker'
+					toolNames.set(role, (request.tools ?? []).map(tool => tool.name))
+					if (role === 'orchestrator' && !toolNames.has('worker')) {
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Work' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return { content: 'Done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Start')
+
+			expect(toolNames.get('orchestrator')).toContain('resume_agent')
+			expect(toolNames.get('worker')).not.toContain('resume_agent')
+
+			await harness.shutdown()
+		})
+
+		it('orchestrator resumes its paused child', async () => {
+			let started = false
+			let resumeIssued = false
+
+			const harness = new TestHarness({
+				presets: [workerPreset()],
+				mockHandler: (request) => {
+					if (request.systemPrompt.includes('Orchestrator')) {
+						const asked = JSON.stringify(request.messages).includes('Resume the worker')
+						if (asked && !resumeIssued) {
+							resumeIssued = true
+							return {
+								content: null,
+								toolCalls: [{ id: ToolCallId('tc2'), name: 'resume_agent', input: { agentId: 'worker_1' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						}
+						if (!started) {
+							started = true
+							return {
+								content: null,
+								toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Work' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						}
+						return { content: 'Done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+					}
+					return { content: 'Worker done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Start')
+
+			const pauseResult = await session.callPluginMethod('agents.pause', { agentId: 'worker_1' })
+			expect(pauseResult.ok).toBe(true)
+			expect(session.state.agents.get(AgentId('worker_1'))!.status).toBe('paused')
+
+			await session.sendMessage('Resume the worker')
+			await waitFor(() => session.state.agents.get(AgentId('worker_1'))!.status !== 'paused')
+
+			const resumedEvents = await session.getEventsByType(agentEvents, 'agent_resumed')
+			expect(resumedEvents.filter(e => e.agentId === AgentId('worker_1'))).toHaveLength(1)
+			expect(session.state.agents.get(AgentId('worker_1'))!.status).not.toBe('paused')
+
+			await harness.shutdown()
+		})
+
+		it('refuses an agent that is not the caller\'s child', async () => {
+			let delegated = false
+			let subDelegated = false
+			let resumeIssued = false
+			let toolResult = ''
+
+			const harness = new TestHarness({
+				presets: [createMultiAgentPreset([
+					{ name: 'worker_a', system: 'Worker A agent.', tools: [], agents: ['worker_b'] },
+					{ name: 'worker_b', system: 'Worker B agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' })],
+				mockHandler: (request) => {
+					if (request.systemPrompt.includes('Orchestrator')) {
+						const last = request.messages[request.messages.length - 1]
+						if (last?.role === 'tool' && resumeIssued) toolResult = JSON.stringify(last.content)
+
+						const asked = JSON.stringify(request.messages).includes('Resume the grandchild')
+						if (asked && !resumeIssued) {
+							resumeIssued = true
+							// worker_b is a grandchild — spawned by worker_a, not by the orchestrator
+							return {
+								content: null,
+								toolCalls: [{ id: ToolCallId('tc3'), name: 'resume_agent', input: { agentId: 'worker_b_1' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						}
+						if (!delegated) {
+							delegated = true
+							return {
+								content: null,
+								toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker_a', input: { message: 'Delegate' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						}
+						return { content: 'Done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+					}
+
+					if (request.systemPrompt.includes('Worker A')) {
+						if (subDelegated) {
+							return { content: 'Worker A done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+						}
+						subDelegated = true
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('tc2'), name: 'start_worker_b', input: { message: 'Sub-task' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return { content: 'Worker done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Start', { timeoutMs: 15_000 })
+
+			await session.callPluginMethod('agents.pause', { agentId: 'worker_b_1' })
+			await session.sendMessage('Resume the grandchild')
+			await waitFor(() => toolResult !== '')
+
+			expect(toolResult).toContain('not your child')
+			expect(session.state.agents.get(AgentId('worker_b_1'))!.status).toBe('paused')
+
+			await harness.shutdown()
+		}, 20_000)
+	})
 })
