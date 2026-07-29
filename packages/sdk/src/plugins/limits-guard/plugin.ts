@@ -1,4 +1,4 @@
-import type { AgentId } from '~/core/agents/schema.js'
+import { AgentId } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { contextEvents } from '~/core/context/state.js'
 import { llmEvents } from '~/core/llm/state.js'
@@ -27,6 +27,8 @@ export interface AgentCounters {
 	toolCallCount: number
 	spawnedAgentCount: number
 	messagesSentCount: number
+	/** Consecutive inference turns whose only tool calls were outbound communication. */
+	consecutiveNoProgressTurns: number
 	/** Number of context compaction events for this agent. */
 	compactionCount: number
 	/** Cumulative LLM cost (USD) summed from inference metrics. NOT reset on resume. */
@@ -46,6 +48,7 @@ export const createAgentCounters = (): AgentCounters => ({
 	toolCallCount: 0,
 	spawnedAgentCount: 0,
 	messagesSentCount: 0,
+	consecutiveNoProgressTurns: 0,
 	compactionCount: 0,
 	costSpent: 0,
 	tokensUsed: 0,
@@ -63,6 +66,12 @@ export function sumSessionSpend(limits: Map<AgentId, AgentCounters>): BudgetSpen
 		tokensUsed += counters.tokensUsed
 	}
 	return { costSpent, tokensUsed }
+}
+
+const OUTBOUND_COMMUNICATION_TOOLS = new Set(['send_message', 'tell_user'])
+
+function isOutboundCommunicationOnly(toolCalls: Array<{ name: string }>): boolean {
+	return toolCalls.length > 0 && toolCalls.every((toolCall) => OUTBOUND_COMMUNICATION_TOOLS.has(toolCall.name))
 }
 
 /**
@@ -160,17 +169,27 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 				}
 
 				case 'mailbox_message': {
+					let newLimits = limits
+					const recipientCounters = limits.get(event.toAgentId)
+					if (recipientCounters?.consecutiveNoProgressTurns) {
+						newLimits = new Map(limits)
+						newLimits.set(event.toAgentId, {
+							...recipientCounters,
+							consecutiveNoProgressTurns: 0,
+						})
+					}
+
 					// Increment sender's messagesSentCount if sender is an agent
 					const senderAgentId = typeof event.message.from === 'string' && event.message.from !== 'user'
 						? event.message.from
 						: null
-					if (!senderAgentId) return limits
+					if (!senderAgentId) return newLimits
 
-					const senderCounters = limits.get(senderAgentId as AgentId)
-					if (!senderCounters) return limits
+					const senderCounters = newLimits.get(AgentId(senderAgentId))
+					if (!senderCounters) return newLimits
 
-					const newLimits = new Map(limits)
-					newLimits.set(senderAgentId as AgentId, {
+					if (newLimits === limits) newLimits = new Map(limits)
+					newLimits.set(AgentId(senderAgentId), {
 						...senderCounters,
 						messagesSentCount: senderCounters.messagesSentCount + 1,
 					})
@@ -182,6 +201,7 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 					if (!counters) return limits
 
 					const hasToolCalls = event.response.toolCalls.length > 0
+					const communicationOnly = isOutboundCommunicationOnly(event.response.toolCalls)
 					let newRecentResponseHashes = counters.recentResponseHashes
 
 					if (!hasToolCalls) {
@@ -198,6 +218,9 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 						inferenceCount: counters.inferenceCount + 1,
 						costSpent: counters.costSpent + (event.metrics.cost ?? 0),
 						tokensUsed: counters.tokensUsed + (event.metrics.totalTokens ?? 0),
+						consecutiveNoProgressTurns: communicationOnly
+							? counters.consecutiveNoProgressTurns + 1
+							: 0,
 						recentResponseHashes: newRecentResponseHashes,
 					})
 					return newLimits
@@ -296,6 +319,7 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 						toolCallCount: 0,
 						spawnedAgentCount: 0,
 						messagesSentCount: 0,
+						consecutiveNoProgressTurns: 0,
 						compactionCount: 0,
 						consecutiveToolFailures: {},
 						recentToolCallHashes: [],
@@ -368,9 +392,13 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 		// The inference_completed event hasn't been emitted yet, so project
 		// what the counters will be after it's processed by the reducer.
 		const hasToolCalls = ctx.response.toolCalls.length > 0
+		const communicationOnly = isOutboundCommunicationOnly(ctx.response.toolCalls)
 		const projected: AgentCounters = {
 			...counters,
 			inferenceCount: counters.inferenceCount + 1,
+			consecutiveNoProgressTurns: communicationOnly
+				? counters.consecutiveNoProgressTurns + 1
+				: 0,
 			recentResponseHashes: hasToolCalls
 				? counters.recentResponseHashes
 				: [...counters.recentResponseHashes, responseFingerprint(ctx.response.content)].slice(-10),

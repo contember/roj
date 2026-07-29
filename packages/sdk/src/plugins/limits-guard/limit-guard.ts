@@ -20,6 +20,7 @@ export interface ResolvedAgentLimits {
 	softLimitRatio: number
 	maxRepeatedToolCalls: number
 	maxRepeatedResponses: number
+	maxConsecutiveNoProgressTurns: number
 	maxCost: number
 	maxTokens: number
 	maxCompactions: number
@@ -34,6 +35,7 @@ const DEFAULTS: ResolvedAgentLimits = {
 	softLimitRatio: 0.8,
 	maxRepeatedToolCalls: 3,
 	maxRepeatedResponses: 3,
+	maxConsecutiveNoProgressTurns: 3,
 	// Budgets and the compaction cap are opt-in: unset means unlimited.
 	maxCost: Number.POSITIVE_INFINITY,
 	maxTokens: Number.POSITIVE_INFINITY,
@@ -51,6 +53,8 @@ export function resolveAgentLimits(config?: AgentLimits): ResolvedAgentLimits {
 		softLimitRatio: config.softLimitRatio ?? DEFAULTS.softLimitRatio,
 		maxRepeatedToolCalls: config.maxRepeatedToolCalls ?? DEFAULTS.maxRepeatedToolCalls,
 		maxRepeatedResponses: config.maxRepeatedResponses ?? DEFAULTS.maxRepeatedResponses,
+		maxConsecutiveNoProgressTurns:
+			config.maxConsecutiveNoProgressTurns ?? DEFAULTS.maxConsecutiveNoProgressTurns,
 		maxCost: config.maxCost ?? DEFAULTS.maxCost,
 		maxTokens: config.maxTokens ?? DEFAULTS.maxTokens,
 		maxCompactions: config.maxCompactions ?? DEFAULTS.maxCompactions,
@@ -165,16 +169,24 @@ export function checkLimits(counters: AgentCounters, limits: ResolvedAgentLimits
 		{ name: 'maxSpawnedAgents', current: counters.spawnedAgentCount, max: limits.maxSpawnedAgents },
 		{ name: 'maxMessagesSent', current: counters.messagesSentCount, max: limits.maxMessagesSent },
 		{ name: 'maxCompactions', current: counters.compactionCount, max: limits.maxCompactions },
+		{
+			name: 'maxConsecutiveNoProgressTurns',
+			current: counters.consecutiveNoProgressTurns,
+			max: limits.maxConsecutiveNoProgressTurns,
+		},
 	]
 
 	for (const check of hardChecks) {
 		if (check.current >= check.max) {
+			const reason = check.name === 'maxConsecutiveNoProgressTurns'
+				? `No progress detected: ${check.current} consecutive turns used only outbound communication`
+				: `${check.name} reached: ${check.current}/${check.max}`
 			return {
 				status: 'hard_limit',
 				limitName: check.name,
 				currentValue: check.current,
 				hardLimit: check.max,
-				reason: `${check.name} reached: ${check.current}/${check.max}`,
+				reason,
 			}
 		}
 	}
