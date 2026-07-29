@@ -23,7 +23,7 @@ export interface AgentLimits {
 	maxRepeatedToolCalls?: number
 	/** Maximum consecutive identical text-only responses. Default: 3 */
 	maxRepeatedResponses?: number
-	/** Maximum consecutive turns containing only outbound communication. Default: 3 */
+	/** Maximum consecutive outbound-only turns without newly consumed inbound work. Default: 3 */
 	maxConsecutiveNoProgressTurns?: number
 	/**
 	 * Maximum cumulative LLM cost (USD) this agent may spend before it is paused.

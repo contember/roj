@@ -65,6 +65,10 @@ export const agentEvents = createEventsFactory({
 		agent_resumed: z4.object({
 			agentId: agentIdSchema,
 		}),
+		agent_input_consumed: z4.object({
+			agentId: agentIdSchema,
+			sourcePlugins: z4.array(z4.string()),
+		}),
 		communicator_linked: z4.object({
 			communicatorId: agentIdSchema,
 			orchestratorId: agentIdSchema,
@@ -85,6 +89,7 @@ export type HandlerCompletedEvent = (typeof agentEvents)['Events']['handler_comp
 export type PreambleAddedEvent = (typeof agentEvents)['Events']['preamble_added']
 export type AgentPausedEvent = (typeof agentEvents)['Events']['agent_paused']
 export type AgentResumedEvent = (typeof agentEvents)['Events']['agent_resumed']
+export type AgentInputConsumedEvent = (typeof agentEvents)['Events']['agent_input_consumed']
 export type CommunicatorLinkedEvent = (typeof agentEvents)['Events']['communicator_linked']
 export type AgentConversationSplicedEvent = (typeof agentEvents)['Events']['agent_conversation_spliced']
 

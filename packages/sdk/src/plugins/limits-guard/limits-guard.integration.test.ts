@@ -38,6 +38,15 @@ async function waitForAgentPaused(session: TestSession, agentId: AgentId, timeou
 	throw new Error(`waitForAgentPaused timed out after ${timeoutMs}ms for agent ${agentId}`)
 }
 
+async function waitUntil(predicate: () => boolean, timeoutMs = 10000): Promise<void> {
+	const deadline = Date.now() + timeoutMs
+	while (Date.now() < deadline) {
+		if (predicate()) return
+		await new Promise((resolve) => setTimeout(resolve, 10))
+	}
+	throw new Error(`waitUntil timed out after ${timeoutMs}ms`)
+}
+
 /**
  * Wait for all agents to be either idle (pending with no work) or paused.
  */
@@ -184,7 +193,7 @@ describe('limits-guard plugin', () => {
 			await harness.shutdown()
 		})
 
-		it('reworded communication-only loop → agent pauses within the no-progress limit', async () => {
+		it('communication-only loop without new inbound work → soft-stops and remains wakeable', async () => {
 			let inferenceCount = 0
 
 			const harness = createLimitsHarness({
@@ -196,6 +205,14 @@ describe('limits-guard plugin', () => {
 				})],
 				mockHandler: () => {
 					inferenceCount++
+					if (inferenceCount > 4) {
+						return {
+							content: 'Recovered for new work',
+							toolCalls: [],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
 					return {
 						content: null,
 						toolCalls: [{
@@ -211,16 +228,94 @@ describe('limits-guard plugin', () => {
 
 			const session = await harness.createSession('test')
 			const entryAgentId = session.getEntryAgentId()!
-			await session.sendMessage('Start')
-			await waitForAgentPaused(session, entryAgentId)
+			await session.sendAndWaitForIdle('Start')
 
-			expect(inferenceCount).toBe(3)
+			// The response to "Start" had inbound work. The next three turns were
+			// driven only by the previous tell_user result, so the fourth inference
+			// reaches the limit and its redundant tool call is suppressed.
+			expect(inferenceCount).toBe(4)
 			const toolStarted = await session.getEventsByType(toolEvents, 'tool_started')
-			expect(toolStarted).toHaveLength(2)
+			expect(toolStarted).toHaveLength(3)
 
 			const pauseEvents = await session.getEventsByType(agentEvents, 'agent_paused')
-			const pauseEvent = pauseEvents.find((event) => event.agentId === entryAgentId)
-			expect(pauseEvent?.message).toContain('3 consecutive turns used only outbound communication')
+			expect(pauseEvents.some((event) => event.agentId === entryAgentId)).toBe(false)
+
+			const warningEvents = await session.getEventsByType(limitsEvents, 'limit_warning')
+			const noProgressEvent = warningEvents.find((event) =>
+				event.agentId === entryAgentId
+				&& event.limitName === 'maxConsecutiveNoProgressTurns'
+			)
+			expect(noProgressEvent?.currentValue).toBe(3)
+			expect(noProgressEvent?.message).toContain('until new input arrives')
+			expect(session.state.agents.get(entryAgentId)?.status).toBe('pending')
+
+			// The stop is recoverable without agents.resume or human intervention.
+			await session.sendAndWaitForIdle('Now do real work')
+			expect(inferenceCount).toBe(5)
+			expect(session.state.agents.get(entryAgentId)?.status).toBe('pending')
+
+			await harness.shutdown()
+		})
+
+		it('communication-only replies to distinct user messages do not count as no progress', async () => {
+			let inferenceCount = 0
+			let allowProcessing = false
+			const preset = createTestPreset({
+				orchestratorSystem: 'Test agent.',
+				orchestratorPlugins: [limitsGuardPlugin.configureAgent({
+					limits: { maxConsecutiveNoProgressTurns: 3, maxTurns: 100 },
+				})],
+			})
+			preset.orchestrator.debounceCallback = () => {
+				if (!allowProcessing) return 'wait'
+				allowProcessing = false
+				return 'process_now'
+			}
+			preset.orchestrator.checkIntervalMs = 1
+
+			const harness = createLimitsHarness({
+				presets: [preset],
+				mockHandler: () => {
+					inferenceCount++
+					return {
+						content: null,
+						toolCalls: [{
+							id: ToolCallId(`reply-${inferenceCount}`),
+							name: 'tell_user',
+							input: { message: `Reply ${inferenceCount}` },
+						}],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetrics(),
+					}
+				},
+			})
+
+			const session = await harness.createSession('test')
+			const entryAgentId = session.getEntryAgentId()!
+
+			for (let messageNumber = 1; messageNumber <= 3; messageNumber++) {
+				await session.sendMessage(`User message ${messageNumber}`)
+				allowProcessing = true
+				await waitUntil(() => {
+					const state = session.state.agents.get(entryAgentId)
+					return inferenceCount === messageNumber && state?.pendingToolResults.length === 1
+				})
+
+				const counters = selectPluginState<Map<AgentId, AgentCounters>>(
+					session.state,
+					'agentLimits',
+				)?.get(entryAgentId)
+				expect(counters?.consecutiveNoProgressTurns).toBe(0)
+			}
+
+			const consumedEvents = await session.getEventsByType(agentEvents, 'agent_input_consumed')
+			expect(consumedEvents).toHaveLength(3)
+			expect(consumedEvents.every((event) => event.sourcePlugins.includes('user-chat'))).toBe(true)
+
+			const pauseEvents = await session.getEventsByType(agentEvents, 'agent_paused')
+			expect(pauseEvents.some((event) => event.agentId === entryAgentId)).toBe(false)
+			const warningEvents = await session.getEventsByType(limitsEvents, 'limit_warning')
+			expect(warningEvents.some((event) => event.limitName === 'maxConsecutiveNoProgressTurns')).toBe(false)
 
 			await harness.shutdown()
 		})

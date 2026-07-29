@@ -785,7 +785,8 @@ export class Agent {
 		if (postInferenceState) {
 			agentState = postInferenceState
 		}
-		const afterResult = await this.executeAfterInference(agentState, response)
+		const dequeuedSourcePlugins = pluginDequeued.map((dequeued) => dequeued.plugin.name)
+		const afterResult = await this.executeAfterInference(agentState, response, dequeuedSourcePlugins)
 		if (afterResult !== null) {
 			if (afterResult.action === 'pause') {
 				// Commit the turn before pausing so pendingMessages move to conversationHistory.
@@ -1225,6 +1226,7 @@ export class Agent {
 	private async executeAfterInference(
 		agentState: AgentState,
 		response: LLMResponse,
+		dequeuedSourcePlugins: readonly string[],
 	): Promise<AfterInferenceResult> {
 		this.logger.debug('Executing afterInference handlers', {
 			agentId: this.id,
@@ -1241,6 +1243,7 @@ export class Agent {
 					...this.buildPluginHookContext(plugin, agentContext),
 					response,
 					turnNumber: this.turnNumber,
+					dequeuedSourcePlugins,
 				}
 				const result = await plugin.agentHooks.afterInference(ctx)
 				if (result === null) {
@@ -1740,6 +1743,15 @@ export class Agent {
 			if (!dequeued.plugin.dequeue) continue
 			const pluginCtx = this.buildPluginHookContext(dequeued.plugin, ctx)
 			await dequeued.plugin.dequeue.markConsumed(pluginCtx, dequeued.token)
+		}
+		if (pluginDequeued.length > 0) {
+			await this.store.emit(withSessionId(
+				this.store.sessionId,
+				agentEvents.create('agent_input_consumed', {
+					agentId: this.id,
+					sourcePlugins: pluginDequeued.map((dequeued) => dequeued.plugin.name),
+				}),
+			))
 		}
 	}
 }
