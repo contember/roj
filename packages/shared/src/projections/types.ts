@@ -197,8 +197,12 @@ export interface TimelineItem {
 
 /** A single conversation message captured on a compaction timeline item. */
 export interface CompactionMessage {
-	role: 'user' | 'assistant' | 'system'
+	role: 'user' | 'assistant' | 'tool' | 'system'
 	content: string
+	toolCalls?: Array<{ id: ToolCallId; name: string; input: unknown }>
+	toolCallId?: ToolCallId
+	toolName?: string
+	isError?: boolean
 }
 
 // ============================================================================

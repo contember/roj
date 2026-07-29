@@ -22,9 +22,11 @@ interface LLMMessage {
 	content: string | Array<{ type: string; text?: string }>
 	toolCalls?: Array<{ id: ToolCallId; name: string; input: unknown }>
 	toolCallId?: ToolCallId
+	toolName?: string
 	isError?: boolean
 	sourceMessageIds?: MessageId[]
 	timestamp?: number
+	cacheControl?: { type: 'ephemeral'; ttl?: '5m' | '1h' }
 	cost?: number
 	llmCallId?: LLMCallId
 	promptTokens?: number
@@ -357,10 +359,40 @@ export function applyEventToAgentDetail(state: AgentDetailProjectionState, event
 			const newAgents = new Map(state.agents)
 			newAgents.set(event.agentId, {
 				...agent,
-				conversationHistory: event.newConversationHistory.map((m): LLMMessage => ({
-					role: m.role,
-					content: m.content,
-				})),
+				conversationHistory: event.newConversationHistory.map((m): LLMMessage => {
+					switch (m.role) {
+						case 'user':
+							return {
+								role: 'user',
+								content: m.content,
+								sourceMessageIds: m.sourceMessageIds ?? [],
+								cacheControl: m.cacheControl,
+							}
+						case 'assistant':
+							return {
+								role: 'assistant',
+								content: m.content,
+								toolCalls: m.toolCalls,
+								cacheControl: m.cacheControl,
+							}
+						case 'tool':
+							return {
+								role: 'tool',
+								content: m.content,
+								toolCallId: m.toolCallId,
+								toolName: m.toolName,
+								isError: m.isError,
+								timestamp: m.timestamp,
+								cacheControl: m.cacheControl,
+							}
+						case 'system':
+							return {
+								role: 'system',
+								content: m.content,
+								cacheControl: m.cacheControl,
+							}
+					}
+				}),
 			})
 			return { ...state, agents: newAgents }
 		}

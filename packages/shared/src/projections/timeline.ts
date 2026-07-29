@@ -3,9 +3,10 @@
  */
 
 import type { AgentId, InferenceStartedEvent, LLMCallLogEntry, ToolCallId, ToolStartedEvent } from '@roj-ai/sdk'
+import { contentToString } from '../lib/domain-utils.js'
 import type { AgentRegistryState } from './agent-registry.js'
 import type { ProjectionEvent } from './events.js'
-import type { TimelineItem } from './types.js'
+import type { CompactionMessage, TimelineItem } from './types.js'
 
 export interface TimelineState {
 	items: TimelineItem[]
@@ -177,7 +178,34 @@ export function applyEventToTimeline(
 				messagesRemoved: event.messagesRemoved,
 				compactionOriginalMessages: event.originalMessages,
 				compactedContent: event.compactedContent,
-				compactionNewHistory: event.newConversationHistory,
+				compactionNewHistory: event.newConversationHistory.map((message): CompactionMessage => {
+					switch (message.role) {
+						case 'user':
+							return {
+								role: 'user',
+								content: contentToString(message.content),
+							}
+						case 'assistant':
+							return {
+								role: 'assistant',
+								content: message.content,
+								toolCalls: message.toolCalls,
+							}
+						case 'tool':
+							return {
+								role: 'tool',
+								content: contentToString(message.content),
+								toolCallId: message.toolCallId,
+								toolName: message.toolName,
+								isError: message.isError,
+							}
+						case 'system':
+							return {
+								role: 'system',
+								content: message.content,
+							}
+					}
+				}),
 			}
 
 			return {

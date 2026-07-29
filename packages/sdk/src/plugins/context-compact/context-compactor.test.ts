@@ -1,10 +1,15 @@
 import { beforeEach, describe, expect, it } from 'bun:test'
+import { agentEvents } from '~/core/agents/state.js'
 import type { AgentId } from '~/core/agents/schema.js'
 import { generateTestAgentId } from '~/core/agents/schema.js'
+import { contextCompactedEventSchema, contextEvents } from '~/core/context/state.js'
+import { withSessionId } from '~/core/events/test-helpers.js'
 import type { InferenceResponse, LLMMessage } from '~/core/llm/provider.js'
 import { ModelId } from '~/core/llm/schema.js'
+import { estimateMessagesTokens } from '~/core/llm/tokens.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import { generateSessionId } from '~/core/sessions/schema.js'
+import { coreReducer, createSessionState } from '~/core/sessions/state.js'
 import { generateToolCallId } from '~/core/tools/schema.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import { silentLogger } from '../../lib/logger/logger.js'
@@ -315,12 +320,26 @@ describe('createContextCompactedEvent', () => {
 		expect(event.timestamp).toBeDefined()
 	})
 
-	it('converts tool role to system in history', () => {
+	it('preserves assistant tool calls and tool results in history', () => {
 		const sessionId = generateSessionId()
 		const agentId = generateTestAgentId()
 		const toolCallId = generateToolCallId()
 		const result: CompactionResult = {
-			compactedMessages: [{ role: 'tool', content: 'tool result', toolCallId }],
+			compactedMessages: [
+				{
+					role: 'assistant',
+					content: 'Checking.',
+					toolCalls: [{ id: toolCallId, name: 'read', input: { path: '/src/index.ts' } }],
+				},
+				{
+					role: 'tool',
+					content: 'tool result',
+					toolCallId,
+					toolName: 'read',
+					isError: false,
+					timestamp: 123,
+				},
+			],
 			originalMessages: [],
 			summary: '',
 			originalTokens: 100,
@@ -330,8 +349,44 @@ describe('createContextCompactedEvent', () => {
 
 		const event = createContextCompactedEvent(sessionId, agentId, result)
 
-		// tool role should be converted to system
-		expect(event.newConversationHistory[0].role).toBe('system')
+		expect(event.newConversationHistory).toEqual(result.compactedMessages)
+	})
+
+	it('parses and reduces old-shape events exactly as before', () => {
+		const sessionId = generateSessionId()
+		const agentId = generateTestAgentId()
+		const oldPayload = contextCompactedEventSchema.parse({
+			agentId,
+			compactedContent: 'Old summary',
+			newConversationHistory: [
+				{ role: 'user', content: 'summary' },
+				{ role: 'assistant', content: 'recent response' },
+				{ role: 'system', content: 'legacy context' },
+			],
+			originalTokens: 1000,
+			compactedTokens: 100,
+			messagesRemoved: 12,
+		})
+
+		let state = createSessionState(sessionId, 'test', 0)
+		state = coreReducer(state, withSessionId(
+			sessionId,
+			agentEvents.create('agent_spawned', {
+				agentId,
+				definitionName: 'test-agent',
+				parentId: null,
+			}),
+		))
+		state = coreReducer(state, withSessionId(
+			sessionId,
+			contextEvents.create('context_compacted', oldPayload),
+		))
+
+		expect(state.agents.get(agentId)?.conversationHistory).toEqual([
+			{ role: 'user', content: 'summary', sourceMessageIds: [], cacheControl: undefined },
+			{ role: 'assistant', content: 'recent response', toolCalls: undefined, cacheControl: undefined },
+			{ role: 'system', content: 'legacy context', cacheControl: undefined },
+		])
 	})
 })
 
@@ -613,6 +668,97 @@ describe('ContextCompactor with tool calls', () => {
 		}
 		// All 5 original messages should be compacted (none kept except summary)
 		expect(result.value.messagesRemoved).toBe(5)
+	})
+
+	it('round-trips a kept tool turn and accounts for its token structure', async () => {
+		inference.setResponses([
+			{
+				content: 'Short summary',
+				toolCalls: [],
+				finishReason: 'stop',
+				metrics: { promptTokens: 50, completionTokens: 20, totalTokens: 70, latencyMs: 100, model: 'mock' },
+			},
+		])
+
+		const toolCallId = generateToolCallId()
+		const toolTurn: LLMMessage[] = [
+			{
+				role: 'assistant',
+				content: 'I will inspect the file.',
+				toolCalls: [{
+					id: toolCallId,
+					name: 'read',
+					input: { path: '/src/index.ts', reason: 'x'.repeat(400) },
+				}],
+			},
+			{
+				role: 'tool',
+				content: 'export const value = 1',
+				toolCallId,
+				toolName: 'read',
+				isError: false,
+				timestamp: 123,
+			},
+		]
+		const messages: LLMMessage[] = [
+			{ role: 'user', content: 'old context '.repeat(1000) },
+			{ role: 'assistant', content: 'old response '.repeat(1000) },
+			...toolTurn,
+		]
+		const preservingCompactor = new ContextCompactor(silentLogger, {
+			maxTokens: 100,
+			keepRecentMessages: 2,
+		})
+
+		const result = await preservingCompactor.compact(sessionId, agentId, messages, inference.run)
+		expect(result.ok).toBe(true)
+		if (!result.ok) return
+
+		expect(result.value.compactedMessages.slice(1)).toEqual(toolTurn)
+		expect(result.value.compactedTokens).toBeLessThan(result.value.originalTokens)
+		expect(result.value.compactedTokens).toBeGreaterThan(
+			estimateMessagesTokens(result.value.compactedMessages),
+		)
+
+		const event = createContextCompactedEvent(sessionId, agentId, result.value)
+		expect(event.newConversationHistory.slice(1)).toEqual(toolTurn)
+	})
+
+	it('keeps an open tool declaration even when keep limits are zero', async () => {
+		inference.setResponses([
+			{
+				content: 'Summary',
+				toolCalls: [],
+				finishReason: 'stop',
+				metrics: { promptTokens: 50, completionTokens: 20, totalTokens: 70, latencyMs: 100, model: 'mock' },
+			},
+		])
+
+		const toolCallId = generateToolCallId()
+		const openToolCall: LLMMessage = {
+			role: 'assistant',
+			content: '',
+			toolCalls: [{ id: toolCallId, name: 'read', input: { path: '/src/index.ts' } }],
+		}
+		const zeroKeepCompactor = new ContextCompactor(silentLogger, {
+			maxTokens: 100,
+			keepRecentMessages: 0,
+			keepRecentTokens: 0,
+		})
+
+		const result = await zeroKeepCompactor.compact(
+			sessionId,
+			agentId,
+			[
+				{ role: 'user', content: 'old context' },
+				openToolCall,
+			],
+			inference.run,
+		)
+		expect(result.ok).toBe(true)
+		if (!result.ok) return
+
+		expect(result.value.compactedMessages.at(-1)).toEqual(openToolCall)
 	})
 })
 
