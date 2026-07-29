@@ -13,6 +13,7 @@ import type {
 	LLMMessage,
 	LLMMetrics,
 	LLMProvider,
+	OpenRouterProviderRouting,
 	ProviderHttpRequest,
 	RawInferenceRequest,
 } from './provider.js'
@@ -123,13 +124,6 @@ interface OpenRouterToolDefinition {
 		description: string
 		parameters: Record<string, unknown>
 	}
-}
-
-interface OpenRouterProviderRouting {
-	order?: string[]
-	allow?: string[]
-	deny?: string[]
-	quantizations?: string[]
 }
 
 interface OpenRouterRequestBody {

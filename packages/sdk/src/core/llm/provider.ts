@@ -28,18 +28,22 @@ export interface RawToolSpec {
  *
  * @see https://openrouter.ai/docs/api-reference/overview
  */
+export interface OpenRouterProviderRouting {
+	/** Preferred provider ordering */
+	order?: string[]
+	/** Only allow these providers */
+	only?: string[]
+	/** Exclude these providers */
+	ignore?: string[]
+	/** Whether to allow backup providers */
+	allow_fallbacks?: boolean
+	/** Allowed quantizations (e.g. "bf16", "int8") */
+	quantizations?: string[]
+}
+
 export interface OpenRouterRequestOptions {
 	/** Provider routing preferences */
-	providers?: {
-		/** Preferred provider ordering */
-		order?: string[]
-		/** Only allow these providers */
-		allow?: string[]
-		/** Exclude these providers */
-		deny?: string[]
-		/** Allowed quantizations (e.g. "bf16", "int8") */
-		quantizations?: string[]
-	}
+	providers?: OpenRouterProviderRouting
 	/** Routing strategy */
 	route?: 'fallback'
 	/** Model transforms */

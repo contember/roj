@@ -109,11 +109,11 @@ export function useProvider(name: string): LLMMiddleware {
  *
  * @example
  * ```ts
- * // Exclude Google providers:
- * llmMiddleware: [withOpenRouter({ providers: { deny: ['Google'] } })]
+ * // Exclude Amazon Bedrock while retaining provider fallbacks:
+ * llmMiddleware: [withOpenRouter({ providers: { ignore: ['amazon-bedrock'], allow_fallbacks: true } })]
  *
  * // Prefer specific providers:
- * llmMiddleware: [withOpenRouter({ providers: { order: ['Anthropic', 'AWS Bedrock'] } })]
+ * llmMiddleware: [withOpenRouter({ providers: { order: ['anthropic', 'google-vertex'] } })]
  * ```
  */
 export function withOpenRouter(opts: OpenRouterRequestOptions): LLMMiddleware {
