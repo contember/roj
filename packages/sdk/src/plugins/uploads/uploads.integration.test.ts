@@ -3,6 +3,7 @@ import z from 'zod/v4'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
+import type { TestSession } from '~/testing/index.js'
 import type { UploadsState } from './state.js'
 import { uploadEvents } from './state.js'
 
@@ -15,6 +16,12 @@ function okValue<T>(result: { ok: boolean; value?: unknown }, schema: z.ZodType<
 	expect(result.ok).toBe(true)
 	if (!result.ok) throw new Error('Expected ok result')
 	return schema.parse(result.value)
+}
+
+async function pauseEntryAgent(session: TestSession): Promise<void> {
+	const entryAgentId = session.getEntryAgentId()
+	if (!entryAgentId) throw new Error('Expected entry agent')
+	await session.pauseAgent(entryAgentId, 'Keep upload pending for storage test')
 }
 
 const uploadResultSchema = z.object({
@@ -174,7 +181,7 @@ describe('uploads plugin', () => {
 	// =========================================================================
 
 	describe('dequeue', () => {
-		it('pending upload delivered to agent as LLM message with <attachment> XML', async () => {
+		it('upload arriving while agent is idle wakes exactly one inference', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
 				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Got it', toolCalls: [] }),
@@ -191,8 +198,8 @@ describe('uploads plugin', () => {
 				fileBuffer: fileContent,
 			})
 
-			// Send a message to trigger inference — the pending upload should be dequeued
-			await session.sendAndWaitForIdle('Process the file')
+			await session.waitForIdle()
+			expect(harness.llmProvider.getCallCount()).toBe(1)
 
 			// Check that the LLM received the attachment in its messages
 			const lastRequest = harness.llmProvider.getLastRequest()
@@ -212,42 +219,75 @@ describe('uploads plugin', () => {
 			await harness.shutdown()
 		})
 
-		it('after delivery, upload consumed (attachments_consumed event, removed from pending)', async () => {
+		it('several quick uploads debounce into one inference and one consumption event', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
 				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Got it', toolCalls: [] }),
 			})
 
 			const session = await harness.createSession('test')
-			const fileContent = Buffer.from('Some data')
+			const filenames = ['one.txt', 'two.txt', 'three.txt']
+			await Promise.all(filenames.map((filename) => {
+				const fileContent = Buffer.from(`Content of ${filename}`)
+				return session.callPluginMethod('uploads.upload', {
+					sessionId: String(session.sessionId),
+					filename,
+					mimeType: 'text/plain',
+					size: fileContent.length,
+					fileBuffer: fileContent,
+				})
+			}))
 
+			await session.waitForIdle()
+			expect(harness.llmProvider.getCallCount()).toBe(1)
+
+			const lastRequest = harness.llmProvider.getLastRequest()
+			expect(lastRequest).toBeDefined()
+			const requestText = lastRequest?.messages
+				.map((message) => typeof message.content === 'string' ? message.content : '')
+				.join('\n') ?? ''
+			for (const filename of filenames) {
+				expect(requestText).toContain(`filename="${filename}"`)
+			}
+
+			const consumedEvents = await session.getEventsByType(uploadEvents, 'attachments_consumed')
+			expect(consumedEvents).toHaveLength(1)
+			expect(consumedEvents[0].uploadIds).toHaveLength(3)
+
+			const uploadsAfter = selectPluginState<UploadsState>(session.state, 'uploads')
+			expect(uploadsAfter).toBeDefined()
+			if (!uploadsAfter) throw new Error('Expected uploads state')
+			expect(uploadsAfter.pending).toHaveLength(0)
+
+			await harness.shutdown()
+		})
+
+		it('upload does not wake a paused agent', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Got it', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			const entryAgentId = session.getEntryAgentId()
+			if (!entryAgentId) throw new Error('Expected entry agent')
+			await session.pauseAgent(entryAgentId, 'Paused by user')
+
+			const fileContent = Buffer.from('Wait until resume')
 			await session.callPluginMethod('uploads.upload', {
 				sessionId: String(session.sessionId),
-				filename: 'data.txt',
+				filename: 'paused.txt',
 				mimeType: 'text/plain',
 				size: fileContent.length,
 				fileBuffer: fileContent,
 			})
 
-			// Before inference, should be in pending
-			const uploadsBefore = selectPluginState<UploadsState>(session.state, 'uploads')
-			expect(uploadsBefore).toBeDefined()
-			if (!uploadsBefore) throw new Error('Expected uploads state')
-			expect(uploadsBefore.pending).toHaveLength(1)
+			await new Promise((resolve) => setTimeout(resolve, 25))
+			expect(harness.llmProvider.getCallCount()).toBe(0)
+			expect(session.state.agents.get(entryAgentId)?.status).toBe('paused')
 
-			// Trigger inference
-			await session.sendAndWaitForIdle('Handle this')
-
-			// After inference, should be consumed
-			const consumedEvents = await session.getEventsByType(uploadEvents, 'attachments_consumed')
-			expect(consumedEvents).toHaveLength(1)
-			expect(consumedEvents[0].uploadIds).toHaveLength(1)
-
-			// Pending should be empty
-			const uploadsAfter = selectPluginState<UploadsState>(session.state, 'uploads')
-			expect(uploadsAfter).toBeDefined()
-			if (!uploadsAfter) throw new Error('Expected uploads state')
-			expect(uploadsAfter.pending).toHaveLength(0)
+			const uploads = selectPluginState<UploadsState>(session.state, 'uploads')
+			expect(uploads?.pending).toHaveLength(1)
 
 			await harness.shutdown()
 		})
@@ -265,6 +305,7 @@ describe('uploads plugin', () => {
 			})
 
 			const session = await harness.createSession('test')
+			await pauseEntryAgent(session)
 
 			await session.callPluginMethod('uploads.upload', {
 				sessionId: String(session.sessionId),
@@ -304,6 +345,7 @@ describe('uploads plugin', () => {
 			})
 
 			const session = await harness.createSession('test')
+			await pauseEntryAgent(session)
 
 			const uploadData = okValue(
 				await session.callPluginMethod('uploads.upload', {
@@ -340,6 +382,7 @@ describe('uploads plugin', () => {
 			})
 
 			const session = await harness.createSession('test')
+			await pauseEntryAgent(session)
 
 			const uploadData = okValue(
 				await session.callPluginMethod('uploads.upload', {
@@ -381,6 +424,7 @@ describe('uploads plugin', () => {
 			})
 
 			const session = await harness.createSession('test')
+			await pauseEntryAgent(session)
 
 			const uploadData = okValue(
 				await session.callPluginMethod('uploads.upload', {
@@ -417,6 +461,7 @@ describe('uploads plugin', () => {
 			})
 
 			const session = await harness.createSession('test')
+			await pauseEntryAgent(session)
 
 			const uploadData = okValue(
 				await session.callPluginMethod('uploads.upload', {
@@ -482,6 +527,7 @@ describe('uploads plugin', () => {
 			})
 
 			const session = await harness.createSession('test')
+			await pauseEntryAgent(session)
 
 			const uploadData = okValue(
 				await session.callPluginMethod('uploads.upload', {
@@ -617,7 +663,7 @@ describe('uploads plugin', () => {
 		// uploadAsync method
 		// =========================================================================
 
-		it('uploadAsync returns processing immediately, then statusChanged → ready', async () => {
+		it('uploadAsync returns processing, then ready upload wakes the idle agent', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
 				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
@@ -655,12 +701,13 @@ describe('uploads plugin', () => {
 			expect(own[0].status).toBe('processing')
 			expect(own[1].status).toBe('ready')
 
-			// State only carries ready uploads — processing event is filtered by reducer.
+			await session.waitForIdle()
+			expect(harness.llmProvider.getCallCount()).toBe(1)
+
+			// The ready upload was delivered and consumed by the woken agent.
 			const uploads = selectPluginState<UploadsState>(session.state, 'uploads')
 			if (!uploads) throw new Error('Expected uploads state')
-			expect(uploads.pending).toHaveLength(1)
-			expect(uploads.pending[0]?.uploadId).toBe(data.uploadId)
-			expect(uploads.pending[0]?.status).toBe('ready')
+			expect(uploads.pending).toHaveLength(0)
 
 			// First notification was processing.
 			const all = harness.notifications.getByType('uploads', 'uploadStatusChanged')
@@ -704,6 +751,7 @@ describe('uploads plugin', () => {
 			})
 
 			const session = await harness.createSession('test')
+			await pauseEntryAgent(session)
 
 			const result = await session.callPluginMethod('uploads.uploadAsync', {
 				sessionId: String(session.sessionId),
@@ -743,6 +791,7 @@ describe('uploads plugin', () => {
 			})
 
 			const session = await harness.createSession('test')
+			await pauseEntryAgent(session)
 
 			const uploadData = okValue(
 				await session.callPluginMethod('uploads.upload', {

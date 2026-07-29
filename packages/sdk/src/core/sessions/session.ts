@@ -234,6 +234,9 @@ export class Session {
 	 * Schedule agent processing (with debounce).
 	 */
 	scheduleAgent(agentId: AgentId): void {
+		const agentState = this.store.getAgentState(agentId)
+		if (!agentState || agentState.status === 'paused') return
+
 		const agent = this.agents.get(agentId)
 		if (agent) {
 			agent.scheduleProcessing()
