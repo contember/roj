@@ -47,7 +47,26 @@ const asBlocks = (content: string | AnyBlock[]): AnyBlock[] => {
 	return content
 }
 
-describe('OpenRouterProvider buildHttpRequest cache placement', () => {
+describe('OpenRouterProvider buildHttpRequest', () => {
+	test('includes inline provider routing preferences', async () => {
+		const request = buildRequest([{ role: 'user', content: 'Hello' }])
+		request.openrouter = {
+			providers: {
+				ignore: ['amazon-bedrock'],
+				allow_fallbacks: true,
+			},
+		}
+
+		const http = await createProvider().buildHttpRequest(request)
+
+		expect(http.body).toEqual(expect.objectContaining({
+			provider: {
+				ignore: ['amazon-bedrock'],
+				allow_fallbacks: true,
+			},
+		}))
+	})
+
 	test('pure tool_result target: cache_control lands on the tool role message content', async () => {
 		const messages = applyCacheBreakpoint([
 			{ role: 'user', content: 'What is the weather?' },
