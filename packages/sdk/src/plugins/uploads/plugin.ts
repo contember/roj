@@ -3,6 +3,7 @@ import { ValidationErrors } from '~/core/errors.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { SessionId } from '~/core/sessions/schema.js'
+import { getEntryAgentId } from '~/core/sessions/state.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { PreprocessorRegistry } from './preprocessor.js'
 import { generateUploadId, type MessageAttachment, UploadId, type UploadMetadata } from './schema.js'
@@ -430,6 +431,11 @@ export const uploadsPlugin = definePlugin('uploads')
 				error: result.error,
 			}))
 
+			const entryAgentId = getEntryAgentId(ctx.sessionState)
+			if (result.status === 'ready' && entryAgentId) {
+				ctx.scheduleAgent(entryAgentId)
+			}
+
 			return Ok({
 				uploadId: String(uploadId),
 				status: result.status,
@@ -501,8 +507,9 @@ export const uploadsPlugin = definePlugin('uploads')
 			// Capture refs from ctx before the handler returns — `notify`/`emitEvent`
 			// closures stay valid for the lifetime of the session, which in roj
 			// outlives any single handler call.
-			const { emitEvent, notify, logger } = ctx
+			const { emitEvent, notify, logger, scheduleAgent } = ctx
 			const sessionId = ctx.sessionId
+			const entryAgentId = getEntryAgentId(ctx.sessionState)
 
 			void (async () => {
 				try {
@@ -528,6 +535,9 @@ export const uploadsPlugin = definePlugin('uploads')
 						derivedPaths: result.derivedPaths,
 						error: result.error,
 					}))
+					if (result.status === 'ready' && entryAgentId) {
+						scheduleAgent(entryAgentId)
+					}
 					notify('uploadStatusChanged', {
 						sessionId: input.sessionId,
 						uploadId: uploadIdStr,
