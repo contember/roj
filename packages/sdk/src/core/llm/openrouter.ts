@@ -17,6 +17,7 @@ import type {
 	ProviderHttpRequest,
 	RawInferenceRequest,
 } from './provider.js'
+import { ProviderMessageValidationError, sanitizeProviderMessages } from './message-sanitization.js'
 
 // ============================================================================
 // Configuration
@@ -257,7 +258,8 @@ export class OpenRouterProvider implements LLMProvider {
 	}
 
 	async buildHttpRequest(request: RawInferenceRequest, context?: InferenceContext): Promise<ProviderHttpRequest> {
-		const mappedMessages = await Promise.all(request.messages.map((m) => this.mapMessage(m, context)))
+		const sanitizedMessages = sanitizeProviderMessages(request.messages, this.name, this.logger)
+		const mappedMessages = await Promise.all(sanitizedMessages.map((m) => this.mapMessage(m, context)))
 
 		const messages: OpenRouterMessage[] = [
 			{ role: 'system', content: [{ type: 'text', text: request.systemPrompt, cache_control: { type: 'ephemeral' } }] },
@@ -441,6 +443,9 @@ export class OpenRouterProvider implements LLMProvider {
 	}
 
 	private mapError(err: unknown): LLMError {
+		if (err instanceof ProviderMessageValidationError) {
+			return { type: 'invalid_request', message: err.message }
+		}
 		if (err instanceof Error && err.name === 'AbortError') {
 			return { type: 'aborted', message: 'Request was aborted' }
 		}

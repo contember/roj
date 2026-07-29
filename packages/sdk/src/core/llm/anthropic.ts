@@ -17,6 +17,7 @@ import type {
 	RawInferenceRequest,
 	RawToolSpec,
 } from './provider.js'
+import { ProviderMessageValidationError, sanitizeProviderMessages } from './message-sanitization.js'
 import type { RoutableLLMProvider } from './routing-provider.js'
 
 // ============================================================================
@@ -321,7 +322,8 @@ export class AnthropicProvider implements RoutableLLMProvider {
 	}
 
 	async buildHttpRequest(request: RawInferenceRequest, context?: InferenceContext): Promise<ProviderHttpRequest> {
-		const mappedMessages = await Promise.all(request.messages.map((m) => this.mapMessage(m, context)))
+		const sanitizedMessages = sanitizeProviderMessages(request.messages, this.name, this.logger)
+		const mappedMessages = await Promise.all(sanitizedMessages.map((m) => this.mapMessage(m, context)))
 		const mergedMessages = this.mergeConsecutiveMessages(mappedMessages)
 
 		const body: AnthropicRequestBody = {
@@ -574,6 +576,9 @@ export class AnthropicProvider implements RoutableLLMProvider {
 	}
 
 	private mapError(err: unknown): LLMError {
+		if (err instanceof ProviderMessageValidationError) {
+			return { type: 'invalid_request', message: err.message }
+		}
 		if (err instanceof Error && err.name === 'AbortError') {
 			return { type: 'aborted', message: 'Request was aborted' }
 		}

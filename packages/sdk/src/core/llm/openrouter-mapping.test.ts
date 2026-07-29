@@ -106,12 +106,14 @@ describe('OpenRouterProvider buildHttpRequest', () => {
 					{ id: ToolCallId('call_2'), name: 'search', input: { query: 'weather' } },
 				],
 			},
-		], 0)
+			{ role: 'tool', toolCallId: ToolCallId('call_1'), content: 'Sunny' },
+			{ role: 'tool', toolCallId: ToolCallId('call_2'), content: 'Found results' },
+		], 2)
 
 		const http = await createProvider().buildHttpRequest(buildRequest(messages))
 		const msgs = getBodyMessages(http.body)
 
-		const assistant = msgs[msgs.length - 1]
+		const assistant = msgs[msgs.length - 3]
 		expect(assistant.role).toBe('assistant')
 		expect(assistant.tool_calls).toBeDefined()
 		// String content got wrapped so cache_control has a place to live

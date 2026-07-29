@@ -354,12 +354,14 @@ describe('AnthropicProvider buildHttpRequest cache placement', () => {
 					{ id: ToolCallId('call_2'), name: 'search', input: { query: 'weather' } },
 				],
 			},
-		], 0)
+			{ role: 'tool', toolCallId: ToolCallId('call_1'), content: 'Sunny' },
+			{ role: 'tool', toolCallId: ToolCallId('call_2'), content: 'Found results' },
+		], 2)
 
 		const http = await createProvider().buildHttpRequest(buildRequest(messages))
 		const msgs = getBodyMessages(http.body)
 
-		const assistant = msgs[msgs.length - 1]
+		const assistant = msgs[msgs.length - 2]
 		expect(assistant.role).toBe('assistant')
 		expect(assistant.content.length).toBe(3) // text + 2 tool_use
 		expect(assistant.content[0].type).toBe('text')
@@ -411,8 +413,9 @@ describe('AnthropicProvider buildHttpRequest cache placement', () => {
 				{ role: 'assistant', content: 'preamble part B' }, // last preamble msg → prefix breakpoint
 				{ role: 'user', content: 'conversation turn' },
 				{ role: 'assistant', content: 'tail reply' }, // tail breakpoint
+				{ role: 'user', content: 'tail continuation' },
 			],
-			0, // no uncached suffix → tailIdx = 3
+			1, // one uncached user suffix → tailIdx = 3
 			undefined,
 			2, // cachedPrefixCount → prefixIdx = 1
 		)
@@ -420,7 +423,7 @@ describe('AnthropicProvider buildHttpRequest cache placement', () => {
 		const http = await createProvider().buildHttpRequest(buildRequest(messages))
 		const msgs = getBodyMessages(http.body)
 
-		expect(msgs.length).toBe(4)
+		expect(msgs.length).toBe(5)
 		// Prefix breakpoint on the last preamble message
 		const prefix = msgs[1]
 		expect(prefix.role).toBe('assistant')
