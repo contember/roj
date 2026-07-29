@@ -228,7 +228,9 @@ type PluginSelf<TMethods extends Record<string, MethodEntry>> = {
 type HookMap<TCtx> = {
 	onStart: (ctx: TCtx) => Promise<OnStartResult>
 	beforeInference: (ctx: TCtx & { pendingMessages: MailboxMessage[]; turnNumber: number }) => Promise<BeforeInferenceResult>
-	afterInference: (ctx: TCtx & { response: LLMResponse; turnNumber: number }) => Promise<AfterInferenceResult>
+	afterInference: (
+		ctx: TCtx & { response: LLMResponse; turnNumber: number; dequeuedSourcePlugins: readonly string[] },
+	) => Promise<AfterInferenceResult>
 	beforeToolCall: (ctx: TCtx & { toolCall: ToolCall }) => Promise<BeforeToolCallResult>
 	afterToolCall: (ctx: TCtx & { toolCall: ToolCall; result: { isError: boolean; content: ToolResultContent } }) => Promise<AfterToolCallResult>
 	onComplete: (ctx: TCtx) => Promise<OnCompleteResult>
@@ -298,7 +300,9 @@ export type BaseMethodHandlerContext = SessionContext & {
 type ErasedAgentHookMap = {
 	onStart: (ctx: BasePluginHookContext) => Promise<OnStartResult>
 	beforeInference: (ctx: BasePluginHookContext & { pendingMessages: MailboxMessage[]; turnNumber: number }) => Promise<BeforeInferenceResult>
-	afterInference: (ctx: BasePluginHookContext & { response: LLMResponse; turnNumber: number }) => Promise<AfterInferenceResult>
+	afterInference: (
+		ctx: BasePluginHookContext & { response: LLMResponse; turnNumber: number; dequeuedSourcePlugins: readonly string[] },
+	) => Promise<AfterInferenceResult>
 	beforeToolCall: (ctx: BasePluginHookContext & { toolCall: ToolCall }) => Promise<BeforeToolCallResult>
 	afterToolCall: (
 		ctx: BasePluginHookContext & { toolCall: ToolCall; result: { isError: boolean; content: ToolResultContent } },

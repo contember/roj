@@ -179,7 +179,7 @@ export function checkLimits(counters: AgentCounters, limits: ResolvedAgentLimits
 	for (const check of hardChecks) {
 		if (check.current >= check.max) {
 			const reason = check.name === 'maxConsecutiveNoProgressTurns'
-				? `No progress detected: ${check.current} consecutive turns used only outbound communication`
+				? `No progress detected: ${check.current} consecutive turns used only outbound communication without new input`
 				: `${check.name} reached: ${check.current}/${check.max}`
 			return {
 				status: 'hard_limit',

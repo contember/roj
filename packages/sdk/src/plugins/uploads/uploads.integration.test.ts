@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import z from 'zod/v4'
+import { agentEvents } from '~/core/agents/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
@@ -215,6 +216,10 @@ describe('uploads plugin', () => {
 			}
 			expect(attachmentMessage.content).toContain('filename="doc.txt"')
 			expect(attachmentMessage.content).toContain('type="text/plain"')
+
+			const consumedEvents = await session.getEventsByType(agentEvents, 'agent_input_consumed')
+			expect(consumedEvents).toHaveLength(1)
+			expect(consumedEvents[0].sourcePlugins).toContain('uploads')
 
 			await harness.shutdown()
 		})

@@ -27,7 +27,7 @@ export interface AgentCounters {
 	toolCallCount: number
 	spawnedAgentCount: number
 	messagesSentCount: number
-	/** Consecutive inference turns whose only tool calls were outbound communication. */
+	/** Consecutive outbound-only turns with no newly consumed inbound work. */
 	consecutiveNoProgressTurns: number
 	/** Number of context compaction events for this agent. */
 	compactionCount: number
@@ -169,29 +169,31 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 				}
 
 				case 'mailbox_message': {
-					let newLimits = limits
-					const recipientCounters = limits.get(event.toAgentId)
-					if (recipientCounters?.consecutiveNoProgressTurns) {
-						newLimits = new Map(limits)
-						newLimits.set(event.toAgentId, {
-							...recipientCounters,
-							consecutiveNoProgressTurns: 0,
-						})
-					}
-
 					// Increment sender's messagesSentCount if sender is an agent
 					const senderAgentId = typeof event.message.from === 'string' && event.message.from !== 'user'
 						? event.message.from
 						: null
-					if (!senderAgentId) return newLimits
+					if (!senderAgentId) return limits
 
-					const senderCounters = newLimits.get(AgentId(senderAgentId))
-					if (!senderCounters) return newLimits
+					const senderCounters = limits.get(AgentId(senderAgentId))
+					if (!senderCounters) return limits
 
-					if (newLimits === limits) newLimits = new Map(limits)
+					const newLimits = new Map(limits)
 					newLimits.set(AgentId(senderAgentId), {
 						...senderCounters,
 						messagesSentCount: senderCounters.messagesSentCount + 1,
+					})
+					return newLimits
+				}
+
+				case 'agent_input_consumed': {
+					const counters = limits.get(event.agentId)
+					if (!counters?.consecutiveNoProgressTurns) return limits
+
+					const newLimits = new Map(limits)
+					newLimits.set(event.agentId, {
+						...counters,
+						consecutiveNoProgressTurns: 0,
 					})
 					return newLimits
 				}
@@ -393,10 +395,11 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 		// what the counters will be after it's processed by the reducer.
 		const hasToolCalls = ctx.response.toolCalls.length > 0
 		const communicationOnly = isOutboundCommunicationOnly(ctx.response.toolCalls)
+		const hasInboundWork = ctx.dequeuedSourcePlugins.length > 0
 		const projected: AgentCounters = {
 			...counters,
 			inferenceCount: counters.inferenceCount + 1,
-			consecutiveNoProgressTurns: communicationOnly
+			consecutiveNoProgressTurns: communicationOnly && !hasInboundWork
 				? counters.consecutiveNoProgressTurns + 1
 				: 0,
 			recentResponseHashes: hasToolCalls
@@ -407,6 +410,25 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 		const limitCheck = checkLimits(projected, resolvedLimits)
 
 		if (limitCheck.status === 'hard_limit') {
+			if (limitCheck.limitName === 'maxConsecutiveNoProgressTurns') {
+				const message = `${limitCheck.reason}; suppressing redundant outbound communication until new input arrives`
+				await ctx.emitEvent(limitsEvents.create('limit_warning', {
+					agentId: ctx.agentId,
+					limitName: limitCheck.limitName,
+					currentValue: limitCheck.currentValue,
+					hardLimit: limitCheck.hardLimit,
+					message,
+				}))
+				ctx.logger.warn('Communication-only agent loop stopped', {
+					agentId: ctx.agentId,
+					consecutiveTurns: limitCheck.currentValue,
+					dequeuedSourcePlugins: ctx.dequeuedSourcePlugins,
+				})
+				return {
+					action: 'modify',
+					response: { content: 'WAITING', toolCalls: [] },
+				}
+			}
 			return { action: 'pause', reason: limitCheck.reason }
 		}
 
