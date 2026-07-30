@@ -326,10 +326,16 @@ export class AnthropicProvider implements RoutableLLMProvider {
 		const mappedMessages = await Promise.all(sanitizedMessages.map((m) => this.mapMessage(m, context)))
 		const mergedMessages = this.mergeConsecutiveMessages(mappedMessages)
 
+		// The system prompt precedes every message and Anthropic requires a longer
+		// TTL to come BEFORE a shorter one, so it has to match the longest TTL any
+		// breakpoint asks for — otherwise the order is 5m → 1h → 5m.
+		const systemCacheControl: AnthropicCacheControl = { type: 'ephemeral' }
+		if (sanitizedMessages.some((m) => m.cacheControl?.ttl === '1h')) systemCacheControl.ttl = '1h'
+
 		const body: AnthropicRequestBody = {
 			model: request.model ?? this.defaultModel,
 			max_tokens: request.maxTokens ?? 100_000,
-			system: [{ type: 'text', text: request.systemPrompt, cache_control: { type: 'ephemeral' } }],
+			system: [{ type: 'text', text: request.systemPrompt, cache_control: systemCacheControl }],
 			messages: mergedMessages,
 			stream: false,
 		}

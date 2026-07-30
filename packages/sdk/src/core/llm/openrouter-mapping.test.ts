@@ -21,7 +21,7 @@ const createProvider = () =>
 		defaultModel: 'anthropic/claude-haiku-4.5',
 	})
 
-type AnyBlock = { type: string; cache_control?: { type: 'ephemeral' }; [key: string]: unknown }
+type AnyBlock = { type: string; cache_control?: { type: 'ephemeral'; ttl?: '5m' | '1h' }; [key: string]: unknown }
 type OpenRouterMessage = {
 	role: string
 	content: string | AnyBlock[]
@@ -150,6 +150,42 @@ describe('OpenRouterProvider buildHttpRequest', () => {
 		expect(last.role).toBe('user')
 		// Without flag, user content stays as plain string (no block wrap, no cache_control)
 		expect(last.content).toBe('<session-context>plugin status</session-context>')
+	})
+
+	test('ttl reaches the wire and the system block matches it', async () => {
+		// The whole point of the fix: OpenRouter dropped `ttl` on the floor, so a
+		// preset asking for the 1-hour tier silently ran on the 5-minute default.
+		const messages = applyCacheBreakpoint([
+			{ role: 'user', content: 'preamble' },
+			{ role: 'assistant', content: 'ok' },
+			{ role: 'user', content: 'work' },
+		], 0, '1h', 1)
+
+		const http = await createProvider().buildHttpRequest(buildRequest(messages))
+		const msgs = getBodyMessages(http.body)
+
+		// System precedes every message, so it must carry the longest TTL in use —
+		// Anthropic rejects a longer entry that follows a shorter one.
+		const systemBlocks = asBlocks(msgs[0].content)
+		expect(systemBlocks[0].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
+
+		// prefix breakpoint (message index 0 → body index 1) carries 1h
+		expect(asBlocks(msgs[1].content)[0].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' })
+		// tail breakpoint stays on the cheap short tier
+		expect(asBlocks(msgs[3].content)[0].cache_control).toEqual({ type: 'ephemeral' })
+	})
+
+	test('no ttl requested: system block stays on the default tier', async () => {
+		const messages = applyCacheBreakpoint([
+			{ role: 'user', content: 'preamble' },
+			{ role: 'user', content: 'work' },
+		], 0, undefined, 1)
+
+		const http = await createProvider().buildHttpRequest(buildRequest(messages))
+		const msgs = getBodyMessages(http.body)
+
+		expect(asBlocks(msgs[0].content)[0].cache_control).toEqual({ type: 'ephemeral' })
+		expect(asBlocks(msgs[1].content)[0].cache_control).toEqual({ type: 'ephemeral' })
 	})
 
 	test('no flag on any message: only system has cache_control', async () => {

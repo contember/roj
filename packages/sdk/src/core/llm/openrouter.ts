@@ -89,11 +89,17 @@ interface OpenRouterErrorResponse {
 // Request body types
 // ============================================================================
 
+interface OpenRouterCacheControl {
+	type: 'ephemeral'
+	/** Omitted = the provider default 5-minute tier. */
+	ttl?: '5m' | '1h'
+}
+
 interface OpenRouterContentItem {
 	type: string
 	text?: string
 	image_url?: { url: string; detail?: string }
-	cache_control?: { type: 'ephemeral' }
+	cache_control?: OpenRouterCacheControl
 }
 
 interface OpenRouterMessage {
@@ -104,18 +110,34 @@ interface OpenRouterMessage {
 }
 
 /**
- * Add `cache_control: { type: 'ephemeral' }` to the LAST content block of an
- * OpenRouterMessage, converting string content to an array text block first
- * so the mark has a place to live.
+ * Add `cache_control` to the LAST content block of an OpenRouterMessage,
+ * converting string content to an array text block first so the mark has a
+ * place to live.
+ *
+ * `ttl` reaches Anthropic through the Chat Completions surface. It is NOT
+ * expressible on the Responses API, where a breakpoint is downgraded to the
+ * default 5-minute tier — so this must stay on `/chat/completions`.
  */
-function applyCacheControlToLastBlock(msg: OpenRouterMessage): void {
+function applyCacheControlToLastBlock(msg: OpenRouterMessage, cacheControl: OpenRouterCacheControl): void {
 	if (typeof msg.content === 'string') {
-		msg.content = [{ type: 'text', text: msg.content, cache_control: { type: 'ephemeral' } }]
+		msg.content = [{ type: 'text', text: msg.content, cache_control: cacheControl }]
 		return
 	}
 	if (msg.content.length === 0) return
 	const lastIdx = msg.content.length - 1
-	msg.content[lastIdx] = { ...msg.content[lastIdx], cache_control: { type: 'ephemeral' } }
+	msg.content[lastIdx] = { ...msg.content[lastIdx], cache_control: cacheControl }
+}
+
+/**
+ * Longest TTL requested anywhere in the message list, or undefined when none.
+ *
+ * The system prompt precedes every message, and Anthropic requires a longer TTL
+ * to come BEFORE a shorter one. So when any breakpoint asks for 1h, the system
+ * block has to carry 1h too — otherwise the order is 5m → 1h → 5m and the
+ * longer entry is invalid.
+ */
+function longestCacheTtl(messages: LLMMessage[]): '1h' | undefined {
+	return messages.some((m) => m.cacheControl?.ttl === '1h') ? '1h' : undefined
 }
 
 interface OpenRouterToolDefinition {
@@ -261,8 +283,10 @@ export class OpenRouterProvider implements LLMProvider {
 		const sanitizedMessages = sanitizeProviderMessages(request.messages, this.name, this.logger)
 		const mappedMessages = await Promise.all(sanitizedMessages.map((m) => this.mapMessage(m, context)))
 
+		const systemTtl = longestCacheTtl(sanitizedMessages)
+		const systemCacheControl: OpenRouterCacheControl = systemTtl ? { type: 'ephemeral', ttl: systemTtl } : { type: 'ephemeral' }
 		const messages: OpenRouterMessage[] = [
-			{ role: 'system', content: [{ type: 'text', text: request.systemPrompt, cache_control: { type: 'ephemeral' } }] },
+			{ role: 'system', content: [{ type: 'text', text: request.systemPrompt, cache_control: systemCacheControl }] },
 			...mappedMessages,
 		]
 
@@ -317,7 +341,9 @@ export class OpenRouterProvider implements LLMProvider {
 	private async mapMessage(msg: LLMMessage, context?: InferenceContext): Promise<OpenRouterMessage> {
 		const mapped = await this.mapMessageContent(msg, context)
 		if (msg.cacheControl) {
-			applyCacheControlToLastBlock(mapped)
+			const cacheControl: OpenRouterCacheControl = { type: 'ephemeral' }
+			if (msg.cacheControl.ttl) cacheControl.ttl = msg.cacheControl.ttl
+			applyCacheControlToLastBlock(mapped, cacheControl)
 		}
 		return mapped
 	}
