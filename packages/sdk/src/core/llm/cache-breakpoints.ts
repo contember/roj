@@ -28,9 +28,20 @@ import type { LLMMessage, LLMMessageCacheControl } from '~/core/agents/state.js'
  *
  * If the prefix and tail indices coincide, only one breakpoint is set.
  *
- * `ttl` opts into Anthropic's 1-hour cache tier (write cost 2× input, read
- * still 0.1×). Useful for long-lived agents where the default 5-minute TTL
- * would expire between user turns. Omit for the default 5-minute tier.
+ * `ttl` opts into Anthropic's 1-hour cache tier (write 2× input, read still
+ * 0.1×) and applies to the **stable prefix breakpoint only** — the tail keeps
+ * the default 5-minute tier.
+ *
+ * Applying a long TTL to both is a losing trade for an interactive agent. On a
+ * measured 5-week production session, 95% of inferences followed a gap under
+ * five minutes, so a uniform 1h would have raised the cost of every one of
+ * those writes from 1.25× to 2× while fixing only the minority that actually
+ * expired — a net loss. The prefix is the part that must survive human pauses;
+ * the tail churns turn-to-turn and is cheapest on the short tier.
+ *
+ * Order matters: Anthropic requires a longer TTL to precede a shorter one, and
+ * the prefix breakpoint always sits before the tail. Providers must also give
+ * the system block the longest TTL in use, since it precedes both.
  */
 export function applyCacheBreakpoint(
 	messages: LLMMessage[],
@@ -38,10 +49,11 @@ export function applyCacheBreakpoint(
 	ttl?: '5m' | '1h',
 	cachedPrefixCount = 0,
 ): LLMMessage[] {
-	const cacheControl: LLMMessageCacheControl = ttl ? { type: 'ephemeral', ttl } : { type: 'ephemeral' }
+	const prefixCacheControl: LLMMessageCacheControl = ttl ? { type: 'ephemeral', ttl } : { type: 'ephemeral' }
+	const tailCacheControl: LLMMessageCacheControl = { type: 'ephemeral' }
 	const result = [...messages]
 
-	const mark = (idx: number) => {
+	const mark = (idx: number, cacheControl: LLMMessageCacheControl) => {
 		if (idx < 0 || idx >= result.length) return
 		const target = result[idx]
 		switch (target.role) {
@@ -59,7 +71,9 @@ export function applyCacheBreakpoint(
 	// summary, sliding recent window), so the immutable preamble is read at 0.1×
 	// on every inference AND compaction call instead of being re-billed each turn.
 	const prefixIdx = cachedPrefixCount - 1
-	if (prefixIdx !== tailIdx) mark(prefixIdx)
-	mark(tailIdx)
+	if (prefixIdx !== tailIdx) mark(prefixIdx, prefixCacheControl)
+	// When the two coincide there is only one entry to pin, and it covers the
+	// preamble — so it takes the prefix TTL.
+	mark(tailIdx, prefixIdx === tailIdx ? prefixCacheControl : tailCacheControl)
 	return result
 }

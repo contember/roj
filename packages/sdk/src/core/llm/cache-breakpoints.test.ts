@@ -37,13 +37,33 @@ describe('applyCacheBreakpoint', () => {
 		expect(cachedIndices(result)).toEqual([3])
 	})
 
-	test('ttl is propagated onto the marked messages', () => {
+	test('ttl applies to the stable prefix only — the tail keeps the 5m default', () => {
+		// A uniform long TTL is a losing trade: on a measured production session 95%
+		// of inferences followed a sub-5-minute gap, so paying 2× on every tail write
+		// to rescue the expiring minority came out net negative.
 		const messages = userMessages(6)
 		const result = applyCacheBreakpoint(messages, 0, '1h', 2)
 		// prefix = 1, tail = 5
+		const prefix = result[1]
+		const tail = result[5]
+		expect('cacheControl' in prefix && prefix.cacheControl).toEqual({ type: 'ephemeral', ttl: '1h' })
+		expect('cacheControl' in tail && tail.cacheControl).toEqual({ type: 'ephemeral' })
+	})
+
+	test('prefixIdx === tailIdx with a ttl → the single mark covers the preamble, so it takes the ttl', () => {
+		const messages = userMessages(3)
+		const result = applyCacheBreakpoint(messages, 0, '1h', 3)
+		expect(cachedIndices(result)).toEqual([2])
+		const only = result[2]
+		expect('cacheControl' in only && only.cacheControl).toEqual({ type: 'ephemeral', ttl: '1h' })
+	})
+
+	test('no ttl → neither breakpoint carries one', () => {
+		const messages = userMessages(6)
+		const result = applyCacheBreakpoint(messages, 0, undefined, 2)
 		for (const idx of [1, 5]) {
 			const m = result[idx]
-			expect('cacheControl' in m && m.cacheControl).toEqual({ type: 'ephemeral', ttl: '1h' })
+			expect('cacheControl' in m && m.cacheControl).toEqual({ type: 'ephemeral' })
 		}
 	})
 
