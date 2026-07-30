@@ -4,6 +4,7 @@
 
 import z from 'zod/v4'
 import type { DebounceCallback } from '~/core/agents/debounce.js'
+import type { CacheTtlConfig } from '~/core/llm/cache-breakpoints.js'
 import type { LLMMiddleware } from '~/core/llm/middleware.js'
 import { ModelId } from '~/core/llm/schema.js'
 import type { AgentPluginConfig } from '~/core/plugins/plugin-builder.js'
@@ -57,8 +58,11 @@ export interface BaseAgentConfig<TInput = unknown> {
 	 * '1h' opts into Anthropic's extended cache tier for long-lived agents
 	 * (e.g. an orchestrator that waits minutes between user turns). Defaults
 	 * to the standard 5-minute tier.
+	 *
+	 * A bare tier applies to both breakpoints; `{ prefix, tail }` sets them
+	 * independently, which usually pays better. See {@link CacheTtlConfig}.
 	 */
-	cacheTtl?: '5m' | '1h'
+	cacheTtl?: CacheTtlConfig
 	/**
 	 * Outer backoff between error-resume cycles after an inference exhausts its
 	 * LLM retries on a retryable error (the message stays queued and is retried).

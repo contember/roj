@@ -159,7 +159,7 @@ describe('OpenRouterProvider buildHttpRequest', () => {
 			{ role: 'user', content: 'preamble' },
 			{ role: 'assistant', content: 'ok' },
 			{ role: 'user', content: 'work' },
-		], 0, '1h', 1)
+		], 0, { prefix: '1h' }, 1)
 
 		const http = await createProvider().buildHttpRequest(buildRequest(messages))
 		const msgs = getBodyMessages(http.body)
