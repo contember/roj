@@ -37,34 +37,44 @@ describe('applyCacheBreakpoint', () => {
 		expect(cachedIndices(result)).toEqual([3])
 	})
 
-	test('ttl applies to the stable prefix only — the tail keeps the 5m default', () => {
-		// A uniform long TTL is a losing trade: on a measured production session 95%
-		// of inferences followed a sub-5-minute gap, so paying 2× on every tail write
-		// to rescue the expiring minority came out net negative.
-		const messages = userMessages(6)
-		const result = applyCacheBreakpoint(messages, 0, '1h', 2)
-		// prefix = 1, tail = 5
-		const prefix = result[1]
-		const tail = result[5]
-		expect('cacheControl' in prefix && prefix.cacheControl).toEqual({ type: 'ephemeral', ttl: '1h' })
-		expect('cacheControl' in tail && tail.cacheControl).toEqual({ type: 'ephemeral' })
+	// prefix = 1, tail = 5 for userMessages(6) with suffix 0 and cachedPrefixCount 2
+	const ttlsOf = (messages: LLMMessage[]) => [1, 5].map((idx) => {
+		const m = messages[idx]
+		return 'cacheControl' in m && m.cacheControl ? m.cacheControl.ttl : undefined
 	})
 
-	test('prefixIdx === tailIdx with a ttl → the single mark covers the preamble, so it takes the ttl', () => {
-		const messages = userMessages(3)
-		const result = applyCacheBreakpoint(messages, 0, '1h', 3)
+	test('a bare tier applies to both breakpoints', () => {
+		const result = applyCacheBreakpoint(userMessages(6), 0, '1h', 2)
+		expect(ttlsOf(result)).toEqual(['1h', '1h'])
+	})
+
+	test('{ prefix } leaves the tail on the default tier', () => {
+		// Usually the paying configuration for an interactive agent: the immutable
+		// preamble survives human pauses, the churning tail stays cheap to write.
+		const result = applyCacheBreakpoint(userMessages(6), 0, { prefix: '1h' }, 2)
+		expect(ttlsOf(result)).toEqual(['1h', undefined])
+	})
+
+	test('{ prefix, tail } sets each breakpoint independently', () => {
+		const result = applyCacheBreakpoint(userMessages(6), 0, { prefix: '1h', tail: '5m' }, 2)
+		expect(ttlsOf(result)).toEqual(['1h', '5m'])
+	})
+
+	test('{ tail } alone is honoured — the SDK does not second-guess the caller', () => {
+		const result = applyCacheBreakpoint(userMessages(6), 0, { tail: '1h' }, 2)
+		expect(ttlsOf(result)).toEqual([undefined, '1h'])
+	})
+
+	test('prefixIdx === tailIdx → the single mark covers the preamble, so it takes the prefix ttl', () => {
+		const result = applyCacheBreakpoint(userMessages(3), 0, { prefix: '1h' }, 3)
 		expect(cachedIndices(result)).toEqual([2])
 		const only = result[2]
 		expect('cacheControl' in only && only.cacheControl).toEqual({ type: 'ephemeral', ttl: '1h' })
 	})
 
 	test('no ttl → neither breakpoint carries one', () => {
-		const messages = userMessages(6)
-		const result = applyCacheBreakpoint(messages, 0, undefined, 2)
-		for (const idx of [1, 5]) {
-			const m = result[idx]
-			expect('cacheControl' in m && m.cacheControl).toEqual({ type: 'ephemeral' })
-		}
+		const result = applyCacheBreakpoint(userMessages(6), 0, undefined, 2)
+		expect(ttlsOf(result)).toEqual([undefined, undefined])
 	})
 
 	test('does not mutate the input array', () => {

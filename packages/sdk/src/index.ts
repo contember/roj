@@ -53,6 +53,7 @@ export type { AgentPauseReason, AgentState, LLMMessage } from '~/core/agents/sta
 export type { DomainEvent } from '~/core/events/types.js'
 export type { FactoryEventType } from '~/core/events/types.js'
 export { isDomainEvent } from '~/core/events/types.js'
+export type { CacheTtl, CacheTtlConfig } from '~/core/llm/cache-breakpoints.js'
 export type { ChatMessageContentItem, LLMCallLogEntry, LLMCallMessage, ToolResultContent } from '~/core/llm/llm-log-types.js'
 export { contentToString } from '~/core/llm/llm-log-types.js'
 export { applyMiddleware, useProvider, withAnthropic, withMaxTokens, withOpenRouter, withTemperature } from '~/core/llm/middleware.js'

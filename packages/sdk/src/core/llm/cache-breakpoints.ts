@@ -1,5 +1,44 @@
 import type { LLMMessage, LLMMessageCacheControl } from '~/core/agents/state.js'
 
+/** Anthropic's two ephemeral cache tiers: 5-minute (write 1.25×) and 1-hour (write 2×). Reads are 0.1× on both. */
+export type CacheTtl = '5m' | '1h'
+
+/**
+ * Per-breakpoint prompt cache TTL.
+ *
+ * A bare tier applies to both breakpoints. The object form sets them
+ * independently, which is usually what you want: the stable prefix and the
+ * churning conversation tail have opposite cost profiles.
+ *
+ * Choosing between them is an economic question about a specific agent's call
+ * pattern, so the SDK does not pick for you:
+ *
+ * - A long TTL on the **prefix** pays off when calls are spread further apart
+ *   than the short tier survives — an orchestrator waiting on a human.
+ * - A long TTL on the **tail** costs 2× on every write while the tail is
+ *   rewritten turn-to-turn anyway, so it only pays when consecutive calls are
+ *   themselves minutes apart.
+ *
+ * Worked example, from a measured 5-week production session: 95% of inferences
+ * followed a sub-5-minute gap, so `'1h'` uniformly came out ~2.5% *worse* than
+ * the default, while `{ prefix: '1h' }` targeted the 29 rewrites that actually
+ * expired. A batch agent called in a tight loop would want the opposite.
+ *
+ * Constraint: Anthropic requires a longer TTL to precede a shorter one, and the
+ * prefix breakpoint always sits before the tail. So `{ prefix: '5m', tail: '1h' }`
+ * is invalid at the API and will be rejected — the tail TTL must not exceed the
+ * prefix TTL.
+ */
+export type CacheTtlConfig = CacheTtl | { prefix?: CacheTtl; tail?: CacheTtl }
+
+const resolveTtls = (config: CacheTtlConfig | undefined): { prefix?: CacheTtl; tail?: CacheTtl } => {
+	if (config === undefined) return {}
+	if (typeof config === 'string') return { prefix: config, tail: config }
+	return config
+}
+
+const cacheControl = (ttl: CacheTtl | undefined): LLMMessageCacheControl => ttl ? { type: 'ephemeral', ttl } : { type: 'ephemeral' }
+
 /**
  * Mark the prompt cache breakpoints on a message list.
  *
@@ -26,31 +65,23 @@ import type { LLMMessage, LLMMessageCacheControl } from '~/core/agents/state.js'
  *    every inference AND compaction call. Anthropic allows up to 4 breakpoints
  *    and matches the longest cached prefix, so the two coexist.
  *
- * If the prefix and tail indices coincide, only one breakpoint is set.
+ * If the prefix and tail indices coincide, only one breakpoint is set — it
+ * covers the preamble, so it takes the prefix TTL.
  *
- * `ttl` opts into Anthropic's 1-hour cache tier (write 2× input, read still
- * 0.1×) and applies to the **stable prefix breakpoint only** — the tail keeps
- * the default 5-minute tier.
- *
- * Applying a long TTL to both is a losing trade for an interactive agent. On a
- * measured 5-week production session, 95% of inferences followed a gap under
- * five minutes, so a uniform 1h would have raised the cost of every one of
- * those writes from 1.25× to 2× while fixing only the minority that actually
- * expired — a net loss. The prefix is the part that must survive human pauses;
- * the tail churns turn-to-turn and is cheapest on the short tier.
- *
- * Order matters: Anthropic requires a longer TTL to precede a shorter one, and
- * the prefix breakpoint always sits before the tail. Providers must also give
- * the system block the longest TTL in use, since it precedes both.
+ * `ttl` sets the cache tier per breakpoint; see {@link CacheTtlConfig} for how
+ * to choose. Providers must additionally give the system block the longest TTL
+ * in use, since it precedes every message and Anthropic rejects a longer entry
+ * that follows a shorter one.
  */
 export function applyCacheBreakpoint(
 	messages: LLMMessage[],
 	uncachedSuffixCount: number,
-	ttl?: '5m' | '1h',
+	ttl?: CacheTtlConfig,
 	cachedPrefixCount = 0,
 ): LLMMessage[] {
-	const prefixCacheControl: LLMMessageCacheControl = ttl ? { type: 'ephemeral', ttl } : { type: 'ephemeral' }
-	const tailCacheControl: LLMMessageCacheControl = { type: 'ephemeral' }
+	const ttls = resolveTtls(ttl)
+	const prefixCacheControl = cacheControl(ttls.prefix)
+	const tailCacheControl = cacheControl(ttls.tail)
 	const result = [...messages]
 
 	const mark = (idx: number, cacheControl: LLMMessageCacheControl) => {

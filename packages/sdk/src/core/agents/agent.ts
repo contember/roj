@@ -14,7 +14,7 @@ import type { AgentState, HandlerResult } from '~/core/agents/state.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { FileStore } from '~/core/file-store/types.js'
-import { applyCacheBreakpoint } from '~/core/llm/cache-breakpoints.js'
+import { applyCacheBreakpoint, type CacheTtlConfig } from '~/core/llm/cache-breakpoints.js'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { InferenceRequest, InferenceResponse, LLMError, LLMMessage, LLMProvider } from '~/core/llm/provider.js'
 import { LLMCallId, ModelId } from '~/core/llm/schema.js'
@@ -87,8 +87,11 @@ export interface AgentConfig<TInput = unknown> {
 	 * — useful for long-lived agents (e.g. an orchestrator that waits minutes
 	 * between user turns) where the default 5-minute TTL would expire and force
 	 * full re-uploads. Omit (or '5m') for the standard tier.
+	 *
+	 * A bare tier applies to both breakpoints; `{ prefix, tail }` sets them
+	 * independently, which usually pays better. See {@link CacheTtlConfig}.
 	 */
-	cacheTtl?: '5m' | '1h'
+	cacheTtl?: CacheTtlConfig
 	/** Outer backoff between error-resume cycles (see BaseAgentConfig.errorResumeBackoff). */
 	errorResumeBackoff?: { baseDelayMs?: number; maxDelayMs?: number }
 }
