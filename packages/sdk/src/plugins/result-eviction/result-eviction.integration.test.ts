@@ -19,6 +19,18 @@ const bigOutputPlugin = definePlugin('big-output')
 			input: z.object({ size: z.number() }),
 			execute: async (input) => Ok('x'.repeat(input.size)),
 		}),
+		// Mirrors a page-snapshot style result: a large JSON/text block plus an
+		// image part. These used to bypass eviction entirely.
+		createTool({
+			name: 'generate_snapshot',
+			description: 'Generate a text + image result of a given text size',
+			input: z.object({ size: z.number() }),
+			execute: async (input) =>
+				Ok([
+					{ type: 'text' as const, text: 'x'.repeat(input.size) },
+					{ type: 'image_url' as const, imageUrl: { url: 'data:image/png;base64,AAAA' } },
+				]),
+		}),
 	])
 	.build()
 
@@ -96,6 +108,82 @@ describe('result-eviction plugin', () => {
 		expect(toolResultContent!).toContain('.results/')
 		expect(toolResultContent!).toContain('Full output saved to:')
 		expect(toolResultContent!.length).toBeLessThan(250_000)
+
+		await harness.shutdown()
+	})
+
+	it('large multi-part output → text evicted, image part kept', async () => {
+		let toolContent: unknown = null
+		const harness = createEvictionHarness({
+			presets: [createEvictionPreset()],
+			mockHandler: (request) => {
+				const callCount = harness.llmProvider.getCallCount()
+				if (callCount === 1) {
+					return {
+						content: null,
+						toolCalls: [{ id: ToolCallId('tc1'), name: 'generate_snapshot', input: { size: 250_000 } }],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetrics(),
+					}
+				}
+				for (const msg of request.messages) {
+					if (msg.role === 'tool' && Array.isArray(msg.content)) {
+						toolContent = msg.content
+					}
+				}
+				return { content: 'Done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			},
+		})
+
+		const session = await harness.createSession('test')
+		await session.sendAndWaitForIdle('Generate large snapshot')
+
+		expect(Array.isArray(toolContent)).toBe(true)
+		const parts = toolContent as Array<{ type: string; text?: string }>
+
+		// Text collapsed to a preview that names the spill file...
+		const textParts = parts.filter((p) => p.type === 'text')
+		expect(textParts).toHaveLength(1)
+		expect(textParts[0].text).toContain('truncated')
+		expect(textParts[0].text).toContain('.results/')
+		expect(textParts[0].text!.length).toBeLessThan(250_000)
+
+		// ...and the image survives, because there is no partial image: the only
+		// alternative to keeping it is losing the observation.
+		expect(parts.filter((p) => p.type === 'image_url')).toHaveLength(1)
+
+		await harness.shutdown()
+	})
+
+	it('small multi-part output → returned unchanged', async () => {
+		let toolContent: unknown = null
+		const harness = createEvictionHarness({
+			presets: [createEvictionPreset()],
+			mockHandler: (request) => {
+				const callCount = harness.llmProvider.getCallCount()
+				if (callCount === 1) {
+					return {
+						content: null,
+						toolCalls: [{ id: ToolCallId('tc1'), name: 'generate_snapshot', input: { size: 100 } }],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetrics(),
+					}
+				}
+				for (const msg of request.messages) {
+					if (msg.role === 'tool' && Array.isArray(msg.content)) {
+						toolContent = msg.content
+					}
+				}
+				return { content: 'Done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			},
+		})
+
+		const session = await harness.createSession('test')
+		await session.sendAndWaitForIdle('Generate small snapshot')
+
+		const parts = toolContent as Array<{ type: string; text?: string }>
+		expect(parts.filter((p) => p.type === 'text')[0].text).toBe('x'.repeat(100))
+		expect(parts.filter((p) => p.type === 'image_url')).toHaveLength(1)
 
 		await harness.shutdown()
 	})
