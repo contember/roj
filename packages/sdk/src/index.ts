@@ -99,7 +99,7 @@ export type { EvictionAgentConfig, EvictionConfig } from '~/plugins/result-evict
 export { servicePlugin } from '~/plugins/services/plugin.js'
 export type { ServiceAgentConfig, ServiceStatusChangedEvent } from '~/plugins/services/plugin.js'
 export { selectSessionStats, sessionStatsPlugin } from '~/plugins/session-stats/plugin.js'
-export type { SessionStatsState } from '~/plugins/session-stats/plugin.js'
+export type { AgentStats, ProviderStats, SessionStatsState } from '~/plugins/session-stats/plugin.js'
 export { sessionStatePlugin } from '~/plugins/session-state/plugin.js'
 export type { SessionStatePluginConfig } from '~/plugins/session-state/plugin.js'
 export { presetsPlugin, sessionLifecyclePlugin } from '~/plugins/session-lifecycle/plugin.js'
