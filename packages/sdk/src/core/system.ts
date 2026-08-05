@@ -10,6 +10,7 @@
 import type z4 from 'zod/v4'
 import type { Logger } from '~/lib/logger/logger.js'
 import type { Platform } from '~/platform/index.js'
+import type { ServicePidRegistry } from '~/plugins/services/pid-registry.js'
 import type { PortPool } from '~/plugins/services/port-pool.js'
 import type { PreprocessorRegistry } from '~/plugins/uploads/preprocessor.js'
 import type { EventStore } from './events/event-store.js'
@@ -120,6 +121,7 @@ export interface CreateSystemOptions<TPlugins extends readonly PluginDefinition<
 	preprocessorRegistry?: PreprocessorRegistry
 	llmLogger?: LLMLogger
 	portPool?: PortPool
+	pidRegistry?: ServicePidRegistry
 	/** Host-environment adapters (filesystem, process). */
 	platform: Platform
 }
@@ -145,6 +147,7 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		preprocessorRegistry,
 		llmLogger,
 		portPool,
+		pidRegistry,
 		platform,
 	} = options
 
@@ -167,6 +170,7 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		preprocessorRegistry,
 		llmLogger,
 		portPool,
+		pidRegistry,
 		platform,
 		systemPlugins: [...plugins],
 	})

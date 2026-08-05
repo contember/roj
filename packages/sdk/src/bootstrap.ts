@@ -37,6 +37,7 @@ import { llmDebugPlugin } from './plugins/llm-debug/plugin.js'
 import { logsPlugin } from './plugins/logs/index.js'
 import { mailboxPlugin } from './plugins/mailbox/plugin.js'
 import { servicePlugin } from './plugins/services/plugin.js'
+import { ServicePidRegistry } from './plugins/services/pid-registry.js'
 import { PortPool } from './plugins/services/port-pool.js'
 import { presetsPlugin, sessionLifecyclePlugin } from './plugins/session-lifecycle/index.js'
 import { sessionStatsPlugin } from './plugins/session-stats/index.js'
@@ -89,6 +90,8 @@ export interface Services {
 	config: Config
 	/** Global port pool shared across all sessions */
 	portPool: PortPool
+	/** Durable record of spawned service processes, swept once at boot. */
+	pidRegistry: ServicePidRegistry
 	/** Preprocessor registry for upload content extraction */
 	preprocessorRegistry: PreprocessorRegistry
 	/** Host-environment adapters (filesystem, process). */
@@ -118,6 +121,8 @@ export function bootstrap(config: Config, userConfig: RojConfig, platform: Platf
 	const toolExecutor = new ToolExecutorImpl(logger)
 	const dataFileStore = new SessionFileStore(config.dataPath, undefined, false, platform.fs, 'session')
 	const portPool = new PortPool()
+	// Swept by the server before it serves — see ServicePidRegistry.sweepOrphans.
+	const pidRegistry = new ServicePidRegistry(platform.fs, logger, config.dataPath)
 
 	const preprocessorRegistry = new PreprocessorRegistry()
 	const imageClassifierGate = new Semaphore(config.imageClassifierConcurrency ?? 10)
@@ -148,6 +153,7 @@ export function bootstrap(config: Config, userConfig: RojConfig, platform: Platf
 		dataFileStore,
 		config,
 		portPool,
+		pidRegistry,
 		preprocessorRegistry,
 		platform,
 	}
@@ -253,6 +259,7 @@ export function createSystemFromServices(
 		preprocessorRegistry: services.preprocessorRegistry,
 		llmLogger: services.llmLogger,
 		portPool: services.portPool,
+		pidRegistry: services.pidRegistry,
 		platform: services.platform,
 	})
 }

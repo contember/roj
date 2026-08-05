@@ -34,6 +34,7 @@ import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { SpawnableAgentInfo } from '~/plugins/agents/index.js'
 import { getAgentUnconsumedMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
+import type { ServicePidRegistry } from '~/plugins/services/pid-registry.js'
 import type { PortPool } from '~/plugins/services/port-pool.js'
 import type { ServiceConfig } from '~/plugins/services/schema.js'
 import { selectSessionStats, type SessionStatsState } from '~/plugins/session-stats/index.js'
@@ -77,6 +78,7 @@ export interface SessionManagerOptions {
 	preprocessorRegistry?: PreprocessorRegistry
 	llmLogger?: LLMLogger
 	portPool?: PortPool
+	pidRegistry?: ServicePidRegistry
 	/** Host-environment adapters (filesystem, process). */
 	platform: Platform
 	systemPlugins?: readonly PluginDefinition<string, any, any, any, any>[]
@@ -108,6 +110,7 @@ export class SessionManager {
 	private readonly preprocessorRegistry?: PreprocessorRegistry
 	private readonly llmLogger?: LLMLogger
 	private readonly portPool?: PortPool
+	private readonly pidRegistry?: ServicePidRegistry
 	private readonly platform: Platform
 	private readonly systemPlugins: readonly PluginDefinition<string, any, any, any, any>[]
 
@@ -124,6 +127,7 @@ export class SessionManager {
 		this.preprocessorRegistry = options.preprocessorRegistry
 		this.llmLogger = options.llmLogger
 		this.portPool = options.portPool
+		this.pidRegistry = options.pidRegistry
 		this.platform = options.platform
 		this.systemPlugins = options.systemPlugins ?? []
 		this.managerMethods = this.collectManagerMethods()
@@ -774,7 +778,7 @@ export class SessionManager {
 			}
 		}
 		if (servicesByType.size > 0 && this.portPool) {
-			configs.set('services', { services: [...servicesByType.values()], portPool: this.portPool })
+			configs.set('services', { services: [...servicesByType.values()], portPool: this.portPool, pidRegistry: this.pidRegistry })
 		}
 
 		return configs

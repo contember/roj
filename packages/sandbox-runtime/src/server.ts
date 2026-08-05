@@ -59,6 +59,10 @@ export async function startServer(options: StartServerOptions): Promise<ServerHa
 	const services = bootstrap(config, { presets }, createBunPlatform())
 	const { logger } = services
 
+	// Reap service processes left behind by a previous agent, before any session can load
+	// and start its own. At boot this agent owns nothing, so every survivor is an orphan.
+	await services.pidRegistry.sweepOrphans()
+
 	if (options.onBeforeStart) {
 		await options.onBeforeStart({ config, logger })
 	}

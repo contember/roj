@@ -13,6 +13,7 @@ import { Err, Ok } from '~/lib/utils/result.js'
 import type { FileSystem } from '~/platform/fs.js'
 import type { ChildProcess, ProcessRunner } from '~/platform/process.js'
 import type { PortPool } from '~/plugins/services/port-pool.js'
+import type { ServicePidRegistry } from '~/plugins/services/pid-registry.js'
 import type { ServiceConfig, ServiceStartArgs, ServiceStatus } from '~/plugins/services/schema.js'
 import type { ToolError } from '../../core/tools/executor.js'
 import type { Logger } from '../../lib/logger/logger.js'
@@ -89,6 +90,8 @@ const MAX_PORT_CONFLICT_RETRIES = 3
 export interface ServiceExecutorDeps {
 	fs: FileSystem
 	process: ProcessRunner
+	/** Durable pid record, swept at agent boot. Optional so embedders without a data dir still work. */
+	pidRegistry?: ServicePidRegistry
 }
 
 export class ServiceExecutor {
@@ -103,6 +106,7 @@ export class ServiceExecutor {
 	private readonly portPool: PortPool
 	private readonly fs: FileSystem
 	private readonly processRunner: ProcessRunner
+	private readonly pidRegistry?: ServicePidRegistry
 
 	/** Optional callback invoked on every service status change */
 	onStatusChanged?: (
@@ -117,6 +121,7 @@ export class ServiceExecutor {
 		this.portPool = portPool
 		this.fs = deps.fs
 		this.processRunner = deps.process
+		this.pidRegistry = deps.pidRegistry
 	}
 
 	private notifyStatusChanged(
@@ -354,6 +359,11 @@ export class ServiceExecutor {
 		// "our process" from "an unrelated process that grabbed this PID after ours died"
 		const pidStartTime = await getProcessStartTime(this.fs, child.pid)
 
+		// Durably record the process so a future agent can reap it if we die before the
+		// `close` handler gets to forget it. The session projection cannot serve that
+		// purpose — see ServicePidRegistry.
+		await this.pidRegistry?.record({ sessionId: String(sessionId), serviceType: config.type, pid: child.pid, pidStartTime, command })
+
 		// Emit starting event with PID, port, resolved cwd/command, and start time.
 		this.notifyStatusChanged(sessionId, config.type, 'starting', { port, pid: child.pid, pidStartTime, cwd, command })
 
@@ -512,6 +522,8 @@ export class ServiceExecutor {
 		// Handle unexpected exit
 		child.on('close', (code) => {
 			clearReadinessTimers()
+			// The process is gone, so its durable record has nothing left to reap.
+			void this.pidRegistry?.forget(String(sessionId), config.type)
 			// Flush remaining partial lines
 			if (stdoutPartial) {
 				processLine(stdoutPartial)

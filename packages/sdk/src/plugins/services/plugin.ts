@@ -8,6 +8,7 @@ import { Err, Ok } from '~/lib/utils/result.js'
 import type { PortPool } from './port-pool.js'
 import { buildServiceStatusMessage } from './prompt.js'
 import type { ServiceConfig, ServiceEntry } from './schema.js'
+import type { ServicePidRegistry } from './pid-registry.js'
 import { getProcessStartTime, ServiceExecutor } from './service.js'
 
 export const serviceEvents = createEventsFactory({
@@ -33,6 +34,8 @@ export type ServiceStatusChangedEvent = (typeof serviceEvents)['Events']['servic
 export interface ServicePluginConfig {
 	services: ServiceConfig[]
 	portPool: PortPool
+	/** Durable pid record swept at agent boot. Absent for embedders without a data dir. */
+	pidRegistry?: ServicePidRegistry
 }
 
 /**
@@ -133,7 +136,11 @@ export const servicePlugin = definePlugin('services')
 		},
 	})
 	.context(async (ctx, pluginConfig) => {
-		const executor = new ServiceExecutor(ctx.logger, pluginConfig.portPool, { fs: ctx.platform.fs, process: ctx.platform.process })
+		const executor = new ServiceExecutor(ctx.logger, pluginConfig.portPool, {
+			fs: ctx.platform.fs,
+			process: ctx.platform.process,
+			pidRegistry: pluginConfig.pidRegistry,
+		})
 		executor.onStatusChanged = (sessionId, serviceType, status, details) => {
 			void ctx.emitEvent(serviceEvents.create('service_status_changed', {
 				serviceType,
