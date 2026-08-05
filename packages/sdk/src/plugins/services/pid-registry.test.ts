@@ -46,7 +46,7 @@ async function unusablePid(): Promise<number> {
 async function writeRecord(dataPath: string, record: Record<string, unknown>): Promise<string> {
 	const dir = join(dataPath, 'service-pids')
 	await mkdir(dir, { recursive: true })
-	const path = join(dir, `${record.sessionId}__${record.serviceType}.json`)
+	const path = join(dir, `${record.sessionId}__${record.serviceType}__${record.pid}.json`)
 	await writeFile(path, JSON.stringify(record))
 	return path
 }
@@ -70,6 +70,7 @@ describe('ServicePidRegistry', () => {
 			await makeRegistry(dataPath).sweepOrphans()
 
 			await victim.exited
+			// `exited` resolves on the leader; give the group a beat before asserting.
 			expect(isAlive(victim.pid)).toBe(false)
 			expect(await readdir(join(dataPath, 'service-pids'))).toEqual([])
 		})
@@ -172,9 +173,112 @@ describe('ServicePidRegistry', () => {
 			await registry.record({ sessionId: 'sess-1', serviceType: 'astro-dev', pid: 1, pidStartTime: 1, command: 'x' })
 			expect(await readdir(join(dataPath, 'service-pids'))).toHaveLength(1)
 
-			await registry.forget('sess-1', 'astro-dev')
+			await registry.forget('sess-1', 'astro-dev', 1)
 
 			expect(await readdir(join(dataPath, 'service-pids'))).toEqual([])
+		})
+	})
+
+	it('records each generation separately, so an older one stays reapable', async () => {
+		await withDataDir(async dataPath => {
+			const registry = makeRegistry(dataPath)
+			const first = spawnVictim()
+			const second = spawnVictim()
+			try {
+				for (const pid of [first.pid, second.pid]) {
+					await registry.record({
+						sessionId: 'sess-1',
+						serviceType: 'astro-dev',
+						pid,
+						pidStartTime: await getProcessStartTime(fs, pid),
+						command: 'sleep 60',
+					})
+				}
+
+				// Two generations of ONE (session, serviceType) — the shape that leaked in prod.
+				expect(await readdir(join(dataPath, 'service-pids'))).toHaveLength(2)
+			} finally {
+				process.kill(-first.pid, 'SIGKILL')
+				process.kill(-second.pid, 'SIGKILL')
+			}
+		})
+	})
+
+	it('a stale generation forgetting itself does not drop the live one', async () => {
+		await withDataDir(async dataPath => {
+			const registry = makeRegistry(dataPath)
+			const stale = spawnVictim()
+			const live = spawnVictim()
+			try {
+				for (const pid of [stale.pid, live.pid]) {
+					await registry.record({ sessionId: 'sess-1', serviceType: 'astro-dev', pid, pidStartTime: 1, command: 'x' })
+				}
+
+				// gen-1's `close` can arrive long after gen-2 started.
+				await registry.forget('sess-1', 'astro-dev', stale.pid)
+
+				const left = await readdir(join(dataPath, 'service-pids'))
+				expect(left).toEqual([`sess-1__astro-dev__${live.pid}.json`])
+			} finally {
+				process.kill(-stale.pid, 'SIGKILL')
+				process.kill(-live.pid, 'SIGKILL')
+			}
+		})
+	})
+
+	it('refuses to kill a record with no recorded start time', async () => {
+		await withDataDir(async dataPath => {
+			const victim = spawnVictim()
+			try {
+				await writeRecord(dataPath, {
+					sessionId: 'sess-1',
+					serviceType: 'astro-dev',
+					pid: victim.pid,
+					command: 'sleep 60',
+					agentPid: await unusablePid(),
+				})
+
+				await makeRegistry(dataPath).sweepOrphans()
+
+				// Unprovable ownership must fail closed: a wrong SIGKILL beats a leaked process.
+				expect(isAlive(victim.pid)).toBe(true)
+			} finally {
+				process.kill(-victim.pid, 'SIGKILL')
+			}
+		})
+	})
+
+	it('refuses pids that would widen the blast radius', async () => {
+		await withDataDir(async dataPath => {
+			for (const pid of [1, process.pid]) {
+				await writeRecord(dataPath, { sessionId: `s${pid}`, serviceType: 'astro-dev', pid, pidStartTime: 1, agentPid: await unusablePid() })
+			}
+
+			// kill(-1) would signal the whole VM; our own group would take the agent down at boot.
+			await makeRegistry(dataPath).sweepOrphans()
+
+			expect(await readdir(join(dataPath, 'service-pids'))).toEqual([])
+		})
+	})
+
+	it('treats a reused agent pid as a dead agent, not as ourselves', async () => {
+		await withDataDir(async dataPath => {
+			const victim = spawnVictim()
+			await writeRecord(dataPath, {
+				sessionId: 'sess-1',
+				serviceType: 'astro-dev',
+				pid: victim.pid,
+				pidStartTime: await getProcessStartTime(fs, victim.pid),
+				command: 'sleep 60',
+				// Our pid, but a start time that is not ours — a record from before a reboot.
+				agentPid: process.pid,
+				agentStartTime: ((await getProcessStartTime(fs, process.pid)) ?? 0) + 999,
+			})
+
+			await makeRegistry(dataPath).sweepOrphans()
+
+			await victim.exited
+			expect(isAlive(victim.pid)).toBe(false)
 		})
 	})
 })

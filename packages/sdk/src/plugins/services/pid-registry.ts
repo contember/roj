@@ -41,6 +41,13 @@ export interface ServicePidRecord {
 
 const REGISTRY_DIR = 'service-pids'
 
+/**
+ * Collapse anything that could steer a path into a single safe token. Session ids arrive as
+ * caller-supplied text (`sessions.create` takes an unconstrained string), so `..` or a slash
+ * would let `join` walk out of the registry directory and unlink or overwrite something else.
+ */
+const safeSegment = (value: string): string => value.replace(/[^A-Za-z0-9._-]/g, '_')
+
 export class ServicePidRegistry {
 	constructor(
 		private readonly fs: FileSystem,
@@ -53,10 +60,21 @@ export class ServicePidRegistry {
 		return join(this.dataPath, REGISTRY_DIR)
 	}
 
-	private recordPath(sessionId: string, serviceType: string): string {
-		// Service types are plugin-configured identifiers (`astro-dev`, `cms-sidecar`) and
-		// session ids are uuids, so neither needs escaping to be a safe file name.
-		return join(this.root, `${sessionId}__${serviceType}.json`)
+	/**
+	 * One file per spawned PROCESS, not per (session, service type).
+	 *
+	 * Keying by the pair would reproduce the very limitation this registry exists to fix: the
+	 * session projection keeps one pid per service type, so each start loses the previous
+	 * generation. The incident that motivated all of this was two generations of one pair —
+	 * two dev servers for a single session — and a pair-keyed file would have recorded only
+	 * the newer one and left the older running for good.
+	 *
+	 * The name is sanitised because a session id reaches us as caller-supplied text: `join`
+	 * would happily walk `..` out of the registry directory and unlink something else. Field
+	 * values are read from the file body, so collapsing characters here is harmless.
+	 */
+	private recordPath(sessionId: string, serviceType: string, pid: number): string {
+		return join(this.root, `${safeSegment(sessionId)}__${safeSegment(serviceType)}__${pid}.json`)
 	}
 
 	/**
@@ -71,16 +89,23 @@ export class ServicePidRegistry {
 				agentPid: process.pid,
 				agentStartTime: await getProcessStartTime(this.fs, process.pid),
 			}
-			await this.fs.writeFile(this.recordPath(record.sessionId, record.serviceType), JSON.stringify(full))
+			await this.fs.writeFile(this.recordPath(record.sessionId, record.serviceType, record.pid), JSON.stringify(full))
 		} catch (error) {
 			this.logger.debug('Could not record service pid', { sessionId: record.sessionId, serviceType: record.serviceType, error })
 		}
 	}
 
-	/** Drop the record for a service whose process is gone. */
-	async forget(sessionId: string, serviceType: string): Promise<void> {
+	/**
+	 * Drop the record for a service process that has exited.
+	 *
+	 * The pid is what makes this safe. A stale generation's `close` can arrive long after its
+	 * replacement has started — a grandchild that ignored SIGTERM keeps the inherited pipes
+	 * open until it dies — and without the pid it would delete the live process's record and
+	 * silently reintroduce the leak.
+	 */
+	async forget(sessionId: string, serviceType: string, pid: number): Promise<void> {
 		try {
-			await this.fs.unlink(this.recordPath(sessionId, serviceType))
+			await this.fs.unlink(this.recordPath(sessionId, serviceType, pid))
 		} catch {
 			// Already gone, or never recorded.
 		}
@@ -148,23 +173,42 @@ export class ServicePidRegistry {
 	}
 
 	/**
-	 * Whether a live agent still owns this record. Ourselves counts: a record carrying our own
-	 * pid describes a service this very process started, which the sweep must never touch —
-	 * that is what makes the sweep safe to run at any time, not only before the first start.
+	 * Whether a live agent still owns this record — including ourselves, which is what lets the
+	 * sweep run at any time rather than only before the first service start.
+	 *
+	 * Ownership needs the start time to agree, not just the pid. After a genuine reboot the pid
+	 * space restarts, so a dead agent's record can name the pid we now hold; trusting the pid
+	 * alone would mark its orphans "ours" and skip them forever.
 	 */
 	private async isAgentAlive(record: ServicePidRecord): Promise<boolean> {
-		if (record.agentPid === process.pid) return true
 		if (record.agentPid === 0) return false
+		// Our own pid is only proof of ownership if the start times agree too. After a real
+		// reboot the pid space restarts, so a dead agent's record can carry the pid we now hold;
+		// skipping those as "ours" would disable the sweep for exactly the records it exists for.
 		const currentStartTime = await getProcessStartTime(this.fs, record.agentPid)
 		if (currentStartTime === undefined) return false
-		return record.agentStartTime === undefined || currentStartTime === record.agentStartTime
+		if (record.agentStartTime === undefined) return record.agentPid === process.pid
+		return currentStartTime === record.agentStartTime
 	}
 
 	private async killIfStillOurs(record: ServicePidRecord): Promise<void> {
+		// Fail closed on anything that would widen the blast radius. `kill(-1)` signals every
+		// process we may signal — the whole VM, as root in a sandbox — and killing our own group
+		// would take the agent down at boot, forever.
+		if (record.pid <= 1 || record.pid === process.pid) {
+			this.logger.warn('Refusing to sweep an unusable service pid', {
+				sessionId: record.sessionId,
+				serviceType: record.serviceType,
+				pid: record.pid,
+			})
+			return
+		}
 		const currentStartTime = await getProcessStartTime(this.fs, record.pid)
 		if (currentStartTime === undefined) return // Process is gone.
-		if (record.pidStartTime !== undefined && currentStartTime !== record.pidStartTime) {
-			this.logger.warn('PID reuse detected during orphan sweep — refusing to kill', {
+		// No recorded start time means we cannot prove this pid is still the process we spawned.
+		// A wrong SIGKILL is far worse than a leaked process, so decline.
+		if (record.pidStartTime === undefined || currentStartTime !== record.pidStartTime) {
+			this.logger.warn('Cannot prove this pid is still our service — refusing to kill', {
 				sessionId: record.sessionId,
 				serviceType: record.serviceType,
 				pid: record.pid,

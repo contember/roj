@@ -355,14 +355,13 @@ export class ServiceExecutor {
 			return Err({ message: 'Failed to spawn service process', recoverable: true })
 		}
 
+		// Bind the pid once the spawn is known to have produced one: the `close` handler below
+		// is a closure and cannot see the guard above narrowing `child.pid`.
+		const childPid = child.pid
+
 		// Capture start time immediately so a later PID-reuse check can distinguish
 		// "our process" from "an unrelated process that grabbed this PID after ours died"
-		const pidStartTime = await getProcessStartTime(this.fs, child.pid)
-
-		// Durably record the process so a future agent can reap it if we die before the
-		// `close` handler gets to forget it. The session projection cannot serve that
-		// purpose — see ServicePidRegistry.
-		await this.pidRegistry?.record({ sessionId: String(sessionId), serviceType: config.type, pid: child.pid, pidStartTime, command })
+		const pidStartTime = await getProcessStartTime(this.fs, childPid)
 
 		// Emit starting event with PID, port, resolved cwd/command, and start time.
 		this.notifyStatusChanged(sessionId, config.type, 'starting', { port, pid: child.pid, pidStartTime, cwd, command })
@@ -522,8 +521,10 @@ export class ServiceExecutor {
 		// Handle unexpected exit
 		child.on('close', (code) => {
 			clearReadinessTimers()
-			// The process is gone, so its durable record has nothing left to reap.
-			void this.pidRegistry?.forget(String(sessionId), config.type)
+			// This generation's process is gone, so its durable record has nothing left to reap.
+			// Keyed by THIS child's pid: a stale generation's `close` can land long after its
+			// replacement started, and must not delete the live one's record.
+			void this.pidRegistry?.forget(String(sessionId), config.type, childPid)
 			// Flush remaining partial lines
 			if (stdoutPartial) {
 				processLine(stdoutPartial)
@@ -580,6 +581,14 @@ export class ServiceExecutor {
 				this.portConflictRetries.delete(config.type)
 			}
 		})
+
+		// Durably record the process so a future agent can reap it if we die before the `close`
+		// handler forgets it — the session projection cannot serve that purpose, see
+		// ServicePidRegistry. NOT awaited, deliberately: nothing in this start depends on the
+		// record landing, and an await anywhere in `start` reorders the rest of the startup
+		// against an instantly-exiting child's `close`, which then loses the `failed` status it
+		// had just been given.
+		void this.pidRegistry?.record({ sessionId: String(sessionId), serviceType: config.type, pid: childPid, pidStartTime, command })
 
 		this.logger.info('Service starting', {
 			serviceType: config.type,

@@ -77,7 +77,9 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 
 	// Reap service processes left behind by a previous agent, before any session can load
 	// and start its own. At boot this agent owns nothing, so every survivor is an orphan.
-	await services.pidRegistry.sweepOrphans()
+	await services.pidRegistry.sweepOrphans().catch((error: unknown) => {
+		logger.error('Orphan service sweep failed', error instanceof Error ? error : new Error(String(error)))
+	})
 
 	const instance = createInstance({
 		id: options.instanceId,
