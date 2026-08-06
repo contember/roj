@@ -1,10 +1,14 @@
 import { describe, expect, test } from 'bun:test'
 import type { LLMMessage } from '~/core/agents/state.js'
+import { isRetryableLLMError } from '~/core/agents/retry.js'
 import { ModelId } from '~/core/llm/schema.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { AnthropicProvider } from './anthropic.js'
 import { applyCacheBreakpoint } from './cache-breakpoints.js'
-import type { RawInferenceRequest } from './provider.js'
+import { SessionFileStore } from '~/core/file-store/file-store.js'
+import { createNodeFileSystem } from '~/testing/node-platform.js'
+import type { InferenceContext, RawInferenceRequest } from './provider.js'
+import { LLMMessageFactory, mapProviderError } from './provider.js'
 
 // ============================================================================
 // Helpers — access private methods via prototype for testing
@@ -25,7 +29,6 @@ const mergeConsecutiveMessages = (provider as any).mergeConsecutiveMessages.bind
 	msgs: { role: string; content: unknown }[],
 ) => { role: string; content: unknown }[]
 const mapStopReason = (provider as any).mapStopReason.bind(provider) as (reason: string | null) => string
-const mapError = (provider as any).mapError.bind(provider) as (err: unknown) => unknown
 
 // ============================================================================
 // Message Mapping
@@ -486,24 +489,93 @@ describe('AnthropicProvider stop reason mapping', () => {
 // Error Mapping
 // ============================================================================
 
-describe('AnthropicProvider error mapping', () => {
-	test('maps AbortError', () => {
+describe('provider error mapping', () => {
+	const abortError = () => {
 		const err = new Error('aborted')
 		err.name = 'AbortError'
-		const result = mapError(err) as any
-		expect(result.type).toBe('aborted')
+		return err
+	}
+
+	test('maps a caller-initiated AbortError to aborted', () => {
+		expect(mapProviderError(abortError()).type).toBe('aborted')
+	})
+
+	test('maps the same AbortError to timeout when our timeout fired', () => {
+		const result = mapProviderError(abortError(), { timedOut: true })
+		expect(result.type).toBe('timeout')
+		expect(isRetryableLLMError(result)).toBe(true)
+	})
+
+	test('an aborted request stays non-retryable', () => {
+		expect(isRetryableLLMError(mapProviderError(abortError()))).toBe(false)
 	})
 
 	test('maps unknown error to network_error', () => {
-		const result = mapError(new Error('something')) as any
+		const result = mapProviderError(new Error('something'))
 		expect(result.type).toBe('network_error')
 		expect(result.message).toBe('something')
 	})
 
 	test('maps string error', () => {
-		const result = mapError('boom') as any
+		const result = mapProviderError('boom')
 		expect(result.type).toBe('network_error')
 		expect(result.message).toBe('boom')
+	})
+})
+
+describe('AnthropicProvider request timeout', () => {
+	/** Provider whose fetch never settles on its own — only the abort signal ends it. */
+	const stallingProvider = (timeout: number) => {
+		let onFetchCalled: () => void
+		const fetchCalled = new Promise<void>((resolve) => {
+			onFetchCalled = resolve
+		})
+		const provider = new AnthropicProvider({
+			apiKey: 'test-key',
+			timeout,
+			imageProcessor: { resolveContent: async (content) => content },
+			fetch: ((_url: string, init?: { signal?: AbortSignal }) => {
+				onFetchCalled()
+				return new Promise((_resolve, reject) => {
+					init?.signal?.addEventListener('abort', () => {
+						const err = new Error('aborted')
+						err.name = 'AbortError'
+						reject(err)
+					})
+				})
+			}) as unknown as typeof fetch,
+		})
+		return { provider, fetchCalled }
+	}
+
+	const request = { messages: [LLMMessageFactory.user('hi')], model: ModelId('claude-opus-4-6'), systemPrompt: '' }
+	// Never touched — a plain-text message resolves no file:// URLs — but the type requires it.
+	const fileStore = new SessionFileStore('/tmp/roj-anthropic-test', undefined, false, createNodeFileSystem(), 'session')
+	const contextWith = (signal: AbortSignal): InferenceContext => ({
+		sessionId: 'session-1',
+		agentId: 'agent-1',
+		signal,
+		fileStore,
+	})
+
+	test('reports a stalled provider as timeout, not aborted', async () => {
+		const result = await stallingProvider(10).provider.inference(request)
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.type).toBe('timeout')
+		expect(isRetryableLLMError(result.error)).toBe(true)
+	})
+
+	test('reports a caller cancel as aborted', async () => {
+		const { provider, fetchCalled } = stallingProvider(60_000)
+		const controller = new AbortController()
+		const promise = provider.inference(request, contextWith(controller.signal))
+		await fetchCalled
+		controller.abort()
+		const result = await promise
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.type).toBe('aborted')
 	})
 })
 
