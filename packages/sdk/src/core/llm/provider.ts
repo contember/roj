@@ -4,6 +4,7 @@ import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { ToolDefinition } from '~/core/tools/definition.js'
 import type { ToolCallId } from '~/core/tools/schema.js'
 import type { Result } from '~/lib/utils/result.js'
+import { ProviderMessageValidationError } from './message-sanitization.js'
 import { ModelId } from './schema.js'
 
 // Re-export LLMMessage types from agents/state for backwards compatibility
@@ -239,4 +240,31 @@ export const LLMMessageFactory = {
 	}),
 
 	system: (content: string): SystemLLMMessage => ({ role: 'system', content }),
+}
+
+// ============================================================================
+// Error mapping
+// ============================================================================
+
+/**
+ * Maps a thrown provider error onto an LLMError.
+ *
+ * `timedOut` distinguishes our own request timeout from a caller-initiated
+ * cancel: both abort the same controller and surface as an indistinguishable
+ * AbortError, but only the timeout is retryable. Mapping a timeout to 'aborted'
+ * makes Agent.runInference bail silently and leave the agent stuck 'inferring'.
+ */
+export function mapProviderError(err: unknown, opts?: { timedOut?: boolean }): LLMError {
+	if (err instanceof ProviderMessageValidationError) {
+		return { type: 'invalid_request', message: err.message }
+	}
+	if (err instanceof Error && err.name === 'AbortError') {
+		return opts?.timedOut
+			? { type: 'timeout', message: 'Request timed out', cause: err }
+			: { type: 'aborted', message: 'Request was aborted' }
+	}
+	if (err instanceof TypeError && (err.message.includes('fetch') || err.message.includes('network'))) {
+		return { type: 'network_error', message: err.message, cause: err }
+	}
+	return { type: 'network_error', message: err instanceof Error ? err.message : String(err), cause: err }
 }

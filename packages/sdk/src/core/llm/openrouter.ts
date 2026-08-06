@@ -17,7 +17,8 @@ import type {
 	ProviderHttpRequest,
 	RawInferenceRequest,
 } from './provider.js'
-import { ProviderMessageValidationError, sanitizeProviderMessages } from './message-sanitization.js'
+import { mapProviderError } from './provider.js'
+import { sanitizeProviderMessages } from './message-sanitization.js'
 
 // ============================================================================
 // Configuration
@@ -194,6 +195,8 @@ export class OpenRouterProvider implements LLMProvider {
 
 	async inference(request: InferenceRequest, context?: InferenceContext): Promise<Result<InferenceResponse, LLMError>> {
 		const startTime = Date.now()
+		// Our timeout and the caller's cancel abort the same controller — only this flag tells them apart.
+		let timedOut = false
 
 		try {
 			const rawRequest: RawInferenceRequest = {
@@ -208,7 +211,10 @@ export class OpenRouterProvider implements LLMProvider {
 			const httpRequest = await this.buildHttpRequest(rawRequest, context)
 
 			const controller = new AbortController()
-			const timeoutId = setTimeout(() => controller.abort(), this.timeout)
+			const timeoutId = setTimeout(() => {
+				timedOut = true
+				controller.abort()
+			}, this.timeout)
 
 			if (context?.signal) {
 				context.signal.addEventListener('abort', () => controller.abort(), { once: true })
@@ -275,7 +281,7 @@ export class OpenRouterProvider implements LLMProvider {
 				providerRequestId: data.id,
 			})
 		} catch (error) {
-			return Err(this.mapError(error))
+			return Err(mapProviderError(error, { timedOut }))
 		}
 	}
 
@@ -468,16 +474,4 @@ export class OpenRouterProvider implements LLMProvider {
 		return { type: 'server_error', message, statusCode: status, responseBody: body }
 	}
 
-	private mapError(err: unknown): LLMError {
-		if (err instanceof ProviderMessageValidationError) {
-			return { type: 'invalid_request', message: err.message }
-		}
-		if (err instanceof Error && err.name === 'AbortError') {
-			return { type: 'aborted', message: 'Request was aborted' }
-		}
-		if (err instanceof TypeError && (err.message.includes('fetch') || err.message.includes('network'))) {
-			return { type: 'network_error', message: err.message, cause: err }
-		}
-		return { type: 'network_error', message: err instanceof Error ? err.message : String(err), cause: err }
-	}
 }

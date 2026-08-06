@@ -17,7 +17,8 @@ import type {
 	RawInferenceRequest,
 	RawToolSpec,
 } from './provider.js'
-import { ProviderMessageValidationError, sanitizeProviderMessages } from './message-sanitization.js'
+import { mapProviderError } from './provider.js'
+import { sanitizeProviderMessages } from './message-sanitization.js'
 import type { RoutableLLMProvider } from './routing-provider.js'
 
 // ============================================================================
@@ -233,6 +234,8 @@ export class AnthropicProvider implements RoutableLLMProvider {
 
 	async inference(request: InferenceRequest, context?: InferenceContext): Promise<Result<InferenceResponse, LLMError>> {
 		const startTime = Date.now()
+		// Our timeout and the caller's cancel abort the same controller — only this flag tells them apart.
+		let timedOut = false
 
 		try {
 			const rawRequest: RawInferenceRequest = {
@@ -247,7 +250,10 @@ export class AnthropicProvider implements RoutableLLMProvider {
 			const httpRequest = await this.buildHttpRequest(rawRequest, context)
 
 			const controller = new AbortController()
-			const timeoutId = setTimeout(() => controller.abort(), this.timeout)
+			const timeoutId = setTimeout(() => {
+				timedOut = true
+				controller.abort()
+			}, this.timeout)
 
 			// Combine with external signal if provided
 			if (context?.signal) {
@@ -317,7 +323,7 @@ export class AnthropicProvider implements RoutableLLMProvider {
 				reasoning: reasoning || undefined,
 			})
 		} catch (error) {
-			return Err(this.mapError(error))
+			return Err(mapProviderError(error, { timedOut }))
 		}
 	}
 
@@ -581,16 +587,4 @@ export class AnthropicProvider implements RoutableLLMProvider {
 		return { type: 'server_error', message, statusCode: status, responseBody: body }
 	}
 
-	private mapError(err: unknown): LLMError {
-		if (err instanceof ProviderMessageValidationError) {
-			return { type: 'invalid_request', message: err.message }
-		}
-		if (err instanceof Error && err.name === 'AbortError') {
-			return { type: 'aborted', message: 'Request was aborted' }
-		}
-		if (err instanceof TypeError && (err.message.includes('fetch') || err.message.includes('network'))) {
-			return { type: 'network_error', message: err.message, cause: err }
-		}
-		return { type: 'network_error', message: err instanceof Error ? err.message : String(err), cause: err }
-	}
 }
