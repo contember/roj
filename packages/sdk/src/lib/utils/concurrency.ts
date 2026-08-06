@@ -33,7 +33,11 @@ export async function mapWithConcurrency<T, R>(
  */
 export class Semaphore {
 	private active = 0
-	private readonly waiters: Array<() => void> = []
+	private readonly waiters: Array<{
+		resolve: () => void
+		signal?: AbortSignal
+		onAbort?: () => void
+	}> = []
 
 	constructor(private readonly limit: number) {
 		if (!Number.isInteger(limit) || limit < 1) {
@@ -41,22 +45,44 @@ export class Semaphore {
 		}
 	}
 
-	async run<T>(fn: () => Promise<T>): Promise<T> {
-		await this.acquire()
+	async run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+		let acquired = false
 		try {
+			await this.acquire(signal)
+			acquired = true
+			signal?.throwIfAborted()
 			return await fn()
 		} finally {
-			this.release()
+			if (acquired) this.release()
 		}
 	}
 
-	private acquire(): Promise<void> {
+	private acquire(signal?: AbortSignal): Promise<void> {
+		if (signal?.aborted) {
+			return Promise.reject(signal.reason)
+		}
 		if (this.active < this.limit) {
 			this.active++
 			return Promise.resolve()
 		}
-		return new Promise<void>(resolve => {
-			this.waiters.push(resolve)
+		return new Promise<void>((resolve, reject) => {
+			const waiter: {
+				resolve: () => void
+				signal?: AbortSignal
+				onAbort?: () => void
+			} = { resolve, signal }
+			if (signal) {
+				const onAbort = () => {
+					const index = this.waiters.indexOf(waiter)
+					if (index === -1) return
+					this.waiters.splice(index, 1)
+					signal.removeEventListener('abort', onAbort)
+					reject(signal.reason)
+				}
+				waiter.onAbort = onAbort
+				signal.addEventListener('abort', onAbort, { once: true })
+			}
+			this.waiters.push(waiter)
 		})
 	}
 
@@ -64,7 +90,10 @@ export class Semaphore {
 		const next = this.waiters.shift()
 		if (next) {
 			// Slot transfers directly to the next waiter; active stays unchanged.
-			next()
+			if (next.signal && next.onAbort) {
+				next.signal.removeEventListener('abort', next.onAbort)
+			}
+			next.resolve()
 		} else {
 			this.active--
 		}

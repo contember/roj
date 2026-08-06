@@ -1,14 +1,14 @@
 import z from 'zod/v4'
 import { ValidationErrors } from '~/core/errors.js'
 import type { FileStore } from '~/core/file-store/types.js'
+import type { InferenceContext } from '~/core/llm/provider.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { SessionId } from '~/core/sessions/schema.js'
 import { getEntryAgentId } from '~/core/sessions/state.js'
-import { Err, Ok } from '~/lib/utils/result.js'
-import type { PreprocessorRegistry } from './preprocessor.js'
+import { Err, Ok, type Result } from '~/lib/utils/result.js'
+import type { PreprocessorRegistry, PreprocessorResult } from './preprocessor.js'
 import { generateUploadId, type MessageAttachment, UploadId, type UploadMetadata } from './schema.js'
 import { type PendingUpload, uploadEvents, type UploadsState } from './state.js'
-import { sleep } from '~/lib/utils/sleep.js'
 
 // ============================================================================
 // Notification schemas
@@ -46,6 +46,7 @@ const ALLOWED_MIME_TYPES = [
 ]
 
 const PROCESSING_TIMEOUT_MS = 120_000 // 120 seconds
+const PROCESSING_ABORT_GRACE_MS = 1_000
 
 // ============================================================================
 // Config
@@ -54,6 +55,47 @@ const PROCESSING_TIMEOUT_MS = 120_000 // 120 seconds
 export interface UploadsPluginConfig {
 	dataFileStore: FileStore
 	preprocessorRegistry?: PreprocessorRegistry
+	/** Override for tests or deployments with a stricter preprocessing budget. */
+	processingTimeoutMs?: number
+	/** Maximum time to wait for cooperative cancellation before finalizing. */
+	processingAbortGraceMs?: number
+}
+
+interface PreprocessingResult {
+	status: 'ready' | 'failed'
+	extractedContent?: string
+	derivedPaths?: string[]
+	error?: string
+}
+
+interface ActiveUploadLifecycle {
+	controller: AbortController
+	completion: Promise<void>
+}
+
+interface UploadsPluginContext {
+	activeUploads: Map<string, ActiveUploadLifecycle>
+	closing: boolean
+}
+
+interface PreprocessorCompleted {
+	kind: 'completed'
+	result: Result<PreprocessorResult, Error>
+}
+
+interface PreprocessorThrew {
+	kind: 'threw'
+	error: unknown
+}
+
+type PreprocessorOutcome = PreprocessorCompleted | PreprocessorThrew
+
+interface PreprocessorAborted {
+	kind: 'aborted'
+}
+
+interface AbortGraceExpired {
+	kind: 'abort_grace_expired'
 }
 
 // ============================================================================
@@ -91,12 +133,11 @@ async function runPreprocessAndPersist(args: {
 	size: number
 	createdAt: number
 	preprocessorRegistry?: PreprocessorRegistry
-}): Promise<{
-	status: 'ready' | 'failed'
-	extractedContent?: string
-	derivedPaths?: string[]
-	error?: string
-}> {
+	processingTimeoutMs?: number
+	processingAbortGraceMs?: number
+	controller: AbortController
+	inferenceContext?: Omit<InferenceContext, 'signal'>
+}): Promise<PreprocessingResult> {
 	const preprocessor = args.preprocessorRegistry?.getForMimeType(args.mimeType)
 
 	let status: 'ready' | 'failed' = 'ready'
@@ -105,20 +146,71 @@ async function runPreprocessAndPersist(args: {
 	let errorMessage: string | undefined
 
 	if (preprocessor) {
-		const processPromise = preprocessor.process(args.filePath, args.mimeType, {
-			files: args.uploadStore,
+		let timedOut = false
+		const processPromise: Promise<PreprocessorOutcome> = (async () => {
+			try {
+				return {
+					kind: 'completed',
+					result: await preprocessor.process(args.filePath, args.mimeType, {
+						files: args.uploadStore,
+						signal: args.controller.signal,
+						inferenceContext: args.inferenceContext,
+					}),
+				}
+			} catch (error) {
+				return { kind: 'threw', error }
+			}
+		})()
+		const abortPromise = new Promise<PreprocessorAborted>((resolve) => {
+			const aborted: PreprocessorAborted = { kind: 'aborted' }
+			if (args.controller.signal.aborted) {
+				resolve(aborted)
+				return
+			}
+			args.controller.signal.addEventListener('abort', () => resolve(aborted), { once: true })
 		})
-		const timeoutPromise = sleep(PROCESSING_TIMEOUT_MS).then(() => ({
-			ok: false as const,
-			error: new Error('Processing timeout'),
-		}))
-		const result = await Promise.race([processPromise, timeoutPromise])
-		if (result.ok) {
-			extractedContent = result.value.extractedContent
-			derivedPaths = result.value.derivedPaths
-		} else {
+		const timeoutId = setTimeout(() => {
+			timedOut = true
+			args.controller.abort(new Error('Processing timeout'))
+		}, args.processingTimeoutMs ?? PROCESSING_TIMEOUT_MS)
+
+		let processOutcome: PreprocessorOutcome | undefined
+		try {
+			const firstOutcome = await Promise.race([processPromise, abortPromise])
+			if (firstOutcome.kind === 'aborted') {
+				let graceTimer: ReturnType<typeof setTimeout> | undefined
+				const graceExpired = new Promise<AbortGraceExpired>((resolve) => {
+					graceTimer = setTimeout(
+						() => resolve({ kind: 'abort_grace_expired' }),
+						args.processingAbortGraceMs ?? PROCESSING_ABORT_GRACE_MS,
+					)
+				})
+				const graceOutcome = await Promise.race([processPromise, graceExpired])
+				if (graceTimer !== undefined) clearTimeout(graceTimer)
+				if (graceOutcome.kind !== 'abort_grace_expired') processOutcome = graceOutcome
+			} else {
+				processOutcome = firstOutcome
+			}
+		} finally {
+			clearTimeout(timeoutId)
+		}
+
+		if (args.controller.signal.aborted) {
 			status = 'failed'
-			errorMessage = result.error.message
+			errorMessage = timedOut ? 'Processing timeout' : 'Processing cancelled'
+		} else if (processOutcome?.kind === 'completed') {
+			if (processOutcome.result.ok) {
+				extractedContent = processOutcome.result.value.extractedContent
+				derivedPaths = processOutcome.result.value.derivedPaths
+			} else {
+				status = 'failed'
+				errorMessage = processOutcome.result.error.message
+			}
+		} else if (processOutcome?.kind === 'threw') {
+			status = 'failed'
+			errorMessage = processOutcome.error instanceof Error
+				? processOutcome.error.message
+				: String(processOutcome.error)
 		}
 	}
 
@@ -132,12 +224,35 @@ async function runPreprocessAndPersist(args: {
 		status,
 		extractedContent,
 		derivedPaths,
+		error: errorMessage,
 		createdAt: args.createdAt,
 		completedAt: Date.now(),
 	}
 	await args.uploadStore.write('meta.json', JSON.stringify(metadata, null, 2))
 
 	return { status, extractedContent, derivedPaths, error: errorMessage }
+}
+
+function beginUploadLifecycle<T>(
+	pluginContext: UploadsPluginContext,
+	uploadId: string,
+	run: (controller: AbortController) => Promise<T>,
+): { controller: AbortController; result: Promise<T>; completion: Promise<void> } {
+	const controller = new AbortController()
+	if (pluginContext.closing) controller.abort(new Error('Session closed'))
+	const result = run(controller)
+	let operation: ActiveUploadLifecycle | undefined
+	const completion = result.then(
+		() => undefined,
+		() => undefined,
+	).then(() => {
+		if (operation && pluginContext.activeUploads.get(uploadId) === operation) {
+			pluginContext.activeUploads.delete(uploadId)
+		}
+	})
+	operation = { controller, completion }
+	pluginContext.activeUploads.set(uploadId, operation)
+	return { controller, result, completion }
 }
 
 // ============================================================================
@@ -178,6 +293,10 @@ export const uploadsPlugin = definePlugin('uploads')
 			}
 		},
 	})
+	.context(async (): Promise<UploadsPluginContext> => ({
+		activeUploads: new Map(),
+		closing: false,
+	}))
 	.dequeue({
 		hasPendingMessages: (ctx) => {
 			const uploads = ctx.pluginState
@@ -388,7 +507,7 @@ export const uploadsPlugin = definePlugin('uploads')
 			extractedContent: z.string().optional(),
 		}),
 		handler: async (ctx, input) => {
-			const { dataFileStore, preprocessorRegistry } = ctx.pluginConfig
+			const { dataFileStore, preprocessorRegistry, processingTimeoutMs, processingAbortGraceMs } = ctx.pluginConfig
 
 			if (input.size > MAX_FILE_SIZE) {
 				return Err(ValidationErrors.invalid(`File too large: max ${MAX_FILE_SIZE / (1024 * 1024)}MB`))
@@ -405,33 +524,46 @@ export const uploadsPlugin = definePlugin('uploads')
 				return Err(ValidationErrors.invalid('Failed to write file'))
 			}
 
-			const result = await runPreprocessAndPersist({
-				uploadId: String(uploadId),
-				sessionId: ctx.sessionId,
-				uploadStore,
-				filePath: writeResult.value.path,
-				filename: input.filename,
-				mimeType: input.mimeType,
-				size: input.size,
-				createdAt: Date.now(),
-				preprocessorRegistry,
-			})
-
-			await ctx.emitEvent(uploadEvents.create('attachment_uploaded', {
-				uploadId,
-				filename: input.filename,
-				mimeType: input.mimeType,
-				size: input.size,
-				status: result.status,
-				extractedContent: result.extractedContent,
-				derivedPaths: result.derivedPaths,
-				error: result.error,
-			}))
-
 			const entryAgentId = getEntryAgentId(ctx.sessionState)
-			if (result.status === 'ready' && entryAgentId) {
-				ctx.scheduleAgent(entryAgentId)
-			}
+			const lifecycle = beginUploadLifecycle(ctx.pluginContext, String(uploadId), async (controller) => {
+				const result = await runPreprocessAndPersist({
+					uploadId: String(uploadId),
+					sessionId: ctx.sessionId,
+					uploadStore,
+					filePath: writeResult.value.path,
+					filename: input.filename,
+					mimeType: input.mimeType,
+					size: input.size,
+					createdAt: Date.now(),
+					preprocessorRegistry,
+					processingTimeoutMs,
+					processingAbortGraceMs,
+					controller,
+					inferenceContext: entryAgentId ? {
+						sessionId: String(ctx.sessionId),
+						agentId: String(entryAgentId),
+						fileStore: ctx.files,
+					} : undefined,
+				})
+				if (ctx.pluginContext.closing) return result
+
+				await ctx.emitEvent(uploadEvents.create('attachment_uploaded', {
+					uploadId,
+					filename: input.filename,
+					mimeType: input.mimeType,
+					size: input.size,
+					status: result.status,
+					extractedContent: result.extractedContent,
+					derivedPaths: result.derivedPaths,
+					error: result.error,
+				}))
+
+				if (!ctx.pluginContext.closing && result.status === 'ready' && entryAgentId) {
+					ctx.scheduleAgent(entryAgentId)
+				}
+				return result
+			})
+			const result = await lifecycle.result
 
 			return Ok({
 				uploadId: String(uploadId),
@@ -453,7 +585,7 @@ export const uploadsPlugin = definePlugin('uploads')
 			status: z.enum(['processing']),
 		}),
 		handler: async (ctx, input) => {
-			const { dataFileStore, preprocessorRegistry } = ctx.pluginConfig
+			const { dataFileStore, preprocessorRegistry, processingTimeoutMs, processingAbortGraceMs } = ctx.pluginConfig
 
 			if (input.size > MAX_FILE_SIZE) {
 				return Err(ValidationErrors.invalid(`File too large: max ${MAX_FILE_SIZE / (1024 * 1024)}MB`))
@@ -507,8 +639,7 @@ export const uploadsPlugin = definePlugin('uploads')
 			const { emitEvent, notify, logger, scheduleAgent } = ctx
 			const sessionId = ctx.sessionId
 			const entryAgentId = getEntryAgentId(ctx.sessionState)
-
-			void (async () => {
+			beginUploadLifecycle(ctx.pluginContext, uploadIdStr, async (controller) => {
 				try {
 					const result = await runPreprocessAndPersist({
 						uploadId: uploadIdStr,
@@ -520,7 +651,16 @@ export const uploadsPlugin = definePlugin('uploads')
 						size: input.size,
 						createdAt,
 						preprocessorRegistry,
+						processingTimeoutMs,
+						processingAbortGraceMs,
+						controller,
+						inferenceContext: entryAgentId ? {
+							sessionId: String(sessionId),
+							agentId: String(entryAgentId),
+							fileStore: ctx.files,
+						} : undefined,
 					})
+					if (ctx.pluginContext.closing) return
 
 					await emitEvent(uploadEvents.create('attachment_uploaded', {
 						uploadId,
@@ -532,9 +672,10 @@ export const uploadsPlugin = definePlugin('uploads')
 						derivedPaths: result.derivedPaths,
 						error: result.error,
 					}))
-					if (result.status === 'ready' && entryAgentId) {
+					if (!ctx.pluginContext.closing && result.status === 'ready' && entryAgentId) {
 						scheduleAgent(entryAgentId)
 					}
+					if (ctx.pluginContext.closing) return
 					notify('uploadStatusChanged', {
 						sessionId: input.sessionId,
 						uploadId: uploadIdStr,
@@ -548,6 +689,7 @@ export const uploadsPlugin = definePlugin('uploads')
 						uploadId: uploadIdStr,
 						filename: input.filename,
 					})
+					if (ctx.pluginContext.closing) return
 					try {
 						await emitEvent(uploadEvents.create('attachment_uploaded', {
 							uploadId,
@@ -560,6 +702,7 @@ export const uploadsPlugin = definePlugin('uploads')
 					} catch {
 						// Even event emission failed — best-effort; nothing useful left to do.
 					}
+					if (ctx.pluginContext.closing) return
 					notify('uploadStatusChanged', {
 						sessionId: input.sessionId,
 						uploadId: uploadIdStr,
@@ -567,12 +710,21 @@ export const uploadsPlugin = definePlugin('uploads')
 						error: message,
 					})
 				}
-			})()
+			})
 
 			return Ok({
 				uploadId: uploadIdStr,
 				status: 'processing' as const,
 			})
 		},
+	})
+	.sessionHook('onSessionClose', async (ctx) => {
+		ctx.pluginContext.closing = true
+		const operations = [...ctx.pluginContext.activeUploads.values()]
+		for (const operation of operations) {
+			operation.controller.abort(new Error('Session closed'))
+		}
+		await Promise.all(operations.map(operation => operation.completion))
+		ctx.pluginContext.activeUploads.clear()
 	})
 	.build()

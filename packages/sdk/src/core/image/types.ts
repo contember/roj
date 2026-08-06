@@ -5,6 +5,8 @@ export interface ImageResizeOptions {
 	maxFileSizeBytes?: number
 	/** Override the resizer's default max dimension (long side, px). */
 	maxDimension?: number
+	/** Cancels external image-processing commands. */
+	signal?: AbortSignal
 }
 
 export interface ImageResizer {

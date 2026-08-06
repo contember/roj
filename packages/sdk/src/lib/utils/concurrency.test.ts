@@ -1,7 +1,11 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it, spyOn } from 'bun:test'
 import { mapWithConcurrency, Semaphore } from './concurrency.js'
 
-function defer<T = void>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void } {
+function defer<T = void>(): {
+	promise: Promise<T>
+	resolve: (v: T) => void
+	reject: (e: unknown) => void
+} {
 	let resolve!: (v: T) => void
 	let reject!: (e: unknown) => void
 	const promise = new Promise<T>((res, rej) => {
@@ -64,7 +68,7 @@ describe('mapWithConcurrency', () => {
 
 	it('propagates errors thrown by the worker fn', async () => {
 		await expect(
-			mapWithConcurrency([1, 2, 3], 2, async (n) => {
+			mapWithConcurrency([1, 2, 3], 2, async n => {
 				if (n === 2) throw new Error('boom')
 				return n
 			}),
@@ -142,13 +146,104 @@ describe('Semaphore', () => {
 	it('releases the slot when the body throws', async () => {
 		const gate = new Semaphore(1)
 
-		await expect(gate.run(async () => {
-			throw new Error('boom')
-		})).rejects.toThrow('boom')
+		await expect(
+			gate.run(async () => {
+				throw new Error('boom')
+			}),
+		).rejects.toThrow('boom')
 
 		// Slot must be free again — this would deadlock otherwise.
 		const result = await gate.run(async () => 42)
 		expect(result).toBe(42)
+	})
+
+	it('rejects a pre-aborted run without invoking its body', async () => {
+		const gate = new Semaphore(1)
+		const controller = new AbortController()
+		const reason = new Error('cancelled before acquire')
+		let invoked = false
+		controller.abort(reason)
+
+		await expect(
+			gate.run(async () => {
+				invoked = true
+			}, controller.signal),
+		).rejects.toBe(reason)
+		expect(invoked).toBe(false)
+
+		await expect(gate.run(async () => 'next')).resolves.toBe('next')
+	})
+
+	it('removes an aborted queued waiter and preserves FIFO capacity', async () => {
+		const gate = new Semaphore(1)
+		const holderRelease = defer()
+		const firstRelease = defer()
+		const events: string[] = []
+		const controller = new AbortController()
+		const reason = new Error('cancel queued waiter')
+
+		const holder = gate.run(async () => {
+			events.push('holder')
+			await holderRelease.promise
+		})
+		const first = gate.run(async () => {
+			events.push('first')
+			await firstRelease.promise
+		})
+		let cancelledInvoked = false
+		const cancelled = gate.run(async () => {
+			cancelledInvoked = true
+		}, controller.signal)
+		const third = gate.run(async () => {
+			events.push('third')
+		})
+
+		controller.abort(reason)
+		await expect(cancelled).rejects.toBe(reason)
+		expect(cancelledInvoked).toBe(false)
+
+		holderRelease.resolve()
+		await new Promise(resolve => setTimeout(resolve, 0))
+		expect(events).toEqual(['holder', 'first'])
+
+		firstRelease.resolve()
+		await Promise.all([holder, first, third])
+		expect(events).toEqual(['holder', 'first', 'third'])
+
+		await expect(gate.run(async () => 'capacity remains usable')).resolves.toBe('capacity remains usable')
+	})
+
+	it('releases a transferred permit when abort wins before the waiter continuation', async () => {
+		const gate = new Semaphore(1)
+		const holderStarted = defer()
+		const holderRelease = defer()
+		const controller = new AbortController()
+		const reason = new Error('cancel during permit handoff')
+		const removeListenerSpy = spyOn(controller.signal, 'removeEventListener')
+		let cancelledInvoked = false
+		let trailingInvoked = false
+
+		const holder = gate.run(async () => {
+			holderStarted.resolve()
+			await holderRelease.promise
+		})
+		await holderStarted.promise
+		const cancelled = gate.run(async () => {
+			cancelledInvoked = true
+		}, controller.signal)
+		const trailing = gate.run(async () => {
+			trailingInvoked = true
+		})
+
+		holderRelease.resolve()
+		queueMicrotask(() => queueMicrotask(() => controller.abort(reason)))
+
+		await expect(cancelled).rejects.toBe(reason)
+		await Promise.all([holder, trailing])
+		expect(cancelledInvoked).toBe(false)
+		expect(trailingInvoked).toBe(true)
+		expect(removeListenerSpy).toHaveBeenCalled()
+		await expect(gate.run(async () => 'still usable')).resolves.toBe('still usable')
 	})
 
 	it('serializes work under limit=1', async () => {

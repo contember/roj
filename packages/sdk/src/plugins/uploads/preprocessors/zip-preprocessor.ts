@@ -8,16 +8,22 @@
  */
 
 import { extname } from 'node:path'
+import { inspectZipArchive } from '~/lib/archive/index.js'
 import { mapWithConcurrency } from '~/lib/utils/concurrency.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { ProcessRunner } from '~/platform/process.js'
 import type { Logger } from '../../../lib/logger/logger.js'
-import type { Preprocessor, PreprocessorContext, PreprocessorRegistry, PreprocessorResult } from '../preprocessor.js'
+import {
+	getPreprocessingSignal,
+	preprocessingAbortError,
+	type Preprocessor,
+	type PreprocessorContext,
+	type PreprocessorRegistry,
+	type PreprocessorResult,
+} from '../preprocessor.js'
 
 const MAX_DEPTH = 3
-const MAX_FILES = 500
-const MAX_TOTAL_SIZE = 100 * 1024 * 1024 // 100MB
 const ZIP_FILE_CONCURRENCY = 10
 
 const MIME_MAP: Record<string, string> = {
@@ -49,7 +55,7 @@ function getMimeType(filename: string): string | null {
 }
 
 function makeExec(processRunner: ProcessRunner) {
-	return (cmd: string, args: string[]) => processRunner.execFile(cmd, args, { timeout: 60_000, maxBuffer: 50 * 1024 * 1024 })
+	return (cmd: string, args: string[], signal?: AbortSignal) => processRunner.execFile(cmd, args, { timeout: 60_000, maxBuffer: 50 * 1024 * 1024, signal })
 }
 
 function formatSize(bytes: number): string {
@@ -72,7 +78,7 @@ export class ZipPreprocessor implements Preprocessor {
 	private readonly registry: PreprocessorRegistry
 	private readonly logger: Logger
 	private readonly processRunner: ProcessRunner
-	private readonly exec: (cmd: string, args: string[]) => Promise<{ stdout: string; stderr: string }>
+	private readonly exec: (cmd: string, args: string[], signal?: AbortSignal) => Promise<{ stdout: string; stderr: string }>
 	private readonly depth: number
 
 	constructor(config: ZipPreprocessorConfig) {
@@ -88,9 +94,23 @@ export class ZipPreprocessor implements Preprocessor {
 		_mimeType: string,
 		ctx: PreprocessorContext,
 	): Promise<Result<PreprocessorResult, Error>> {
+		const signal = getPreprocessingSignal(ctx)
+		if (signal.aborted) return Err(preprocessingAbortError(signal))
 		if (this.depth >= MAX_DEPTH) {
 			return Err(new Error(`ZIP nesting depth limit reached (max ${MAX_DEPTH})`))
 		}
+		const inspection = await inspectZipArchive(this.processRunner, filePath, {
+			signal,
+		})
+		if (!inspection.ok) {
+			if (signal.aborted) return Err(preprocessingAbortError(signal))
+			return Err(
+				new Error(`ZIP inspection failed: ${inspection.error.message}`, {
+					cause: inspection.error,
+				}),
+			)
+		}
+		if (signal.aborted) return Err(preprocessingAbortError(signal))
 
 		// Extract to disk via unzip
 		const extractStore = ctx.files.scoped('extracted')
@@ -98,54 +118,39 @@ export class ZipPreprocessor implements Preprocessor {
 		if (!extractDirResult.ok) {
 			return Err(new Error('Failed to resolve extraction directory'))
 		}
+		if (signal.aborted) return Err(preprocessingAbortError(signal))
 
 		try {
-			await this.exec('unzip', ['-o', '-q', filePath, '-d', extractDirResult.value])
+			await this.exec('unzip', ['-o', '-q', filePath, '-d', extractDirResult.value], signal)
 		} catch (error) {
+			if (signal.aborted) return Err(preprocessingAbortError(signal))
 			const message = error instanceof Error ? error.message : String(error)
 			if (message.includes('ENOENT')) {
 				return Err(new Error('unzip not found'))
 			}
-			// unzip returns exit code 1 for warnings (e.g. skipped dirs) — still usable
-			if (!message.includes('exit code 1')) {
-				return Err(new Error(`unzip failed: ${message}`))
-			}
+			return Err(new Error(`unzip failed: ${message}`))
 		}
+		if (signal.aborted) return Err(preprocessingAbortError(signal))
 
 		// List extracted files
 		const listResult = await extractStore.list('', { maxDepth: 10 })
 		if (!listResult.ok) {
 			return Err(new Error('Failed to list extracted files'))
 		}
+		if (signal.aborted) return Err(preprocessingAbortError(signal))
 
 		const files = listResult.value
 			.filter(e => e.type === 'file')
 			.sort((a, b) => a.name.localeCompare(b.name))
 
-		// Pick eligible files first (limits depend on cumulative iteration order, so this stays sequential)
-		const eligible: typeof files = []
-		let totalSize = 0
-		let truncationNotice: string | null = null
+		const fileCount = files.length
 
-		for (const file of files) {
-			if (eligible.length >= MAX_FILES) {
-				truncationNotice = `... (truncated, ${files.length - eligible.length} more files)`
-				break
-			}
-			const fileSize = file.size ?? 0
-			if (totalSize + fileSize > MAX_TOTAL_SIZE) {
-				truncationNotice = '... (total size limit reached)'
-				break
-			}
-			totalSize += fileSize
-			eligible.push(file)
-		}
-
-		const fileCount = eligible.length
-
-		// Process eligible files in parallel with bounded concurrency
-		const processed = await mapWithConcurrency(eligible, ZIP_FILE_CONCURRENCY, async (file) => {
+		// Process files in parallel with bounded concurrency
+		const processed = await mapWithConcurrency(files, ZIP_FILE_CONCURRENCY, async (file) => {
 			const collectedPaths: string[] = []
+			if (signal.aborted) {
+				return { manifestEntry: '', derivedPaths: collectedPaths }
+			}
 
 			const fileRealPath = extractStore.realPath(file.name)
 			if (!fileRealPath.ok) {
@@ -175,6 +180,7 @@ export class ZipPreprocessor implements Preprocessor {
 
 				if (preprocessor) {
 					const subResult = await preprocessor.process(fileRealPath.value, mime, {
+						...ctx,
 						files: ctx.files.scoped(`extracted/${file.name}-content`),
 					})
 					if (subResult.ok) {
@@ -200,6 +206,7 @@ export class ZipPreprocessor implements Preprocessor {
 				derivedPaths: collectedPaths,
 			}
 		})
+		if (signal.aborted) return Err(preprocessingAbortError(signal))
 
 		const derivedPaths: string[] = []
 		const manifest: string[] = []
@@ -207,18 +214,17 @@ export class ZipPreprocessor implements Preprocessor {
 			derivedPaths.push(...item.derivedPaths)
 			manifest.push(item.manifestEntry)
 		}
-		if (truncationNotice) manifest.push(truncationNotice)
-
 		const fullManifest = `## ZIP Contents (${fileCount} files)\n\n${manifest.join('\n')}`
 
 		// Write full manifest to disk
+		if (signal.aborted) return Err(preprocessingAbortError(signal))
 		await ctx.files.write('content.txt', fullManifest)
 		derivedPaths.push('content.txt')
 
 		this.logger.debug('ZIP processed', {
 			filePath,
 			filesExtracted: fileCount,
-			totalSize,
+			totalSize: inspection.value.totalUncompressedSize,
 			depth: this.depth,
 		})
 

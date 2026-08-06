@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, spyOn } from 'bun:test'
 import { tmpdir } from 'node:os'
-import { VipsImageResizer } from './vips-resizer.js'
-import { createNodeFileSystem } from '~/testing/node-platform.js'
+import type { FileSystem } from '~/platform/fs.js'
 import type { ExecFileResult, ProcessRunner } from '~/platform/process.js'
+import { createNodeFileSystem } from '~/testing/node-platform.js'
+import { VipsImageResizer } from './vips-resizer.js'
 
 type ExecFileCallback = (error: Error | null, stdout: string, stderr: string) => void
 let execFileImpl: (cmd: string, args: string[], opts: unknown, cb: ExecFileCallback) => void = () => {}
@@ -26,9 +27,9 @@ function createFakeProcessRunner(): ProcessRunner {
 	}
 }
 
-function createResizer(maxDimension?: number): InstanceType<typeof VipsImageResizer> {
+function createResizer(maxDimension?: number, fs: FileSystem = createNodeFileSystem()): InstanceType<typeof VipsImageResizer> {
 	return new VipsImageResizer({
-		fs: createNodeFileSystem(),
+		fs,
 		process: createFakeProcessRunner(),
 		tmpDir: tmpdir(),
 		maxDimension,
@@ -65,6 +66,21 @@ describe('VipsImageResizer', () => {
 		const result = await resizer.resize(testJpegPath, 'image/jpeg')
 
 		expect(result).toEqual({ path: testJpegPath, mimeType: 'image/jpeg' })
+	})
+
+	it('rejects when vipsheader resolves after aborting a within-limit request', async () => {
+		const controller = new AbortController()
+		const reason = new Error('cancel dimensions')
+		execFileImpl = (cmd, _args, _opts, cb) => {
+			if (cmd === 'vipsheader') {
+				controller.abort(reason)
+				cb(null, '4000\n3000\n', '')
+			}
+		}
+
+		await expect(
+			createResizer().resize(testJpegPath, 'image/jpeg', { signal: controller.signal }),
+		).rejects.toBe(reason)
 	})
 
 	it('converts png to jpeg even when within dimension limits', async () => {
@@ -182,6 +198,69 @@ describe('VipsImageResizer', () => {
 		expect(warnSpy).toHaveBeenCalled()
 	})
 
+	it('removes a partial resize output when vipsthumbnail fails', async () => {
+		let partialPath = ''
+		execFileImpl = (cmd, args, _opts, cb) => {
+			if (cmd === 'vipsheader') {
+				cb(null, '10000\n10000\n', '')
+			} else if (cmd === 'vipsthumbnail') {
+				partialPath = args[args.indexOf('-o') + 1]
+				Bun.write(partialPath, Buffer.from('partial')).then(() => cb(new Error('resize failed'), '', ''))
+			}
+		}
+
+		const result = await createResizer().resize(testJpegPath, 'image/png')
+
+		expect(result).toEqual({ path: testJpegPath, mimeType: 'image/png' })
+		expect(await Bun.file(partialPath).exists()).toBe(false)
+	})
+
+	it('removes a partial resize output and rethrows an abort', async () => {
+		const controller = new AbortController()
+		const reason = new Error('cancel resize')
+		let partialPath = ''
+		execFileImpl = (cmd, args, _opts, cb) => {
+			if (cmd === 'vipsheader') {
+				cb(null, '10000\n10000\n', '')
+			} else if (cmd === 'vipsthumbnail') {
+				partialPath = args[args.indexOf('-o') + 1]
+				Bun.write(partialPath, Buffer.from('partial')).then(() => {
+					controller.abort(reason)
+					cb(reason, '', '')
+				})
+			}
+		}
+
+		await expect(
+			createResizer().resize(testJpegPath, 'image/png', {
+				signal: controller.signal,
+			}),
+		).rejects.toBe(reason)
+		expect(await Bun.file(partialPath).exists()).toBe(false)
+	})
+
+	it('removes a generated resize when vipsthumbnail resolves after aborting', async () => {
+		const controller = new AbortController()
+		const reason = new Error('cancel successful resize')
+		let outputPath = ''
+		execFileImpl = (cmd, args, _opts, cb) => {
+			if (cmd === 'vipsheader') {
+				cb(null, '10000\n10000\n', '')
+			} else if (cmd === 'vipsthumbnail') {
+				outputPath = args[args.indexOf('-o') + 1]
+				Bun.write(outputPath, Buffer.from('complete')).then(() => {
+					controller.abort(reason)
+					cb(null, '', '')
+				})
+			}
+		}
+
+		await expect(
+			createResizer().resize(testJpegPath, 'image/png', { signal: controller.signal }),
+		).rejects.toBe(reason)
+		expect(await Bun.file(outputPath).exists()).toBe(false)
+	})
+
 	it('returns original path when vipsheader returns unparseable output for jpeg', async () => {
 		execFileImpl = (cmd, _args, _opts, cb) => {
 			if (cmd === 'vipsheader') cb(null, 'not-a-number\n', '')
@@ -211,6 +290,71 @@ describe('VipsImageResizer', () => {
 	})
 
 	describe('compression (maxFileSizeBytes)', () => {
+		it('rejects when the size stat resolves after aborting', async () => {
+			const testPath = '/tmp/test-abort-stat.jpg'
+			await Bun.write(testPath, Buffer.alloc(100))
+			const controller = new AbortController()
+			const reason = new Error('cancel size check')
+			const baseFs = createNodeFileSystem()
+			const fs: FileSystem = {
+				...baseFs,
+				async stat(path) {
+					const result = await baseFs.stat(path)
+					controller.abort(reason)
+					return result
+				},
+			}
+			execFileImpl = (cmd, _args, _opts, cb) => {
+				if (cmd === 'vipsheader') cb(null, '4000\n3000\n', '')
+			}
+
+			await expect(
+				createResizer(undefined, fs).resize(testPath, 'image/jpeg', {
+					maxFileSizeBytes: 1000,
+					signal: controller.signal,
+				}),
+			).rejects.toBe(reason)
+
+			await import('node:fs/promises').then(fs => fs.unlink(testPath).catch(() => {}))
+		})
+
+		it('removes compression output when its stat resolves after aborting', async () => {
+			const testPath = '/tmp/test-abort-compression-stat.jpg'
+			await Bun.write(testPath, Buffer.alloc(2000))
+			const controller = new AbortController()
+			const reason = new Error('cancel compression stat')
+			const baseFs = createNodeFileSystem()
+			let statCount = 0
+			let outputPath = ''
+			const fs: FileSystem = {
+				...baseFs,
+				async stat(path) {
+					const result = await baseFs.stat(path)
+					statCount++
+					if (statCount === 2) controller.abort(reason)
+					return result
+				},
+			}
+			execFileImpl = (cmd, args, _opts, cb) => {
+				if (cmd === 'vipsheader') {
+					cb(null, '4000\n3000\n', '')
+				} else if (cmd === 'vipsthumbnail') {
+					outputPath = args[args.indexOf('-o') + 1].replace(/\[.*\]$/, '')
+					Bun.write(outputPath, Buffer.alloc(50)).then(() => cb(null, '', ''))
+				}
+			}
+
+			await expect(
+				createResizer(undefined, fs).resize(testPath, 'image/jpeg', {
+					maxFileSizeBytes: 100,
+					signal: controller.signal,
+				}),
+			).rejects.toBe(reason)
+			expect(await Bun.file(outputPath).exists()).toBe(false)
+
+			await import('node:fs/promises').then(fs => fs.unlink(testPath).catch(() => {}))
+		})
+
 		it('skips compression when file fits within limit', async () => {
 			const testPath = '/tmp/test-small.jpg'
 			// Write a small file for size check
@@ -221,7 +365,9 @@ describe('VipsImageResizer', () => {
 			}
 
 			const resizer = createResizer()
-			const result = await resizer.resize(testPath, 'image/jpeg', { maxFileSizeBytes: 1000 })
+			const result = await resizer.resize(testPath, 'image/jpeg', {
+				maxFileSizeBytes: 1000,
+			})
 
 			expect(result).toEqual({ path: testPath, mimeType: 'image/jpeg' })
 
@@ -247,7 +393,9 @@ describe('VipsImageResizer', () => {
 			}
 
 			const resizer = createResizer()
-			const result = await resizer.resize(testPath, 'image/jpeg', { maxFileSizeBytes: 100 })
+			const result = await resizer.resize(testPath, 'image/jpeg', {
+				maxFileSizeBytes: 100,
+			})
 
 			expect(result.mimeType).toBe('image/jpeg')
 			expect(result.tempFile).toBeDefined()
@@ -282,7 +430,9 @@ describe('VipsImageResizer', () => {
 			}
 
 			const resizer = createResizer()
-			const result = await resizer.resize(testPath, 'image/jpeg', { maxFileSizeBytes: 100 })
+			const result = await resizer.resize(testPath, 'image/jpeg', {
+				maxFileSizeBytes: 100,
+			})
 
 			expect(compressionAttempts).toBe(3) // Q=85, Q=70 failed, Q=50 succeeded
 			expect(result.mimeType).toBe('image/jpeg')
@@ -315,7 +465,9 @@ describe('VipsImageResizer', () => {
 			}
 
 			const resizer = createResizer()
-			const result = await resizer.resize(testPath, 'image/jpeg', { maxFileSizeBytes: 100 })
+			const result = await resizer.resize(testPath, 'image/jpeg', {
+				maxFileSizeBytes: 100,
+			})
 
 			// 4 full-dim attempts + 3 half-dim attempts
 			expect(compressionAttempts).toBe(7)
@@ -346,7 +498,9 @@ describe('VipsImageResizer', () => {
 			}
 
 			const resizer = createResizer()
-			const result = await resizer.resize(testPath, 'image/jpeg', { maxFileSizeBytes: 100 })
+			const result = await resizer.resize(testPath, 'image/jpeg', {
+				maxFileSizeBytes: 100,
+			})
 
 			// Returns the last attempt even though it doesn't fit
 			expect(result.mimeType).toBe('image/jpeg')
@@ -354,6 +508,41 @@ describe('VipsImageResizer', () => {
 
 			if (result.tempFile) {
 				await import('node:fs/promises').then(fs => fs.unlink(result.tempFile!).catch(() => {}))
+			}
+			await import('node:fs/promises').then(fs => fs.unlink(testPath).catch(() => {}))
+		})
+
+		it('removes the current and superseded compression outputs when stat fails', async () => {
+			const testPath = '/tmp/test-stat-failure.jpg'
+			await Bun.write(testPath, Buffer.alloc(2000))
+			const outputPaths: string[] = []
+
+			execFileImpl = (cmd, args, _opts, cb) => {
+				if (cmd === 'vipsheader') {
+					cb(null, '4000\n3000\n', '')
+				} else if (cmd === 'vipsthumbnail') {
+					const outputArg = args[args.indexOf('-o') + 1]
+					const outputPath = outputArg.replace(/\[.*\]$/, '')
+					outputPaths.push(outputPath)
+					if (outputPaths.length === 1) {
+						Bun.write(outputPath, Buffer.alloc(2000)).then(() => cb(null, '', ''))
+					} else {
+						Bun.write(outputPath, Buffer.alloc(2000)).then(async () => {
+							await import('node:fs/promises').then(fs => fs.unlink(outputPath))
+							cb(null, '', '')
+						})
+					}
+				}
+			}
+
+			const result = await createResizer().resize(testPath, 'image/jpeg', {
+				maxFileSizeBytes: 100,
+			})
+
+			expect(result).toEqual({ path: testPath, mimeType: 'image/jpeg' })
+			expect(outputPaths).toHaveLength(2)
+			for (const outputPath of outputPaths) {
+				expect(await Bun.file(outputPath).exists()).toBe(false)
 			}
 			await import('node:fs/promises').then(fs => fs.unlink(testPath).catch(() => {}))
 		})
@@ -373,7 +562,9 @@ describe('VipsImageResizer', () => {
 			}
 
 			const resizer = createResizer()
-			const result = await resizer.resize(testPath, 'image/png', { maxFileSizeBytes: 100 })
+			const result = await resizer.resize(testPath, 'image/png', {
+				maxFileSizeBytes: 100,
+			})
 
 			// Even though input was PNG, compression outputs JPEG
 			expect(result.mimeType).toBe('image/jpeg')

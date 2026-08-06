@@ -23,7 +23,15 @@ import type { FileSystem } from '~/platform/fs.js'
 import type { ProcessRunner } from '~/platform/process.js'
 import type { FileStore } from '../../../core/file-store/types.js'
 import type { Logger } from '../../../lib/logger/logger.js'
-import type { Preprocessor, PreprocessorContext, PreprocessorRegistry, PreprocessorResult } from '../preprocessor.js'
+import {
+	getPreprocessingSignal,
+	preprocessingAbortError,
+	throwIfPreprocessingAborted,
+	type Preprocessor,
+	type PreprocessorContext,
+	type PreprocessorRegistry,
+	type PreprocessorResult,
+} from '../preprocessor.js'
 
 const MAX_IMAGES = 20
 const IMAGE_CLASSIFY_CONCURRENCY = 10
@@ -49,8 +57,8 @@ const MARKITDOWN_TIMEOUT_MS = 60_000
 const IMAGE_EXTRACT_TIMEOUT_MS = 5 * 60_000
 
 function makeExec(processRunner: ProcessRunner) {
-	return (cmd: string, args: string[], timeoutMs: number = MARKITDOWN_TIMEOUT_MS) =>
-		processRunner.execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 50 * 1024 * 1024 })
+	return (cmd: string, args: string[], timeoutMs: number = MARKITDOWN_TIMEOUT_MS, signal?: AbortSignal) =>
+		processRunner.execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 50 * 1024 * 1024, signal })
 }
 
 /** MIME types where markitdown converts to markdown (non-ZIP, non-image, non-PDF) */
@@ -97,7 +105,7 @@ export class MarkitdownPreprocessor implements Preprocessor {
 	private readonly logger: Logger
 	private readonly fs: FileSystem
 	private readonly processRunner: ProcessRunner
-	private readonly exec: (cmd: string, args: string[], timeoutMs?: number) => Promise<{ stdout: string; stderr: string }>
+	private readonly exec: (cmd: string, args: string[], timeoutMs?: number, signal?: AbortSignal) => Promise<{ stdout: string; stderr: string }>
 
 	constructor(config: MarkitdownPreprocessorConfig) {
 		this.registry = config.registry
@@ -113,6 +121,8 @@ export class MarkitdownPreprocessor implements Preprocessor {
 		ctx: PreprocessorContext,
 	): Promise<Result<PreprocessorResult, Error>> {
 		const totalStart = Date.now()
+		const signal = getPreprocessingSignal(ctx)
+		throwIfPreprocessingAborted(signal)
 
 		this.logger.info('Markitdown processing started', { filePath, mimeType })
 
@@ -126,12 +136,13 @@ export class MarkitdownPreprocessor implements Preprocessor {
 		// independent, so there's no reason to serialize them. For documents
 		// where pandoc extraction isn't applicable, the image task resolves
 		// immediately.
-		const markdownTask = this.runMarkitdown(filePath, mimeType, contentPathResult.value)
+		const markdownTask = this.runMarkitdown(filePath, mimeType, contentPathResult.value, signal)
 		const imageTask = PANDOC_EXTRACT_MIMES.has(mimeType)
-			? this.extractImagesWithPandoc(filePath, mimeType, ctx)
+			? this.extractImagesWithPandoc(filePath, mimeType, ctx, signal)
 			: Promise.resolve<Array<{ relativePath: string; description: string }>>([])
 
 		const [markdownResult, images] = await Promise.all([markdownTask, imageTask])
+		if (signal.aborted) return Err(preprocessingAbortError(signal))
 
 		if (!markdownResult.ok) return markdownResult
 
@@ -166,11 +177,13 @@ export class MarkitdownPreprocessor implements Preprocessor {
 		filePath: string,
 		mimeType: string,
 		outputPath: string,
+		signal: AbortSignal,
 	): Promise<Result<string, Error>> {
 		const markitdownStart = Date.now()
 		try {
-			await this.exec('markitdown', [filePath, '-o', outputPath])
+			await this.exec('markitdown', [filePath, '-o', outputPath], MARKITDOWN_TIMEOUT_MS, signal)
 		} catch (error) {
+			if (signal.aborted) return Err(preprocessingAbortError(signal))
 			const message = error instanceof Error ? error.message : String(error)
 			this.logger.error(
 				'markitdown CLI failed',
@@ -182,6 +195,7 @@ export class MarkitdownPreprocessor implements Preprocessor {
 			}
 			return Err(new Error(`markitdown failed: ${message}`))
 		}
+		if (signal.aborted) return Err(preprocessingAbortError(signal))
 
 		let markdown = ''
 		try {
@@ -204,7 +218,9 @@ export class MarkitdownPreprocessor implements Preprocessor {
 		filePath: string,
 		mimeType: string,
 		ctx: PreprocessorContext,
+		signal: AbortSignal,
 	): Promise<Array<{ relativePath: string; description: string }>> {
+		if (signal.aborted) return []
 		const mediaStore = ctx.files.scoped('media')
 		const mediaDirResult = mediaStore.realPath('')
 		if (!mediaDirResult.ok) return []
@@ -219,8 +235,10 @@ export class MarkitdownPreprocessor implements Preprocessor {
 				'pandoc',
 				['-f', format, '-t', 'gfm', filePath, '-o', '/dev/null', `--extract-media=${mediaDirResult.value}`],
 				IMAGE_EXTRACT_TIMEOUT_MS,
+				signal,
 			)
 		} catch (error) {
+			if (signal.aborted) return []
 			extractSucceeded = false
 			this.logger.warn('pandoc --extract-media failed (will classify any partial output)', {
 				filePath,
@@ -228,6 +246,7 @@ export class MarkitdownPreprocessor implements Preprocessor {
 				error: error instanceof Error ? error.message : String(error),
 			})
 		}
+		if (signal.aborted) return []
 		if (extractSucceeded) {
 			this.logger.info('pandoc --extract-media complete', {
 				filePath,
@@ -302,12 +321,13 @@ export function shouldClassifyImage(meta: { width: number; height: number; sizeB
 export async function getImageDimensions(
 	filePath: string,
 	processRunner: ProcessRunner,
+	signal?: AbortSignal,
 ): Promise<{ width: number; height: number } | null> {
 	try {
 		const { stdout } = await processRunner.execFile(
 			'vipsheader',
 			['-f', 'width', '-f', 'height', filePath],
-			{ timeout: 10_000 },
+			{ timeout: 10_000, signal },
 		)
 		const lines = stdout.trim().split('\n')
 		if (lines.length < 2) return null
@@ -315,7 +335,8 @@ export async function getImageDimensions(
 		const height = parseInt(lines[1], 10)
 		if (!Number.isFinite(width) || !Number.isFinite(height)) return null
 		return { width, height }
-	} catch {
+	} catch (error) {
+		if (signal?.aborted) throw error
 		return null
 	}
 }
@@ -329,6 +350,8 @@ export async function classifyExtractedImages(
 	fs: FileSystem,
 	processRunner: ProcessRunner,
 ): Promise<Array<{ relativePath: string; description: string }>> {
+	const signal = getPreprocessingSignal(ctx)
+	if (signal.aborted) return []
 	const listResult = await imageStore.list('', { maxDepth: 3 })
 	if (!listResult.ok) return []
 
@@ -336,6 +359,7 @@ export async function classifyExtractedImages(
 
 	// Stat + density filter, then keep the top MAX_IMAGES by file size.
 	const inspected = await mapWithConcurrency(candidates, 8, async (entry) => {
+		if (signal.aborted) return null
 		const pathResult = imageStore.realPath(entry.name)
 		if (!pathResult.ok) return null
 
@@ -346,7 +370,7 @@ export async function classifyExtractedImages(
 			return null
 		}
 
-		const dims = await getImageDimensions(pathResult.value, processRunner)
+		const dims = await getImageDimensions(pathResult.value, processRunner, signal)
 		if (!dims) {
 			// Unknown dims — include but warn; better to classify than silently drop.
 			return { name: entry.name, sizeBytes, width: 0, height: 0, kept: true }
@@ -357,7 +381,7 @@ export async function classifyExtractedImages(
 	})
 
 	const filtered = inspected
-		.filter((r): r is NonNullable<typeof r> => r !== null && r.kept)
+		.filter((r): r is NonNullable<typeof r> => r?.kept === true)
 		.sort((a, b) => b.sizeBytes - a.sizeBytes)
 		.slice(0, MAX_IMAGES)
 
@@ -373,6 +397,7 @@ export async function classifyExtractedImages(
 	}
 
 	const settled = await mapWithConcurrency(filtered, IMAGE_CLASSIFY_CONCURRENCY, async (imgFile) => {
+		if (signal.aborted) return null
 		const imgPathResult = imageStore.realPath(imgFile.name)
 		if (!imgPathResult.ok) return null
 
@@ -382,6 +407,7 @@ export async function classifyExtractedImages(
 		const classifier = registry.getForMimeType(imgMime)
 		if (classifier) {
 			const classifyResult = await classifier.process(imgPathResult.value, imgMime, {
+				...ctx,
 				files: ctx.files.scoped(`${relativePrefix}/${imgFile.name}-meta`),
 			})
 			if (classifyResult.ok && classifyResult.value.extractedContent) {

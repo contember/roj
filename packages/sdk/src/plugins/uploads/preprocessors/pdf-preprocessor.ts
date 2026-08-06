@@ -27,7 +27,15 @@ import { Err, Ok } from '~/lib/utils/result.js'
 import type { FileSystem } from '~/platform/fs.js'
 import type { ProcessRunner } from '~/platform/process.js'
 import type { Logger } from '../../../lib/logger/logger.js'
-import type { Preprocessor, PreprocessorContext, PreprocessorRegistry, PreprocessorResult } from '../preprocessor.js'
+import {
+	getPreprocessingSignal,
+	preprocessingAbortError,
+	throwIfPreprocessingAborted,
+	type Preprocessor,
+	type PreprocessorContext,
+	type PreprocessorRegistry,
+	type PreprocessorResult,
+} from '../preprocessor.js'
 import {
 	getImageDimensions,
 	guessImageMime,
@@ -75,6 +83,8 @@ export class PdfPreprocessor implements Preprocessor {
 		ctx: PreprocessorContext,
 	): Promise<Result<PreprocessorResult, Error>> {
 		const totalStart = Date.now()
+		const signal = getPreprocessingSignal(ctx)
+		throwIfPreprocessingAborted(signal)
 		this.logger.info('PDF processing started', { filePath })
 
 		const contentPathResult = ctx.files.realPath('content.md')
@@ -89,9 +99,10 @@ export class PdfPreprocessor implements Preprocessor {
 		// Run text extraction and image extraction (with streaming classification)
 		// in parallel. They share no state and don't block each other.
 		const [textResult, images] = await Promise.all([
-			this.extractText(filePath, contentPathResult.value),
+			this.extractText(filePath, contentPathResult.value, signal),
 			this.extractAndClassifyImages(filePath, imagesDirResult.value, ctx),
 		])
+		if (signal.aborted) return Err(preprocessingAbortError(signal))
 
 		const markdown = textResult.ok ? textResult.value : ''
 
@@ -128,19 +139,21 @@ export class PdfPreprocessor implements Preprocessor {
 	 * `-layout` preserves the original visual layout (columns, tables),
 	 * which is what users typically expect when looking at PDFs.
 	 */
-	private async extractText(filePath: string, outputPath: string): Promise<Result<string, Error>> {
+	private async extractText(filePath: string, outputPath: string, signal: AbortSignal): Promise<Result<string, Error>> {
 		const start = Date.now()
 		try {
 			await this.processRunner.execFile(
 				'pdftotext',
 				['-layout', filePath, outputPath],
-				{ timeout: PDFTOTEXT_TIMEOUT_MS, maxBuffer: 50 * 1024 * 1024 },
+				{ timeout: PDFTOTEXT_TIMEOUT_MS, maxBuffer: 50 * 1024 * 1024, signal },
 			)
 		} catch (error) {
+			if (signal.aborted) return Err(preprocessingAbortError(signal))
 			const message = error instanceof Error ? error.message : String(error)
 			this.logger.warn('pdftotext failed', { filePath, durationMs: Date.now() - start, error: message })
 			return Err(new Error(`pdftotext failed: ${message}`))
 		}
+		if (signal.aborted) return Err(preprocessingAbortError(signal))
 
 		let text = ''
 		try {
@@ -179,6 +192,7 @@ export class PdfPreprocessor implements Preprocessor {
 		imagesDir: string,
 		ctx: PreprocessorContext,
 	): Promise<Array<{ relativePath: string; description: string }>> {
+		const signal = getPreprocessingSignal(ctx)
 		const extractStart = Date.now()
 		const seen = new Set<string>()
 		const acceptedQueue: Array<{ name: string; sizeBytes: number; width: number; height: number }> = []
@@ -203,6 +217,7 @@ export class PdfPreprocessor implements Preprocessor {
 		const classifyOne = async (name: string): Promise<{ relativePath: string; description: string } | null> => {
 			await acquire()
 			try {
+				if (signal.aborted) return null
 				const mime = guessImageMime(name)
 				const fullPath = `${imagesDir}/${name}`
 				const imageStore = ctx.files.scoped('images')
@@ -211,6 +226,7 @@ export class PdfPreprocessor implements Preprocessor {
 				const classifier = this.registry.getForMimeType(mime)
 				if (classifier) {
 					const result = await classifier.process(fullPath, mime, {
+						...ctx,
 						files: ctx.files.scoped(`images/${name}-meta`),
 					})
 					if (result.ok && result.value.extractedContent) {
@@ -225,7 +241,7 @@ export class PdfPreprocessor implements Preprocessor {
 		}
 
 		const inspectAndMaybeClassify = async (name: string) => {
-			if (seen.has(name) || stopAccepting) return
+			if (signal.aborted || seen.has(name) || stopAccepting) return
 			seen.add(name)
 
 			if (!IMAGE_EXT_RE.test(name)) {
@@ -241,7 +257,8 @@ export class PdfPreprocessor implements Preprocessor {
 				return
 			}
 
-			const dims = await getImageDimensions(fullPath, this.processRunner)
+			const dims = await getImageDimensions(fullPath, this.processRunner, signal)
+			if (signal.aborted) return
 			const hasDims = dims !== null
 			const passesFilter = hasDims
 				? shouldClassifyImage({ width: dims.width, height: dims.height, sizeBytes })
@@ -273,7 +290,7 @@ export class PdfPreprocessor implements Preprocessor {
 		const pdfimagesPromise = this.processRunner.execFile(
 			'pdfimages',
 			['-all', filePath, `${imagesDir}/img`],
-			{ timeout: PDFIMAGES_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
+			{ timeout: PDFIMAGES_TIMEOUT_MS, maxBuffer: 1024 * 1024, signal },
 		).then(() => true).catch((error) => {
 			this.logger.warn('pdfimages failed (will classify any partial output)', {
 				filePath,
@@ -285,13 +302,15 @@ export class PdfPreprocessor implements Preprocessor {
 
 		let extractionDone = false
 		const poll = async () => {
-			while (!extractionDone) {
+			while (!extractionDone && !signal.aborted) {
 				await this.scanAndDispatch(imagesDir, inspectAndMaybeClassify)
-				await sleep(STREAM_POLL_INTERVAL_MS)
+				await sleep(STREAM_POLL_INTERVAL_MS, signal)
 			}
 			// Final sweep — pick up anything that landed between the last poll
 			// and pdfimages exiting.
-			await this.scanAndDispatch(imagesDir, inspectAndMaybeClassify)
+			if (!signal.aborted) {
+				await this.scanAndDispatch(imagesDir, inspectAndMaybeClassify)
+			}
 		}
 
 		const pollPromise = poll()
