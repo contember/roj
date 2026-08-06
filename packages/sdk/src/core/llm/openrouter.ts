@@ -19,6 +19,7 @@ import type {
 	RawInferenceRequest,
 } from './provider.js'
 import { mapProviderError } from './provider.js'
+import { ProviderRequestAbortError, runProviderRequest } from './provider-request.js'
 import { sanitizeProviderMessages } from './message-sanitization.js'
 
 // ============================================================================
@@ -202,8 +203,6 @@ export class OpenRouterProvider implements LLMProvider {
 
 	async inference(request: InferenceRequest, context?: InferenceContext): Promise<Result<InferenceResponse, LLMError>> {
 		const startTime = Date.now()
-		// Our timeout and the caller's cancel abort the same controller — only this flag tells them apart.
-		let timedOut = false
 
 		try {
 			const rawRequest: RawInferenceRequest = {
@@ -216,82 +215,74 @@ export class OpenRouterProvider implements LLMProvider {
 			}
 
 			const httpRequest = await this.buildHttpRequest(rawRequest, context)
-
-			const controller = new AbortController()
-			const timeoutId = setTimeout(() => {
-				timedOut = true
-				controller.abort()
-			}, this.timeout)
-
-			if (context?.signal) {
-				context.signal.addEventListener('abort', () => controller.abort(), { once: true })
-			}
-
-			let response: Response
-			try {
-				response = await this.fetchFn(httpRequest.url, {
+			return await runProviderRequest({ callerSignal: context?.signal, timeoutMs: this.timeout }, async (signal) => {
+				const response = await this.fetchFn(httpRequest.url, {
 					method: httpRequest.method,
 					headers: {
 						...httpRequest.headers,
 						'Authorization': `Bearer ${this.apiKey}`,
 					},
 					body: JSON.stringify(httpRequest.body),
-					signal: controller.signal,
+					signal,
 				})
-			} finally {
-				clearTimeout(timeoutId)
-			}
 
-			if (!response.ok) {
-				const body = await response.text()
-				return Err(this.mapHttpError(response.status, body))
-			}
+				if (!response.ok) {
+					const body = await response.text()
+					return Err(this.mapHttpError(response.status, body))
+				}
 
-			const data = await response.json() as OpenRouterResponse
-			const latencyMs = Date.now() - startTime
+				const data = await response.json() as OpenRouterResponse
+				const latencyMs = Date.now() - startTime
 
-			const choice = data.choices[0]
-			if (!choice) {
-				return Err({ type: 'server_error', message: 'No choices returned from LLM' })
-			}
+				const choice = data.choices[0]
+				if (!choice) {
+					return Err({ type: 'server_error', message: 'No choices returned from LLM' })
+				}
 
-			const toolCalls: ToolCall[] = (choice.message.tool_calls ?? []).map(
-				(tc) => ({
-					id: ToolCallId(tc.id),
-					name: tc.function.name,
-					input: this.parseToolArguments(tc.function.arguments),
-				}),
-			)
+				const toolCalls: ToolCall[] = (choice.message.tool_calls ?? []).map(
+					(tc) => ({
+						id: ToolCallId(tc.id),
+						name: tc.function.name,
+						input: this.parseToolArguments(tc.function.arguments),
+					}),
+				)
 
-			const promptTokens = data.usage?.prompt_tokens ?? 0
-			const completionTokens = data.usage?.completion_tokens ?? 0
-			const cost = data.usage?.cost
+				const promptTokens = data.usage?.prompt_tokens ?? 0
+				const completionTokens = data.usage?.completion_tokens ?? 0
+				const cost = data.usage?.cost
 
-			const metrics: LLMMetrics = {
-				promptTokens,
-				completionTokens,
-				totalTokens: data.usage?.total_tokens ?? 0,
-				latencyMs,
-				model: data.model,
-				provider: this.name,
-				cost,
-				cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens || undefined,
-				cacheWriteTokens: data.usage?.prompt_tokens_details?.cache_write_tokens || undefined,
-				reasoningTokens: data.usage?.completion_tokens_details?.reasoning_tokens || undefined,
-			}
+				const metrics: LLMMetrics = {
+					promptTokens,
+					completionTokens,
+					totalTokens: data.usage?.total_tokens ?? 0,
+					latencyMs,
+					model: data.model,
+					provider: this.name,
+					cost,
+					cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens || undefined,
+					cacheWriteTokens: data.usage?.prompt_tokens_details?.cache_write_tokens || undefined,
+					reasoningTokens: data.usage?.completion_tokens_details?.reasoning_tokens || undefined,
+				}
 
-			return Ok({
-				content: this.extractContent(choice.message.content),
-				toolCalls,
-				finishReason: this.mapFinishReason(choice.finish_reason),
-				metrics,
-				providerRequestId: data.id,
-				reasoning: choice.message.reasoning || undefined,
-				// Normalized to undefined here so an empty array never reaches the wire on the way back.
-				reasoningDetails: choice.message.reasoning_details?.length ? choice.message.reasoning_details : undefined,
+				return Ok({
+					content: this.extractContent(choice.message.content),
+					toolCalls,
+					finishReason: this.mapFinishReason(choice.finish_reason),
+					metrics,
+					providerRequestId: data.id,
+					reasoning: choice.message.reasoning || undefined,
+					// Normalized to undefined here so an empty array never reaches the wire on the way back.
+					reasoningDetails: choice.message.reasoning_details?.length ? choice.message.reasoning_details : undefined,
+				})
 			})
 		} catch (error) {
-			return Err(mapProviderError(error, { timedOut }))
+			if (error instanceof ProviderRequestAbortError) {
+				return Err({
+					type: error.abortCause === 'caller' ? 'aborted' : 'timeout',
+					message: error.message,
+				})
+			}
+			return Err(mapProviderError(error))
 		}
 	}
 

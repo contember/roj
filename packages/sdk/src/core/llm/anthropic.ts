@@ -18,6 +18,7 @@ import type {
 	RawToolSpec,
 } from './provider.js'
 import { mapProviderError } from './provider.js'
+import { ProviderRequestAbortError, runProviderRequest } from './provider-request.js'
 import { sanitizeProviderMessages } from './message-sanitization.js'
 import type { RoutableLLMProvider } from './routing-provider.js'
 
@@ -279,8 +280,6 @@ export class AnthropicProvider implements RoutableLLMProvider {
 
 	async inference(request: InferenceRequest, context?: InferenceContext): Promise<Result<InferenceResponse, LLMError>> {
 		const startTime = Date.now()
-		// Our timeout and the caller's cancel abort the same controller — only this flag tells them apart.
-		let timedOut = false
 
 		try {
 			const rawRequest: RawInferenceRequest = {
@@ -293,21 +292,8 @@ export class AnthropicProvider implements RoutableLLMProvider {
 			}
 
 			const httpRequest = await this.buildHttpRequest(rawRequest, context)
-
-			const controller = new AbortController()
-			const timeoutId = setTimeout(() => {
-				timedOut = true
-				controller.abort()
-			}, this.timeout)
-
-			// Combine with external signal if provided
-			if (context?.signal) {
-				context.signal.addEventListener('abort', () => controller.abort(), { once: true })
-			}
-
-			let response: Response
-			try {
-				response = await this.fetchFn(httpRequest.url, {
+			return await runProviderRequest({ callerSignal: context?.signal, timeoutMs: this.timeout }, async (signal) => {
+				const response = await this.fetchFn(httpRequest.url, {
 					method: httpRequest.method,
 					headers: {
 						...httpRequest.headers,
@@ -315,66 +301,70 @@ export class AnthropicProvider implements RoutableLLMProvider {
 						'anthropic-dangerous-direct-browser-access': 'true',
 					},
 					body: JSON.stringify(httpRequest.body),
-					signal: controller.signal,
+					signal,
 				})
-			} finally {
-				clearTimeout(timeoutId)
-			}
 
-			if (!response.ok) {
-				const body = await response.text()
-				return Err(this.mapHttpError(response.status, body))
-			}
+				if (!response.ok) {
+					const body = await response.text()
+					return Err(this.mapHttpError(response.status, body))
+				}
 
-			const data = await response.json() as AnthropicMessageResponse
-			const latencyMs = Date.now() - startTime
+				const data = await response.json() as AnthropicMessageResponse
+				const latencyMs = Date.now() - startTime
 
-			const textContent = data.content
-				.filter((block): block is AnthropicTextBlock => block.type === 'text')
-				.map((block) => block.text)
-				.join('')
+				const textContent = data.content
+					.filter((block): block is AnthropicTextBlock => block.type === 'text')
+					.map((block) => block.text)
+					.join('')
 
-			// Kept whole, in order, signatures included: the API verifies them on replay.
-			// `redacted_thinking` has no readable text but still has to travel.
-			const thinkingBlocks = data.content.filter(isThinkingBlock)
+				// Kept whole, in order, signatures included: the API verifies them on replay.
+				// `redacted_thinking` has no readable text but still has to travel.
+				const thinkingBlocks = data.content.filter(isThinkingBlock)
 
-			const reasoning = thinkingBlocks
-				.filter((block): block is AnthropicThinkingBlock => block.type === 'thinking')
-				.map((block) => block.thinking)
-				.join('')
+				const reasoning = thinkingBlocks
+					.filter((block): block is AnthropicThinkingBlock => block.type === 'thinking')
+					.map((block) => block.thinking)
+					.join('')
 
-			const toolCalls: ToolCall[] = data.content
-				.filter((block): block is AnthropicToolUseBlock => block.type === 'tool_use')
-				.map((block) => ({
-					id: ToolCallId(block.id),
-					name: block.name,
-					input: block.input,
-				}))
+				const toolCalls: ToolCall[] = data.content
+					.filter((block): block is AnthropicToolUseBlock => block.type === 'tool_use')
+					.map((block) => ({
+						id: ToolCallId(block.id),
+						name: block.name,
+						input: block.input,
+					}))
 
-			const metrics: LLMMetrics = {
-				promptTokens: data.usage.input_tokens,
-				completionTokens: data.usage.output_tokens,
-				totalTokens: data.usage.input_tokens + data.usage.output_tokens,
-				latencyMs,
-				model: data.model,
-				provider: this.name,
-				cost: this.calculateCost(data.model, data.usage),
-				cachedTokens: data.usage.cache_read_input_tokens || undefined,
-				cacheWriteTokens: data.usage.cache_creation_input_tokens || undefined,
-			}
+				const metrics: LLMMetrics = {
+					promptTokens: data.usage.input_tokens,
+					completionTokens: data.usage.output_tokens,
+					totalTokens: data.usage.input_tokens + data.usage.output_tokens,
+					latencyMs,
+					model: data.model,
+					provider: this.name,
+					cost: this.calculateCost(data.model, data.usage),
+					cachedTokens: data.usage.cache_read_input_tokens || undefined,
+					cacheWriteTokens: data.usage.cache_creation_input_tokens || undefined,
+				}
 
-			return Ok({
-				content: textContent || null,
-				toolCalls,
-				finishReason: this.mapStopReason(data.stop_reason),
-				metrics,
-				providerRequestId: data.id,
-				reasoning: reasoning || undefined,
-				// Normalized to undefined so an empty array never reaches the wire on the way back.
-				thinkingBlocks: thinkingBlocks.length > 0 ? thinkingBlocks : undefined,
+				return Ok({
+					content: textContent || null,
+					toolCalls,
+					finishReason: this.mapStopReason(data.stop_reason),
+					metrics,
+					providerRequestId: data.id,
+					reasoning: reasoning || undefined,
+					// Normalized to undefined so an empty array never reaches the wire on the way back.
+					thinkingBlocks: thinkingBlocks.length > 0 ? thinkingBlocks : undefined,
+				})
 			})
 		} catch (error) {
-			return Err(mapProviderError(error, { timedOut }))
+			if (error instanceof ProviderRequestAbortError) {
+				return Err({
+					type: error.abortCause === 'caller' ? 'aborted' : 'timeout',
+					message: error.message,
+				})
+			}
+			return Err(mapProviderError(error))
 		}
 	}
 

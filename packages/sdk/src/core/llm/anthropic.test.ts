@@ -3,7 +3,7 @@ import type { LLMMessage } from '~/core/agents/state.js'
 import { isRetryableLLMError } from '~/core/agents/retry.js'
 import { ModelId } from '~/core/llm/schema.js'
 import { ToolCallId } from '~/core/tools/schema.js'
-import { AnthropicProvider } from './anthropic.js'
+import { type AnthropicConfig, AnthropicProvider } from './anthropic.js'
 import { applyCacheBreakpoint } from './cache-breakpoints.js'
 import { SessionFileStore } from '~/core/file-store/file-store.js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
@@ -524,28 +524,83 @@ describe('provider error mapping', () => {
 })
 
 describe('AnthropicProvider request timeout', () => {
+	type ProviderFetch = NonNullable<AnthropicConfig['fetch']>
+
+	const abortError = () => {
+		const error = new Error('aborted')
+		error.name = 'AbortError'
+		return error
+	}
+
 	/** Provider whose fetch never settles on its own — only the abort signal ends it. */
-	const stallingProvider = (timeout: number) => {
+	const stallingProvider = (timeout: number, deferAbortRejection = false) => {
 		let onFetchCalled: () => void
 		const fetchCalled = new Promise<void>((resolve) => {
 			onFetchCalled = resolve
 		})
+		let releaseRejection = () => {}
+		const fetchFn: ProviderFetch = (_input, init) => {
+			onFetchCalled()
+			return new Promise((_resolve, reject) => {
+				const rejectAbort = () => reject(abortError())
+				if (init?.signal?.aborted) {
+					rejectAbort()
+					return
+				}
+				init?.signal?.addEventListener('abort', () => {
+					if (deferAbortRejection) {
+						releaseRejection = rejectAbort
+					} else {
+						rejectAbort()
+					}
+				}, { once: true })
+			})
+		}
 		const provider = new AnthropicProvider({
 			apiKey: 'test-key',
 			timeout,
 			imageProcessor: { resolveContent: async (content) => content },
-			fetch: ((_url: string, init?: { signal?: AbortSignal }) => {
-				onFetchCalled()
-				return new Promise((_resolve, reject) => {
-					init?.signal?.addEventListener('abort', () => {
-						const err = new Error('aborted')
-						err.name = 'AbortError'
-						reject(err)
-					})
-				})
-			}) as unknown as typeof fetch,
+			fetch: fetchFn,
 		})
-		return { provider, fetchCalled }
+		return { provider, fetchCalled, releaseRejection: () => releaseRejection() }
+	}
+
+	const bodyStallingProvider = (timeout: number, status: number) => {
+		let markBodyReadStarted = () => {}
+		const bodyReadStarted = new Promise<void>((resolve) => {
+			markBodyReadStarted = resolve
+		})
+		let releaseBodyFailure = () => {}
+		const fetchFn: ProviderFetch = (_input, init) => {
+			const bodyResult = new Promise<never>((_resolve, reject) => {
+				const rejectAbort = () => reject(abortError())
+				releaseBodyFailure = () => reject(new Error('body failed'))
+				if (init?.signal?.aborted) {
+					rejectAbort()
+				} else {
+					init?.signal?.addEventListener('abort', rejectAbort, { once: true })
+				}
+			})
+			class StallingResponse extends Response {
+				override readonly text = (): Promise<string> => {
+					markBodyReadStarted()
+					return bodyResult
+				}
+
+				override readonly json = <T = unknown>(): Promise<T> => {
+					markBodyReadStarted()
+					return bodyResult
+				}
+			}
+			return Promise.resolve(new StallingResponse(null, { status }))
+		}
+		const provider = new AnthropicProvider({
+			apiKey: 'test-key',
+			timeout,
+			imageProcessor: { resolveContent: async (content) => content },
+			fetch: fetchFn,
+		})
+		return { provider, bodyReadStarted, releaseBodyFailure: () => releaseBodyFailure() }
 	}
 
 	const request = { messages: [LLMMessageFactory.user('hi')], model: ModelId('claude-opus-4-6'), systemPrompt: '' }
@@ -572,6 +627,53 @@ describe('AnthropicProvider request timeout', () => {
 		const promise = provider.inference(request, contextWith(controller.signal))
 		await fetchCalled
 		controller.abort()
+		const result = await promise
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.type).toBe('aborted')
+	})
+
+	test('reports an already-aborted caller as aborted', async () => {
+		const { provider } = stallingProvider(60_000)
+		const controller = new AbortController()
+		controller.abort()
+		const result = await provider.inference(request, contextWith(controller.signal))
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.type).toBe('aborted')
+	})
+
+	test('times out while consuming a success response body', async () => {
+		const { provider, bodyReadStarted } = bodyStallingProvider(10, 200)
+		const promise = provider.inference(request)
+		await bodyReadStarted
+		const result = await promise
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.type).toBe('timeout')
+	})
+
+	test('caller can cancel while consuming an error response body', async () => {
+		const { provider, bodyReadStarted, releaseBodyFailure } = bodyStallingProvider(60_000, 429)
+		const controller = new AbortController()
+		const promise = provider.inference(request, contextWith(controller.signal))
+		await bodyReadStarted
+		controller.abort()
+		releaseBodyFailure()
+		const result = await promise
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.type).toBe('aborted')
+	})
+
+	test('caller cancellation remains the cause when timeout fires before fetch rejects', async () => {
+		const { provider, fetchCalled, releaseRejection } = stallingProvider(40, true)
+		const controller = new AbortController()
+		const promise = provider.inference(request, contextWith(controller.signal))
+		await fetchCalled
+		controller.abort()
+		await new Promise<void>((resolve) => setTimeout(resolve, 80))
+		releaseRejection()
 		const result = await promise
 		expect(result.ok).toBe(false)
 		if (result.ok) return
