@@ -379,6 +379,24 @@ export class ServiceExecutor {
 			return Err({ message: 'Failed to spawn service process', recoverable: true })
 		}
 
+		// Listen before the first await. Neither Node nor Bun replays buffered stdio
+		// or a 'close' to a listener attached after the child exited, and the two
+		// awaits below — the /proc start-time read and the pid-registry write — are
+		// long enough for a fast crash (bad command, missing binary, occupied port)
+		// to slip through the gap. These collectors hold both until the real
+		// handlers exist further down, which then take over and replay them.
+		const bufferedStdout: Buffer[] = []
+		const bufferedStderr: Buffer[] = []
+		let exitDuringSetup: { code: number | null } | undefined
+		const bufferStdout = (data: Buffer) => void bufferedStdout.push(data)
+		const bufferStderr = (data: Buffer) => void bufferedStderr.push(data)
+		const bufferClose = (code: number | null) => {
+			exitDuringSetup = { code }
+		}
+		child.stdout?.on('data', bufferStdout)
+		child.stderr?.on('data', bufferStderr)
+		child.on('close', bufferClose)
+
 		// Capture start time immediately so a later PID-reuse check can distinguish
 		// "our process" from "an unrelated process that grabbed this PID after ours died"
 		const pidStartTime = await getProcessStartTime(this.fs, child.pid)
@@ -524,27 +542,42 @@ export class ServiceExecutor {
 
 		// Pipe stdout/stderr line by line
 		let stdoutPartial = ''
-		child.stdout?.on('data', (data: Buffer) => {
+		const onStdout = (data: Buffer) => {
 			stdoutPartial += data.toString()
 			const lines = stdoutPartial.split('\n')
 			stdoutPartial = lines.pop()!
 			for (const line of lines) {
 				processLine(line)
 			}
-		})
+		}
 
 		let stderrPartial = ''
-		child.stderr?.on('data', (data: Buffer) => {
+		const onStderr = (data: Buffer) => {
 			stderrPartial += data.toString()
 			const lines = stderrPartial.split('\n')
 			stderrPartial = lines.pop()!
 			for (const line of lines) {
 				processLine(`[stderr] ${line}`)
 			}
-		})
+		}
 
-		// Handle unexpected exit
-		child.on('close', (code) => {
+		// Take over from the setup collectors and replay what they caught, so a
+		// service that already spoke (or already died) is judged on its real output:
+		// the ready pattern, the port-conflict pattern and the failure log all read
+		// from it. Swap and replay synchronously — no 'data' can land in between.
+		child.stdout?.off('data', bufferStdout)
+		child.stderr?.off('data', bufferStderr)
+		child.stdout?.on('data', onStdout)
+		child.stderr?.on('data', onStderr)
+		for (const chunk of bufferedStdout) onStdout(chunk)
+		for (const chunk of bufferedStderr) onStderr(chunk)
+
+		// Handle unexpected exit. Named and guarded because it also has to be
+		// replayable — see the exit-during-setup check after markReady() below.
+		let closeHandled = false
+		const handleClose = (code: number | null) => {
+			if (closeHandled) return
+			closeHandled = true
 			clearReadinessTimers()
 			// The process is gone, so its durable record has nothing left to reap.
 			void this.pidRegistry?.forget(String(sessionId), config.type)
@@ -607,7 +640,9 @@ export class ServiceExecutor {
 					code,
 				})
 			}
-		})
+		}
+		child.on('close', handleClose)
+		child.off('close', bufferClose)
 
 		this.logger.info('Service starting', {
 			serviceType: config.type,
@@ -619,8 +654,19 @@ export class ServiceExecutor {
 			startupTimeoutMs,
 		})
 
-		// If no ready pattern, immediately mark as ready
-		if (!readyRegex && !config.readyWhen) {
+		// A service that died inside the bookkeeping above closed while only the
+		// setup collector was listening, so replay that close now — its output has
+		// just been replayed, so the handler sees the same log a live exit would.
+		// `alreadyReaped` covers the in-between state: the exit is recorded but
+		// 'close' has not fired yet because it waits for the stdio EOF. The listener
+		// above is guaranteed to receive it, so calling handleClose here would only
+		// drop the tail of the log the failure has to explain — while marking such a
+		// child ready would be a lie.
+		const alreadyReaped = child.exitCode != null || child.signalCode != null
+		if (exitDuringSetup) {
+			handleClose(exitDuringSetup.code)
+		} else if (!alreadyReaped && !readyRegex && !config.readyWhen) {
+			// If no ready condition is configured, a live child is ready immediately.
 			markReady()
 		}
 
