@@ -199,10 +199,14 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 	}
 
 	process.on('SIGINT', () => {
-		void shutdown().then(() => process.exit(0))
+		void shutdown()
+			.catch((err) => console.error('Shutdown failed', err))
+			.finally(() => process.exit(0))
 	})
 	process.on('SIGTERM', () => {
-		void shutdown().then(() => process.exit(0))
+		void shutdown()
+			.catch((err) => console.error('Shutdown failed', err))
+			.finally(() => process.exit(0))
 	})
 
 	return { config, logger, instance, port: server.port ?? config.port, sessionManager, shutdown }

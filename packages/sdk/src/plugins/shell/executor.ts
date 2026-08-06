@@ -367,6 +367,11 @@ export class ShellExecutor {
 				})
 			}
 
+			// A command that ignores stdin (or exits first) makes the write EPIPE.
+			// An unhandled 'error' on a writable is an uncaught exception, which
+			// would take down the agent instead of failing the tool call.
+			child.stdin?.on('error', () => {})
+
 			// Handle stdin
 			if (input.stdin) {
 				child.stdin?.write(input.stdin)
