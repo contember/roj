@@ -93,3 +93,4 @@ buzola.gen.ts
 # jj
 .jj/
 .claude/agent-canvas/
+.smellhunt/
