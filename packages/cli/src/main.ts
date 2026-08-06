@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 import { SessionId } from '@roj-ai/shared'
 import { RpcError } from '@roj-ai/shared/rpc'
 import { createCliClient } from './client.js'

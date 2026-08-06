@@ -3,6 +3,9 @@
 	"version": "0.1.0",
 	"type": "module",
 	"main": "./dist/main.js",
+	"bin": {
+		"roj-cli": "./dist/main.js"
+	},
 	"files": [
 		"src",
 		"dist"
