@@ -11,7 +11,7 @@ import { agentIdSchema } from '~/core/agents'
 import { COMMUNICATOR_ROLE, ORCHESTRATOR_ROLE } from '~/core/agents/agent-roles.js'
 import { type DomainError, PresetErrors, SessionErrors, ValidationErrors } from '~/core/errors.js'
 import { definePlugin } from '~/core/plugins/index.js'
-import { SessionId, sessionIdSchema } from '~/core/sessions/schema.js'
+import { SessionId, sessionIdSchema, sessionMetadataSchema } from '~/core/sessions/schema.js'
 import { getEntryAgentId, sessionEvents } from '~/core/sessions/state.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 
@@ -154,7 +154,10 @@ export const sessionLifecyclePlugin = definePlugin('sessions')
 			order: z4.enum(['asc', 'desc']).optional(),
 		}),
 		output: z4.object({
-			sessions: z4.array(z4.unknown()),
+			// The handler returns SessionMetadata[]; z.unknown() used to hide that
+			// from every caller, which is how standalone-server's sessions.list
+			// drifted from the platform contract unnoticed.
+			sessions: z4.array(sessionMetadataSchema),
 			total: z4.number(),
 		}),
 		handler: async (ctx, input) => {

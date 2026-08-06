@@ -66,6 +66,10 @@ export { applyEvent } from '~/core/sessions/apply-event.js'
 export { selectPluginState } from '~/core/sessions/reducer.js'
 export { SessionId } from '~/core/sessions/schema.js'
 export type { SessionMetadata } from '~/core/sessions/schema.js'
+// Exported so a consumer can validate a callManagerMethod('sessions.list')
+// result — that call is typed Result<unknown>, so the plugin's output schema
+// does not reach the caller.
+export { sessionMetadataSchema } from '~/core/sessions/schema.js'
 export { createSessionState, reconstructSessionState } from '~/core/sessions/state.js'
 export type { SessionState } from '~/core/sessions/state.js'
 export type { ToolCallId } from '~/core/tools/schema.js'
