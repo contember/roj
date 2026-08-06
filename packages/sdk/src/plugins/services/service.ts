@@ -83,6 +83,12 @@ const PORT_CONFLICT_PATTERN = /EADDRINUSE|address already in use/i
  */
 const MAX_PORT_CONFLICT_RETRIES = 3
 
+/** `restartPolicy` defaults — see ServiceConfig.restartPolicy for the rationale. */
+const DEFAULT_MAX_RESTART_RETRIES = 3
+const DEFAULT_RESTART_DELAY_MS = 1000
+const DEFAULT_MAX_RESTART_DELAY_MS = 30_000
+const DEFAULT_RESTART_HEALTHY_AFTER_MS = 60_000
+
 // ============================================================================
 // ServiceExecutor
 // ============================================================================
@@ -102,6 +108,10 @@ export class ServiceExecutor {
 	private readonly startInFlight = new Map<string, Promise<Result<void, ToolError>>>()
 	/** Per-type counter bounding automatic EADDRINUSE port re-allocation retries. */
 	private readonly portConflictRetries = new Map<string, number>()
+	/** Per-type counter bounding `restartPolicy` revivals after an unexpected exit. */
+	private readonly restartRetries = new Map<string, number>()
+	/** Pending `restartPolicy` timers, cancelled when someone stops or starts the service by hand. */
+	private readonly restartTimers = new Map<string, ReturnType<typeof setTimeout>>()
 	private readonly logger: Logger
 	private readonly portPool: PortPool
 	private readonly fs: FileSystem
@@ -254,6 +264,9 @@ export class ServiceExecutor {
 		workspaceDir?: string,
 		preferredPort?: number,
 	): Promise<Result<void, ToolError>> {
+		// This start supersedes any revival the policy had queued.
+		this.cancelPendingRestart(config.type)
+
 		const existing = this.services.get(config.type)
 		if (existing && (existing.status === 'starting' || existing.status === 'ready')) {
 			return Ok(undefined)
@@ -578,6 +591,7 @@ export class ServiceExecutor {
 					code,
 				})
 				this.portConflictRetries.delete(config.type)
+				this.scheduleRestart(config, sessionId, workspaceDir, Date.now() - startTime, code)
 			}
 		})
 
@@ -603,12 +617,82 @@ export class ServiceExecutor {
 	 * Stop a running service gracefully.
 	 * Port is NOT released — kept for session-level stability across restarts.
 	 */
+	/**
+	 * Bring a crashed service back if its `restartPolicy` allows it. The port
+	 * allocation is kept on purpose — the preview URL has to survive the bounce.
+	 */
+	private scheduleRestart(
+		config: ServiceConfig,
+		sessionId: SessionId,
+		workspaceDir: string | undefined,
+		uptimeMs: number,
+		exitCode: number | null,
+	): void {
+		const policy = config.restartPolicy
+		if (!policy) return
+
+		// A service that ran for a while and then died is a new problem, not the
+		// continuation of a boot loop — give it a full budget again.
+		if (uptimeMs >= (policy.healthyAfterMs ?? DEFAULT_RESTART_HEALTHY_AFTER_MS)) {
+			this.restartRetries.delete(config.type)
+		}
+
+		const attempt = this.restartRetries.get(config.type) ?? 0
+		const maxRetries = policy.maxRetries ?? DEFAULT_MAX_RESTART_RETRIES
+		if (attempt >= maxRetries) {
+			this.logger.warn('Service left failed — automatic restart budget spent', {
+				serviceType: config.type,
+				attempts: attempt,
+				exitCode,
+			})
+			this.restartRetries.delete(config.type)
+			return
+		}
+
+		const initialDelayMs = policy.initialDelayMs ?? DEFAULT_RESTART_DELAY_MS
+		const delayMs = Math.min(initialDelayMs * 2 ** attempt, policy.maxDelayMs ?? DEFAULT_MAX_RESTART_DELAY_MS)
+		this.restartRetries.set(config.type, attempt + 1)
+		this.logger.info('Restarting service after unexpected exit', {
+			serviceType: config.type,
+			attempt: attempt + 1,
+			maxRetries,
+			delayMs,
+			exitCode,
+		})
+
+		const timer = setTimeout(() => {
+			this.restartTimers.delete(config.type)
+			void this.start(config, sessionId, workspaceDir)
+		}, delayMs)
+		// A pending revival must not keep the process alive on its own.
+		timer.unref?.()
+		this.restartTimers.set(config.type, timer)
+	}
+
+	/** Drop a pending automatic restart — an explicit start or stop wins over it. Returns true if one was queued. */
+	private cancelPendingRestart(serviceType: string): boolean {
+		const timer = this.restartTimers.get(serviceType)
+		if (!timer) return false
+		clearTimeout(timer)
+		this.restartTimers.delete(serviceType)
+		return true
+	}
+
 	async stop(serviceType: string, sessionId: SessionId): Promise<Result<void, ToolError>> {
+		const hadPendingRestart = this.cancelPendingRestart(serviceType)
+		this.restartRetries.delete(serviceType)
 		const entry = this.services.get(serviceType)
 		if (!entry) {
 			return Err({ message: `Service '${serviceType}' not found`, recoverable: false })
 		}
 		if (entry.status !== 'starting' && entry.status !== 'ready' && entry.status !== 'paused') {
+			// A failed service with a revival queued is really "about to restart",
+			// and calling that off is a legitimate stop rather than an error.
+			if (hadPendingRestart) {
+				entry.status = 'stopped'
+				this.notifyStatusChanged(sessionId, serviceType, 'stopped')
+				return Ok(undefined)
+			}
 			return Err({ message: `Service '${serviceType}' is ${entry.status}, cannot stop`, recoverable: false })
 		}
 
@@ -763,6 +847,10 @@ export class ServiceExecutor {
 	 * Called on session close.
 	 */
 	async shutdown(): Promise<void> {
+		// Nothing queued may spawn after the executor is gone.
+		for (const serviceType of [...this.restartTimers.keys()]) this.cancelPendingRestart(serviceType)
+		this.restartRetries.clear()
+
 		const promises: Promise<void>[] = []
 
 		for (const [serviceType, entry] of this.services) {

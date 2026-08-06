@@ -824,6 +824,146 @@ describe('services plugin', () => {
 	})
 
 	// =========================================================================
+	// restartPolicy — reviving a service that exited on its own
+	// =========================================================================
+
+	describe('restartPolicy', () => {
+		const waitUntil = async (predicate: () => boolean, timeoutMs = 8000): Promise<void> => {
+			const deadline = Date.now() + timeoutMs
+			while (Date.now() < deadline) {
+				if (predicate()) return
+				await new Promise((r) => setTimeout(r, 20))
+			}
+		}
+
+		const waitUntilAsync = async (predicate: () => Promise<boolean>, timeoutMs = 8000): Promise<void> => {
+			const deadline = Date.now() + timeoutMs
+			while (Date.now() < deadline) {
+				if (await predicate()) return
+				await new Promise((r) => setTimeout(r, 20))
+			}
+		}
+
+		const marker = (name: string) => join(tmpdir(), `roj-restart-${name}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`)
+		/** Records every spawn, then crashes or stays up depending on the run count. */
+		const crashCommand = (path: string, crashRuns: number) =>
+			`echo x >> ${path}; runs=$(wc -l < ${path} | tr -d ' '); if [ "$runs" -le ${crashRuns} ]; then exit 1; fi; echo "listening READY"; sleep 30`
+		const spawnCount = async (path: string): Promise<number> => {
+			try {
+				return (await readFile(path, 'utf-8')).split('\n').filter((l) => l.length > 0).length
+			} catch {
+				return 0
+			}
+		}
+
+		it('revives a crashed service on the port it already holds', async () => {
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: platform.process })
+			const path = marker('revive')
+			const config: ServiceConfig = {
+				type: 'revive-svc',
+				description: 'crashes once, then stays up',
+				command: crashCommand(path, 1),
+				readyPattern: 'READY',
+				startupTimeoutMs: 5000,
+				restartPolicy: { maxRetries: 3, initialDelayMs: 20 },
+			}
+			const ports: number[] = []
+			executor.onStatusChanged = (_s, _t, status, details) => {
+				if (status === 'starting' && details.port !== undefined) ports.push(details.port)
+			}
+
+			try {
+				await executor.start(config, SessionId('s-revive'))
+				await waitUntil(() => executor.getStatus('revive-svc') === 'ready')
+				expect(executor.getStatus('revive-svc')).toBe('ready')
+				expect(await spawnCount(path)).toBe(2)
+				// The preview URL must survive the bounce.
+				expect(new Set(ports).size).toBe(1)
+			} finally {
+				await executor.shutdown()
+				await rm(path, { force: true })
+			}
+		})
+
+		it('leaves the service failed once the retry budget is spent', async () => {
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: platform.process })
+			const path = marker('budget')
+			const config: ServiceConfig = {
+				type: 'budget-svc',
+				description: 'always crashes',
+				command: crashCommand(path, 99),
+				readyPattern: 'READY',
+				startupTimeoutMs: 5000,
+				restartPolicy: { maxRetries: 2, initialDelayMs: 20 },
+			}
+
+			try {
+				await executor.start(config, SessionId('s-budget'))
+				// One initial spawn plus two retries, then it stays down.
+				await waitUntilAsync(async () => (await spawnCount(path)) >= 3 && executor.getStatus('budget-svc') === 'failed')
+				await new Promise((r) => setTimeout(r, 300))
+				expect(await spawnCount(path)).toBe(3)
+				expect(executor.getStatus('budget-svc')).toBe('failed')
+			} finally {
+				await executor.shutdown()
+				await rm(path, { force: true })
+			}
+		})
+
+		it('without a policy a crash stays a crash', async () => {
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: platform.process })
+			const path = marker('nopolicy')
+			const config: ServiceConfig = {
+				type: 'nopolicy-svc',
+				description: 'always crashes, no restartPolicy',
+				command: crashCommand(path, 99),
+				readyPattern: 'READY',
+				startupTimeoutMs: 5000,
+			}
+
+			try {
+				await executor.start(config, SessionId('s-nopolicy'))
+				await waitUntil(() => executor.getStatus('nopolicy-svc') === 'failed')
+				await new Promise((r) => setTimeout(r, 300))
+				expect(await spawnCount(path)).toBe(1)
+			} finally {
+				await executor.shutdown()
+				await rm(path, { force: true })
+			}
+		})
+
+		it('an explicit stop calls off a queued revival', async () => {
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: platform.process })
+			const path = marker('stop')
+			const config: ServiceConfig = {
+				type: 'stop-svc',
+				description: 'always crashes, revival queued behind a long delay',
+				command: crashCommand(path, 99),
+				readyPattern: 'READY',
+				startupTimeoutMs: 5000,
+				restartPolicy: { maxRetries: 3, initialDelayMs: 1500 },
+			}
+
+			try {
+				await executor.start(config, SessionId('s-stop'))
+				await waitUntil(() => executor.getStatus('stop-svc') === 'failed')
+				const stopped = await executor.stop('stop-svc', SessionId('s-stop'))
+				expect(stopped.ok).toBe(true)
+				expect(executor.getStatus('stop-svc')).toBe('stopped')
+				await new Promise((r) => setTimeout(r, 2000))
+				expect(await spawnCount(path)).toBe(1)
+			} finally {
+				await executor.shutdown()
+				await rm(path, { force: true })
+			}
+		})
+	})
+
+	// =========================================================================
 	// agentVisible: false — infrastructure services hidden from agents
 	// =========================================================================
 

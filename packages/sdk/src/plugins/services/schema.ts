@@ -101,6 +101,28 @@ export interface ServiceConfig {
 	logBufferSize?: number
 	/** Startup timeout in ms — service marked as failed if not ready within this time (default: 30000) */
 	startupTimeoutMs?: number
+	/**
+	 * Bring the service back after an unexpected exit, on the port it already
+	 * holds. Omitted means what has always happened: the service is left
+	 * `failed` and waits for someone to call restart.
+	 *
+	 * For a long-running service nobody is watching — a dev server behind a
+	 * preview URL — a crash otherwise means the URL stays dead until a human
+	 * or an agent notices. The retry budget is per consecutive failure and
+	 * resets once the service has stayed up for `healthyAfterMs`, so a process
+	 * that dies repeatedly at startup still ends up `failed` instead of
+	 * looping forever.
+	 */
+	restartPolicy?: {
+		/** Consecutive automatic restarts before giving up (default: 3) */
+		maxRetries?: number
+		/** Delay before the first retry; doubles per attempt (default: 1000) */
+		initialDelayMs?: number
+		/** Ceiling for the doubling (default: 30000) */
+		maxDelayMs?: number
+		/** Uptime that counts as healthy and resets the budget (default: 60000) */
+		healthyAfterMs?: number
+	}
 	/** Auto-pause configuration (interface prepared, not yet implemented) */
 	autoPause?: { inactivityMs: number }
 	/**
