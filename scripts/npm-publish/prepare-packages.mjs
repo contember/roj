@@ -1,6 +1,7 @@
-import { readdir, readFile, writeFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { dependencyFields, discoverWorkspacePackages } from './workspace-plan.mjs'
 
 const versionArg = process.argv[2]
 
@@ -16,8 +17,6 @@ if (!match) {
 const releaseVersion = match[1]
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, '../..')
-const packagesDir = path.resolve(repoRoot, 'packages')
-const dependencyFields = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
 
 const rootPkg = JSON.parse(await readFile(path.resolve(repoRoot, 'package.json'), 'utf8'))
 const defaultCatalog = rootPkg.workspaces?.catalog ?? {}
@@ -36,20 +35,7 @@ const resolveCatalogRef = (depName, value) => {
 	return resolved
 }
 
-const packageDirs = await readdir(packagesDir, { withFileTypes: true })
-const packages = []
-
-for (const entry of packageDirs) {
-	if (!entry.isDirectory()) continue
-	const packageJsonPath = path.join(packagesDir, entry.name, 'package.json')
-	try {
-		const source = await readFile(packageJsonPath, 'utf8')
-		const pkg = JSON.parse(source)
-		packages.push({ dir: entry.name, path: packageJsonPath, pkg })
-	} catch {
-		// Skip directories without package.json.
-	}
-}
+const packages = await discoverWorkspacePackages(repoRoot)
 
 const publicPackageNames = new Set(
 	packages.filter(({ pkg }) => pkg.private !== true).map(({ pkg }) => pkg.name),

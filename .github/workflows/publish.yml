@@ -51,6 +51,9 @@ jobs:
       - name: Prepare package manifests
         run: node ./scripts/npm-publish/prepare-packages.mjs "${{ github.ref_name }}"
 
+      - name: Pack and validate published artifacts
+        run: node ./scripts/npm-publish/pack-and-validate.mjs
+
       - name: Publish NPM
         run: bash ./scripts/npm-publish/run.sh
         env:
