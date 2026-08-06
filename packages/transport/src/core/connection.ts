@@ -92,12 +92,31 @@ export abstract class Connection<TReceive extends ProtocolDef, TSend extends Pro
 
 	private sendBuffer: string[] = []
 	private readonly maxBufferSize: number = 500
+	private droppedSinceLastFlush = 0
+
+	/**
+	 * Buffer one message, dropping the OLDEST on overflow.
+	 *
+	 * These are ephemeral notifications, so a stale one is worth less than a
+	 * fresh one — the previous behaviour dropped the newest and kept a queue of
+	 * 500 obsolete updates. Overflow is logged once per episode rather than per
+	 * message: silently vanishing notifications leave a "the UI stopped
+	 * updating" report with no server-side trace at all.
+	 */
+	private buffer(data: string): void {
+		if (this.sendBuffer.length >= this.maxBufferSize) {
+			this.sendBuffer.shift()
+			if (this.droppedSinceLastFlush === 0) {
+				console.warn(`[transport] send buffer full (${this.maxBufferSize}), dropping oldest notifications`)
+			}
+			this.droppedSinceLastFlush++
+		}
+		this.sendBuffer.push(data)
+	}
 
 	send(data: string): boolean {
 		if (!this.ws || this.ws.readyState !== WebSocketReadyState.OPEN) {
-			if (this.sendBuffer.length < this.maxBufferSize) {
-				this.sendBuffer.push(data)
-			}
+			this.buffer(data)
 			return false
 		}
 		this.flushSendBuffer()
@@ -105,9 +124,7 @@ export abstract class Connection<TReceive extends ProtocolDef, TSend extends Pro
 			this.ws.send(data)
 			return true
 		} catch {
-			if (this.sendBuffer.length < this.maxBufferSize) {
-				this.sendBuffer.push(data)
-			}
+			this.buffer(data)
 			return false
 		}
 	}
@@ -122,6 +139,10 @@ export abstract class Connection<TReceive extends ProtocolDef, TSend extends Pro
 				this.sendBuffer.unshift(msg)
 				break
 			}
+		}
+		if (this.sendBuffer.length === 0 && this.droppedSinceLastFlush > 0) {
+			console.warn(`[transport] send buffer drained; ${this.droppedSinceLastFlush} notification(s) were dropped`)
+			this.droppedSinceLastFlush = 0
 		}
 	}
 

@@ -115,10 +115,14 @@ export async function startServer(options: StartServerOptions): Promise<ServerHa
 	}
 
 	process.on('SIGINT', () => {
-		void shutdown().then(() => process.exit(0))
+		void shutdown()
+			.catch((err) => console.error('Shutdown failed', err))
+			.finally(() => process.exit(0))
 	})
 	process.on('SIGTERM', () => {
-		void shutdown().then(() => process.exit(0))
+		void shutdown()
+			.catch((err) => console.error('Shutdown failed', err))
+			.finally(() => process.exit(0))
 	})
 
 	return { config, logger, shutdown }

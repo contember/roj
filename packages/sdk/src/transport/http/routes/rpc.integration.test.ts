@@ -4,7 +4,7 @@
  * Tests for the RPC dispatch system using TestHarness + Hono.
  * Covers batch calls, method dispatch, error handling.
  */
-import { beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { Hono } from 'hono'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
@@ -41,6 +41,10 @@ async function rpcBatch(app: Hono<AppEnv>, calls: Array<{ method: string; input?
 describe('RPC integration', () => {
 	let app: Hono<AppEnv>
 	let harness: TestHarness
+
+	afterEach(async () => {
+		await harness.shutdown()
+	})
 
 	beforeEach(() => {
 		harness = new TestHarness({
