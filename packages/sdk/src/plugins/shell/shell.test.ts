@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'bun:test'
+import { ChildProcess } from 'node:child_process'
+import { Writable } from 'node:stream'
 import type { SessionEnvironment } from '~/core/sessions/session-environment.js'
+import type { ExecFileResult, ProcessRunner } from '~/platform/process.js'
 import { createNodePlatform } from '~/testing/node-platform.js'
 import { buildBwrapArgs, type ShellConfig, ShellExecutor } from './executor.js'
 
@@ -215,6 +218,45 @@ describe('ShellExecutor', () => {
 		if (!result.ok) return
 
 		expect(result.value.stdout).toBe('Hello from stdin')
+		expect(result.value.exitCode).toBe(0)
+	})
+
+	it('contains stdin EPIPE errors inside the tool call', async () => {
+		const stdin = new Writable({
+			write(_chunk, _encoding, callback) {
+				const error = new Error('broken pipe')
+				Object.defineProperty(error, 'code', { value: 'EPIPE' })
+				callback(error)
+			},
+		})
+		const child = new ChildProcess()
+		Object.defineProperties(child, {
+			pid: { value: 424_243 },
+			stdin: { value: stdin },
+			stdout: { value: null },
+			stderr: { value: null },
+		})
+		const processRunner: ProcessRunner = {
+			spawn: () => {
+				setTimeout(() => child.emit('close', 0, null), 0)
+				return child
+			},
+			execFile: async (): Promise<ExecFileResult> => {
+				throw new Error('Unexpected execFile call')
+			},
+		}
+		const executor = new ShellExecutor(defaultConfig, {
+			fs: testPlatform.fs,
+			process: processRunner,
+		})
+
+		const result = await executor.execute(
+			{ command: 'ignores-stdin', stdin: 'data after exit' },
+			createTestEnvironment(),
+		)
+
+		expect(result.ok).toBe(true)
+		if (!result.ok) return
 		expect(result.value.exitCode).toBe(0)
 	})
 
