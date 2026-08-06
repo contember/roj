@@ -33,9 +33,7 @@
 		"type-check": "tsc --noEmit"
 	},
 	"dependencies": {
-		"@roj-ai/client": "workspace:*",
 		"@roj-ai/sdk": "workspace:*",
-		"@roj-ai/shared": "workspace:*",
 		"@roj-ai/transport": "workspace:*",
 		"hono": "catalog:libs"
 	},
