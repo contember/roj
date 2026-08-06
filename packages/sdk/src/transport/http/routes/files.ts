@@ -9,7 +9,7 @@ import { Hono } from 'hono'
 import { resolve } from 'node:path'
 import { getMimeType, preventTraversal } from '~/plugins/filesystem/listing.js'
 import { SessionId } from '~/core/sessions/schema.js'
-import { type AppContext, type AppEnv, getServices } from '../app.js'
+import { type AppContext, type AppEnv, getServices } from '../context.js'
 
 // ============================================================================
 // Helpers

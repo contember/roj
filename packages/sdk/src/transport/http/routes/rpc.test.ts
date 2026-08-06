@@ -7,7 +7,7 @@ import { ModelId } from '~/core/llm/schema.js'
 import type { Preset } from '~/core/preset/index.js'
 import { createSessionManager } from '../../../bootstrap.js'
 import { bootstrapForTesting } from '../../../testing/bootstrap-for-testing.js'
-import type { AppEnv, AppServices } from '../app.js'
+import type { AppEnv, AppServices } from '../context.js'
 import { createRpcRoutes } from './rpc.js'
 
 /** Minimal preset for testing */

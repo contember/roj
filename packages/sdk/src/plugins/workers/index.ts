@@ -3,8 +3,8 @@ export { workerPlugin } from './plugin.js'
 export type { WorkerAgentConfig, WorkerPresetConfig } from './plugin.js'
 
 // Events (now in plugin.ts)
-export { workerEvents } from './plugin.js'
-export type { WorkerCompletedEvent, WorkerFailedEvent, WorkerStartedEvent, WorkerStatusChangedEvent, WorkerSubEventEmittedEvent } from './plugin.js'
+export { workerEvents } from './state.js'
+export type { WorkerCompletedEvent, WorkerFailedEvent, WorkerStartedEvent, WorkerStatusChangedEvent, WorkerSubEventEmittedEvent } from './state.js'
 
 // Definition
 export type { WorkerDefinition, WorkerSubEvent } from './definition.js'
@@ -18,4 +18,4 @@ export { WorkerContextImpl } from './context.js'
 export type { WorkerError, WorkerResult } from './worker.js'
 
 // Types
-export type { EmitEvent } from './plugin.js'
+export type { EmitEvent } from './state.js'
