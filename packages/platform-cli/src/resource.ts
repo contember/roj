@@ -1,4 +1,5 @@
 import { execSync } from 'node:child_process'
+import { postFile, sha256Hex } from '@roj-ai/client/platform'
 import { mkdtempSync, statSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -51,7 +52,7 @@ export async function uploadResource(pathOrDir: string, options: {
 				contentHash,
 				filename,
 				mimeType,
-				body: { buf, filename, mimeType },
+				body: new Blob([buf], { type: mimeType }),
 			})
 		}
 
@@ -132,57 +133,9 @@ export async function uploadResource(pathOrDir: string, options: {
 	}
 }
 
-interface PostFileArgs {
-	url: string
-	apiKey: string
-	contentHash: string
-	filename: string
-	mimeType: string
-	body?: { buf: ArrayBuffer; filename: string; mimeType: string }
-}
 
-interface PostFileResult {
-	status: number
-	body: {
-		ok?: boolean
-		error?: string
-		fileId?: string
-		filename?: string
-		mimeType?: string
-		size?: number
-		r2Key?: string
-		deduped?: boolean
-	} | null
-}
 
-async function postFile(args: PostFileArgs): Promise<PostFileResult> {
-	const formData = new FormData()
-	formData.append('contentHash', args.contentHash)
-	formData.append('filename', args.filename)
-	formData.append('mimeType', args.mimeType)
-	if (args.body) {
-		formData.append('file', new Blob([args.body.buf], { type: args.body.mimeType }), args.body.filename)
-	}
 
-	const response = await fetch(`${args.url}/api/v1/files/upload`, {
-		method: 'POST',
-		headers: { Authorization: `Bearer ${args.apiKey}` },
-		body: formData,
-	})
-
-	const body = await response.json().catch(() => null) as PostFileResult['body']
-	return { status: response.status, body }
-}
-
-async function sha256Hex(buf: ArrayBuffer): Promise<string> {
-	const digest = await crypto.subtle.digest('SHA-256', buf)
-	const bytes = new Uint8Array(digest)
-	let hex = ''
-	for (let i = 0; i < bytes.length; i++) {
-		hex += bytes[i].toString(16).padStart(2, '0')
-	}
-	return hex
-}
 
 function guessMimeType(filename: string): string {
 	const ext = filename.split('.').pop()?.toLowerCase()

@@ -240,7 +240,7 @@ export function createRojClient(options: RojClientOptions): RojClient {
 	}
 }
 
-interface PostFileArgs {
+export interface PostFileArgs {
 	url: string
 	apiKey: string
 	contentHash: string
@@ -249,7 +249,7 @@ interface PostFileArgs {
 	body?: Blob
 }
 
-interface PostFileResult {
+export interface PostFileResult {
 	status: number
 	body: {
 		ok?: boolean
@@ -263,7 +263,7 @@ interface PostFileResult {
 	} | null
 }
 
-async function postFile(args: PostFileArgs): Promise<PostFileResult> {
+export async function postFile(args: PostFileArgs): Promise<PostFileResult> {
 	const formData = new FormData()
 	formData.append('contentHash', args.contentHash)
 	formData.append('filename', args.filename)
@@ -280,7 +280,7 @@ async function postFile(args: PostFileArgs): Promise<PostFileResult> {
 	return { status: response.status, body }
 }
 
-async function sha256Hex(buf: ArrayBuffer): Promise<string> {
+export async function sha256Hex(buf: ArrayBuffer): Promise<string> {
 	const digest = await crypto.subtle.digest('SHA-256', buf)
 	const bytes = new Uint8Array(digest)
 	let hex = ''

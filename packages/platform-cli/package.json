@@ -22,6 +22,7 @@
 		"url": "https://github.com/contember/roj/issues"
 	},
 	"dependencies": {
+		"@roj-ai/client": "workspace:*",
 		"@roj-ai/sandbox-runtime": "workspace:*"
 	},
 	"devDependencies": {

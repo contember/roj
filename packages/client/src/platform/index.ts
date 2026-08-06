@@ -33,5 +33,10 @@ export type { BuildPreviewUrlOptions, BuildWsUrlOptions } from './urls.js'
 export { createRojClient } from './rest-client.js'
 export type { RojClient, RojClientOptions, SessionRpcInput } from './rest-client.js'
 
+// File upload wire contract — shared with @roj-ai/platform-cli, which posts to
+// the same /api/v1/files/upload endpoint against a server outside this repo.
+export { postFile, sha256Hex } from './rest-client.js'
+export type { PostFileArgs, PostFileResult } from './rest-client.js'
+
 // Errors
 export { RojApiError } from './errors.js'
