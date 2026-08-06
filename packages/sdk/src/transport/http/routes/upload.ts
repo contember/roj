@@ -6,6 +6,7 @@
  * Business logic delegated to uploads plugin.
  */
 
+import { parseError, sessionNotFound } from '../responses.js'
 import { Hono } from 'hono'
 import { SessionId } from '~/core/sessions/schema.js'
 import { type AppContext, type AppEnv, getServices } from '../app.js'
@@ -42,10 +43,7 @@ export function createUploadRoutes(): Hono<AppEnv> {
 		// 1. Verify session exists
 		const sessionResult = await sessionRuntime.getSession(sessionId)
 		if (!sessionResult.ok) {
-			return c.json(
-				{ error: { type: 'session_not_found', message: `Session not found: ${sessionId}` } },
-				404,
-			)
+			return sessionNotFound(c, sessionId)
 		}
 
 		// 2. Parse multipart form data (transport concern — stays in HTTP layer)
@@ -53,10 +51,7 @@ export function createUploadRoutes(): Hono<AppEnv> {
 		try {
 			body = await c.req.parseBody()
 		} catch {
-			return c.json(
-				{ error: { type: 'parse_error', message: 'Failed to parse multipart form data' } },
-				400,
-			)
+			return parseError(c, 'Failed to parse multipart form data')
 		}
 
 		const file = body.file
@@ -134,20 +129,14 @@ export function createUploadRoutes(): Hono<AppEnv> {
 
 		const sessionResult = await sessionRuntime.getSession(sessionId)
 		if (!sessionResult.ok) {
-			return c.json(
-				{ error: { type: 'session_not_found', message: `Session not found: ${sessionId}` } },
-				404,
-			)
+			return sessionNotFound(c, sessionId)
 		}
 
 		let body: Record<string, string | File>
 		try {
 			body = await c.req.parseBody()
 		} catch {
-			return c.json(
-				{ error: { type: 'parse_error', message: 'Failed to parse multipart form data' } },
-				400,
-			)
+			return parseError(c, 'Failed to parse multipart form data')
 		}
 
 		const file = body.file
@@ -218,10 +207,7 @@ export function createUploadRoutes(): Hono<AppEnv> {
 		// 1. Verify session exists
 		const sessionResult = await sessionRuntime.getSession(sessionId)
 		if (!sessionResult.ok) {
-			return c.json(
-				{ error: { type: 'session_not_found', message: `Session not found: ${sessionId}` } },
-				404,
-			)
+			return sessionNotFound(c, sessionId)
 		}
 
 		// 2. Parse JSON body
@@ -229,10 +215,7 @@ export function createUploadRoutes(): Hono<AppEnv> {
 		try {
 			body = await c.req.json()
 		} catch {
-			return c.json(
-				{ error: { type: 'parse_error', message: 'Failed to parse JSON body' } },
-				400,
-			)
+			return parseError(c, 'Failed to parse JSON body')
 		}
 
 		if (!body.url || !body.filename || !body.mimeType) {

@@ -7,6 +7,7 @@
  * organization resources into sessions, bypassing the uploads/attachment pipeline.
  */
 
+import { parseError, sessionNotFound } from '../responses.js'
 import { Hono } from 'hono'
 import type { AppContext, AppEnv } from '../app.js'
 import { getServices } from '../app.js'
@@ -22,10 +23,7 @@ export function createResourceRoutes(): Hono<AppEnv> {
 		// 1. Verify session exists
 		const sessionResult = await sessionRuntime.getSession(sessionId)
 		if (!sessionResult.ok) {
-			return c.json(
-				{ error: { type: 'session_not_found', message: `Session not found: ${sessionId}` } },
-				404,
-			)
+			return sessionNotFound(c, sessionId)
 		}
 
 		// 2. Parse JSON body
@@ -33,10 +31,7 @@ export function createResourceRoutes(): Hono<AppEnv> {
 		try {
 			body = await c.req.json()
 		} catch {
-			return c.json(
-				{ error: { type: 'parse_error', message: 'Failed to parse JSON body' } },
-				400,
-			)
+			return parseError(c, 'Failed to parse JSON body')
 		}
 
 		if (!body.url || !body.filename || !body.mimeType) {
