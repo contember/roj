@@ -4,12 +4,12 @@ Bun-based agent server: LLM sessions, plugin architecture, event sourcing.
 
 ## Commands
 
+Run from the repo root — this package declares only `type-check`.
+
 ```bash
-bun run dev            # Watch mode with example config
-bun run start          # Production start
-bun run build          # Bundle to dist/ (bun build, single file)
-bun run type-check     # tsc --noEmit
-bun test               # Bun native test runner
+bun run ts:build       # Build all packages (tsc --build + tsc-alias)
+bun run lint           # Biome (this package IS linted — 262 files)
+bun test packages/sdk/src
 ```
 
 ## Architecture
@@ -22,9 +22,9 @@ bun test               # Bun native test runner
 
 ```
 src/
-  main.ts              # CLI entry (bun src/main.ts <config-path>)
-  server.ts            # startServer() high-level API
+  index.ts             # Public API surface
   bootstrap.ts         # Composition root — wires all services
+  builtin-events.ts    # Event definitions shared across core
   config.ts            # Config interface, loadConfig (env vars)
   user-config.ts       # defineConfig for roj.config.ts files
   core/
@@ -35,12 +35,17 @@ src/
     tools/             # Tool definitions, executor
     preset/            # defineAgent, createPreset, createOrchestrator
     events/            # EventStore (file/memory), types
-  plugins/             # 15+ built-in plugins (mailbox, filesystem, shell, etc.)
+    file-store/        # SessionFileStore — agent-visible path resolution
+    image/             # Image processing and resizing
+  plugins/             # 22 built-in plugins (mailbox, filesystem, shell, services, etc.)
   transport/
     http/              # Hono routes: /rpc, /health, uploads, files
     adapter/           # ServerAdapter (standalone) / ClientAdapter (worker mode)
     rpc/               # RPC protocol types
-  testing/             # TestHarness, NotificationCollector
+  testing/             # TestHarness, NotificationCollector (published as ./testing)
+  lib/                 # Logger, Result, small utilities
+  platform/            # Platform interfaces (fs, process)
+  bun-platform/        # Bun implementations (published as ./bun-platform)
 ```
 
 ## Plugin System
