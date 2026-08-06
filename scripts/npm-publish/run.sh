@@ -10,7 +10,16 @@ set -euo pipefail
 
 NPM_TAG="${NPM_TAG:-latest}"
 
-for dir in packages/*; do
+# Dependency order, not glob order: `packages/*` sorts alphabetically, which
+# publishes cli and client before the shared/sdk/transport they depend on. All
+# packages ship the same version in lockstep, so during that window a consumer
+# installing the new @roj-ai/client gets ETARGET for a @roj-ai/shared that is
+# not on the registry yet — and a failure partway through leaves the release
+# permanently half-shipped. Mirrors ORDER in scripts/ts-build.mjs.
+PUBLISH_ORDER="transport sdk shared client sandbox-runtime platform-cli cli debug client-react standalone-server demo"
+
+for name in $PUBLISH_ORDER; do
+  dir="packages/$name"
   [ -f "$dir/package.json" ] || continue
   if grep -q '"private": true' "$dir/package.json"; then
     continue
