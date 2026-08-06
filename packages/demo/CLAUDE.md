@@ -9,8 +9,8 @@ consumes it with the same hooks real users would use.
 ## Dual purpose
 
 1. **Manual demo** — `bun run dev` to try the full stack in a browser.
-2. **E2E test** (`tests/app-builder.e2e.test.ts`) — spins up the real server,
-   talks to it over REST+WS, snapshots LLM calls so CI can replay deterministically.
+2. **E2E test** (`tests/app-builder.e2e.test.ts`) — always checks the REST
+   surface; opt-in record/replay modes exercise the LLM-backed build turn.
 
 ## Key files
 
@@ -19,17 +19,21 @@ consumes it with the same hooks real users would use.
 - `server.ts` — thin launcher around `startStandaloneServer({ presets: [...] })`.
 - `spa/App.tsx` — landing form → `useChat()` workspace. Talks to standalone
   REST at `PLATFORM_URL` (derived from `window.location`, port 2486).
-- `tests/app-builder.e2e.test.ts` — runs on port 0, uses
-  `createSnapshotLLMMiddleware` for deterministic LLM. Test skips the live-turn
-  assertion when neither `ANTHROPIC_API_KEY` nor snapshots are present.
+- `tests/app-builder.e2e.test.ts` — runs on port 0 and uses
+  `createSnapshotLLMMiddleware`. The REST smoke test always runs. Recording the
+  build turn needs `ROJ_E2E_RECORD=1` plus a key; replay needs `LIVE_TESTS=1`
+  plus committed snapshots and never calls the provider.
 
 ## Snapshot workflow
 
 ```bash
-# Record (local, once)
-ANTHROPIC_API_KEY=sk-... bun test packages/demo/tests/
+# Record or refresh snapshots
+ROJ_E2E_RECORD=1 ANTHROPIC_API_KEY=sk-... bun test packages/demo/tests/
 
-# Replay (CI, default)
+# Replay the build turn without network access
+LIVE_TESTS=1 bun test packages/demo/tests/
+
+# Default CI: REST smoke only
 bun test packages/demo/tests/
 ```
 
