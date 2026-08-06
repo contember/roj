@@ -7,9 +7,8 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { SDK_VERSION } from '~/info.js'
-import type { PreprocessorRegistry } from '~/plugins/uploads/preprocessor.js'
-import type { Services } from '../../bootstrap.js'
-import type { SessionManager } from '../../core/sessions/session-manager.js'
+import type { AppEnv, AppServices } from './context.js'
+import { getServices } from './context.js'
 import { createBearerAuth } from './middleware/bearer-auth.js'
 import { errorHandler } from './middleware/error-handler.js'
 import { createFileRoutes } from './routes/files.js'
@@ -17,38 +16,10 @@ import { createResourceRoutes } from './routes/resources.js'
 import { createRpcRoutes } from './routes/rpc.js'
 import { createUploadRoutes } from './routes/upload.js'
 
-/**
- * Extended services with SessionManager for HTTP routes.
- */
-export type AppServices = Services & {
-	sessionRuntime: SessionManager
-	/** Bearer token for authenticating HTTP requests. Optional - only used in worker mode. */
-	agentToken?: string
-	/** File preprocessor registry for upload routes. Optional - only available when uploads plugin is configured. */
-	preprocessorRegistry?: PreprocessorRegistry
-}
-
-/**
- * Environment type for Hono app with injected services.
- */
-export type AppEnv = {
-	Variables: {
-		services: AppServices
-	}
-}
-
-/**
- * Hono context type for routes.
- */
-export type AppContext = import('hono').Context<AppEnv>
-
-/**
- * Type-safe accessor for services from Hono context.
- * Guarantees services are present (set by middleware).
- */
-export function getServices(c: AppContext): AppServices {
-	return c.get('services')
-}
+// Re-exported so `from './app.js'` keeps working for consumers; the
+// declarations live in context.js, which routes import directly.
+export type { AppContext, AppEnv, AppServices } from './context.js'
+export { getServices } from './context.js'
 
 /**
  * Creates the Hono application with all middleware and routes.

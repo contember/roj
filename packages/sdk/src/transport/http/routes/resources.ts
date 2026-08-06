@@ -9,8 +9,8 @@
 
 import { parseError, sessionNotFound } from '../responses.js'
 import { Hono } from 'hono'
-import type { AppContext, AppEnv } from '../app.js'
-import { getServices } from '../app.js'
+import type { AppContext, AppEnv } from '../context.js'
+import { getServices } from '../context.js'
 import { SessionId } from '~/core/sessions/schema.js'
 
 export function createResourceRoutes(): Hono<AppEnv> {

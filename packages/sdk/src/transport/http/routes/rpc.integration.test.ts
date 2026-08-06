@@ -9,7 +9,7 @@ import { Hono } from 'hono'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 import { bootstrapForTesting } from '../../../testing/bootstrap-for-testing.js'
-import type { AppEnv } from '../app.js'
+import type { AppEnv } from '../context.js'
 import { createRpcRoutes } from './rpc.js'
 
 interface RpcResponse<T = unknown> {

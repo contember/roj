@@ -21,8 +21,8 @@ import type { DomainError } from '~/core/errors.js'
 import { type CallerContext, DEFAULT_CALLER } from '~/core/plugins/plugin-builder.js'
 import { SessionId } from '~/core/sessions/schema.js'
 import type { SessionManager } from '~/core/sessions/session-manager.js'
-import { getServices } from '../app.js'
-import type { AppEnv } from '../app.js'
+import { getServices } from '../context.js'
+import type { AppEnv } from '../context.js'
 
 type MethodResult =
 	| { ok: true; value: unknown }

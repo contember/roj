@@ -6,7 +6,7 @@
  */
 
 import type { MiddlewareHandler } from 'hono'
-import type { AppEnv } from '../app.js'
+import type { AppEnv } from '../context.js'
 
 /**
  * Creates bearer auth middleware.
