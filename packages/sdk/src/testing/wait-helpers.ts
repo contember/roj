@@ -1,3 +1,4 @@
+import { sleep } from '~/lib/utils/sleep.js'
 import type { AgentId } from '~/core/agents/schema.js'
 import type { Session } from '~/core/sessions/session.js'
 
@@ -77,8 +78,4 @@ function areAllAgentsIdle(session: Session): boolean {
 		}
 	}
 	return true
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms))
 }

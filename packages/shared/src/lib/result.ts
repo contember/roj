@@ -1,6 +1,12 @@
 /**
  * Result type for explicit error handling without exceptions.
- * Inspired by Rust/Go approach.
+ *
+ * @roj-ai/transport owns the canonical definition and @roj-ai/sdk re-exports it
+ * from there. This copy stays standalone on purpose: @roj-ai/shared declares no
+ * runtime dependency beyond zod, and the client tier depends on shared. The
+ * type is structural, so the two are mutually assignable — but keep them in
+ * sync by hand, or move shared onto transport if that dependency ever becomes
+ * acceptable.
  */
 
 export type Result<T, E = Error> =

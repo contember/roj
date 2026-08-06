@@ -2,6 +2,7 @@ import type { LLMError } from '~/core/llm/provider.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err } from '~/lib/utils/result.js'
 import type { Logger } from '../../lib/logger/logger.js'
+import { sleep } from '~/lib/utils/sleep.js'
 
 // ============================================================================
 // Retry Options
@@ -112,17 +113,6 @@ function calculateDelay<E>(
 	const jitter = Math.random() * 0.3 * exponentialDelay
 
 	return Math.min(exponentialDelay + jitter, opts.maxDelayMs)
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-	if (signal?.aborted) return Promise.resolve()
-	return new Promise<void>((resolve) => {
-		const timer = setTimeout(resolve, ms)
-		signal?.addEventListener('abort', () => {
-			clearTimeout(timer)
-			resolve()
-		}, { once: true })
-	})
 }
 
 // ============================================================================
