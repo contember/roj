@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it } from 'bun:test'
+import { ChildProcess } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -8,6 +10,7 @@ import { selectPluginState } from '~/core/sessions/reducer.js'
 import { SessionId } from '~/core/sessions/schema.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { silentLogger } from '~/lib/logger/logger.js'
+import type { ExecFileResult, ProcessRunner } from '~/platform/process.js'
 import { createNodePlatform } from '~/testing/node-platform.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 import { serviceEvents, servicePlugin } from './plugin.js'
@@ -133,6 +136,20 @@ async function waitForServiceStateStatus(
 	throw new Error(
 		`Timed out after ${timeoutMs}ms waiting for '${serviceType}' state to be '${targetStatus}'; it is '${actual ?? 'absent'}'`,
 	)
+}
+
+/** Wait for a condition observed directly off a ServiceExecutor, not a session. */
+async function waitFor(
+	condition: () => boolean,
+	describeState: () => string,
+	timeoutMs = 5000,
+): Promise<void> {
+	const deadline = Date.now() + timeoutMs
+	while (Date.now() < deadline) {
+		if (condition()) return
+		await new Promise((r) => setTimeout(r, 20))
+	}
+	throw new Error(`Timed out after ${timeoutMs}ms; saw ${describeState()}`)
 }
 
 // ============================================================================
@@ -528,6 +545,108 @@ describe('services plugin', () => {
 			const failEvent = events.find((e) => e.serviceType === 'failing' && e.toStatus === 'failed')
 			expect(failEvent).toBeDefined()
 			expect(failEvent!.error).toBeDefined()
+		})
+
+		it('a service that closes during spawn setup skips ready and schedules restart', async () => {
+			const child = new ChildProcess()
+			Object.defineProperties(child, {
+				pid: { value: 424_242 },
+				stdin: { value: null },
+				stdout: { value: null },
+				stderr: { value: null },
+			})
+			const processRunner: ProcessRunner = {
+				spawn: () => {
+					// The death lands in the window between spawn and the handlers —
+					// the case a runtime never replays. exitCode is deliberately left
+					// unset so only the event can reveal it.
+					queueMicrotask(() => child.emit('close', 1))
+					return child
+				},
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: processRunner,
+			})
+			const observed: Array<{ status: ServiceStatus; details: ServiceStatusChangeDetails }> = []
+			executor.onStatusChanged = (_sessionId, _serviceType, status, details) => {
+				observed.push({ status, details })
+			}
+
+			try {
+				const result = await executor.start({
+					type: 'missed-close',
+					description: 'Process is already gone when spawn returns',
+					command: 'unused',
+					restartPolicy: { maxRetries: 1, initialDelayMs: 60_000 },
+				}, SessionId('s-missed-close'))
+
+				expect(result.ok).toBe(true)
+				expect(observed.map(({ status }) => status)).toEqual(['starting', 'failed'])
+				expect(observed.filter(({ status }) => status === 'failed')).toHaveLength(1)
+				const failure = observed.find(({ status }) => status === 'failed')
+				expect(failure?.details.restartAttempt).toBe(1)
+				expect(failure?.details.restartMaxRetries).toBe(1)
+				expect(failure?.details.restartAt).toBeGreaterThan(Date.now())
+			} finally {
+				await executor.shutdown()
+			}
+		})
+
+		it('keeps the output a service produced during spawn setup', async () => {
+			const child = new ChildProcess()
+			// Bare emitters, not streams: a real child's pipe drops what it emitted
+			// before anything listened, and a buffering stream would hide exactly the
+			// loss this test is about.
+			const stderr = new EventEmitter()
+			Object.defineProperties(child, {
+				pid: { value: 424_243 },
+				stdin: { value: null },
+				stdout: { value: new EventEmitter() },
+				stderr: { value: stderr },
+			})
+			const processRunner: ProcessRunner = {
+				spawn: () => {
+					queueMicrotask(() => {
+						stderr.emit('data', Buffer.from('config file not found\n'))
+						child.emit('close', 7)
+					})
+					return child
+				},
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: processRunner,
+			})
+			const observed: ServiceStatus[] = []
+			executor.onStatusChanged = (_sessionId, _serviceType, status) => {
+				observed.push(status)
+			}
+
+			try {
+				await executor.start({
+					type: 'loud-crash',
+					description: 'Explains itself on stderr, then exits',
+				}, SessionId('s-loud-crash'))
+
+				await waitFor(() => observed.includes('failed'), () => `[${observed.join(', ')}]`)
+
+				const logs = executor.getLogs('loud-crash')
+				expect(logs.ok).toBe(true)
+				if (logs.ok) {
+					expect(logs.value.join('\n')).toContain('config file not found')
+				}
+			} finally {
+				await executor.shutdown()
+			}
 		})
 	})
 
