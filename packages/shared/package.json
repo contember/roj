@@ -35,10 +35,10 @@
 		"type-check": "tsc --noEmit"
 	},
 	"dependencies": {
+		"@roj-ai/sdk": "workspace:*",
 		"zod": "catalog:libs"
 	},
 	"devDependencies": {
-		"@roj-ai/sdk": "workspace:*",
 		"typescript": "^5.7.2"
 	},
 	"types": "./dist/index.d.ts"
