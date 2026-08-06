@@ -113,7 +113,8 @@
 			"types": "./dist/transport/rpc/index.d.ts",
 			"import": "./dist/transport/rpc/index.js",
 			"default": "./dist/transport/rpc/index.js"
-		}
+		},
+		"./package.json": "./package.json"
 	},
 	"files": [
 		"src",
