@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, mock, test } from 'bun:test'
+import { SessionFileStore } from '~/core/file-store/file-store.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import { Err, isErr, isOk, Ok } from '~/lib/utils/result.js'
-import type { InferenceRequest, InferenceResponse, LLMError } from './provider.js'
+import { createNodeFileSystem } from '~/testing/node-platform.js'
+import { type OpenRouterConfig, OpenRouterProvider } from './openrouter.js'
+import type { InferenceContext, InferenceRequest, InferenceResponse, LLMError } from './provider.js'
+import { LLMMessageFactory } from './provider.js'
 import { ModelId } from './schema.js'
 
 // ============================================================================
@@ -495,5 +499,164 @@ describe('Retry Logic', () => {
 				expect(result.error.type).toBe('invalid_request')
 			}
 		})
+	})
+})
+
+describe('OpenRouterProvider request timeout', () => {
+	type ProviderFetch = NonNullable<OpenRouterConfig['fetch']>
+
+	const abortError = () => {
+		const error = new Error('aborted')
+		error.name = 'AbortError'
+		return error
+	}
+
+	const stallingProvider = (timeout: number, deferAbortRejection = false) => {
+		let markFetchCalled = () => {}
+		const fetchCalled = new Promise<void>((resolve) => {
+			markFetchCalled = resolve
+		})
+		let releaseRejection = () => {}
+		const fetchFn: ProviderFetch = (_input, init) => {
+			markFetchCalled()
+			return new Promise<Response>((_resolve, reject) => {
+				const rejectAbort = () => reject(abortError())
+				if (init?.signal?.aborted) {
+					rejectAbort()
+					return
+				}
+				init?.signal?.addEventListener('abort', () => {
+					if (deferAbortRejection) {
+						releaseRejection = rejectAbort
+					} else {
+						rejectAbort()
+					}
+				}, { once: true })
+			})
+		}
+		const provider = new OpenRouterProvider({
+			apiKey: 'test-key',
+			timeout,
+			imageProcessor: { resolveContent: async (content) => content },
+			fetch: fetchFn,
+		})
+		return { provider, fetchCalled, releaseRejection: () => releaseRejection() }
+	}
+
+	const bodyStallingProvider = (timeout: number, status: number) => {
+		let markBodyReadStarted = () => {}
+		const bodyReadStarted = new Promise<void>((resolve) => {
+			markBodyReadStarted = resolve
+		})
+		let releaseBodyFailure = () => {}
+		const fetchFn: ProviderFetch = (_input, init) => {
+			const bodyResult = new Promise<never>((_resolve, reject) => {
+				const rejectAbort = () => reject(abortError())
+				releaseBodyFailure = () => reject(new Error('body failed'))
+				if (init?.signal?.aborted) {
+					rejectAbort()
+				} else {
+					init?.signal?.addEventListener('abort', rejectAbort, { once: true })
+				}
+			})
+			class StallingResponse extends Response {
+				override readonly text = (): Promise<string> => {
+					markBodyReadStarted()
+					return bodyResult
+				}
+
+				override readonly json = <T = unknown>(): Promise<T> => {
+					markBodyReadStarted()
+					return bodyResult
+				}
+			}
+			return Promise.resolve(new StallingResponse(null, { status }))
+		}
+		const provider = new OpenRouterProvider({
+			apiKey: 'test-key',
+			timeout,
+			imageProcessor: { resolveContent: async (content) => content },
+			fetch: fetchFn,
+		})
+		return { provider, bodyReadStarted, releaseBodyFailure: () => releaseBodyFailure() }
+	}
+
+	const request = {
+		messages: [LLMMessageFactory.user('hi')],
+		model: ModelId('anthropic/claude-opus-4.6'),
+		systemPrompt: '',
+	}
+	const fileStore = new SessionFileStore('/tmp/roj-openrouter-test', undefined, false, createNodeFileSystem(), 'session')
+	const contextWith = (signal: AbortSignal): InferenceContext => ({
+		sessionId: 'session-1',
+		agentId: 'agent-1',
+		signal,
+		fileStore,
+	})
+
+	test('reports a stalled provider as timeout', async () => {
+		const result = await stallingProvider(10).provider.inference(request)
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.type).toBe('timeout')
+	})
+
+	test('reports a caller cancel as aborted', async () => {
+		const { provider, fetchCalled } = stallingProvider(60_000)
+		const controller = new AbortController()
+		const promise = provider.inference(request, contextWith(controller.signal))
+		await fetchCalled
+		controller.abort()
+		const result = await promise
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.type).toBe('aborted')
+	})
+
+	test('reports an already-aborted caller as aborted', async () => {
+		const { provider } = stallingProvider(60_000)
+		const controller = new AbortController()
+		controller.abort()
+		const result = await provider.inference(request, contextWith(controller.signal))
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.type).toBe('aborted')
+	})
+
+	test('times out while consuming a success response body', async () => {
+		const { provider, bodyReadStarted } = bodyStallingProvider(10, 200)
+		const promise = provider.inference(request)
+		await bodyReadStarted
+		const result = await promise
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.type).toBe('timeout')
+	})
+
+	test('caller can cancel while consuming an error response body', async () => {
+		const { provider, bodyReadStarted, releaseBodyFailure } = bodyStallingProvider(60_000, 429)
+		const controller = new AbortController()
+		const promise = provider.inference(request, contextWith(controller.signal))
+		await bodyReadStarted
+		controller.abort()
+		releaseBodyFailure()
+		const result = await promise
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.type).toBe('aborted')
+	})
+
+	test('caller cancellation remains the cause when timeout fires before fetch rejects', async () => {
+		const { provider, fetchCalled, releaseRejection } = stallingProvider(40, true)
+		const controller = new AbortController()
+		const promise = provider.inference(request, contextWith(controller.signal))
+		await fetchCalled
+		controller.abort()
+		await new Promise<void>((resolve) => setTimeout(resolve, 80))
+		releaseRejection()
+		const result = await promise
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.type).toBe('aborted')
 	})
 })
