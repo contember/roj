@@ -20,8 +20,10 @@ consumes it with the same hooks real users would use.
 - `spa/App.tsx` — landing form → `useChat()` workspace. Talks to standalone
   REST at `PLATFORM_URL` (derived from `window.location`, port 2486).
 - `tests/app-builder.e2e.test.ts` — runs on port 0, uses
-  `createSnapshotLLMMiddleware` for deterministic LLM. Test skips the live-turn
-  assertion when neither `ANTHROPIC_API_KEY` nor snapshots are present.
+  `createSnapshotLLMMiddleware` for deterministic LLM. The REST-surface test
+  always runs; the live build turn needs `LIVE_TESTS=1` plus a key. Snapshots
+  alone do not enable it — a stale snapshot makes replay hang to the 120s idle
+  timeout instead of failing, and the committed ones are currently stale.
 
 ## Snapshot workflow
 

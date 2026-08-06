@@ -529,6 +529,30 @@ describe('services plugin', () => {
 			expect(failEvent).toBeDefined()
 			expect(failEvent!.error).toBeDefined()
 		})
+
+		it('a service that exits during spawn bookkeeping still reports failed', async () => {
+			// The 'close' handler is attached well after spawn — the /proc start-time
+			// read and the awaited pid-registry write sit in between — and Node drops
+			// a 'close' that fired before anything was listening. `exit 1` reliably
+			// lands in that window under load, and the service used to stay 'ready'.
+			const portPool = new PortPool()
+			const harness = createServicesHarness({
+				presets: [createServicesPreset([failingService], ['failing'], portPool)],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			await session.callPluginMethod('services.start', { serviceType: 'failing' })
+
+			await waitForServiceStateStatus(session, 'failing', 'failed')
+
+			const statuses = (await session.getEventsByType(serviceEvents, 'service_status_changed'))
+				.filter((e) => e.serviceType === 'failing')
+				.map((e) => e.toStatus)
+			expect(statuses).toContain('failed')
+			// Exactly one terminal transition — the replay must not double-fire.
+			expect(statuses.filter((s) => s === 'failed')).toHaveLength(1)
+		})
 	})
 
 	// =========================================================================

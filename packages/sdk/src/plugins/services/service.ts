@@ -543,8 +543,12 @@ export class ServiceExecutor {
 			}
 		})
 
-		// Handle unexpected exit
-		child.on('close', (code) => {
+		// Handle unexpected exit. Named and guarded because it also has to be
+		// replayable — see the already-exited check after markReady() below.
+		let closeHandled = false
+		const handleClose = (code: number | null) => {
+			if (closeHandled) return
+			closeHandled = true
 			clearReadinessTimers()
 			// The process is gone, so its durable record has nothing left to reap.
 			void this.pidRegistry?.forget(String(sessionId), config.type)
@@ -607,7 +611,8 @@ export class ServiceExecutor {
 					code,
 				})
 			}
-		})
+		}
+		child.on('close', handleClose)
 
 		this.logger.info('Service starting', {
 			serviceType: config.type,
@@ -622,6 +627,16 @@ export class ServiceExecutor {
 		// If no ready pattern, immediately mark as ready
 		if (!readyRegex && !config.readyWhen) {
 			markReady()
+		}
+
+		// A service that dies inside the bookkeeping above — the /proc start-time
+		// read and the awaited pid-registry write both sit between spawn and the
+		// listener below — fires 'close' before anything is listening, and Node
+		// drops it. Without this the service sits at 'ready' (or 'starting')
+		// forever: no `failed` event, no restart policy, and a preview URL
+		// pointing at nothing. Runs after markReady() so the terminal status wins.
+		if (child.exitCode != null || child.signalCode != null) {
+			handleClose(child.exitCode)
 		}
 
 		return Ok(undefined)
