@@ -112,3 +112,51 @@ export interface ToolLogContext extends LogContext {
 	toolCallId: string
 	durationMs?: number
 }
+
+/**
+ * Shared base for sink-backed loggers.
+ *
+ * The four level methods and the Error->context flattening in error() were
+ * copied verbatim into ConsoleLogger, JsonLogger and FileLogger. The flattening
+ * is the part worth having in one place — it is the only path by which a stack
+ * trace reaches a structured log, so a sink that misses it drops the field
+ * silently.
+ *
+ * Subclasses supply only log() and child(); child() stays per-class because each
+ * returns its own type with its own config. TeeLogger does NOT extend this — it
+ * fans out to other loggers rather than writing to a sink.
+ */
+export abstract class BaseLogger implements Logger {
+	abstract readonly level: LogLevel
+
+	protected abstract log(level: LogLevel, message: string, context?: LogContext): void
+
+	abstract child(context: LogContext): Logger
+
+	debug(message: string, context?: LogContext): void {
+		this.log('debug', message, context)
+	}
+
+	info(message: string, context?: LogContext): void {
+		this.log('info', message, context)
+	}
+
+	warn(message: string, context?: LogContext): void {
+		this.log('warn', message, context)
+	}
+
+	error(message: string, error?: Error, context?: LogContext): void {
+		const errorContext = error
+			? {
+				...context,
+				error: {
+					name: error.name,
+					message: error.message,
+					stack: error.stack,
+				},
+			}
+			: context
+
+		this.log('error', message, errorContext)
+	}
+}

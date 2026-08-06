@@ -1,5 +1,5 @@
 import type { LogContext, Logger, LogLevel } from './logger.js'
-import { shouldLog } from './logger.js'
+import { BaseLogger, shouldLog } from './logger.js'
 
 export interface ConsoleLoggerConfig {
 	level: LogLevel
@@ -15,45 +15,20 @@ const COLORS = {
 	error: '\x1b[31m', // red
 }
 
-export class ConsoleLogger implements Logger {
+export class ConsoleLogger extends BaseLogger {
 	readonly level: LogLevel
 	private useColors: boolean
 	private showTimestamps: boolean
 	private baseContext: LogContext
 
 	constructor(config: ConsoleLoggerConfig, baseContext: LogContext = {}) {
+		super()
 		this.level = config.level
 		this.useColors = config.colors ?? true
 		this.showTimestamps = config.timestamps ?? true
 		this.baseContext = baseContext
 	}
 
-	debug(message: string, context?: LogContext): void {
-		this.log('debug', message, context)
-	}
-
-	info(message: string, context?: LogContext): void {
-		this.log('info', message, context)
-	}
-
-	warn(message: string, context?: LogContext): void {
-		this.log('warn', message, context)
-	}
-
-	error(message: string, error?: Error, context?: LogContext): void {
-		const errorContext = error
-			? {
-				...context,
-				error: {
-					name: error.name,
-					message: error.message,
-					stack: error.stack,
-				},
-			}
-			: context
-
-		this.log('error', message, errorContext)
-	}
 
 	child(context: LogContext): Logger {
 		return new ConsoleLogger(
@@ -66,7 +41,7 @@ export class ConsoleLogger implements Logger {
 		)
 	}
 
-	private log(level: LogLevel, message: string, context?: LogContext): void {
+	protected log(level: LogLevel, message: string, context?: LogContext): void {
 		if (!shouldLog(level, this.level)) return
 
 		const fullContext = { ...this.baseContext, ...context }
@@ -118,47 +93,22 @@ export class ConsoleLogger implements Logger {
 /**
  * JSON Logger for production (structured output)
  */
-export class JsonLogger implements Logger {
+export class JsonLogger extends BaseLogger {
 	readonly level: LogLevel
 	private baseContext: LogContext
 
 	constructor(level: LogLevel, baseContext: LogContext = {}) {
+		super()
 		this.level = level
 		this.baseContext = baseContext
 	}
 
-	debug(message: string, context?: LogContext): void {
-		this.log('debug', message, context)
-	}
-
-	info(message: string, context?: LogContext): void {
-		this.log('info', message, context)
-	}
-
-	warn(message: string, context?: LogContext): void {
-		this.log('warn', message, context)
-	}
-
-	error(message: string, error?: Error, context?: LogContext): void {
-		const errorContext = error
-			? {
-				...context,
-				error: {
-					name: error.name,
-					message: error.message,
-					stack: error.stack,
-				},
-			}
-			: context
-
-		this.log('error', message, errorContext)
-	}
 
 	child(context: LogContext): Logger {
 		return new JsonLogger(this.level, { ...this.baseContext, ...context })
 	}
 
-	private log(level: LogLevel, message: string, context?: LogContext): void {
+	protected log(level: LogLevel, message: string, context?: LogContext): void {
 		if (!shouldLog(level, this.level)) return
 
 		const entry = {
