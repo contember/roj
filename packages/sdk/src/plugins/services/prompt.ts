@@ -42,6 +42,14 @@ export function buildServiceStatusMessage(
 		if (entry?.error) {
 			line += ` (error: ${entry.error})`
 		}
+		// A queued revival means the service comes back on its own — say so, or the
+		// agent burns a turn restarting by hand what was about to restart anyway.
+		if (entry?.restartAt !== undefined) {
+			const attempt = entry.restartAttempt !== undefined && entry.restartMaxRetries !== undefined
+				? ` (attempt ${entry.restartAttempt}/${entry.restartMaxRetries})`
+				: ''
+			line += ` — restarting automatically${attempt}, no action needed`
+		}
 		// Deliberately no cwd: it is a real host path, while sandboxed agents see the
 		// world through virtual roots — leaking it sends them chasing paths that
 		// don't exist in their namespace (see webmaster path-identity incident).

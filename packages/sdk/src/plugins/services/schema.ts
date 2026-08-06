@@ -155,6 +155,17 @@ export interface ServiceEntry {
 	startedAt?: number
 	readyAt?: number
 	stoppedAt?: number
+	/**
+	 * When a `restartPolicy` revival is queued, the epoch ms at which it fires.
+	 * Present only while the revival is pending — any later status change clears
+	 * it — so `failed` with `restartAt` set means "down, but coming back on its
+	 * own" and nobody downstream has to treat it as terminal.
+	 */
+	restartAt?: number
+	/** 1-based attempt number of the queued revival. */
+	restartAttempt?: number
+	/** Retry budget the queued revival counts against. */
+	restartMaxRetries?: number
 	/** Process group PID (tracked for orphan cleanup after restart) */
 	pid?: number
 	/**

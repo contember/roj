@@ -70,6 +70,17 @@ export interface ServiceStatusChangeDetails {
 	pidStartTime?: number
 	cwd?: string
 	command?: string
+	/** Set on a `failed` change that already has a revival queued — see ServiceEntry.restartAt. */
+	restartAt?: number
+	restartAttempt?: number
+	restartMaxRetries?: number
+}
+
+/** A revival the policy has queued, as reported on the `failed` status change. */
+interface ScheduledRestart {
+	restartAt: number
+	restartAttempt: number
+	restartMaxRetries: number
 }
 
 /** Matches a port bind-conflict across the Node and Bun runtimes. */
@@ -580,18 +591,21 @@ export class ServiceExecutor {
 				// Unexpected exit
 				current.status = 'failed'
 				const errorMsg = `Process exited unexpectedly with code ${code}`
+				this.portConflictRetries.delete(config.type)
+				// Queue the revival first so the `failed` change can carry it — a
+				// consumer that sees a bare `failed` is entitled to treat it as terminal.
+				const revival = this.scheduleRestart(config, sessionId, workspaceDir, Date.now() - startTime, code)
 				this.notifyStatusChanged(sessionId, config.type, 'failed', {
 					port: current.port,
 					cwd: current.cwd,
 					command: current.command,
 					error: errorMsg,
+					...revival,
 				})
 				this.logger.warn('Service process exited unexpectedly', {
 					serviceType: config.type,
 					code,
 				})
-				this.portConflictRetries.delete(config.type)
-				this.scheduleRestart(config, sessionId, workspaceDir, Date.now() - startTime, code)
 			}
 		})
 
@@ -614,12 +628,11 @@ export class ServiceExecutor {
 	}
 
 	/**
-	 * Stop a running service gracefully.
-	 * Port is NOT released — kept for session-level stability across restarts.
-	 */
-	/**
 	 * Bring a crashed service back if its `restartPolicy` allows it. The port
 	 * allocation is kept on purpose — the preview URL has to survive the bounce.
+	 *
+	 * Returns the queued revival so the caller can put it on the `failed` status
+	 * change, or undefined when the service is left failed for good.
 	 */
 	private scheduleRestart(
 		config: ServiceConfig,
@@ -627,9 +640,9 @@ export class ServiceExecutor {
 		workspaceDir: string | undefined,
 		uptimeMs: number,
 		exitCode: number | null,
-	): void {
+	): ScheduledRestart | undefined {
 		const policy = config.restartPolicy
-		if (!policy) return
+		if (!policy) return undefined
 
 		// A service that ran for a while and then died is a new problem, not the
 		// continuation of a boot loop — give it a full budget again.
@@ -646,7 +659,7 @@ export class ServiceExecutor {
 				exitCode,
 			})
 			this.restartRetries.delete(config.type)
-			return
+			return undefined
 		}
 
 		const initialDelayMs = policy.initialDelayMs ?? DEFAULT_RESTART_DELAY_MS
@@ -667,6 +680,8 @@ export class ServiceExecutor {
 		// A pending revival must not keep the process alive on its own.
 		timer.unref?.()
 		this.restartTimers.set(config.type, timer)
+
+		return { restartAt: Date.now() + delayMs, restartAttempt: attempt + 1, restartMaxRetries: maxRetries }
 	}
 
 	/** Drop a pending automatic restart — an explicit start or stop wins over it. Returns true if one was queued. */
@@ -678,6 +693,15 @@ export class ServiceExecutor {
 		return true
 	}
 
+	/** Whether a `restartPolicy` revival is queued — the service is down but coming back. */
+	hasScheduledRestart(serviceType: string): boolean {
+		return this.restartTimers.has(serviceType)
+	}
+
+	/**
+	 * Stop a running service gracefully.
+	 * Port is NOT released — kept for session-level stability across restarts.
+	 */
 	async stop(serviceType: string, sessionId: SessionId): Promise<Result<void, ToolError>> {
 		const hadPendingRestart = this.cancelPendingRestart(serviceType)
 		this.restartRetries.delete(serviceType)

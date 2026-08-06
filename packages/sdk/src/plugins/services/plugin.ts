@@ -22,6 +22,14 @@ export const serviceEvents = createEventsFactory({
 			command: z.string().optional(),
 			pid: z.number().optional(),
 			pidStartTime: z.number().optional(),
+			/**
+			 * Set on a `failed` change when the `restartPolicy` has already queued a
+			 * revival, so that no consumer — agent prompt, SPA, platform — mistakes it
+			 * for a terminal failure. Cleared by the next status change.
+			 */
+			restartAt: z.number().optional(),
+			restartAttempt: z.number().optional(),
+			restartMaxRetries: z.number().optional(),
 		}),
 	},
 })
@@ -73,6 +81,10 @@ export const servicePlugin = definePlugin('services')
 						const updated: ServiceEntry = {
 							...existing,
 							status: event.toStatus,
+							// A queued revival lives only until the next status change.
+							restartAt: event.restartAt,
+							restartAttempt: event.restartAttempt,
+							restartMaxRetries: event.restartMaxRetries,
 						}
 						if (event.toStatus === 'starting') {
 							updated.startedAt = event.timestamp
@@ -115,17 +127,25 @@ export const servicePlugin = definePlugin('services')
 					let changed = false
 					const newServices = new Map(services)
 					for (const [serviceType, entry] of services) {
-						if (entry.status === 'starting' || entry.status === 'ready') {
-							newServices.set(serviceType, {
-								...entry,
-								status: 'stopped',
-								port: undefined,
-								pid: undefined,
-								pidStartTime: undefined,
-								stoppedAt: event.timestamp,
-							})
-							changed = true
+						const running = entry.status === 'starting' || entry.status === 'ready'
+						// Any queued revival died with the runtime that held its timer.
+						if (!running && entry.restartAt === undefined) continue
+
+						const updated: ServiceEntry = {
+							...entry,
+							restartAt: undefined,
+							restartAttempt: undefined,
+							restartMaxRetries: undefined,
 						}
+						if (running) {
+							updated.status = 'stopped'
+							updated.port = undefined
+							updated.pid = undefined
+							updated.pidStartTime = undefined
+							updated.stoppedAt = event.timestamp
+						}
+						newServices.set(serviceType, updated)
+						changed = true
 					}
 					return changed ? newServices : services
 				}
@@ -151,9 +171,22 @@ export const servicePlugin = definePlugin('services')
 				command: details.command,
 				pid: details.pid,
 				pidStartTime: details.pidStartTime,
+				restartAt: details.restartAt,
+				restartAttempt: details.restartAttempt,
+				restartMaxRetries: details.restartMaxRetries,
 			}))
-			// Broadcast service status to connected clients (DO → SPA) via WS
-			ctx.notify('serviceStatus', { sessionId: String(sessionId), serviceType, status, port: details.port })
+			// Broadcast service status to connected clients (DO → SPA) via WS.
+			// restartAt rides along so a consumer can hold on to a preview URL it
+			// would otherwise tear down on `failed`.
+			ctx.notify('serviceStatus', {
+				sessionId: String(sessionId),
+				serviceType,
+				status,
+				port: details.port,
+				restartAt: details.restartAt,
+				restartAttempt: details.restartAttempt,
+				restartMaxRetries: details.restartMaxRetries,
+			})
 		}
 		return { executor }
 	})
@@ -378,7 +411,10 @@ export const servicePlugin = definePlugin('services')
 	.sessionHook('onSessionClose', async (ctx) => {
 		for (const svcConfig of ctx.pluginConfig.services) {
 			const status = ctx.pluginContext.executor.getStatus(svcConfig.type)
-			if (status === 'ready' || status === 'starting') {
+			// A queued revival outlives the session otherwise: its timer holds the
+			// executor alive and spawns a process into a session that is already gone.
+			const revivalQueued = ctx.pluginContext.executor.hasScheduledRestart(svcConfig.type)
+			if (status === 'ready' || status === 'starting' || revivalQueued) {
 				await ctx.pluginContext.executor.stop(svcConfig.type, ctx.sessionId)
 			}
 		}
@@ -395,7 +431,7 @@ export const servicePlugin = definePlugin('services')
 			createTool({
 				name: 'service_start',
 				description:
-					`Start a stopped or failed session service. Only call this if the session context shows the service is not running — if it is already "ready", you do not need to start it. Available services: ${serviceList}`,
+					`Start a stopped or failed session service. Only call this if the session context shows the service is not running — if it is already "ready", or marked as restarting automatically, you do not need to start it. Available services: ${serviceList}`,
 				input: z.object({
 					serviceType: z.string().describe('Service type identifier'),
 				}),

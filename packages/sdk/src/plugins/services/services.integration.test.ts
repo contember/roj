@@ -15,6 +15,7 @@ import type { ServiceAgentConfig, ServicePluginConfig } from './plugin.js'
 import { PortPool } from './port-pool.js'
 import { buildServiceStatusMessage } from './prompt.js'
 import type { ServiceCommandArgs, ServiceConfig, ServiceCwdArgs, ServiceEntry, ServiceStatus } from './schema.js'
+import type { ServiceStatusChangeDetails } from './service.js'
 import { ServiceExecutor } from './service.js'
 
 // ============================================================================
@@ -931,6 +932,135 @@ describe('services plugin', () => {
 				expect(await spawnCount(path)).toBe(1)
 			} finally {
 				await executor.shutdown()
+				await rm(path, { force: true })
+			}
+		})
+
+		it('a queued revival rides along on the failed status change', async () => {
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: platform.process })
+			const path = marker('event')
+			const config: ServiceConfig = {
+				type: 'event-svc',
+				description: 'crashes once, then stays up',
+				command: crashCommand(path, 1),
+				readyPattern: 'READY',
+				startupTimeoutMs: 5000,
+				restartPolicy: { maxRetries: 3, initialDelayMs: 20 },
+			}
+			const changes: Array<{ status: ServiceStatus; details: ServiceStatusChangeDetails }> = []
+			executor.onStatusChanged = (_s, _t, status, details) => {
+				changes.push({ status, details })
+			}
+
+			try {
+				await executor.start(config, SessionId('s-event'))
+				await waitUntil(() => executor.getStatus('event-svc') === 'ready')
+
+				const failedIndex = changes.findIndex((c) => c.status === 'failed')
+				expect(failedIndex).toBeGreaterThanOrEqual(0)
+				const failed = changes[failedIndex]!
+				expect(failed.details.restartAttempt).toBe(1)
+				expect(failed.details.restartMaxRetries).toBe(3)
+				expect(failed.details.restartAt).toBeGreaterThan(0)
+
+				// The revival's own start must not carry the intent it just honoured.
+				const revivalStart = changes.slice(failedIndex + 1).find((c) => c.status === 'starting')
+				expect(revivalStart).toBeDefined()
+				expect(revivalStart!.details.restartAt).toBeUndefined()
+			} finally {
+				await executor.shutdown()
+				await rm(path, { force: true })
+			}
+		})
+
+		it('the failure that spends the budget carries no revival', async () => {
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: platform.process })
+			const path = marker('terminal')
+			const config: ServiceConfig = {
+				type: 'terminal-svc',
+				description: 'always crashes',
+				command: crashCommand(path, 99),
+				readyPattern: 'READY',
+				startupTimeoutMs: 5000,
+				restartPolicy: { maxRetries: 1, initialDelayMs: 20 },
+			}
+			const failures: ServiceStatusChangeDetails[] = []
+			executor.onStatusChanged = (_s, _t, status, details) => {
+				if (status === 'failed') failures.push(details)
+			}
+
+			try {
+				await executor.start(config, SessionId('s-terminal'))
+				await waitUntilAsync(async () => (await spawnCount(path)) >= 2 && failures.length >= 2)
+				expect(failures[0]?.restartAttempt).toBe(1)
+				expect(failures[1]?.restartAt).toBeUndefined()
+				expect(failures[1]?.restartAttempt).toBeUndefined()
+			} finally {
+				await executor.shutdown()
+				await rm(path, { force: true })
+			}
+		})
+
+		it('session state shows the queued revival and drops it once called off', async () => {
+			const portPool = new PortPool()
+			const config: ServiceConfig = {
+				type: 'reviving',
+				description: 'crashes early, revival queued behind a long delay',
+				// The sleep keeps the exit from beating the executor's close listener.
+				command: 'sleep 0.2; exit 1',
+				restartPolicy: { maxRetries: 3, initialDelayMs: 3000 },
+			}
+			const harness = createServicesHarness({
+				presets: [createServicesPreset([config], ['reviving'], portPool)],
+			})
+			const session = await harness.createSession('test')
+
+			await session.callPluginMethod('services.start', { serviceType: 'reviving' })
+			await waitForServiceStateStatus(session, 'reviving', 'failed')
+
+			const entry = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('reviving')
+			expect(entry?.status).toBe('failed')
+			expect(entry?.restartAt).toBeGreaterThan(Date.now())
+			expect(entry?.restartAttempt).toBe(1)
+			expect(entry?.restartMaxRetries).toBe(3)
+
+			const stopped = await session.callPluginMethod('services.stop', { serviceType: 'reviving' })
+			expect(stopped.ok).toBe(true)
+			await waitForServiceStateStatus(session, 'reviving', 'stopped')
+
+			const after = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('reviving')
+			expect(after?.status).toBe('stopped')
+			expect(after?.restartAt).toBeUndefined()
+			expect(after?.restartAttempt).toBeUndefined()
+		})
+
+		it('closing the session calls off a queued revival', async () => {
+			const portPool = new PortPool()
+			const path = marker('close')
+			const config: ServiceConfig = {
+				type: 'close-svc',
+				description: 'crashes early, revival queued behind a delay',
+				// The sleep keeps the exit from beating the executor's close listener.
+				command: `echo x >> ${path}; sleep 0.2; exit 1`,
+				restartPolicy: { maxRetries: 3, initialDelayMs: 800 },
+			}
+			const harness = createServicesHarness({
+				presets: [createServicesPreset([config], ['close-svc'], portPool)],
+			})
+			const session = await harness.createSession('test')
+
+			try {
+				await session.callPluginMethod('services.start', { serviceType: 'close-svc' })
+				await waitForServiceStateStatus(session, 'close-svc', 'failed')
+				expect(await spawnCount(path)).toBe(1)
+
+				await session.close()
+				// Long enough for the revival to have fired had nothing called it off.
+				await new Promise((r) => setTimeout(r, 1500))
+				expect(await spawnCount(path)).toBe(1)
+			} finally {
 				await rm(path, { force: true })
 			}
 		})
