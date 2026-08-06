@@ -108,6 +108,12 @@ async function waitForServiceStatus(
 		}
 		await new Promise((r) => setTimeout(r, 50))
 	}
+	const seen = (await session.getEventsByType(serviceEvents, 'service_status_changed'))
+		.filter((e) => e.serviceType === serviceType)
+		.map((e) => e.toStatus)
+	throw new Error(
+		`Timed out after ${timeoutMs}ms waiting for '${serviceType}' to reach '${targetStatus}'; saw [${seen.join(', ')}]`,
+	)
 }
 
 /** Wait for the services plugin state slice to reflect a given status for a serviceType */
@@ -123,6 +129,10 @@ async function waitForServiceStateStatus(
 		if (entry?.status === targetStatus) return
 		await new Promise((r) => setTimeout(r, 20))
 	}
+	const actual = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get(serviceType)?.status
+	throw new Error(
+		`Timed out after ${timeoutMs}ms waiting for '${serviceType}' state to be '${targetStatus}'; it is '${actual ?? 'absent'}'`,
+	)
 }
 
 // ============================================================================
@@ -388,7 +398,7 @@ describe('services plugin', () => {
 
 			const events = await session.getEventsByType(serviceEvents, 'service_status_changed')
 			const quickEvents = events.filter((e) => e.serviceType === 'quick')
-			expect(quickEvents.length).toBeGreaterThanOrEqual(1)
+			expect(quickEvents.map((e) => e.toStatus)).toContain('ready')
 		})
 
 		it('agent calls service_status → returns status info', async () => {
@@ -457,7 +467,7 @@ describe('services plugin', () => {
 
 			const events = await session.getEventsByType(serviceEvents, 'service_status_changed')
 			const autoEvents = events.filter((e) => e.serviceType === 'auto-start')
-			expect(autoEvents.length).toBeGreaterThanOrEqual(1)
+			expect(autoEvents.map((e) => e.toStatus)).toContain('ready')
 		})
 
 		it('availableWhen false skips auto-start and explicit start returns an error', async () => {
