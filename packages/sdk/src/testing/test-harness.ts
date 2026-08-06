@@ -1,3 +1,4 @@
+import { rm } from 'node:fs/promises'
 import type { AgentId } from '~/core/agents/schema.js'
 import type { DomainError } from '~/core/errors.js'
 import { MemoryEventStore } from '~/core/events/memory.js'
@@ -76,6 +77,8 @@ export class TestHarness {
 	readonly llmProvider: MockLLMProvider
 	readonly notifications: NotificationCollector
 	readonly sessionManager: SessionManager
+	/** Per-instance scratch dir under /tmp, removed by shutdown(). */
+	private readonly basePath: string
 
 	constructor(options: {
 		presets: Preset[]
@@ -118,6 +121,7 @@ export class TestHarness {
 		}
 
 		const basePath = `/tmp/roj-test-${Math.random().toString(36).slice(2)}`
+		this.basePath = basePath
 		const toolExecutor = new ToolExecutor(silentLogger)
 		const platform = createNodePlatform()
 		const dataFileStore = new SessionFileStore(basePath, undefined, false, platform.fs, 'session')
@@ -177,10 +181,15 @@ export class TestHarness {
 	}
 
 	/**
-	 * Shutdown all sessions.
+	 * Shutdown all sessions and remove the harness's own scratch directory.
+	 *
+	 * The directory is exclusively ours (a per-instance random path under /tmp),
+	 * so nothing else can be relying on it. Idempotent — safe from an afterEach
+	 * that also runs after a failed test.
 	 */
 	async shutdown(): Promise<void> {
 		await this.sessionManager.shutdown()
+		await rm(this.basePath, { recursive: true, force: true })
 	}
 }
 
