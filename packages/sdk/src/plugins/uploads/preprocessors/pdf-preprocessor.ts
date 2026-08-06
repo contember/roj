@@ -20,6 +20,7 @@
  *    layers before the vision call.
  */
 
+import { sleep } from '../../../lib/utils/sleep.js'
 import { dirname } from 'node:path'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
@@ -335,8 +336,4 @@ export class PdfPreprocessor implements Preprocessor {
 		// idempotent for already-seen names.
 		await Promise.all(entries.map(handle))
 	}
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise(resolve => setTimeout(resolve, ms))
 }

@@ -8,6 +8,7 @@ import { Err, Ok } from '~/lib/utils/result.js'
 import type { PreprocessorRegistry } from './preprocessor.js'
 import { generateUploadId, type MessageAttachment, UploadId, type UploadMetadata } from './schema.js'
 import { type PendingUpload, uploadEvents, type UploadsState } from './state.js'
+import { sleep } from '~/lib/utils/sleep.js'
 
 // ============================================================================
 // Notification schemas
@@ -65,10 +66,6 @@ function isAllowedMimeType(mimeType: string): boolean {
 			? mimeType.startsWith(allowed)
 			: mimeType === allowed
 	)
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function formatUploadsForLLM(uploads: PendingUpload[], sessionRoot: string): string {
