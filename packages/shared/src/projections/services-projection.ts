@@ -17,6 +17,14 @@ export interface ServiceEntry {
 	startedAt?: number
 	readyAt?: number
 	stoppedAt?: number
+	/**
+	 * Epoch ms of a queued automatic restart — `failed` with this set means the
+	 * service is down but coming back, not down for good. Cleared by the next
+	 * status change.
+	 */
+	restartAt?: number
+	restartAttempt?: number
+	restartMaxRetries?: number
 }
 
 export interface ServicesProjectionState {
@@ -43,6 +51,10 @@ export function applyEventToServices(state: ServicesProjectionState, event: Proj
 				const updated: ServiceEntry = {
 					...existing,
 					status: event.toStatus,
+					// A queued revival lives only until the next status change.
+					restartAt: event.restartAt,
+					restartAttempt: event.restartAttempt,
+					restartMaxRetries: event.restartMaxRetries,
 				}
 				if (event.toStatus === 'starting') {
 					updated.startedAt = event.timestamp
@@ -70,15 +82,23 @@ export function applyEventToServices(state: ServicesProjectionState, event: Proj
 			let changed = false
 			const newServices = new Map(state.services)
 			for (const [serviceType, entry] of state.services) {
-				if (entry.status === 'starting' || entry.status === 'ready') {
-					newServices.set(serviceType, {
-						...entry,
-						status: 'stopped',
-						port: undefined,
-						stoppedAt: event.timestamp,
-					})
-					changed = true
+				const running = entry.status === 'starting' || entry.status === 'ready'
+				// Any queued revival died with the runtime that held its timer.
+				if (!running && entry.restartAt === undefined) continue
+
+				const updated: ServiceEntry = {
+					...entry,
+					restartAt: undefined,
+					restartAttempt: undefined,
+					restartMaxRetries: undefined,
 				}
+				if (running) {
+					updated.status = 'stopped'
+					updated.port = undefined
+					updated.stoppedAt = event.timestamp
+				}
+				newServices.set(serviceType, updated)
+				changed = true
 			}
 			return changed ? { ...state, services: newServices } : state
 		}
