@@ -14,8 +14,11 @@
  * - instances.archive  — no-op; shutdown the server instead
  */
 
+import { platformMethods } from '@roj-ai/client/platform'
+import type { MethodInput, MethodOutput, PlatformMethodName, PlatformMethods } from '@roj-ai/client/platform'
 import type { Logger, Preset, SessionManager } from '@roj-ai/sdk'
-import { SessionId } from '@roj-ai/sdk'
+import { SessionId, sessionMetadataSchema } from '@roj-ai/sdk'
+import z from 'zod/v4'
 import { randomUUID } from 'node:crypto'
 import { Hono } from 'hono'
 import type { GitInstanceFs } from './git-instance-fs.js'
@@ -68,18 +71,24 @@ export function createPlatformApi(deps: Deps): Hono {
 	return app
 }
 
+const isPlatformMethod = (method: string): method is PlatformMethodName =>
+	Object.hasOwn(platformMethods, method)
+
 async function dispatch(
 	deps: Deps,
 	method: string,
 	input: unknown,
 ): Promise<{ ok: true; value: unknown } | { ok: false; error: { type: string; message: string } }> {
-	const handler = handlers[method]
+	const handler = isPlatformMethod(method) ? handlers[method] : undefined
 	if (!handler) {
 		return { ok: false, error: { type: 'method_not_found', message: `Method not supported in standalone: ${method}` } }
 	}
 
 	try {
-		const value = await handler(deps, input ?? {})
+		// The map is keyed by method, so each handler's input type is its own; the
+		// envelope carries an unvalidated body, which is exactly what the contract
+		// types describe.
+		const value = await (handler as (deps: Deps, input: unknown) => Promise<unknown>)(deps, input ?? {})
 		return { ok: true, value }
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err)
@@ -88,7 +97,26 @@ async function dispatch(
 	}
 }
 
-type Handler = (deps: Deps, input: any) => Promise<unknown>
+/**
+ * A handler for one platform method, typed against the shared contract.
+ *
+ * `MethodInput`/`MethodOutput` come from @roj-ai/client/platform, so renaming a
+ * method or reshaping its payload there is a compile error here instead of a
+ * runtime `method_not_found` or a wrong-shaped JSON body. Two divergences had
+ * already shipped before this was wired up.
+ */
+type Handler<M extends PlatformMethodName> = (
+	deps: Deps,
+	input: MethodInput<PlatformMethods, M>,
+) => Promise<MethodOutput<PlatformMethods, M>>
+
+/**
+ * Partial on purpose: bundles.*, sessions.publish, sessions.usage,
+ * instances.archive and services.getUrl are deliberately unimplemented here and
+ * fall through to `method_not_found`. Partial makes that an explicit gap rather
+ * than a silent one, while still checking every method that IS implemented.
+ */
+type PlatformHandlers = Partial<{ [M in PlatformMethodName]: Handler<M> }>
 
 interface AutoCreateSessionInput {
 	presetId: string
@@ -111,7 +139,7 @@ interface AutoCreateSessionInput {
 async function startSession(
 	deps: Deps,
 	input: { presetId: string; initialPrompt?: string; resourceIds?: string[] },
-): Promise<{ sessionId: string }> {
+): Promise<{ sessionId: string; status: 'active' }> {
 	const sessionId = randomUUID()
 	const workspaceDir = await deps.gitFs.addSessionWorktree(deps.instance.id, sessionId)
 
@@ -144,7 +172,10 @@ async function startSession(
 		}
 	}
 
-	return { sessionId }
+	// Creation is synchronous here — there is no provisioning step to wait on,
+	// so the session is active by the time this returns. The contract's other
+	// value, 'creating', belongs to the CF platform.
+	return { sessionId, status: 'active' }
 }
 
 interface ResolvedResource {
@@ -239,7 +270,7 @@ async function injectRegistryResource(deps: Deps, sessionId: string, resource: R
 	}
 }
 
-const handlers: Record<string, Handler> = {
+const handlers: PlatformHandlers = {
 	'instances.create': async (
 		deps,
 		input: { metadata?: Record<string, unknown>; autoCreateSession?: AutoCreateSessionInput },
@@ -299,10 +330,23 @@ const handlers: Record<string, Handler> = {
 	'sessions.list': async ({ sessionManager }) => {
 		const result = await sessionManager.callManagerMethod('sessions.list', {})
 		if (!result.ok) throw new Error(result.error.message)
-		return result.value as { sessions: unknown[]; total: number }
+		// callManagerMethod is typed Result<unknown>, so the plugin's output schema
+		// does not reach us — validate here rather than assert.
+		const listed = z.object({ sessions: z.array(sessionMetadataSchema) }).parse(result.value)
+		return {
+			sessions: listed.sessions.map(s => ({
+				id: String(s.sessionId),
+				presetId: s.presetId,
+				status: s.status,
+				createdAt: new Date(s.createdAt).toISOString(),
+			})),
+		}
 	},
 
-	'tokens.create': async () => ({ token: '' }),
+	// Standalone has no auth: the token is empty and never checked. expiresAt is
+	// still part of the contract, so hand back a real timestamp rather than
+	// omitting the field and hoping no caller reads it.
+	'tokens.create': async () => ({ token: '', expiresAt: new Date(Date.now() + 3600_000).toISOString() }),
 
 	'resources.create': async (
 		deps,

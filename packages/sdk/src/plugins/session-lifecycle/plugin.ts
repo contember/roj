@@ -12,7 +12,7 @@ import { COMMUNICATOR_ROLE, ORCHESTRATOR_ROLE } from '~/core/agents/agent-roles.
 import { type DomainError, PresetErrors, SessionErrors, ValidationErrors } from '~/core/errors.js'
 import { definePlugin } from '~/core/plugins/index.js'
 import { knownDefinitionNames, unknownOverrideTargets } from '~/core/preset/overrides.js'
-import { SessionId, sessionIdSchema } from '~/core/sessions/schema.js'
+import { SessionId, sessionIdSchema, sessionMetadataSchema } from '~/core/sessions/schema.js'
 import { agentOverridesSchema, getEntryAgentId, sessionEvents, sessionOverridesPatchSchema } from '~/core/sessions/state.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 
@@ -158,7 +158,10 @@ export const sessionLifecyclePlugin = definePlugin('sessions')
 			order: z4.enum(['asc', 'desc']).optional(),
 		}),
 		output: z4.object({
-			sessions: z4.array(z4.unknown()),
+			// The handler returns SessionMetadata[]; z.unknown() used to hide that
+			// from every caller, which is how standalone-server's sessions.list
+			// drifted from the platform contract unnoticed.
+			sessions: z4.array(sessionMetadataSchema),
 			total: z4.number(),
 		}),
 		handler: async (ctx, input) => {
