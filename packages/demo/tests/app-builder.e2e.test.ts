@@ -2,15 +2,16 @@
  * End-to-end test for the App Builder preset over the full @roj-ai/standalone-server
  * HTTP/WS surface.
  *
- * LLM calls are snapshotted with createSnapshotLLMMiddleware — the first run
- * with ANTHROPIC_API_KEY records; subsequent runs replay from disk without a
- * network call. Commit the generated __snapshots__/ directory.
+ * LLM calls are snapshotted with createSnapshotLLMMiddleware. Recording and
+ * replay are explicit so stale snapshots never fall through to a live call.
  *
  * To (re-)record:
- *   ANTHROPIC_API_KEY=sk-... bun test packages/demo/tests/app-builder.e2e.test.ts
+ *   ROJ_E2E_RECORD=1 ANTHROPIC_API_KEY=sk-... bun test packages/demo/tests/app-builder.e2e.test.ts
  *
- * To replay (CI, default):
- *   bun test packages/demo/tests/app-builder.e2e.test.ts
+ * To replay the build turn without network access:
+ *   LIVE_TESTS=1 bun test packages/demo/tests/app-builder.e2e.test.ts
+ *
+ * The default CI command runs only the REST-surface smoke test.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
@@ -32,14 +33,11 @@ const WORKSPACE_DIR = '/tmp/roj-demo-e2e'
 const hasApiKey = !!process.env.ANTHROPIC_API_KEY || !!process.env.OPENROUTER_API_KEY
 const hasSnapshots =
 	existsSync(SNAPSHOTS_DIR) && readdirSync(SNAPSHOTS_DIR).some((f) => f.endsWith('.json'))
-// The build turn needs an explicit opt-in, matching cache-live.test.ts and
-// compaction-live.test.ts. Snapshots on their own are not a safe gate: they are
-// keyed by a hash of the normalized InferenceRequest, so a preset change
-// orphans them and replay hangs until the 120s idle timeout instead of failing
-// fast — which is what the three under __snapshots__/app-builder/ now do. Once
-// they are re-recorded (see the header) this can drop back to
-// `hasApiKey || hasSnapshots`.
-const canRunLiveTurn = process.env.LIVE_TESTS === '1' && hasApiKey
+const recordSnapshots = process.env.ROJ_E2E_RECORD === '1'
+if (recordSnapshots && !hasApiKey) {
+	throw new Error('ROJ_E2E_RECORD=1 requires ANTHROPIC_API_KEY or OPENROUTER_API_KEY')
+}
+const canRunBuildTurn = recordSnapshots || (process.env.LIVE_TESTS === '1' && hasSnapshots)
 
 describe('App Builder e2e', () => {
 	let handle: StandaloneHandle
@@ -74,9 +72,7 @@ describe('App Builder e2e', () => {
 					// Strip session UUIDs and randomly-assigned dev-service ports from
 					// the request before hashing, so snapshots match across runs.
 					normalize: normalizeStripRuntime,
-					// Explicit ROJ_E2E_RECORD=1 to (re-)record; default is strict replay
-					// in CI + auto in dev when snapshots are missing for a new branch.
-					mode: process.env.ROJ_E2E_RECORD === '1' ? 'record' : hasSnapshots ? 'replay' : 'auto',
+					mode: recordSnapshots ? 'record' : 'replay',
 				}),
 			],
 		})
@@ -98,7 +94,7 @@ describe('App Builder e2e', () => {
 		expect(listed.instances[0].instanceId).toBe(handle.instance.id)
 	})
 
-	test.skipIf(!canRunLiveTurn)('session completes a simple build turn', async () => {
+	test.skipIf(!canRunBuildTurn)('session completes a simple build turn', async () => {
 		const session = await client.sessions.create({
 			instanceId: handle.instance.id,
 			presetId: 'app-builder',

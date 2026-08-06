@@ -31,11 +31,9 @@ preview proxy.
 
 ## E2E test
 
-`tests/app-builder.e2e.test.ts` starts the full standalone server on an
-OS-assigned port, creates a session, sends a message, and asserts the
-session reaches idle. LLM calls are snapshotted via
-`createSnapshotLLMMiddleware` — the first run records, subsequent runs
-replay from disk.
+`tests/app-builder.e2e.test.ts` always starts the standalone server and checks
+its REST surface. The LLM-backed build turn is opt-in so the default CI command
+never calls a provider or trusts potentially stale snapshots.
 
 ```bash
 # Record snapshots (first time, or after preset changes)
@@ -43,14 +41,17 @@ ROJ_E2E_RECORD=1 OPENROUTER_API_KEY=sk-or-... bun test packages/demo/tests/
 # or with Anthropic directly
 ROJ_E2E_RECORD=1 ANTHROPIC_API_KEY=sk-ant-... bun test packages/demo/tests/
 
-# Replay (CI, default — no network, strict replay once snapshots exist)
+# Replay the build turn without network access
+LIVE_TESTS=1 bun test packages/demo/tests/
+
+# Default CI: REST-surface smoke test only
 bun test packages/demo/tests/
 ```
 
 Commit `tests/__snapshots__/app-builder/` so CI can replay without an API key.
 When the preset prompt/tools/model change, re-record with `ROJ_E2E_RECORD=1`
-(or just delete the affected snapshot files and let the next run
-auto-record against the live API).
+and a provider key. Replay is strict: a missing snapshot fails instead of
+falling through to a live provider call.
 
 ### How deterministic is it?
 
