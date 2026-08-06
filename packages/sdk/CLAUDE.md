@@ -2,8 +2,6 @@
 
 Bun-based agent server: LLM sessions, plugin architecture, event sourcing.
 
-**Not linted by Biome** (excluded in root biome.json). Uses its own conventions.
-
 ## Commands
 
 ```bash
