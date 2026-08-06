@@ -56,6 +56,20 @@ export interface StandaloneHandle {
 	shutdown(): Promise<void>
 }
 
+export async function shutdownFromSignal(
+	shutdown: () => Promise<void>,
+	reportError: (message: string, error: unknown) => void = (message, error) => console.error(message, error),
+	exit: (code: number) => void = (code) => process.exit(code),
+): Promise<void> {
+	try {
+		await shutdown()
+	} catch (error) {
+		reportError('Shutdown failed', error)
+	} finally {
+		exit(0)
+	}
+}
+
 export async function startStandaloneServer(options: StartStandaloneOptions): Promise<StandaloneHandle> {
 	const envConfig = loadConfig()
 	const config: Config = options.config ? { ...envConfig, ...options.config } : envConfig
@@ -199,14 +213,10 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 	}
 
 	process.on('SIGINT', () => {
-		void shutdown()
-			.catch((err) => console.error('Shutdown failed', err))
-			.finally(() => process.exit(0))
+		void shutdownFromSignal(shutdown)
 	})
 	process.on('SIGTERM', () => {
-		void shutdown()
-			.catch((err) => console.error('Shutdown failed', err))
-			.finally(() => process.exit(0))
+		void shutdownFromSignal(shutdown)
 	})
 
 	return { config, logger, instance, port: server.port ?? config.port, sessionManager, shutdown }
@@ -255,4 +265,3 @@ function startBunServer(
 		websocket: wsHandlers ?? { open() {}, close() {}, message() {} },
 	})
 }
-

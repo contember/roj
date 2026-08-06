@@ -33,6 +33,20 @@ export interface ServerHandle {
 	shutdown(): Promise<void>
 }
 
+export async function shutdownFromSignal(
+	shutdown: () => Promise<void>,
+	reportError: (message: string, error: unknown) => void = (message, error) => console.error(message, error),
+	exit: (code: number) => void = (code) => process.exit(code),
+): Promise<void> {
+	try {
+		await shutdown()
+	} catch (error) {
+		reportError('Shutdown failed', error)
+	} finally {
+		exit(0)
+	}
+}
+
 // ============================================================================
 // startServer
 // ============================================================================
@@ -115,14 +129,10 @@ export async function startServer(options: StartServerOptions): Promise<ServerHa
 	}
 
 	process.on('SIGINT', () => {
-		void shutdown()
-			.catch((err) => console.error('Shutdown failed', err))
-			.finally(() => process.exit(0))
+		void shutdownFromSignal(shutdown)
 	})
 	process.on('SIGTERM', () => {
-		void shutdown()
-			.catch((err) => console.error('Shutdown failed', err))
-			.finally(() => process.exit(0))
+		void shutdownFromSignal(shutdown)
 	})
 
 	return { config, logger, shutdown }
