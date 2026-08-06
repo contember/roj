@@ -32,9 +32,16 @@ const WORKSPACE_DIR = '/tmp/roj-demo-e2e'
 const hasApiKey = !!process.env.ANTHROPIC_API_KEY || !!process.env.OPENROUTER_API_KEY
 const hasSnapshots =
 	existsSync(SNAPSHOTS_DIR) && readdirSync(SNAPSHOTS_DIR).some((f) => f.endsWith('.json'))
-const canRunLiveTurn = hasApiKey || hasSnapshots
+// The build turn needs an explicit opt-in, matching cache-live.test.ts and
+// compaction-live.test.ts. Snapshots on their own are not a safe gate: they are
+// keyed by a hash of the normalized InferenceRequest, so a preset change
+// orphans them and replay hangs until the 120s idle timeout instead of failing
+// fast — which is what the three under __snapshots__/app-builder/ now do. Once
+// they are re-recorded (see the header) this can drop back to
+// `hasApiKey || hasSnapshots`.
+const canRunLiveTurn = process.env.LIVE_TESTS === '1' && hasApiKey
 
-describe.skip('App Builder e2e', () => {
+describe('App Builder e2e', () => {
 	let handle: StandaloneHandle
 	let client: ReturnType<typeof createRojClient>
 
