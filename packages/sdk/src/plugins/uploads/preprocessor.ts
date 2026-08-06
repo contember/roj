@@ -9,6 +9,7 @@
  */
 
 import type { FileStore } from '~/core/file-store/types.js'
+import type { InferenceContext } from '~/core/llm/provider.js'
 import type { Result } from '~/lib/utils/result.js'
 
 // ============================================================================
@@ -21,6 +22,27 @@ import type { Result } from '~/lib/utils/result.js'
 export interface PreprocessorContext {
 	/** FileStore scoped to upload directory for writing derived files */
 	files: FileStore
+	/**
+	 * Cancels subprocesses, inference calls, and derived-file generation.
+	 * Implementations should settle promptly; the host stops awaiting after a bounded grace period.
+	 */
+	signal?: AbortSignal
+	/** Optional metadata required to pass cancellation through LLM providers. */
+	inferenceContext?: Omit<InferenceContext, 'signal'>
+}
+
+const NEVER_ABORTED_SIGNAL = new AbortController().signal
+
+export function getPreprocessingSignal(ctx: PreprocessorContext): AbortSignal {
+	return ctx.signal ?? NEVER_ABORTED_SIGNAL
+}
+
+export function preprocessingAbortError(signal: AbortSignal): Error {
+	return signal.reason instanceof Error ? signal.reason : new Error('Processing cancelled')
+}
+
+export function throwIfPreprocessingAborted(signal: AbortSignal): void {
+	if (signal.aborted) throw preprocessingAbortError(signal)
 }
 
 // ============================================================================
