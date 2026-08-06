@@ -12,7 +12,7 @@ import type { Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import { isDomainError } from '~/core/errors.js'
-import type { AppEnv } from '../app.js'
+import type { AppEnv } from '../context.js'
 
 /**
  * Global error handler for Hono app.

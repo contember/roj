@@ -17,8 +17,8 @@ import { generateMessageId } from '~/plugins/mailbox/schema.js'
 import { mailboxEvents } from '~/plugins/mailbox/state.js'
 import type { Logger } from '../../lib/logger/logger.js'
 import type { WorkerSubEvent } from './definition.js'
-import type { EmitEvent } from './plugin.js'
-import { workerEvents } from './plugin.js'
+import type { EmitEvent } from './state.js'
+import { workerEvents } from './state.js'
 import { WorkerId } from './worker.js'
 
 // ============================================================================

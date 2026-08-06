@@ -9,7 +9,7 @@
 import { parseError, sessionNotFound } from '../responses.js'
 import { Hono } from 'hono'
 import { SessionId } from '~/core/sessions/schema.js'
-import { type AppContext, type AppEnv, getServices } from '../app.js'
+import { type AppContext, type AppEnv, getServices } from '../context.js'
 
 // ============================================================================
 // Routes

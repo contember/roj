@@ -1,59 +1,17 @@
 import z from 'zod/v4'
 import { agentIdSchema } from '~/core/agents/schema.js'
 import { ValidationErrors } from '~/core/errors.js'
-import { createEventsFactory } from '~/core/events/types.js'
 import type { BaseEvent } from '~/core/events/types.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { createTool, type ToolDefinition } from '~/core/tools/definition.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { Logger } from '../../lib/logger/logger.js'
 import { WorkerContextImpl } from './context.js'
+import { workerEvents } from './state.js'
+import type { EmitEvent } from './state.js'
 import type { WorkerCommandDefinition, WorkerDefinition, WorkerSubEvent } from './definition.js'
 import { generateWorkerId, type WorkerEntry, WorkerId, type WorkerId as WorkerIdType, workerIdSchema } from './worker.js'
 
-export const workerEvents = createEventsFactory({
-	events: {
-		worker_started: z.object({
-			workerId: workerIdSchema,
-			agentId: agentIdSchema,
-			workerType: z.string(),
-			config: z.unknown(),
-		}),
-		worker_sub_event: z.object({
-			workerId: workerIdSchema,
-			workerType: z.string(),
-			subEvent: z.record(z.string(), z.unknown()).and(z.object({
-				type: z.string(),
-			})),
-		}),
-		worker_status_changed: z.object({
-			workerId: workerIdSchema,
-			fromStatus: z.enum(['running', 'paused', 'completed', 'failed', 'cancelled']),
-			toStatus: z.enum(['running', 'paused', 'completed', 'failed', 'cancelled']),
-			reason: z.string().optional(),
-		}),
-		worker_completed: z.object({
-			workerId: workerIdSchema,
-			result: z.object({
-				status: z.string(),
-				resultsPath: z.string().optional(),
-				summary: z.string(),
-				data: z.unknown().optional(),
-			}),
-		}),
-		worker_failed: z.object({
-			workerId: workerIdSchema,
-			error: z.string(),
-			resumable: z.boolean(),
-		}),
-	},
-})
-
-export type WorkerStartedEvent = (typeof workerEvents)['Events']['worker_started']
-export type WorkerSubEventEmittedEvent = (typeof workerEvents)['Events']['worker_sub_event']
-export type WorkerStatusChangedEvent = (typeof workerEvents)['Events']['worker_status_changed']
-export type WorkerCompletedEvent = (typeof workerEvents)['Events']['worker_completed']
-export type WorkerFailedEvent = (typeof workerEvents)['Events']['worker_failed']
 
 /**
  * Session-wide worker configuration.
@@ -75,10 +33,6 @@ export interface WorkerAgentConfig {
 // Types moved from executor.ts
 // ============================================================================
 
-/**
- * Event emitter callback - emits events without sessionId (added automatically).
- */
-export type EmitEvent = (event: Omit<BaseEvent<string>, 'sessionId'>) => Promise<void>
 
 /**
  * Represents a running worker instance.
