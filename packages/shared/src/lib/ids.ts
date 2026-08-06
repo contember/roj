@@ -2,7 +2,11 @@
  * Branded ID types and constructors.
  *
  * Uses Zod brands for structural compatibility with agent-server types.
- * These are the canonical definitions — other packages import from here.
+ *
+ * NOT canonical: @roj-ai/sdk declares its own SessionId/AgentId/ChatMessageId
+ * (core/sessions/schema.ts, core/agents/schema.ts) and is the side the domain
+ * vocabulary is migrating to — see sdk/src/index.ts. The brands are structural,
+ * so the two sets stay assignable, but nothing asserts that they agree.
  */
 import z from 'zod/v4'
 
