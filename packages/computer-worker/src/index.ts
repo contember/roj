@@ -2,8 +2,9 @@
  * Durable Object harness: the roj SDK running inside a Worker isolate,
  * against a @cloudflare/computer workspace filesystem.
  *
- * `POST /run` boots the SDK through its normal composition root, runs a
+ * `GET /run` boots the SDK through its normal composition root, runs a
  * two-agent session on a scripted LLM, and reports what landed in the workspace.
+ * `GET /bench` measures how session replay scales with event-log length.
  */
 
 import { Workspace } from '@cloudflare/computer'
@@ -15,6 +16,7 @@ import type { Platform } from '@roj-ai/sdk/platform'
 
 type BootedSystem = ReturnType<typeof createSystemFromServices>
 import { DurableObject } from 'cloudflare:workers'
+import { runBench } from './bench.js'
 import { NOTE_PATH, scriptedHandler } from './mock-llm.js'
 import { isolatePreset } from './preset.js'
 
@@ -108,6 +110,20 @@ export class RojAgentDO extends DurableObject<Env> {
 		})
 	}
 
+	async bench(counts: number[]): Promise<Response> {
+		const { services } = this.#boot()
+		try {
+			const result = await runBench({ services, platform: this.#platform, presetId: isolatePreset.id, counts })
+			return Response.json({ ok: true, ...result })
+		} catch (error) {
+			return Response.json({
+				ok: false,
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			}, { status: 500 })
+		}
+	}
+
 	/** Mirrors testing/wait-helpers, which can't be imported here — it pulls in node:fs. */
 	async #waitForIdle(session: Session, timeoutMs = 20_000): Promise<boolean> {
 		const isIdle = () => {
@@ -172,10 +188,17 @@ export class RojAgentDO extends DurableObject<Env> {
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url)
-		if (url.pathname !== '/run') {
-			return new Response('GET /run?message=...\n', { status: 404 })
-		}
 		const stub = env.AGENT.get(env.AGENT.idFromName('smoke'))
-		return stub.run(url.searchParams.get('message') ?? 'Please write a note file.')
+		if (url.pathname === '/run') {
+			return stub.run(url.searchParams.get('message') ?? 'Please write a note file.')
+		}
+		if (url.pathname === '/bench') {
+			const counts = (url.searchParams.get('counts') ?? '100,500,1000,5000,10000').split(',').map(Number)
+			if (counts.some((count) => !Number.isSafeInteger(count) || count <= 0)) {
+				return new Response('counts must be positive integers\n', { status: 400 })
+			}
+			return stub.bench(counts)
+		}
+		return new Response('GET /run?message=... | GET /bench?counts=100,500\n', { status: 404 })
 	},
 } satisfies ExportedHandler<Env>
