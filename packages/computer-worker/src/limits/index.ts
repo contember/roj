@@ -16,6 +16,8 @@ export const LIMIT_PROBES: Record<string, () => Promise<LimitProbe>> = {
 	payload: async () => (await import('./payload.js')).payloadProbe,
 	/** What one DO takes concurrently — parallel agents, live sessions, execs. */
 	concurrency: async () => (await import('./concurrency.js')).concurrencyProbe,
+	/** Whether the timer-driven agent loop survives a request returning. */
+	lifecycle: async () => (await import('./lifecycle.js')).lifecycleProbe,
 }
 
 export const LIMIT_PROBE_NAMES = Object.keys(LIMIT_PROBES)
