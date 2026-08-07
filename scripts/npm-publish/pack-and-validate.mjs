@@ -100,15 +100,24 @@ const collectTargets = (value, result = []) => {
 	return result
 }
 
-const findCompiledTests = async (dir, relative = '') => {
+/**
+ * Test artifacts anywhere in the published tree.
+ *
+ * Scanning only `dist` was how 63 `.test.ts` sources kept shipping after the
+ * compiled ones were excluded: `files` also ships `src` (for declarationMap and
+ * sourceMap), so the sources walked straight past a dist-only check. Sources
+ * count as much as compiled output — hence `.ts`/`.tsx` in the pattern.
+ */
+const findTestArtifacts = async (dir, relative = '') => {
 	if (!(await pathExists(dir))) return []
 	const found = []
 	for (const entry of await readdir(dir, { withFileTypes: true })) {
 		const entryRelative = path.join(relative, entry.name)
 		if (entry.isDirectory()) {
+			if (entry.name === 'node_modules') continue
 			if (entry.name === '__tests__') found.push(entryRelative)
-			else found.push(...await findCompiledTests(path.join(dir, entry.name), entryRelative))
-		} else if (/\.(?:test|spec)\.(?:[cm]?js|jsx|d\.ts)(?:\.map)?$/.test(entry.name)) {
+			else found.push(...await findTestArtifacts(path.join(dir, entry.name), entryRelative))
+		} else if (/\.(?:test|spec)\.(?:[cm]?[jt]sx?|d\.ts)(?:\.map)?$/.test(entry.name)) {
 			found.push(entryRelative)
 		}
 	}
@@ -137,9 +146,9 @@ for (const entry of packed) {
 		}
 	}
 
-	const compiledTests = await findCompiledTests(path.join(installedDir, 'dist'))
-	if (compiledTests.length > 0) {
-		throw new Error(`${entry.name} ships compiled tests:\n${compiledTests.map((file) => `  ${file}`).join('\n')}`)
+	const testArtifacts = await findTestArtifacts(installedDir)
+	if (testArtifacts.length > 0) {
+		throw new Error(`${entry.name} ships tests:\n${testArtifacts.map((file) => `  ${file}`).join('\n')}`)
 	}
 
 	for (const [binName, binTarget] of Object.entries(manifest.bin ?? {})) {
