@@ -17,6 +17,9 @@ function toBinding(value: unknown): SQLQueryBindings {
 	throw new Error(`Unsupported SQL binding: ${String(value)}`)
 }
 
+/** A Durable Object rejects a statement binding more than this; bun:sqlite does not. */
+const DO_MAX_SQL_VARIABLES = 100
+
 /** bun:sqlite standing in for a Durable Object's SQL surface. */
 class FakeSqlStorage implements SqlStorageHost {
 	private readonly db = new Database(':memory:')
@@ -27,6 +30,11 @@ class FakeSqlStorage implements SqlStorageHost {
 	readonly sql: SqlStorageLike = {
 		exec: <Row extends object>(query: string, ...bindings: unknown[]): SqlCursorLike<Row> => {
 			if (this.failOn?.(query)) throw new Error('injected SQL failure')
+			// Enforced here because bun:sqlite allows ~32k, so an over-bound statement
+			// would pass in tests and fail only on a real Durable Object.
+			if (bindings.length > DO_MAX_SQL_VARIABLES) {
+				throw new Error(`too many SQL variables at offset ${bindings.length}: SQLITE_ERROR`)
+			}
 			const rows = this.db.query<Row, SQLQueryBindings[]>(query).all(...bindings.map(toBinding))
 			return { toArray: () => rows }
 		},

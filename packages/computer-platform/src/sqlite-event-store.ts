@@ -28,6 +28,9 @@ export interface SqlStorageHost {
 const EVENTS_TABLE = 'roj_events'
 const METADATA_TABLE = 'roj_session_metadata'
 
+/** A Durable Object binds at most 100 parameters per statement, and a row costs three. */
+const EVENTS_PER_INSERT = 33
+
 /** `seq` is the 0-based event index the EventStore contract reports as fromIndex/toIndex. */
 interface EventRow {
 	seq: number
@@ -154,11 +157,15 @@ export class SqliteEventStore extends BaseEventStore {
 			try {
 				// exec is synchronous, so claiming the sequence and inserting cannot interleave.
 				const firstSeq = this.lastSeq(sessionId) + 1
-				const tuples = events.map(() => '(?, ?, ?)').join(', ')
-				const bindings = events.flatMap((event, offset) => [sessionId, firstSeq + offset, JSON.stringify(event)])
 
-				// One statement, so a batch lands whole or not at all.
-				this.storage.sql.exec(`INSERT INTO ${EVENTS_TABLE} (session_id, seq, payload) VALUES ${tuples}`, ...bindings)
+				// No await between chunks, so a host that commits a synchronous run
+				// together — a Durable Object does — still lands the batch whole.
+				for (let offset = 0; offset < events.length; offset += EVENTS_PER_INSERT) {
+					const chunk = events.slice(offset, offset + EVENTS_PER_INSERT)
+					const tuples = chunk.map(() => '(?, ?, ?)').join(', ')
+					const bindings = chunk.flatMap((event, index) => [sessionId, firstSeq + offset + index, JSON.stringify(event)])
+					this.storage.sql.exec(`INSERT INTO ${EVENTS_TABLE} (session_id, seq, payload) VALUES ${tuples}`, ...bindings)
+				}
 
 				await this.updateMetadataFromEvents(sessionId, events)
 			} catch (error) {
