@@ -7,6 +7,7 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { SDK_VERSION } from '~/info.js'
+import type { PluginProfile } from '../../bootstrap.js'
 import type { AppEnv, AppServices } from './context.js'
 import { getServices } from './context.js'
 import { createBearerAuth } from './middleware/bearer-auth.js'
@@ -23,8 +24,11 @@ export { getServices } from './context.js'
 
 /**
  * Creates the Hono application with all middleware and routes.
+ *
+ * Accepts either profile — `AppServices<'full'>` and `AppServices<'isolate'>`
+ * both widen to `AppServices<PluginProfile>`.
  */
-export function createApp(services: AppServices): Hono<AppEnv> {
+export function createApp(services: AppServices<PluginProfile>): Hono<AppEnv> {
 	const app = new Hono<AppEnv>()
 
 	// Middleware

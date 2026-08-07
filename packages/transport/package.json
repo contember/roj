@@ -28,6 +28,11 @@
 			"types": "./dist/platform/bun.d.ts",
 			"import": "./dist/platform/bun.js",
 			"default": "./dist/platform/bun.js"
+		},
+		"./workers": {
+			"types": "./dist/platform/workers.d.ts",
+			"import": "./dist/platform/workers.js",
+			"default": "./dist/platform/workers.js"
 		}
 	},
 	"files": [
