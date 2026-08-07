@@ -21,6 +21,7 @@ import { runBench } from './bench.js'
 import type { BenchResult } from './bench.js'
 import { createDoTransport } from './do-transport.js'
 import type { DoTransport } from './do-transport.js'
+import { LIMIT_PROBES, LIMIT_PROBE_NAMES } from './limits/index.js'
 import { NOTE_PATH, scriptedHandler } from './mock-llm.js'
 import { isolatePreset } from './preset.js'
 import { runShellProbes } from './shell-probe.js'
@@ -226,6 +227,28 @@ export class RojAgentDO extends DurableObject<Env> {
 		}
 	}
 
+	/** Runs one probe from src/limits/ — see LIMIT_PROBES for the roster. */
+	async limits(name: string, query: string): Promise<Response> {
+		const load = LIMIT_PROBES[name]
+		if (!load) {
+			return Response.json({ ok: false, error: `unknown probe '${name}'`, probes: LIMIT_PROBE_NAMES }, { status: 404 })
+		}
+		try {
+			const probe = await load()
+			const result = await probe({
+				platform: this.#platform,
+				workspace: this.#workspace,
+				ctx: this.ctx,
+				boot: () => this.#boot(),
+				backend: SHELL_BACKEND,
+				params: new URLSearchParams(query),
+			})
+			return Response.json({ ok: true, probe: name, result })
+		} catch (error) {
+			return Response.json({ ok: false, probe: name, ...describeError(error) }, { status: 500 })
+		}
+	}
+
 	async shell(command: string | null): Promise<Response> {
 		try {
 			return Response.json({ ok: true, ...await runShellProbes({ platform: this.#platform, workspace: this.#workspace, backend: SHELL_BACKEND, command }) })
@@ -388,8 +411,18 @@ export default {
 		if (url.pathname === '/git') {
 			return stub.git()
 		}
+		if (url.pathname === '/limits') {
+			return Response.json({ probes: LIMIT_PROBE_NAMES })
+		}
+		if (url.pathname.startsWith('/limits/')) {
+			// Each probe gets its own DO, so one that OOMs or fills storage cannot
+			// poison the measurements of the next.
+			const name = url.pathname.slice('/limits/'.length)
+			const probeStub = env.AGENT.get(env.AGENT.idFromName(`limits:${name}`))
+			return probeStub.limits(name, url.search)
+		}
 		if (url.pathname === '/') {
-			return new Response('GET /run?message=... | GET /bench?counts=100,500&stores=sqlite,file | GET /shell?cmd=... | GET /git\n', { status: 404 })
+			return new Response('GET /run?message=... | GET /bench?counts=100,500&stores=sqlite,file | GET /shell?cmd=... | GET /git | GET /limits\n', { status: 404 })
 		}
 		// Everything else is the SDK's own transport surface: /rpc, /health, /status, /sessions/*, /ws.
 		return stub.fetch(request)
