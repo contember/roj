@@ -5,6 +5,7 @@
 		{ "path": "./transport" },
 		{ "path": "./shared" },
 		{ "path": "./sdk" },
+		{ "path": "./computer-platform" },
 		{ "path": "./client" },
 		{ "path": "./client-react" },
 		{ "path": "./debug" },

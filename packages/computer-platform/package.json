@@ -1,0 +1,42 @@
+{
+	"name": "@roj-ai/computer-platform",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		}
+	},
+	"files": [
+		"src",
+		"dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/contember/roj.git",
+		"directory": "packages/computer-platform"
+	},
+	"homepage": "https://github.com/contember/roj/tree/main/packages/computer-platform#readme",
+	"bugs": {
+		"url": "https://github.com/contember/roj/issues"
+	},
+	"scripts": {
+		"build": "tsc",
+		"type-check": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@cloudflare/computer": "0.1.1",
+		"@roj-ai/sdk": "workspace:*"
+	},
+	"devDependencies": {
+		"@types/node": "*",
+		"typescript": "^5.7.2"
+	}
+}
