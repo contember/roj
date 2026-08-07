@@ -26,9 +26,11 @@ shelling out has to move, be dropped, or be routed to a container.
 | 1 — plugin profiles | **done** | `bootstrap(..., { pluginProfile: 'isolate' })` |
 | 2 — SqliteEventStore | **done** | Wins on writes, not on reads — see below |
 | 3 — `execFile` over shell | **done** | `spawn` deliberately still ENOSYS |
-| 4 — git | in flight | Optional `git` port on `Platform` |
-| 5 — transport in the DO | SDK half done | Workers WebSocket platform landed; DO wiring in flight |
-| 6 — roj-platform | blocked | Needs the target-shape decision |
+| 4 — git | **done** | Optional `git` port on `Platform` |
+| 5 — transport in the DO | **done** | Workers WebSocket platform + DO wiring, hibernation proven |
+| 6 — roj-platform | deferred | Shape decided; integration deliberately not started |
+| 7 — limits | in flight | What standalone roj costs a Worker, and where it stops |
+| 8 — scheduler port | next | The agent loop's `setTimeout` has no durability on CF |
 
 ## Phase 0 — measured, verdict: go
 
@@ -114,15 +116,25 @@ Wiring took four things, one of them undocumented upstream:
 still needs the container backend or a rewrite. Full probe results are in the
 harness README.
 
-## Phase 4 — git (in flight)
+## Phase 4 — git
 
-**Decided:** `git` becomes an *optional* capability on `Platform` (`git?:
-GitClient`). Uniform with `fs` and `process`, hosts that cannot do git omit it,
-and `isomorphic-git` lands only in `@roj-ai/computer-platform`.
+`git` is an *optional* capability on `Platform` (`git?: GitClient`). Uniform with
+`fs` and `process`; hosts that cannot do git omit it. `git-status` reads the port
+and degrades quietly when it is absent, so it moved back into the isolate
+profile. `bun-platform` is unchanged — the point of the `?`.
 
-`git-status` is rewritten against the port and must degrade cleanly when it is
-absent — no warn loop, no throwing — and stay byte-identical in behaviour for Bun
-hosts, which have no port.
+The port has four methods, each derived from a call `git-status` actually makes,
+not from what git can do: `status`, `log`, `countAhead`, `defaultBranch`.
+
+Two corrections to what this plan originally claimed:
+
+- **The new dependency is not `isomorphic-git`.** It is already bundled inside
+  `@cloudflare/computer`; what `@roj-ai/computer-platform` actually pulls in is
+  `@platformatic/vfs`.
+- **`defaultBranch` can never answer in an isolate.** computer's `symbolic-ref`
+  accepts only `HEAD`, so `refs/remotes/origin/HEAD` exits 129. The port returns
+  `undefined` for "unknown" and the caller keeps its own fallback, rather than
+  inventing an answer.
 
 `snapshotting` uses the `jj` binary and has no equivalent. It stays out.
 
@@ -145,31 +157,96 @@ Two findings worth keeping:
   a 101 carrying the client half of a `WebSocketPair`, not a boolean. It is dead
   code, implemented by no platform including Bun.
 
-**DO half in flight.** Mounting `createApp`, the upgrade route, and forwarding
-`webSocketMessage`/`Close`/`Error` into the handlers.
+**DO half done.** `createDoTransport` mounts `createApp`, upgrades `/ws` before
+`acceptWebSocket`, and forwards `webSocketMessage`/`Close`/`Error` into the
+handlers. `restore(ctx.getWebSockets())` runs in the factory, and a socket
+opened before an isolate eviction still receives notifications after it.
+
+Four findings about `createApp` under workerd, none of them blocking:
+
+- `node:path` is imported at module scope; the app loads only because of
+  `nodejs_compat`.
+- Upload and resource routes mount unconditionally, so under the isolate profile
+  they fail at request time rather than 404.
+- `/status` under-reports after eviction — `getStats` walks in-memory sessions only.
+- Without an `agentToken`, `/rpc` is open.
 
 Open behaviour question, still open: an in-flight LLM stream does not survive DO
 eviction. Event sourcing restores state, not a half-finished inference. Either
 hold the DO with a WebSocket, or make inference resumable.
 
-## Phase 6 — roj-platform (blocked)
+## Phase 6 — roj-platform (deferred)
 
 Today: `RojProjectDO` → `SandboxClient` → HTTP RPC → E2B agent server. The client
 is typed against `@roj-ai/sdk/rpc`, so the RPC surface is already the contract;
 the move is to implement it in-process instead of over the network.
 
-**Blocked on the target-shape decision below.**
+**Shape decided: routed per agent type.** An agent that needs the full power of a
+container keeps running on E2B; one that fits an isolate takes the cheaper DO
+path. So this is a hybrid, but the selector is the agent type rather than a
+per-capability split, and neither backend has to grow into the other.
+
+**Integration deliberately not started.** The current subject is standalone roj
+inside a Worker and where it stops — Phase 7.
+
+## Phase 7 — limits
+
+What one Worker costs roj, measured rather than quoted. `/limits/<name>` routes
+to one probe per file under `packages/computer-worker/src/limits/`, each on its
+own DO so a probe that OOMs or fills storage cannot poison the next.
+
+Settled so far, all locally and without a deploy:
+
+- **Script size: 7.2 MB raw / 1.57 MB gzip.** Fits the 10 MB paid ceiling with
+  room, and even the 3 MB free one.
+- **Startup CPU: ~103 ms of the 400 ms budget** (`wrangler check startup`).
+  Attributed by difference across three minimal Workers: baseline 23.5 ms, plus
+  ~55 ms for `@roj-ai/sdk` (1.1 MB) and ~23 ms for `@cloudflare/computer`
+  (5.9 MB). Bytes do not predict startup — module-scope work does, and the SDK's
+  is zod schema construction. Cloudflare's CPU differs from a dev box, so treat
+  this as a magnitude, not as headroom.
+
+## Phase 8 — scheduler port
+
+`Agent.scheduleProcessing` re-enters through `setTimeout` (500 ms debounce), and
+nothing in the harness or the transport calls `waitUntil` or sets an alarm. A
+Worker keeps an isolate alive for a request in flight, a pending `waitUntil`, or
+an attached non-hibernated socket — a bare timer buys none of those. Locally the
+loop still finishes, because a dev server does not evict; that is exactly the
+class of bug that only appears in production.
+
+The SDK's timers split cleanly in two:
+
+| Class | Sites | Needs a port? |
+|---|---|---|
+| Timeout inside a call in flight | `anthropic`/`openrouter` fetch abort, `retry.ts` backoff sleep, `workers` 5 s shutdown race | No — the invocation is alive because something awaits it |
+| "Wake me later" | `agent.debounceTimer`, `agent.errorRetryTimer`, `agents.scheduleSupervisionTick`, `git-status` poll interval | **Yes** |
+
+Every one of the four in the second class is *wake this agent and let it
+recompute*, not *run this closure*: they call `continue()`, `scheduleProcessing()`,
+`trigger(agentId)` and `tick()` respectively, and none carries data in its
+closure. So the port does not have to serialise anything.
+
+**Decided shape:**
+
+```ts
+export interface Scheduler {
+	/** Wake `key` after `delayMs`. Replaces any pending wake for it. */
+	wake(key: string, delayMs: number): Promise<void>
+	cancel(key: string): Promise<void>
+}
+```
+
+Bun implements it with `setTimeout` and behaves as it does today. The CF
+implementation sets a DO alarm; the alarm handler boots and re-enters the keyed
+agent, which is what makes it survive eviction.
 
 ## Open decisions
 
-**Target shape.** Replace E2B outright, or run a hybrid — isolate for filesystem
-and tools, container backend for `npm install` and dev servers. Hybrid is what
-computer is designed for and keeps `services` alive, but means operating both.
-Outright replacement is simpler and drops every process-dependent plugin. This
-gates Phase 6 and decides whether the `spawn` shim is worth building.
-
 **`spawn` shim.** A `ChildProcess`-shaped wrapper over exec handles would let
-`services` run in an isolate. Only worth it under outright replacement.
+`services` run in an isolate. Under per-agent-type routing an agent that needs
+long-running processes can simply be routed to E2B instead, so this is now a
+convenience rather than a prerequisite.
 
 ## Upstream issues to file
 
