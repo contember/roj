@@ -51,6 +51,7 @@ import type { Logger } from '../../lib/logger/logger.js'
 import type { SessionContext } from '../sessions/context.js'
 import type { SessionStore } from '../sessions/session-store.js'
 import type { SessionState } from '../sessions/state.js'
+import { resolveAgentOverrides } from '../sessions/state.js'
 import type { SessionEnvironment, ToolExecutor } from '../tools/index.js'
 import type { AgentContext } from './context.js'
 import { sanitizeLLMResponse } from './response-sanitizer.js'
@@ -198,6 +199,22 @@ export class Agent {
 	 */
 	get state(): AgentState | null {
 		return this.store.getAgentState(this.id)
+	}
+
+	/**
+	 * Model for the next inference: the session override if one is set, else the
+	 * model from the preset definition.
+	 *
+	 * Resolved per inference rather than frozen at construction so that changing
+	 * the override applies to agents that are already running. Applying it in
+	 * `Session.getAgentConfig()` instead would only reach agents created after the
+	 * change, and catching up the rest would mean rebuilding live Agent instances
+	 * mid-turn — abort controllers, debounce timers and mailbox state included.
+	 */
+	private resolveModel(): ModelId {
+		const definitionName = this.state?.definitionName
+		if (definitionName === undefined) return this.config.model
+		return resolveAgentOverrides(this.store.getState(), definitionName).model ?? this.config.model
 	}
 
 	// ============================================================================
@@ -449,7 +466,7 @@ export class Agent {
 		const cachedMessages = applyCacheBreakpoint(messages, extraMessages.length, this.config.cacheTtl, agentState.preamble.length)
 
 		const request: InferenceRequest = {
-			model: this.config.model,
+			model: this.resolveModel(),
 			systemPrompt: this.buildSystemPrompt(),
 			messages: cachedMessages,
 			tools: this.tools.size > 0 ? [...this.tools.values()] : undefined,
@@ -628,7 +645,7 @@ export class Agent {
 
 		// 5. LLM inference (with retry)
 		const request: InferenceRequest = {
-			model: this.config.model,
+			model: this.resolveModel(),
 			systemPrompt: this.buildSystemPrompt(),
 			messages: cachedMessages,
 			tools: this.tools.size > 0 ? [...this.tools.values()] : undefined,

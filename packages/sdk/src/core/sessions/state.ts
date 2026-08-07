@@ -6,6 +6,7 @@ import { agentEvents } from '~/core/agents/state.js'
 import { contextEvents } from '~/core/context/state.js'
 import { createEventsFactory } from '~/core/events/types'
 import type { DomainEvent } from '~/core/events/types.js'
+import { modelIdSchema } from '~/core/llm/schema.js'
 import { llmEvents } from '~/core/llm/state.js'
 import { SessionId, sessionIdSchema } from '~/core/sessions/schema.js'
 import type { PendingToolResult } from '~/core/tools/schema.js'
@@ -23,6 +24,65 @@ import { createTypedReducer } from './reducer.js'
  * These correspond to ConfiguredPlugin sessionHooks.
  */
 export type SessionHandlerName = 'onSessionReady' | 'onSessionClose'
+
+// ============================================================================
+// Session overrides
+// ============================================================================
+
+/**
+ * Per-agent settings layered over the preset definition.
+ *
+ * Deliberately an object rather than a bare model id: the same layering is where
+ * `cacheTtl`, token caps or reasoning effort belong once they need to be
+ * session-scoped, and adding a field here stays backwards compatible.
+ */
+export const agentOverridesSchema = z4.object({
+	/** Replaces the model declared on the agent definition. */
+	model: modelIdSchema.optional(),
+})
+
+export type AgentOverrides = z4.infer<typeof agentOverridesSchema>
+
+/**
+ * A patch against {@link SessionOverrides}. An absent key is left alone, `null`
+ * clears it, and an object replaces that entry wholesale (it is not merged into
+ * the previous value — the entry *is* the override).
+ */
+export const sessionOverridesPatchSchema = z4.object({
+	defaults: agentOverridesSchema.nullable().optional(),
+	agents: z4.record(z4.string(), agentOverridesSchema.nullable()).optional(),
+})
+
+export type SessionOverridesPatch = z4.infer<typeof sessionOverridesPatchSchema>
+
+/**
+ * Session-scoped configuration layered over the preset, patchable at any time.
+ *
+ * Two levels because they answer different questions. `defaults` is "run this
+ * whole session on X"; `agents` is "…except this one". A preset that pins a
+ * cheap model to specific sub-agents (redo's `fastModel`) would have that intent
+ * flattened by `defaults` alone, so the per-definition level is what makes the
+ * override surgical.
+ */
+export interface SessionOverrides {
+	/** Applied to every agent that has no `agents` entry. */
+	defaults?: AgentOverrides
+	/** Keyed by definitionName, including ORCHESTRATOR_ROLE / COMMUNICATOR_ROLE. */
+	agents: Map<string, AgentOverrides>
+}
+
+/**
+ * Effective overrides for one agent definition: `agents` layered over `defaults`
+ * field by field, so `defaults: { model }` plus a per-agent entry that only sets
+ * some other field keeps the default model.
+ */
+export const resolveAgentOverrides = (
+	state: SessionState,
+	definitionName: string,
+): AgentOverrides => ({
+	...state.overrides.defaults,
+	...state.overrides.agents.get(definitionName),
+})
 
 export const sessionEvents = createEventsFactory({
 	events: {
@@ -44,6 +104,7 @@ export const sessionEvents = createEventsFactory({
 			key: z4.string(),
 			value: z4.unknown(),
 		}),
+		session_overrides_set: sessionOverridesPatchSchema,
 		session_handler_started: z4.object({
 			handlerName: z4.enum(['onSessionReady', 'onSessionClose']),
 			pluginName: z4.string(),
@@ -62,6 +123,7 @@ export type SessionClosedEvent = (typeof sessionEvents)['Events']['session_close
 export type SessionReopenedEvent = (typeof sessionEvents)['Events']['session_reopened']
 export type SessionRestartedEvent = (typeof sessionEvents)['Events']['session_restarted']
 export type SessionMetadataSetEvent = (typeof sessionEvents)['Events']['session_metadata_set']
+export type SessionOverridesSetEvent = (typeof sessionEvents)['Events']['session_overrides_set']
 export type SessionHandlerStartedEvent = (typeof sessionEvents)['Events']['session_handler_started']
 export type SessionHandlerCompletedEvent = (typeof sessionEvents)['Events']['session_handler_completed']
 
@@ -89,6 +151,8 @@ export interface SessionState {
 	workspaceDir?: string
 	/** Generic key-value metadata store (tool sets use their own keys) */
 	metadata: Map<string, unknown>
+	/** Session-scoped settings layered over the preset. See {@link SessionOverrides}. */
+	overrides: SessionOverrides
 	/** If this session was forked from another session */
 	forkedFrom?: { sessionId: SessionId; eventIndex: number }
 }
@@ -109,6 +173,7 @@ export const createSessionState = (
 	createdAt: timestamp,
 	agentCounters: new Map(),
 	metadata: new Map(),
+	overrides: { agents: new Map() },
 })
 
 // ============================================================================
@@ -427,6 +492,18 @@ export const coreReducer = createTypedReducer(
 				const newMetadata = new Map(state.metadata)
 				newMetadata.set(event.key, event.value)
 				return { ...state, metadata: newMetadata }
+			}
+
+			case 'session_overrides_set': {
+				const agents = new Map(state.overrides.agents)
+				for (const [definitionName, override] of Object.entries(event.agents ?? {})) {
+					if (override === null) agents.delete(definitionName)
+					else agents.set(definitionName, override)
+				}
+				// undefined = untouched, null = cleared. `?? undefined` collapses the
+				// explicit null, which the state shape does not carry.
+				const defaults = event.defaults === undefined ? state.overrides.defaults : (event.defaults ?? undefined)
+				return { ...state, overrides: { defaults, agents } }
 			}
 
 			case 'agent_paused':

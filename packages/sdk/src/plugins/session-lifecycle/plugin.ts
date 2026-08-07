@@ -11,8 +11,9 @@ import { agentIdSchema } from '~/core/agents'
 import { COMMUNICATOR_ROLE, ORCHESTRATOR_ROLE } from '~/core/agents/agent-roles.js'
 import { type DomainError, PresetErrors, SessionErrors, ValidationErrors } from '~/core/errors.js'
 import { definePlugin } from '~/core/plugins/index.js'
+import { knownDefinitionNames, unknownOverrideTargets } from '~/core/preset/overrides.js'
 import { SessionId, sessionIdSchema } from '~/core/sessions/schema.js'
-import { getEntryAgentId, sessionEvents } from '~/core/sessions/state.js'
+import { agentOverridesSchema, getEntryAgentId, sessionEvents, sessionOverridesPatchSchema } from '~/core/sessions/state.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 
 // ============================================================================
@@ -115,6 +116,7 @@ export const sessionLifecyclePlugin = definePlugin('sessions')
 			presetId: z4.string().min(1),
 			workspaceDir: z4.string().optional(),
 			sessionId: z4.string().optional(),
+			overrides: sessionOverridesPatchSchema.optional(),
 		}),
 		output: z4.object({
 			sessionId: sessionIdSchema,
@@ -126,11 +128,13 @@ export const sessionLifecyclePlugin = definePlugin('sessions')
 				presetId: input.presetId,
 				workspaceDir: input.workspaceDir ?? null,
 				sessionId: input.sessionId ?? null,
+				overrides: input.overrides ?? null,
 			})
 
 			const sessionResult = await sm.createSession(input.presetId, {
 				workspaceDir: input.workspaceDir,
 				sessionId: input.sessionId,
+				overrides: input.overrides,
 			})
 			if (!sessionResult.ok) return sessionResult
 
@@ -183,6 +187,12 @@ export const sessionLifecyclePlugin = definePlugin('sessions')
 			closedAt: z4.number().optional(),
 			agentCount: z4.number(),
 			entryAgentId: agentIdSchema.nullable(),
+			// Reported back so a caller can tell "the override did not apply" from
+			// "this build predates overrides and dropped the field on input".
+			overrides: z4.object({
+				defaults: agentOverridesSchema.optional(),
+				agents: z4.record(z4.string(), agentOverridesSchema),
+			}),
 		}),
 		handler: async (ctx) => {
 			const state = ctx.sessionState
@@ -194,6 +204,54 @@ export const sessionLifecyclePlugin = definePlugin('sessions')
 				closedAt: state.closedAt,
 				agentCount: state.agents.size,
 				entryAgentId: getEntryAgentId(state),
+				overrides: {
+					defaults: state.overrides.defaults,
+					agents: Object.fromEntries(state.overrides.agents),
+				},
+			})
+		},
+	})
+	// A manager method, not a session method, purely so it can see the preset and
+	// reject unknown agent names — session method contexts carry no preset.
+	// `presets.getAgents` is a manager method for the same reason.
+	.managerMethod('setOverrides', {
+		input: z4.object({
+			sessionId: sessionIdSchema,
+			overrides: sessionOverridesPatchSchema,
+		}),
+		output: z4.object({
+			agents: z4.record(z4.string(), agentOverridesSchema),
+			defaults: agentOverridesSchema.optional(),
+		}),
+		handler: async (ctx, input) => {
+			const sm = ctx.sessionManager
+			const sessionId = SessionId(input.sessionId)
+
+			const sessionResult = await sm.getSession(sessionId)
+			if (!sessionResult.ok) return sessionResult
+			const session = sessionResult.value
+
+			const preset = ctx.presets.get(session.state.presetId)
+			if (!preset) return Err(PresetErrors.notFound(session.state.presetId))
+
+			const unknown = unknownOverrideTargets(preset, input.overrides)
+			if (unknown.length > 0) {
+				return Err(ValidationErrors.invalid(
+					`Unknown agent definitions in overrides: ${unknown.join(', ')}. Preset '${preset.id}' defines: ${knownDefinitionNames(preset).join(', ')}`,
+				))
+			}
+
+			await session.setOverrides(input.overrides)
+
+			// Agents already mid-turn finish on the model they started with: the
+			// override is read when the next inference request is built, not applied
+			// retroactively to one in flight.
+			ctx.logger.info('Session overrides set', { sessionId, overrides: input.overrides })
+
+			const state = session.state
+			return Ok({
+				agents: Object.fromEntries(state.overrides.agents),
+				defaults: state.overrides.defaults,
 			})
 		},
 	})

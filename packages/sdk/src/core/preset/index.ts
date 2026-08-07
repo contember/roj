@@ -9,3 +9,6 @@ export { createPreset, validatePreset } from './config.js'
 // Re-export from preset-builder
 export type { CreateOrchestratorInput, DefineAgentInput } from './preset-builder.js'
 export { createOrchestrator, defineAgent } from './preset-builder.js'
+
+// Re-export from overrides
+export { knownDefinitionNames, unknownOverrideTargets } from './overrides.js'

@@ -21,9 +21,10 @@ import type { LLMLogger } from '~/core/llm/logger.js'
 import type { LLMProvider } from '~/core/llm/provider.js'
 import type { CallerContext, ConfiguredPlugin, ManagerMethodContext, PluginDefinition } from '~/core/plugins/plugin-builder.js'
 import type { Preset } from '~/core/preset/index.js'
+import { knownDefinitionNames, unknownOverrideTargets } from '~/core/preset/overrides.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import { generateSessionId } from '~/core/sessions/schema.js'
-import type { SessionCreatedEvent } from '~/core/sessions/state.js'
+import type { SessionCreatedEvent, SessionOverridesPatch } from '~/core/sessions/state.js'
 import { checkRecoveryNeeded, isSessionCreatedEvent, reconstructSessionState, sessionEvents } from '~/core/sessions/state.js'
 import type { ToolExecutor } from '~/core/tools'
 import { FileLogger } from '~/lib/logger/file.js'
@@ -143,11 +144,20 @@ export class SessionManager {
 	 */
 	async createSession(
 		presetId: string,
-		options?: { workspaceDir?: string; sessionId?: string },
+		options?: { workspaceDir?: string; sessionId?: string; overrides?: SessionOverridesPatch },
 	): Promise<Result<Session, DomainError>> {
 		const preset = this.presets.get(presetId)
 		if (!preset) {
 			return Err(PresetErrors.notFound(presetId))
+		}
+
+		if (options?.overrides) {
+			const unknown = unknownOverrideTargets(preset, options.overrides)
+			if (unknown.length > 0) {
+				return Err(ValidationErrors.invalid(
+					`Unknown agent definitions in overrides: ${unknown.join(', ')}. Preset '${presetId}' defines: ${knownDefinitionNames(preset).join(', ')}`,
+				))
+			}
 		}
 
 		const sessionId = options?.sessionId ? (options.sessionId as any) : generateSessionId()
@@ -175,6 +185,15 @@ export class SessionManager {
 					...(workspaceDir ? { workspaceDir } : {}),
 				}),
 			),
+		]
+
+		// Seeded through the same event a runtime change uses, so there is one code
+		// path and a forked/replayed session reconstructs the overrides for free.
+		if (options?.overrides) {
+			events.push(withSessionId(sessionId, sessionEvents.create('session_overrides_set', options.overrides)))
+		}
+
+		events.push(
 			withSessionId(
 				sessionId,
 				agentEvents.create('agent_spawned', {
@@ -183,7 +202,7 @@ export class SessionManager {
 					parentId: null,
 				}),
 			),
-		]
+		)
 
 		// Spawn communicator if configured
 		const hasCommunicator = !!preset.communicator

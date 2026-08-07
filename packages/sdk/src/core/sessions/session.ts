@@ -22,7 +22,7 @@ import type { AgentPluginConfig, BaseSessionHookContext, CallerContext, Configur
 import { AGENT_CALLER, DEFAULT_CALLER, buildPluginDeps, type PluginNotification } from '~/core/plugins/plugin-builder.js'
 import type { Preset } from '~/core/preset/index.js'
 import type { SessionId } from '~/core/sessions/schema.js'
-import type { SessionState } from '~/core/sessions/state.js'
+import type { SessionOverridesPatch, SessionState } from '~/core/sessions/state.js'
 import { getEntryAgentId, getNextAgentSeq, sessionEvents } from '~/core/sessions/state.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import type { Platform } from '~/platform/index.js'
@@ -210,6 +210,24 @@ export class Session {
 		}
 
 		await this.store.emit(withSessionId(this.id, sessionEvents.create('session_reopened', {})))
+
+		return Ok(undefined)
+	}
+
+	/**
+	 * Patch the session's overrides (see {@link SessionOverrides}).
+	 *
+	 * Takes effect on the next inference each affected agent runs — running agents
+	 * are not rebuilt and a request already in flight completes on the model it
+	 * started with. Callers are expected to have validated the patch against the
+	 * preset; see `unknownOverrideTargets`.
+	 */
+	async setOverrides(patch: SessionOverridesPatch): Promise<Result<void, DomainError>> {
+		if (this.store.isClosed()) {
+			return Err(SessionErrors.closed(String(this.id)))
+		}
+
+		await this.store.emit(withSessionId(this.id, sessionEvents.create('session_overrides_set', patch)))
 
 		return Ok(undefined)
 	}
