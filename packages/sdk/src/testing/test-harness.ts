@@ -13,7 +13,7 @@ import { selectPluginState } from '~/core/sessions/reducer.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import { SessionManager } from '~/core/sessions/session-manager.js'
 import type { Session } from '~/core/sessions/session.js'
-import type { SessionState } from '~/core/sessions/state.js'
+import type { SessionOverridesPatch, SessionState } from '~/core/sessions/state.js'
 import { ToolExecutor } from '~/core/tools/executor.js'
 import { silentLogger } from '~/lib/logger/logger.js'
 import { createNodePlatform } from './node-platform.js'
@@ -145,12 +145,23 @@ export class TestHarness {
 	/**
 	 * Create a session and return a TestSession wrapper.
 	 */
-	async createSession(presetId: string): Promise<TestSession> {
-		const result = await this.sessionManager.createSession(presetId)
+	async createSession(
+		presetId: string,
+		options?: { workspaceDir?: string; overrides?: SessionOverridesPatch },
+	): Promise<TestSession> {
+		const result = await this.sessionManager.createSession(presetId, options)
 		if (!result.ok) {
 			throw new Error(`Failed to create session: ${result.error.type} — ${result.error.message}`)
 		}
 		return new TestSession(result.value, this)
+	}
+
+	/** Create a session expecting failure, returning the error instead of throwing. */
+	async createSessionResult(
+		presetId: string,
+		options?: { workspaceDir?: string; overrides?: SessionOverridesPatch },
+	): Promise<Result<Session, DomainError>> {
+		return this.sessionManager.createSession(presetId, options)
 	}
 
 	/**
@@ -216,6 +227,14 @@ export class TestSession {
 	 */
 	async waitForIdle(opts?: { timeoutMs?: number }): Promise<void> {
 		await waitForAllAgentsIdle(this.session, opts)
+	}
+
+	/** Patch session overrides (see Session.setOverrides). */
+	async setOverrides(patch: SessionOverridesPatch): Promise<void> {
+		const result = await this.session.setOverrides(patch)
+		if (!result.ok) {
+			throw new Error(`setOverrides failed: ${result.error.type} — ${result.error.message}`)
+		}
 	}
 
 	/**
