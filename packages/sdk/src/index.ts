@@ -63,6 +63,7 @@ export type { InferenceNext, LLMMiddleware } from '~/core/llm/middleware.js'
 export type { OpenRouterProviderRouting, OpenRouterReasoningOptions, OpenRouterRequestOptions } from '~/core/llm/provider.js'
 export { ModelId } from '~/core/llm/schema.js'
 export type { LLMCallId } from '~/core/llm/schema.js'
+export { llmEvents } from '~/core/llm/state.js'
 export type { InferenceCompletedEvent, InferenceFailedEvent, InferenceStartedEvent } from '~/core/llm/state.js'
 export { estimateTokens } from '~/core/llm/tokens.js'
 export { applyEvent } from '~/core/sessions/apply-event.js'
@@ -80,10 +81,12 @@ export {
 	createSessionState,
 	reconstructSessionState,
 	resolveAgentOverrides,
+	sessionEvents,
 	sessionOverridesPatchSchema,
 } from '~/core/sessions/state.js'
 export type { SessionState } from '~/core/sessions/state.js'
 export { ToolCallId } from '~/core/tools/schema.js'
+export { toolEvents } from '~/core/tools/state.js'
 export type { ToolStartedEvent } from '~/core/tools/state.js'
 export { getAgentMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
 export type { MailboxPluginState } from '~/plugins/mailbox/query.js'
