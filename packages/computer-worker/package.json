@@ -1,0 +1,20 @@
+{
+	"name": "@roj-ai/computer-worker",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "wrangler dev",
+		"type-check": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@cloudflare/computer": "0.1.1",
+		"@roj-ai/computer-platform": "workspace:*",
+		"@roj-ai/sdk": "workspace:*"
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "^4.20250109.0",
+		"typescript": "^5.7.2",
+		"wrangler": "^4.42.0"
+	}
+}

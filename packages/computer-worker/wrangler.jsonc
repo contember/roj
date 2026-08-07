@@ -1,0 +1,18 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "roj-computer-worker",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-11-01",
+	"compatibility_flags": ["nodejs_compat"],
+	"durable_objects": {
+		"bindings": [
+			{ "name": "AGENT", "class_name": "RojAgentDO" }
+		]
+	},
+	"migrations": [
+		{ "tag": "v1", "new_sqlite_classes": ["RojAgentDO"] }
+	],
+	"observability": {
+		"enabled": true
+	}
+}
