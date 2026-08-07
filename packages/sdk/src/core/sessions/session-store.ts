@@ -98,7 +98,11 @@ export class SessionStore {
 		return SessionStore.fromEvents(sessionId, eventStore, events, applyEvent)
 	}
 
-	/** Build a store from an event log that the caller already loaded. */
+	/**
+	 * Build a SessionStore from an already-loaded event log.
+	 * Callers that must inspect the log first (SessionManager reads the preset off
+	 * event 0) use this so opening a session reads the log only once.
+	 */
 	static async fromEvents(
 		sessionId: SessionId,
 		eventStore: EventStore,

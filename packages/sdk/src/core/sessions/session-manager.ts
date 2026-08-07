@@ -501,8 +501,8 @@ export class SessionManager {
 	 * Internal session loading - throws SessionLoadError on domain errors.
 	 */
 	private async loadSession(sessionId: SessionId, entry: SessionCacheEntry): Promise<Session> {
-		// We need to peek at events first to determine the preset, so we can build plugins
-		// and compose the reducer before loading the store
+		// The log is read once here: event 0 carries the preset, which determines the plugins
+		// and thus the composed reducer the store must replay with.
 		const events = await this.eventStore.load(sessionId)
 		if (events.length === 0) {
 			throw new SessionLoadError(SessionErrors.notFound(String(sessionId)))
@@ -522,7 +522,7 @@ export class SessionManager {
 		const plugins = this.buildPlugins(preset)
 		const composedReducer = createApplyEvent(plugins)
 
-		// Load store with composed reducer
+		// Reuse the log read above — re-reading it here doubles the cost of opening a session
 		const store = await SessionStore.fromEvents(sessionId, this.eventStore, events, composedReducer)
 		if (!store) {
 			throw new SessionLoadError(SessionErrors.notFound(String(sessionId)))
