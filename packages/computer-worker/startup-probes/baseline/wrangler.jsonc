@@ -1,0 +1,6 @@
+{
+	"name": "roj-startup-baseline",
+	"main": "../../src/startup/baseline.ts",
+	"compatibility_date": "2025-11-01",
+	"compatibility_flags": ["nodejs_compat", "experimental", "enable_ctx_exports"]
+}

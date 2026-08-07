@@ -1,0 +1,6 @@
+{
+	"name": "roj-startup-sdk",
+	"main": "../../src/startup/sdk.ts",
+	"compatibility_date": "2025-11-01",
+	"compatibility_flags": ["nodejs_compat", "experimental", "enable_ctx_exports"]
+}

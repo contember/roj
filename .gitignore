@@ -90,6 +90,9 @@ buzola.gen.ts
 .lopata/
 /data/
 
+# wrangler check startup drops this next to the config it profiled
+worker-startup.cpuprofile
+
 # jj
 .jj/
 .claude/agent-canvas/
