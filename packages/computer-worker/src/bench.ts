@@ -12,7 +12,6 @@
 
 import { agentEvents, applyEvent, createSystemFromServices, reconstructSessionState } from '@roj-ai/sdk'
 import type { AgentId, DomainEvent, LLMMessage, Services, SessionId } from '@roj-ai/sdk'
-import type { Platform } from '@roj-ai/sdk/platform'
 
 /** Events per synthetic turn — mirrors the shape of one real inference turn. */
 const EVENTS_PER_TURN = 5
@@ -36,13 +35,16 @@ const ASSISTANT_TEXT = 'I moved the retry policy out of the request loop and int
 export interface BenchRow {
 	/** Events in the log at the moment replay was measured. */
 	events: number
-	logBytes: number
+	/** What the store holds for this session — JSONL bytes, or event-row payload bytes. */
+	storedBytes: number
 	appendBatchMs: number
 	appendBatchPerEventMs: number
 	appendSingleMs: number
 	appendSinglePerEventMs: number
 	/** `EventStore.load` alone — read + JSON.parse + zod validate, no reducers. */
 	eventStoreLoadMs: number
+	/** `loadRange` for the last 10 events — what a poller asks for on every tick. */
+	tailRangeMs: number
 	/** Reduce over the core + mailbox reducer only, no plugin slices. */
 	coreReplayMs: number
 	/** Full `SessionManager.getSession` on a manager that has never seen this session. */
@@ -52,9 +54,20 @@ export interface BenchRow {
 }
 
 export interface BenchResult {
+	/** Which EventStore backed the run. */
+	store: string
 	rows: BenchRow[]
 	totalMs: number
 	notes: string[]
+}
+
+export interface BenchOptions {
+	/** The store under test is whatever `services.eventStore` is. */
+	services: Services<'isolate'>
+	store: string
+	storedBytes: (sessionId: SessionId) => Promise<number>
+	presetId: string
+	counts: readonly number[]
 }
 
 /** workerd freezes the clock between I/O, so a timer yield is needed before reading it. */
@@ -107,18 +120,8 @@ function take(events: Generator<DomainEvent>, count: number): DomainEvent[] {
 	return batch
 }
 
-async function logSize(platform: Platform, dataPath: string, sessionId: SessionId): Promise<number> {
-	const stats = await platform.fs.stat(`${dataPath}/sessions/${sessionId}/.events/events.jsonl`)
-	return stats.size
-}
-
-export async function runBench(options: {
-	services: Services
-	platform: Platform
-	presetId: string
-	counts: readonly number[]
-}): Promise<BenchResult> {
-	const { services, platform, presetId, counts } = options
+export async function runBench(options: BenchOptions): Promise<BenchResult> {
+	const { services, store, storedBytes, presetId, counts } = options
 	const startedAt = await now()
 	const rows: BenchRow[] = []
 
@@ -136,8 +139,9 @@ export async function runBench(options: {
 		const agentId = seed.getEntryAgentId()
 		if (!agentId) throw new Error('session has no entry agent')
 
-		// createSession leaves a live Session whose git-status plugin polls every 2s;
-		// close() clears it and reopen() puts the log back in the active state replay needs.
+		// close() drops the live Session createSession leaves behind, and reopen() puts
+		// the log back in the active state replay needs. Kept as the committed numbers
+		// were measured, so the two stores stay comparable with them.
 		await seed.close()
 		await scheduler.wait(0)
 		await seed.reopen()
@@ -156,8 +160,9 @@ export async function runBench(options: {
 			}
 		})
 
-		const logBytes = await logSize(platform, services.config.dataPath, sessionId)
+		const bytes = await storedBytes(sessionId)
 		const loaded = await timed(() => services.eventStore.load(sessionId))
+		const tailRange = await timed(() => services.eventStore.loadRange(sessionId, { since: loaded.value.length - 11 }))
 		const coreReplay = await timed(() => reconstructSessionState(loaded.value, applyEvent))
 
 		const benchSystem = createSystemFromServices(services)
@@ -165,18 +170,19 @@ export async function runBench(options: {
 		const warm = await timed(() => benchSystem.sessionManager.getSession(sessionId))
 		if (!cold.value.ok) throw new Error(`getSession failed: ${JSON.stringify(cold.value.error)}`)
 
-		// Stop the git-status interval this load started before moving to the next size.
+		// Drop the session this load left live before moving to the next size.
 		await cold.value.value.close()
 		await scheduler.wait(0)
 
 		rows.push({
 			events: loaded.value.length,
-			logBytes,
+			storedBytes: bytes,
 			appendBatchMs: appendBatch.ms,
 			appendBatchPerEventMs: appendBatch.ms / syntheticCount,
 			appendSingleMs: appendSingle.ms,
 			appendSinglePerEventMs: appendSingle.ms / SINGLE_APPEND_PROBE,
 			eventStoreLoadMs: loaded.ms,
+			tailRangeMs: tailRange.ms,
 			coreReplayMs: coreReplay.ms,
 			coldGetSessionMs: cold.ms,
 			warmGetSessionMs: warm.ms,
@@ -184,11 +190,13 @@ export async function runBench(options: {
 	}
 
 	return {
+		store,
 		rows,
 		totalMs: (await now()) - startedAt,
 		notes: [
 			`each turn is ${EVENTS_PER_TURN} events; agent_conversation_spliced stands in for inference_completed (no exported llmEvents factory)`,
 			`seeding uses appendBatch(${SEED_BATCH_SIZE}); appendSingle* is ${SINGLE_APPEND_PROBE} single appends at full log size`,
+			'tailRangeMs reads the last 10 events; every timing includes ~1ms of scheduler overhead, so read it as a ceiling',
 			'coreReplayMs uses the core + mailbox reducer only — getSession composes ~14 more plugin slices',
 			'loadSession calls EventStore.load twice (once to read the presetId, once inside SessionStore.load)',
 			'every timing brackets a scheduler.wait(0) so workerd advances its clock; that adds ~1ms per measurement',

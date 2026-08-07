@@ -7,23 +7,53 @@ its filesystem. Not published.
 ```bash
 bun run dev                     # wrangler dev on :8787
 curl localhost:8787/run         # boot the SDK, run a two-agent session
-curl localhost:8787/bench       # replay scaling: ?counts=100,500,1000,5000,10000
+curl localhost:8787/bench       # replay scaling: ?counts=100,500&stores=sqlite,file
+curl localhost:8787/shell       # probe what just-bash implements; ?cmd=... for one command
 ```
 
 A `RojAgentDO` Durable Object owns one `Workspace`. `createComputerPlatform`
 turns the workspace's `SQLiteWorkspaceProvider` into a roj `Platform`, which
 goes into the SDK's normal composition root (`bootstrap` →
-`createSystemFromServices`). A scripted LLM makes the orchestrator spawn a
-`writer` agent, which writes a file via the filesystem plugin. The response
-reports timings, the event count, and the resulting workspace tree.
+`createSystemFromServices`) under the `isolate` plugin profile. A scripted LLM
+makes the orchestrator spawn a `writer` agent, which writes a file via the
+filesystem plugin. The response reports timings, the event count, and the
+resulting workspace tree.
+
+Three things the DO wires that the SDK's own defaults do not:
+
+- **`{ pluginProfile: 'isolate' }`** — drops `services`, `resources`, `uploads`
+  and `git-status`, the four built-ins that need a process table.
+- **`SqliteEventStore`** over `ctx.storage`, replacing the `FileEventStore`
+  `bootstrap()` builds off `config.persistence`. Swapped in on the `Services`
+  object, since `Config` has no third persistence mode.
+- **`WorkerShellBackend`** on the workspace, so `platform.process.execFile`
+  runs commands instead of rejecting with ENOSYS.
 
 ## What this harness pins down
 
 - The SDK boots and runs in workerd under `nodejs_compat` — no source changes
   beyond narrowing `FileSystem.open()` to `ReadableFileHandle`.
-- Event sourcing persists: events land in `events.jsonl` through the adapter's
-  `appendFile`, which upstream rejects with ENOSYS (see `computer-platform`).
+- Event sourcing persists, either into SQLite rows or into `events.jsonl`
+  through the adapter's `appendFile`, which upstream rejects with ENOSYS.
 - DO state survives isolate restarts — earlier sessions stay in the tree.
+- `execFile` works over the shell backend; `spawn` does not (see below).
+
+## Wiring the shell backend
+
+`WorkerShellBackend` mints a Dynamic Worker running `just-bash` and hands it a
+loopback binding that dials back into this DO for filesystem access. That needs
+four things, all of them easy to miss:
+
+1. `worker_loaders: [{ binding: "LOADER" }]` in `wrangler.jsonc`.
+2. The `experimental` compatibility flag, which gates the loader binding.
+3. The `enable_ctx_exports` compatibility flag. The backend reaches the proxy
+   through `ctx.exports.WorkspaceServiceProxy(...)`; without the flag
+   `ctx.exports` is `undefined` and every exec fails with
+   `Cannot read properties of undefined (reading 'WorkspaceServiceProxy')`.
+4. `WorkspaceServiceProxy` re-exported from the worker's main module, and an
+   `__getWorkspaceStub()` method on the DO for the proxy to call. (The upstream
+   `withWorkspace` mixin supplies the method; this harness constructs its
+   `Workspace` directly and so supplies it itself.)
 
 ## Known gaps
 
@@ -32,37 +62,94 @@ reports timings, the event count, and the resulting workspace tree.
 - **Non-sandboxed presets don't work.** Relative agent paths resolve against
   `process.cwd()`, which a Worker isolate has no meaningful value for. The
   preset sets `sandboxed: true` so agents use virtual paths.
-- **This harness still bootstraps the full plugin profile.** `services`,
-  `resources`, `uploads` and `git-status` all need a process table, and
-  `git-status` shells out to `git` every 2s, so it warns on a loop. Passing
-  `{ pluginProfile: 'isolate' }` to `bootstrap()` drops all four; wiring that up
-  is pending.
+- **`spawn` is still ENOSYS.** It returns a Node `ChildProcess` — streams,
+  `kill()`, `'exit'` — and only the `services` plugin needs it. `execFile` is
+  routed; the `ChildProcess` shim is not built.
+- **`workspace.git` is not configured**, so the shell's built-in `git` command
+  rejects every invocation. Fixing it means passing `createGitClient()` from
+  `@cloudflare/computer/git` as `WorkspaceOptions.git`, which pulls in
+  `isomorphic-git` — a new dependency, so it was left for Phase 4.
 - **The `shell` and `snapshotting` plugins are a preset concern, not a profile
-  one.** They register through `preset.plugins`, which a bootstrap profile has no
-  reach into.
+  one.** They register through `preset.plugins`, which a bootstrap profile has
+  no reach into.
 - **CPU under streaming inference is unmeasured.** The smoke run is ~1.6s wall,
   almost all of it agent debounce. There is no API key in the dev environment,
   so real inference has not been run in an isolate.
+
+## What just-bash implements
+
+`/shell` runs a fixed probe suite through both entry points —
+`platform.process.execFile`, which quotes an argv back into a command line, and
+a raw `runtime.exec` for the shell syntax `execFile` cannot express. Results
+below are from that suite plus ad-hoc `?cmd=` probes; nothing here is inferred.
+
+Works: `echo` `cat` `ls` (incl. `-la`) `pwd` `grep` (incl. `-r`) `rg` `head`
+`tail` `wc` `sed` `awk` `cut` `sort` `xargs` `find` `tree` `mkdir` `cp` `mv`
+`rm` `touch` `stat` `ln -s` `readlink` `tee` `printf` `paste` `date` `sleep`
+`timeout` `env` `which` `type` `test` `sh -c` `bash -c`. `diff`, `tar`, `gzip`,
+`jq` and `sqlite3` exist too, with their own flag surfaces (`--version` is not
+one of them; a `diff` of differing files exits 1, as it should).
+
+Shell syntax works: pipes, `>` and `>>`, `<`, `&&` / `||` / `;`, `$(...)`,
+`$((...))`, variable assignment and `export`, globs, `for`, `if [ ... ]`, `cd`,
+background `&` with `wait`.
+
+Does not work:
+
+| Missing | Detail |
+|---|---|
+| `git` | Registered as a host command, but rejects with `Workspace git is not configured` until `WorkspaceOptions.git` is set. `which git` fails while `type git` and `command -v git` both answer `/usr/bin/git`. |
+| `node`, `unzip`, `pdftotext` | `command not found`. |
+| `python3` | `command not available in browser environments`. |
+| `curl` | `command not found`, and the Dynamic Worker runs with `globalOutbound: null` anyway. |
+| `trap` | `trap: command not found`. |
+
+For roj that means `git-status` (needs `git`), `ZipPreprocessor` (`unzip`),
+`PdfPreprocessor` (`pdftotext`, `pdfimages`), `MarkitdownPreprocessor` and
+`VipsImageResizer` (`vips*`) still cannot run on this backend — they need the
+container backend, or a rewrite against a workspace API.
 
 ## Replay scaling (`/bench`)
 
 Seeds a session with N synthetic events written straight to the `EventStore`,
 then times `SessionManager.getSession` on a manager that has never seen it.
-`wrangler dev` numbers on an 8-vCPU dev box, `cpu_ms` not enforced locally:
+`?stores=sqlite,file` runs the same seed against both stores back to back.
+`wrangler dev` under a 2-vCPU `cpu-lease` on an 8-vCPU dev box, `cpu_ms` not
+enforced locally. `append/ev` is one event's share of an `appendBatch(100)`;
+`append 1` is a single append at full log size.
 
-| events | log | `EventStore.load` | core reducer | cold `getSession` | warm |
-|---:|---:|---:|---:|---:|---:|
-| 100 | 28 KB | 1 ms | <1 ms | 55 ms | 0 ms |
-| 1 000 | 290 KB | 3 ms | 1 ms | 66 ms | 0 ms |
-| 10 000 | 2.9 MB | 19 ms | 24 ms | 144 ms | 0 ms |
-| 100 000 | 29 MB | 294 ms | 1 532 ms | 1 867 ms | 0 ms |
-| 350 000 | 102 MB | 1 110 ms | 34 645 ms | 38 008 ms | 0 ms |
+| events | store | bytes | append/ev | append 1 | `load` | tail `loadRange` | core reducer | cold `getSession` | warm |
+|---:|:--|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100 | sqlite | 28 KB | 0.047 ms | 0.8 ms | 0 ms | 0 ms | 1 ms | 19 ms | 0 ms |
+| 100 | file | 28 KB | 0.174 ms | 11.9 ms | 1 ms | 1 ms | 0 ms | 155 ms | 0 ms |
+| 1 000 | sqlite | 282 KB | 0.019 ms | 0.6 ms | 2 ms | 1 ms | 1 ms | 22 ms | 0 ms |
+| 1 000 | file | 283 KB | 0.136 ms | 12.2 ms | 2 ms | 0 ms | 1 ms | 51 ms | 0 ms |
+| 10 000 | sqlite | 2.8 MB | 0.016 ms | 0.8 ms | 28 ms | 0 ms | 21 ms | 72 ms | 0 ms |
+| 10 000 | file | 2.8 MB | 0.116 ms | 11.3 ms | 24 ms | 2 ms | 15 ms | 88 ms | 0 ms |
+| 100 000 | sqlite | 27.7 MB | 0.011 ms | 0.9 ms | 261 ms | 1 ms | 1 499 ms | 1 690 ms | 0 ms |
+| 100 000 | file | 27.8 MB | 0.049 ms | 11.3 ms | 256 ms | 2 ms | 1 531 ms | 1 701 ms | 0 ms |
+| 350 000 | sqlite | 97.2 MB | 0.007 ms | 0.8 ms | 1 001 ms | 1 ms | 23 389 ms | 25 227 ms | 0 ms |
+| 350 000 | file | 97.5 MB | 0.036 ms | 12.2 ms | 939 ms | 4 ms | 32 289 ms | 34 706 ms | 0 ms |
 
-Replay is linear to ~20 000 events, then the reducer's copy-on-append
-(`conversationHistory`, `agents` Map, `state` spread — one full copy per event)
-turns quadratic and worse. 30 s lands at roughly 320 000 events. A turn costs
-~6 events, so this is orders of magnitude beyond any realistic session.
+Reading it:
 
-Note that `SessionManager.loadSession` calls `EventStore.load` twice — once to
-read the `presetId`, once inside `SessionStore.load`. Cheap to fix, and it is
-the whole of the I/O cost at small N.
+- **Writes are where SQLite wins.** A single append costs SQLite under 1 ms at
+  every log length; the file store costs ~12 ms, because every append `lstat`s
+  the file and writes at its end through the VFS. Batched, SQLite is 3–5×
+  cheaper per event.
+- **`load` is a wash, and at 100 000+ SQLite is not ahead.** Reading the whole
+  log is dominated by `JSON.parse` plus zod validation, which both stores pay
+  identically; rows add per-row overhead that cancels the file read they save.
+  The plan's "a real table gives indexed `loadRange`" does not show up either —
+  `FileEventStore.loadRange` already reads only the tail of the file, so both
+  answer a poller in 0–4 ms at every size.
+- **Replay dominates everything past ~20 000 events.** The reducer copies
+  `conversationHistory` whole on every `inference_completed`, which is quadratic
+  in log length; the `agents` Map and `state` spread are constant factors, not
+  scaling terms. Which store fed it stops mattering. 30 s lands at roughly
+  350 000 events for either. A turn costs ~6 events, so this is orders of
+  magnitude beyond any realistic session.
+
+So SqliteEventStore is the right store for an isolate — it makes the write path
+cheap and flat, which is what an event-sourced session actually does all day —
+but it does not make session load faster, and nobody should expect it to.
