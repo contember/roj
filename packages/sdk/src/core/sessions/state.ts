@@ -260,6 +260,7 @@ export const coreReducer = createTypedReducer(
 					role: 'assistant',
 					content: event.response.content ?? '',
 					toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+					reasoningDetails: event.response.reasoningDetails,
 				}
 
 				return updateAgent(state, event.agentId, (agent) => {
@@ -374,6 +375,8 @@ export const coreReducer = createTypedReducer(
 									role: 'assistant',
 									content: m.content,
 									toolCalls: m.toolCalls,
+									// Survives compaction: a retained turn keeps the reasoning the provider wants echoed back.
+									reasoningDetails: m.reasoningDetails,
 									cacheControl: m.cacheControl,
 								}
 							case 'tool':

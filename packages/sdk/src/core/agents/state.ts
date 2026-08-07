@@ -137,12 +137,24 @@ export interface UserLLMMessage {
 }
 
 /**
+ * Provider chain-of-thought blocks, kept opaque (OpenRouter `reasoning_details`).
+ *
+ * The provider requires the exact sequence it produced to come back verbatim, so
+ * these are never parsed, reordered or normalized — only stored and echoed. The
+ * shape is provider- and model-specific and changes without notice; nothing in
+ * the SDK may depend on it.
+ */
+export type ReasoningDetails = unknown[]
+
+/**
  * Assistant message - LLM response.
  */
 export interface AssistantLLMMessage {
 	role: 'assistant'
 	content: string
 	toolCalls?: ToolCall[]
+	/** Reasoning blocks to echo back on later requests, so the model keeps its chain of thought across tool calls. */
+	reasoningDetails?: ReasoningDetails
 	/** Marks this message as a prompt cache breakpoint. */
 	cacheControl?: LLMMessageCacheControl
 }

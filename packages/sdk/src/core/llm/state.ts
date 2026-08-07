@@ -48,6 +48,9 @@ export type LLMMetrics = {
 // LLM events
 // ============================================================================
 
+/** Opaque by design — the blocks are stored and echoed verbatim, never inspected. */
+const reasoningDetailsSchema = z4.array(z4.unknown())
+
 const llmMetricsSchema = z4.object({
 	promptTokens: z4.number(),
 	completionTokens: z4.number(),
@@ -77,6 +80,13 @@ export const llmEvents = createEventsFactory({
 					name: z4.string(),
 					input: z4.unknown(),
 				})),
+				/**
+				 * Opaque provider reasoning blocks (see ReasoningDetails). Carried by the
+				 * event, not just by the live response, because a session rebuilt from the
+				 * log would otherwise resume without the chain of thought the provider
+				 * expects to get back.
+				 */
+				reasoningDetails: reasoningDetailsSchema.optional(),
 			}),
 			metrics: llmMetricsSchema,
 			llmCallId: llmCallIdSchema.optional(),

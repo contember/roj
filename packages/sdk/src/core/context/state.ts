@@ -56,6 +56,8 @@ export const compactedConversationMessageSchema: z4.ZodType<LLMMessage> = z4.dis
 			name: z4.string(),
 			input: z4.unknown(),
 		})).optional(),
+		/** Opaque provider reasoning blocks — retained turns keep them, see ReasoningDetails. */
+		reasoningDetails: z4.array(z4.unknown()).optional(),
 		cacheControl: cacheControlSchema.optional(),
 	}),
 	z4.object({

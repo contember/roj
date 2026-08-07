@@ -1,4 +1,4 @@
-import type { AssistantLLMMessage, LLMMessage, SystemLLMMessage, ToolCall, ToolLLMMessage, UserLLMMessage } from '~/core/agents/state.js'
+import type { AssistantLLMMessage, LLMMessage, ReasoningDetails, SystemLLMMessage, ToolCall, ToolLLMMessage, UserLLMMessage } from '~/core/agents/state.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { ToolDefinition } from '~/core/tools/definition.js'
@@ -7,7 +7,7 @@ import type { Result } from '~/lib/utils/result.js'
 import { ModelId } from './schema.js'
 
 // Re-export LLMMessage types from agents/state for backwards compatibility
-export type { AssistantLLMMessage, LLMMessage, SystemLLMMessage, ToolCall, ToolLLMMessage, UserLLMMessage }
+export type { AssistantLLMMessage, LLMMessage, ReasoningDetails, SystemLLMMessage, ToolCall, ToolLLMMessage, UserLLMMessage }
 
 // ============================================================================
 // Request types
@@ -141,8 +141,10 @@ export interface InferenceResponse {
 	metrics: LLMMetrics
 	/** Provider-specific request ID (e.g., OpenRouter generation ID for fetching stats) */
 	providerRequestId?: string
-	/** Extended thinking / reasoning content (for models that support it) */
+	/** Extended thinking / reasoning content (for models that support it) — human-readable, for logs and the debug UI. */
 	reasoning?: string
+	/** Opaque reasoning blocks to echo back on the next request. Absent for models that do not reason. */
+	reasoningDetails?: ReasoningDetails
 }
 
 /**
