@@ -8,7 +8,7 @@
 import type { Workspace } from '@cloudflare/computer'
 import type { Platform } from '@roj-ai/sdk/platform'
 import { createComputerFileSystem } from './fs.js'
-import { createUnsupportedProcessRunner } from './process.js'
+import { createShellProcessRunner, createUnsupportedProcessRunner } from './process.js'
 
 export interface ComputerPlatformOptions {
 	/** Directory used for scratch files. Created lazily by callers, like `os.tmpdir()` on a host. */
@@ -23,6 +23,7 @@ export function createComputerPlatform(workspace: Workspace, options: ComputerPl
 	}
 }
 
-export { createComputerFileSystem, createUnsupportedProcessRunner }
+export { createComputerFileSystem, createShellProcessRunner, createUnsupportedProcessRunner }
+export type { ShellProcessRunnerOptions } from './process.js'
 export { SqliteEventStore } from './sqlite-event-store.js'
 export type { SqlCursorLike, SqlStorageHost, SqlStorageLike } from './sqlite-event-store.js'

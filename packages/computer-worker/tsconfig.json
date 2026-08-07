@@ -5,6 +5,8 @@
 		"composite": false,
 		"declaration": false,
 		"declarationMap": false,
+		// Symbol.dispose: exec handles are disposable, and ES2022 does not declare it.
+		"lib": ["ES2022", "ESNext.Disposable"],
 		"types": ["@cloudflare/workers-types"]
 	},
 	"include": ["src/**/*"],

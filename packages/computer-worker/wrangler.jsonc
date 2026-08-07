@@ -3,12 +3,17 @@
 	"name": "roj-computer-worker",
 	"main": "src/index.ts",
 	"compatibility_date": "2025-11-01",
-	"compatibility_flags": ["nodejs_compat"],
+	// `experimental` gates worker_loaders, which the shell backend mints its Dynamic Worker
+	// through; `enable_ctx_exports` gives it the loopback binding back to WorkspaceServiceProxy.
+	"compatibility_flags": ["nodejs_compat", "experimental", "enable_ctx_exports"],
 	"durable_objects": {
 		"bindings": [
 			{ "name": "AGENT", "class_name": "RojAgentDO" }
 		]
 	},
+	"worker_loaders": [
+		{ "binding": "LOADER" }
+	],
 	"migrations": [
 		{ "tag": "v1", "new_sqlite_classes": ["RojAgentDO"] }
 	],
