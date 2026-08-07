@@ -27,7 +27,7 @@ export const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
 export interface WithRetryOptions<E> extends RetryOptions {
 	isRetryable: (error: E) => boolean
 	getRetryDelay?: (error: E) => number | undefined
-	/** Error to return when aborted before first attempt */
+	/** Error to return when the caller's signal aborts, whichever attempt that happens on. */
 	abortError?: E
 	logger?: Logger
 	context?: string
@@ -52,8 +52,13 @@ export async function withRetry<T, E>(
 
 	while (attempt < opts.maxAttempts) {
 		if (options.signal?.aborted) {
-			const error = lastError ?? options.abortError
-			if (error !== undefined) {
+			// abortError wins over lastError: the caller cancelled, and that is what
+			// the cancellation means regardless of how the previous attempt failed.
+			// Returning the previous failure instead makes a cancel indistinguishable
+			// from a genuine one — Agent.runInference then emits inference_failed and
+			// notifies the parent for what was really a shutdown.
+			const error = options.abortError ?? lastError
+			if (error !== null && error !== undefined) {
 				return Err(error)
 			}
 			break
@@ -148,7 +153,7 @@ export async function withLLMRetry<T>(
 		...options,
 		isRetryable: isRetryableLLMError,
 		getRetryDelay: getLLMRetryDelay,
-		abortError: { type: 'aborted', message: 'Aborted before first attempt' },
+		abortError: { type: 'aborted', message: 'Request was aborted' },
 		context: 'LLM inference',
 	})
 }
