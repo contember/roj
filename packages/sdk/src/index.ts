@@ -18,6 +18,7 @@ export type { CreateSystemOptions, System } from './core/system.js'
 
 // Lib exports
 export { BaseEventStore, FileEventStore, MemoryEventStore } from '~/core/events/index.js'
+export { EventAppendError, EventStoreError, SessionNotFoundError } from '~/core/events/index.js'
 export type { LoadRangeOptions, LoadRangeResult } from '~/core/events/index.js'
 export { MockLLMProvider, OpenRouterProvider, RequestMatchers } from '~/core/llm/index.js'
 export type { MockInferenceHandler, OpenRouterConfig } from '~/core/llm/index.js'

@@ -24,3 +24,5 @@ export function createComputerPlatform(workspace: Workspace, options: ComputerPl
 }
 
 export { createComputerFileSystem, createUnsupportedProcessRunner }
+export { SqliteEventStore } from './sqlite-event-store.js'
+export type { SqlCursorLike, SqlStorageHost, SqlStorageLike } from './sqlite-event-store.js'
