@@ -7,11 +7,16 @@
  * changes. The worker DO persists the last snapshot into its session table so
  * versions sidebar and publish bars can render without reaching into the
  * sandbox on every page view.
+ *
+ * Two ways to read that state. `platform.git` answers it directly, which is how
+ * hosts with no process table (a Worker isolate over a VFS) take part; without
+ * the port the plugin shells out to the `git` binary, as it always has.
  */
 
 import z from 'zod/v4'
 import { definePlugin } from '~/core/plugins/index.js'
 import { sessionIdSchema } from '~/core/sessions/schema.js'
+import type { GitClient } from '~/platform/git.js'
 import type { ProcessRunner } from '~/platform/process.js'
 
 const POLL_INTERVAL_MS = 2000
@@ -55,24 +60,39 @@ export const gitStatusPlugin = definePlugin('git-status')
 
 		const sessionId = ctx.sessionId
 		const pluginCtx = ctx.pluginContext
+		const git = ctx.platform.git
 		const processRunner = ctx.platform.process
 		const logger = ctx.logger
 		const notify = ctx.notify
 		pluginCtx.active = true
 
+		const stop = () => {
+			const interval = pluginCtx.intervals.get(sessionId)
+			if (interval) clearInterval(interval)
+			pluginCtx.intervals.delete(sessionId)
+		}
+
 		const tick = async () => {
 			if (!pluginCtx.active) return
 			let baseBranch = pluginCtx.defaultBranches.get(sessionId)
 			if (!baseBranch) {
-				baseBranch = await detectDefaultBranch(processRunner, workdir) ?? DEFAULT_BRANCH_FALLBACK
+				const detected = git
+					? await detectDefaultBranchOverPort(git, workdir)
+					: await detectDefaultBranch(processRunner, workdir)
+				baseBranch = detected ?? DEFAULT_BRANCH_FALLBACK
 				if (!pluginCtx.active) return
 				pluginCtx.defaultBranches.set(sessionId, baseBranch)
 			}
 
-			const snapshot = await computeGitStatus(processRunner, workdir, baseBranch)
+			const snapshot = git
+				? await computeGitStatusOverPort(git, workdir, baseBranch)
+				: await computeGitStatus(processRunner, workdir, baseBranch)
 			if (!pluginCtx.active) return
 			if (!snapshot) {
-				logger.warn('git-status: snapshot failed', { sessionId, workdir, baseBranch })
+				// A workspace with no repository is an ordinary state the port reports
+				// cheaply; only the shell-out path, where a failure means the binary
+				// itself misbehaved, is worth a warning.
+				if (!git) logger.warn('git-status: snapshot failed', { sessionId, workdir, baseBranch })
 				return
 			}
 
@@ -92,14 +112,19 @@ export const gitStatusPlugin = definePlugin('git-status')
 
 		const runTick = () => {
 			tick().catch((err) => {
+				if (isUnsupported(err)) {
+					// Neither a git port nor a process table — no tick can ever succeed here.
+					stop()
+					logger.debug('git-status: disabled, host cannot run git', { sessionId, workdir })
+					return
+				}
 				logger.warn('git-status tick failed', { sessionId, err: err instanceof Error ? err.message : String(err) })
 			})
 		}
 
+		// Registered before the first tick so its failure handler can stop the timer.
+		pluginCtx.intervals.set(sessionId, setInterval(runTick, POLL_INTERVAL_MS))
 		runTick()
-		const interval = setInterval(runTick, POLL_INTERVAL_MS)
-
-		pluginCtx.intervals.set(sessionId, interval)
 	})
 	.sessionHook('onSessionClose', async (ctx) => {
 		const sessionId = ctx.sessionId
@@ -120,6 +145,35 @@ function snapshotsEqual(a: GitStatusSnapshot, b: GitStatusSnapshot): boolean {
 		&& a.uncommittedFiles === b.uncommittedFiles
 		&& a.lastCommitAt === b.lastCommitAt
 		&& a.lastCommitMessage === b.lastCommitMessage
+}
+
+async function computeGitStatusOverPort(git: GitClient, workdir: string, baseBranch: string): Promise<GitStatusSnapshot | null> {
+	try {
+		const [committedAhead, entries, commits] = await Promise.all([
+			git.countAhead({ dir: workdir, base: baseBranch }),
+			git.status({ dir: workdir }),
+			git.log({ dir: workdir, depth: 1 }),
+		])
+
+		const head = commits[0]
+		return {
+			committedAhead,
+			uncommittedFiles: entries.length,
+			lastCommitAt: head?.committedAt ?? null,
+			// The shell path reads `%s`, the subject — so take the same first line here.
+			lastCommitMessage: head ? subjectOf(head.message) : null,
+		}
+	} catch {
+		return null
+	}
+}
+
+async function detectDefaultBranchOverPort(git: GitClient, workdir: string): Promise<string | null> {
+	try {
+		return await git.defaultBranch({ dir: workdir }) ?? null
+	} catch {
+		return null
+	}
 }
 
 async function computeGitStatus(process: ProcessRunner, workdir: string, baseBranch: string): Promise<GitStatusSnapshot | null> {
@@ -161,9 +215,20 @@ async function runGit(process: ProcessRunner, workdir: string, args: string[]): 
 	try {
 		const { stdout } = await process.execFile('git', args, { cwd: workdir, timeout: GIT_TIMEOUT_MS, maxBuffer: 1024 * 1024 })
 		return stdout
-	} catch {
+	} catch (error) {
+		// A failed git call is normal; a host that cannot spawn at all is not — let it out.
+		if (isUnsupported(error)) throw error
 		return null
 	}
+}
+
+/** ENOSYS is what a ProcessRunner without a process table rejects with. */
+function isUnsupported(error: unknown): boolean {
+	return error instanceof Error && 'code' in error && error.code === 'ENOSYS'
+}
+
+function subjectOf(message: string): string | null {
+	return message.split('\n', 1)[0]?.trim() || null
 }
 
 function countNonEmptyLines(output: string): number {

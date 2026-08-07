@@ -6,8 +6,10 @@
  */
 
 import type { Workspace } from '@cloudflare/computer'
+import type { GitClient as ComputerGitClient } from '@cloudflare/computer/git'
 import type { Platform } from '@roj-ai/sdk/platform'
 import { createComputerFileSystem } from './fs.js'
+import { createComputerGitClient } from './git.js'
 import { createShellProcessRunner, createUnsupportedProcessRunner } from './process.js'
 
 export interface ComputerPlatformOptions {
@@ -16,14 +18,25 @@ export interface ComputerPlatformOptions {
 }
 
 export function createComputerPlatform(workspace: Workspace, options: ComputerPlatformOptions = {}): Platform {
+	const git = workspaceGit(workspace)
 	return {
 		fs: createComputerFileSystem(workspace.provider()),
 		process: createUnsupportedProcessRunner(),
+		git: git && createComputerGitClient(git),
 		tmpDir: options.tmpDir ?? '/tmp',
 	}
 }
 
-export { createComputerFileSystem, createShellProcessRunner, createUnsupportedProcessRunner }
+/** The getter throws unless `WorkspaceOptions.git` was set — the only signal a Workspace gives. */
+function workspaceGit(workspace: Workspace): ComputerGitClient | undefined {
+	try {
+		return workspace.git
+	} catch {
+		return undefined
+	}
+}
+
+export { createComputerFileSystem, createComputerGitClient, createShellProcessRunner, createUnsupportedProcessRunner }
 export type { ShellProcessRunnerOptions } from './process.js'
 export { SqliteEventStore } from './sqlite-event-store.js'
 export type { SqlCursorLike, SqlStorageHost, SqlStorageLike } from './sqlite-event-store.js'

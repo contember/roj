@@ -7,9 +7,11 @@
  */
 
 import type { FileSystem } from './fs.js'
+import type { GitClient } from './git.js'
 import type { ProcessRunner } from './process.js'
 
 export type { Dirent, FileHandle, FileSystem, ReadableFileHandle, Stats } from './fs.js'
+export type { GitClient, GitCommit, GitCountAheadOptions, GitLogOptions, GitRepoOptions, GitStatusEntry } from './git.js'
 export type { ChildProcess, ExecFileOptions, ExecFileResult, ProcessRunner, SpawnOptions } from './process.js'
 
 /**
@@ -18,6 +20,8 @@ export type { ChildProcess, ExecFileOptions, ExecFileResult, ProcessRunner, Spaw
 export interface Platform {
 	fs: FileSystem
 	process: ProcessRunner
+	/** Git over the host's repositories. Absent on hosts that cannot run git at all. */
+	git?: GitClient
 	/** Absolute path to the OS temp directory (equivalent to `os.tmpdir()` on Node/Bun). */
 	tmpDir: string
 }

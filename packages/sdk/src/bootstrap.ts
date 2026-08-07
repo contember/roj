@@ -75,8 +75,11 @@ export const fullPlugins = [
 
 /**
  * Built-in plugins that run without an OS process table, for hosts like a Worker
- * isolate. Drops `uploads`, `resources`, `services` and `git-status` — each of
- * them shells out (pdftotext/markitdown, unzip, dev servers, `git`).
+ * isolate. Drops `uploads`, `resources` and `services` — each of them shells out
+ * (pdftotext/markitdown, unzip, dev servers).
+ *
+ * `git-status` stays: it reads `platform.git` where the host offers one, and
+ * stops polling where it does not.
  *
  * `satisfies` keeps this a strict subset of `fullPlugins`, so it cannot name a
  * plugin the RPC contract does not know about.
@@ -93,6 +96,7 @@ export const isolatePlugins = [
 	logsPlugin,
 	sessionStatsPlugin,
 	sessionStatePlugin,
+	gitStatusPlugin,
 ] as const satisfies readonly (typeof fullPlugins)[number][]
 
 /** Which built-in plugin set a host registers. */

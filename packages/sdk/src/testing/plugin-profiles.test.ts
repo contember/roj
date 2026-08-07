@@ -7,7 +7,7 @@ import { createTestPreset } from './preset-helpers.js'
 import { TestHarness } from './test-harness.js'
 
 /** Plugins the isolate profile drops — each one shells out to a binary. */
-const PROCESS_DEPENDENT = ['uploads', 'resources', 'services', 'git-status']
+const PROCESS_DEPENDENT = ['uploads', 'resources', 'services']
 
 function testConfig(): Config {
 	return {
