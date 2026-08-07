@@ -10,6 +10,18 @@ import type { FileHandle } from 'node:fs/promises'
 
 export type { Dirent, FileHandle, Stats }
 
+/**
+ * Positional-read handle — the subset of `node:fs/promises` FileHandle the SDK uses.
+ *
+ * Narrower than `FileHandle` so platforms without a full handle abstraction
+ * (e.g. a VFS exposing only raw fds) can implement it. `FileHandle` satisfies it.
+ */
+export interface ReadableFileHandle {
+	stat(): Promise<Stats>
+	read(buffer: Buffer, offset: number, length: number, position: number): Promise<{ bytesRead: number; buffer: Buffer }>
+	close(): Promise<void>
+}
+
 export interface FileSystem {
 	readFile(path: string): Promise<Buffer>
 	readFile(path: string, encoding: 'utf-8' | 'utf8'): Promise<string>
@@ -28,7 +40,7 @@ export interface FileSystem {
 	rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>
 	cp(source: string, dest: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>
 
-	open(path: string, flags?: string): Promise<FileHandle>
+	open(path: string, flags?: string): Promise<ReadableFileHandle>
 
 	/** Returns true if path exists and is accessible; never throws for missing paths. */
 	exists(path: string): Promise<boolean>

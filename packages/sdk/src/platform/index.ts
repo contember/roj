@@ -9,7 +9,7 @@
 import type { FileSystem } from './fs.js'
 import type { ProcessRunner } from './process.js'
 
-export type { Dirent, FileHandle, FileSystem, Stats } from './fs.js'
+export type { Dirent, FileHandle, FileSystem, ReadableFileHandle, Stats } from './fs.js'
 export type { ChildProcess, ExecFileOptions, ExecFileResult, ProcessRunner, SpawnOptions } from './process.js'
 
 /**
