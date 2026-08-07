@@ -10,7 +10,8 @@
 	"dependencies": {
 		"@cloudflare/computer": "0.1.1",
 		"@roj-ai/computer-platform": "workspace:*",
-		"@roj-ai/sdk": "workspace:*"
+		"@roj-ai/sdk": "workspace:*",
+		"@roj-ai/transport": "workspace:*"
 	},
 	"devDependencies": {
 		"@cloudflare/workers-types": "^4.20250109.0",

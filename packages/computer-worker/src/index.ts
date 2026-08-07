@@ -11,6 +11,7 @@
 import { Workspace, WorkspaceServiceProxy } from '@cloudflare/computer'
 import type { DurableObjectStorageLike, WorkspaceStub } from '@cloudflare/computer'
 import { WorkerShellBackend } from '@cloudflare/computer/backends/worker-shell'
+import { createGitClient } from '@cloudflare/computer/git'
 import { SqliteEventStore, createComputerPlatform, createShellProcessRunner } from '@roj-ai/computer-platform'
 import { FileEventStore, bootstrap, createSystemFromServices, isolatePlugins } from '@roj-ai/sdk'
 import type { Config, IsolateMethodSchemas, Services, Session, SessionId, System } from '@roj-ai/sdk'
@@ -18,6 +19,8 @@ import type { Platform } from '@roj-ai/sdk/platform'
 import { DurableObject } from 'cloudflare:workers'
 import { runBench } from './bench.js'
 import type { BenchResult } from './bench.js'
+import { createDoTransport } from './do-transport.js'
+import type { DoTransport } from './do-transport.js'
 import { NOTE_PATH, scriptedHandler } from './mock-llm.js'
 import { isolatePreset } from './preset.js'
 import { runShellProbes } from './shell-probe.js'
@@ -47,6 +50,16 @@ const DATA_ROOT = '/data'
 /** Selector the shell backend is registered under; `execFile` names it explicitly. */
 const SHELL_BACKEND = 'shell'
 
+/** Repository /git builds in a session workspace — a commit, then a dirty file. */
+const GIT_SETUP = [
+	'git init',
+	'echo "first" > note.txt',
+	'git add note.txt',
+	'git commit -m "add note"',
+	'echo "second" >> note.txt',
+	'echo "untracked" > scratch.txt',
+] as const
+
 /** `loadConfig()` reads process.env/cwd, which a Worker isolate has neither of. */
 const config: Config = {
 	port: 0,
@@ -63,6 +76,9 @@ export class RojAgentDO extends DurableObject<Env> {
 	readonly #workspace: Workspace
 	readonly #platform: Platform
 	readonly #eventStore: SqliteEventStore
+	readonly #transport: DoTransport
+	/** Everything plugins have notified since boot — how /git observes git-status. */
+	readonly #notifications: { type: string; payload: unknown }[] = []
 	#booted?: { services: Services<'isolate'>; system: IsolateSystem }
 
 	constructor(ctx: DurableObjectState, env: Env) {
@@ -81,6 +97,11 @@ export class RojAgentDO extends DurableObject<Env> {
 					ctx,
 				}),
 			],
+			// Backs both the shell's `git` command and platform.git; without it the
+			// workspace has no git client and every invocation rejects.
+			git: createGitClient(),
+			// The isolate has no user, and a commit needs an author to attribute.
+			defaultGitIdentity: { name: 'roj', email: 'roj@example.invalid' },
 		})
 		this.#platform = {
 			...createComputerPlatform(this.#workspace),
@@ -88,6 +109,23 @@ export class RojAgentDO extends DurableObject<Env> {
 			process: createShellProcessRunner(this.#workspace, { backend: SHELL_BACKEND }),
 		}
 		this.#eventStore = new SqliteEventStore(storage)
+		this.#transport = createDoTransport(ctx, () => this.#boot())
+	}
+
+	fetch(request: Request): Promise<Response> {
+		return this.#transport.fetch(request)
+	}
+
+	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
+		this.#transport.webSocketMessage(ws, message)
+	}
+
+	webSocketClose(ws: WebSocket, code: number, reason: string): void {
+		this.#transport.webSocketClose(ws, code, reason)
+	}
+
+	webSocketError(ws: WebSocket, error: unknown): void {
+		this.#transport.webSocketError(ws, error)
 	}
 
 	/** Entry point for the shell backend's Dynamic Worker, via WorkspaceServiceProxy. */
@@ -105,7 +143,14 @@ export class RojAgentDO extends DurableObject<Env> {
 			...bootstrap(config, { presets: [isolatePreset] }, this.#platform, { pluginProfile: 'isolate' }),
 			eventStore: this.#eventStore,
 		}
-		const booted = { services, system: createSystemFromServices(services) }
+		const system = createSystemFromServices(services, {
+			onUserOutput: (notification) => {
+				// Collected for /git to assert on, and fanned out to subscribed sockets.
+				this.#notifications.push({ type: notification.type, payload: notification.payload })
+				this.#transport.broadcast(notification)
+			},
+		})
+		const booted = { services, system }
 		this.#booted = booted
 		return booted
 	}
@@ -187,6 +232,60 @@ export class RojAgentDO extends DurableObject<Env> {
 		} catch (error) {
 			return Response.json({ ok: false, ...describeError(error) }, { status: 500 })
 		}
+	}
+
+	/**
+	 * End-to-end check of the git port: build a repo in a live session's workspace
+	 * through the shell's `git`, then read it back both directly off `platform.git`
+	 * and through the `git-status` plugin's polled notification.
+	 */
+	async git(): Promise<Response> {
+		const { system } = this.#boot()
+		const created = await system.sessionManager.createSession(isolatePreset.id)
+		if (!created.ok) {
+			return Response.json({ ok: false, stage: 'createSession', error: created.error }, { status: 500 })
+		}
+		const session = created.value
+		const workdir = `/workspace/${session.id}`
+
+		try {
+			// git-status' first tick lands before any of this — an empty workspace is
+			// the "no repository yet" case, which must stay quiet rather than warn.
+			const shell: { command: string; exitCode: number; stdout: string; stderr: string }[] = []
+			for (const command of GIT_SETUP) {
+				const handle = await this.#workspace.runtime.exec(command, { backend: SHELL_BACKEND, encoding: 'utf8', cwd: workdir })
+				try {
+					const result = await handle.result()
+					shell.push({ command, exitCode: result.exitCode ?? -1, stdout: result.stdout.trim(), stderr: result.stderr.trim() })
+				} finally {
+					handle[Symbol.dispose]()
+				}
+			}
+
+			const git = this.#platform.git
+			const port = git === undefined ? null : {
+				status: await git.status({ dir: workdir }),
+				log: await git.log({ dir: workdir, depth: 1 }),
+				countAhead: await git.countAhead({ dir: workdir, base: 'main' }),
+				defaultBranch: await git.defaultBranch({ dir: workdir }) ?? null,
+			}
+
+			const snapshot = await this.#awaitGitStatus()
+			return Response.json({ ok: true, sessionId: String(session.id), workdir, shell, port, snapshot })
+		} catch (error) {
+			return Response.json({ ok: false, ...describeError(error) }, { status: 500 })
+		}
+	}
+
+	/** git-status polls every 2s, so give it a couple of ticks to see the new repo. */
+	async #awaitGitStatus(timeoutMs = 10_000): Promise<unknown> {
+		const deadline = Date.now() + timeoutMs
+		while (Date.now() < deadline) {
+			const latest = this.#notifications.filter((entry) => entry.type === 'git_status_changed').at(-1)
+			if (latest) return latest.payload
+			await scheduler.wait(250)
+		}
+		return null
 	}
 
 	/** Bytes the store under test holds for one session — a JSONL file, or event rows. */
@@ -286,6 +385,13 @@ export default {
 		if (url.pathname === '/shell') {
 			return stub.shell(url.searchParams.get('cmd'))
 		}
-		return new Response('GET /run?message=... | GET /bench?counts=100,500&stores=sqlite,file | GET /shell?cmd=...\n', { status: 404 })
+		if (url.pathname === '/git') {
+			return stub.git()
+		}
+		if (url.pathname === '/') {
+			return new Response('GET /run?message=... | GET /bench?counts=100,500&stores=sqlite,file | GET /shell?cmd=... | GET /git\n', { status: 404 })
+		}
+		// Everything else is the SDK's own transport surface: /rpc, /health, /status, /sessions/*, /ws.
+		return stub.fetch(request)
 	},
 } satisfies ExportedHandler<Env>

@@ -9,6 +9,7 @@ bun run dev                     # wrangler dev on :8787
 curl localhost:8787/run         # boot the SDK, run a two-agent session
 curl localhost:8787/bench       # replay scaling: ?counts=100,500&stores=sqlite,file
 curl localhost:8787/shell       # probe what just-bash implements; ?cmd=... for one command
+curl localhost:8787/git         # build a repo in a session workspace, read it back three ways
 ```
 
 A `RojAgentDO` Durable Object owns one `Workspace`. `createComputerPlatform`
@@ -19,15 +20,19 @@ makes the orchestrator spawn a `writer` agent, which writes a file via the
 filesystem plugin. The response reports timings, the event count, and the
 resulting workspace tree.
 
-Three things the DO wires that the SDK's own defaults do not:
+Four things the DO wires that the SDK's own defaults do not:
 
-- **`{ pluginProfile: 'isolate' }`** — drops `services`, `resources`, `uploads`
-  and `git-status`, the four built-ins that need a process table.
+- **`{ pluginProfile: 'isolate' }`** — drops `services`, `resources` and
+  `uploads`, the three built-ins that need a process table.
 - **`SqliteEventStore`** over `ctx.storage`, replacing the `FileEventStore`
   `bootstrap()` builds off `config.persistence`. Swapped in on the `Services`
   object, since `Config` has no third persistence mode.
 - **`WorkerShellBackend`** on the workspace, so `platform.process.execFile`
   runs commands instead of rejecting with ENOSYS.
+- **`createGitClient()`** as `WorkspaceOptions.git`, which backs both the shell's
+  `git` command and `platform.git`, plus a `defaultGitIdentity` so commits have
+  an author. Without the factory the `git` getter throws and
+  `createComputerPlatform` leaves `platform.git` unset.
 
 ## What this harness pins down
 
@@ -37,6 +42,9 @@ Three things the DO wires that the SDK's own defaults do not:
   through the adapter's `appendFile`, which upstream rejects with ENOSYS.
 - DO state survives isolate restarts — earlier sessions stay in the tree.
 - `execFile` works over the shell backend; `spawn` does not (see below).
+- Git runs with no binary and no process table. `/git` runs `git init`, `add`
+  and `commit` through the shell, then reads the same repo back off
+  `platform.git` and out of the `git-status` plugin's notification.
 
 ## Wiring the shell backend
 
@@ -65,10 +73,10 @@ four things, all of them easy to miss:
 - **`spawn` is still ENOSYS.** It returns a Node `ChildProcess` — streams,
   `kill()`, `'exit'` — and only the `services` plugin needs it. `execFile` is
   routed; the `ChildProcess` shim is not built.
-- **`workspace.git` is not configured**, so the shell's built-in `git` command
-  rejects every invocation. Fixing it means passing `createGitClient()` from
-  `@cloudflare/computer/git` as `WorkspaceOptions.git`, which pulls in
-  `isomorphic-git` — a new dependency, so it was left for Phase 4.
+- **`platform.git.defaultBranch()` always answers "unknown" here.** computer's
+  git cannot read a remote's HEAD — its `symbolic-ref` accepts only `HEAD` — so
+  `git-status` compares against its own `main` fallback rather than whatever
+  `origin/HEAD` points at.
 - **The `shell` and `snapshotting` plugins are a preset concern, not a profile
   one.** They register through `preset.plugins`, which a bootstrap profile has
   no reach into.
@@ -90,6 +98,17 @@ Works: `echo` `cat` `ls` (incl. `-la`) `pwd` `grep` (incl. `-r`) `rg` `head`
 `jq` and `sqlite3` exist too, with their own flag surfaces (`--version` is not
 one of them; a `diff` of differing files exits 1, as it should).
 
+`git` works now that the workspace has a client — `init`, `add`, `commit`,
+`log`, `status`, `diff`, `branch`, `checkout`, `rev-parse`, `remote`, `stash`,
+`reset` and friends all dispatch into `workspace.git`. Three divergences from
+the real binary, all measured:
+
+| Divergence | Detail |
+|---|---|
+| `--porcelain` is v2 | Untracked paths come back as `? file`, not `?? file`. `--porcelain=v1` gives the two-char codes real git's plain `--porcelain` does. |
+| `status` outside a repo succeeds | It reports every file untracked instead of failing. `log` and `rev-parse` do reject, which is what `git-status` keys off. |
+| `symbolic-ref` only takes `HEAD` | `refs/remotes/origin/HEAD` exits 129, so remote default-branch detection is unavailable. |
+
 Shell syntax works: pipes, `>` and `>>`, `<`, `&&` / `||` / `;`, `$(...)`,
 `$((...))`, variable assignment and `export`, globs, `for`, `if [ ... ]`, `cd`,
 background `&` with `wait`.
@@ -98,16 +117,17 @@ Does not work:
 
 | Missing | Detail |
 |---|---|
-| `git` | Registered as a host command, but rejects with `Workspace git is not configured` until `WorkspaceOptions.git` is set. `which git` fails while `type git` and `command -v git` both answer `/usr/bin/git`. |
+| `which git` | Fails even though `git` runs, because it is a host command with no path. `type git` and `command -v git` both answer `/usr/bin/git`. |
 | `node`, `unzip`, `pdftotext` | `command not found`. |
 | `python3` | `command not available in browser environments`. |
 | `curl` | `command not found`, and the Dynamic Worker runs with `globalOutbound: null` anyway. |
 | `trap` | `trap: command not found`. |
 
-For roj that means `git-status` (needs `git`), `ZipPreprocessor` (`unzip`),
-`PdfPreprocessor` (`pdftotext`, `pdfimages`), `MarkitdownPreprocessor` and
-`VipsImageResizer` (`vips*`) still cannot run on this backend — they need the
-container backend, or a rewrite against a workspace API.
+For roj that means `ZipPreprocessor` (`unzip`), `PdfPreprocessor` (`pdftotext`,
+`pdfimages`), `MarkitdownPreprocessor` and `VipsImageResizer` (`vips*`) still
+cannot run on this backend — they need the container backend, or a rewrite
+against a workspace API. `git-status` no longer belongs on that list: it reads
+`platform.git` rather than shelling out.
 
 ## Replay scaling (`/bench`)
 
