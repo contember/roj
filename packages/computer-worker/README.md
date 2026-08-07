@@ -10,6 +10,7 @@ curl localhost:8787/run         # boot the SDK, run a two-agent session
 curl localhost:8787/bench       # replay scaling: ?counts=100,500&stores=sqlite,file
 curl localhost:8787/shell       # probe what just-bash implements; ?cmd=... for one command
 curl localhost:8787/git         # build a repo in a session workspace, read it back three ways
+curl localhost:8787/limits      # roster; /limits/<name> runs one probe — see "Limits" below
 ```
 
 A `RojAgentDO` Durable Object owns one `Workspace`. `createComputerPlatform`
@@ -82,7 +83,8 @@ four things, all of them easy to miss:
   no reach into.
 - **CPU under streaming inference is unmeasured.** The smoke run is ~1.6s wall,
   almost all of it agent debounce. There is no API key in the dev environment,
-  so real inference has not been run in an isolate.
+  so real inference has not been run in an isolate. Everything roj does *around*
+  the provider is measured — see Limits.
 
 ## What just-bash implements
 
@@ -173,3 +175,136 @@ Reading it:
 So SqliteEventStore is the right store for an isolate — it makes the write path
 cheap and flat, which is what an event-sourced session actually does all day —
 but it does not make session load faster, and nobody should expect it to.
+
+## Limits (`/limits`)
+
+Where standalone roj stops inside a Worker. `/limits/<name>` runs one probe from
+`src/limits/`, each on its own DO so a probe that OOMs or fills storage cannot
+poison the next. Every probe takes query parameters; `/limits` lists the roster.
+
+**Read the local/production column before quoting any number.** `wrangler dev`
+enforces almost nothing: workerd's OSS `LimitEnforcer` is a no-op, so CPU and
+subrequest budgets never bite, and the memory ceiling you can reach locally is
+V8's, not Cloudflare's.
+
+| Ceiling | Measured | Real, or local only? |
+|---|---|---|
+| Script size | 7.2 MB raw / **1.57 MB gzip** | Real — under the 10 MB paid *and* 3 MB free limits |
+| Startup CPU | **~103 ms** of 400 ms | Real limit, local CPU — a magnitude, not headroom |
+| Event payload (DO SQLite value) | **2 199 994 B** | Real — same workerd binary |
+| `read_file` result | 10 MiB | roj's own guard, not the platform's |
+| WebSocket frame | **32 MiB** over a real hop | Real. An in-isolate `WebSocketPair` has no limit — a loopback artefact |
+| Workspace file | 384 MiB round-tripped | Local only — production is bounded by isolate memory |
+| Isolate memory | ~1.41 GB (V8 heap) | Local only — production is 128 MB, ~11× lower |
+
+### Per turn
+
+One turn is one user message: 2 inferences, N tool executions, **9 events**
+(~3.1 KB). It costs **~10 ms of CPU and 2 subrequests**, plus one subrequest per
+`runtime.exec`.
+
+Turn cost does not grow with session age — 60 turns give a slope of +0.03
+ms/turn — nor with tool-result size (512 B / 64 KB / 512 KB → 9 / 14 / 13 ms).
+The reducer's whole-history copy that dominates `/bench` needs 10⁴ events to
+bite, and a turn adds nine. What does scale: +1.1 ms per tool call, +35 ms of DO
+wall per child agent, +5–6 ms per warm shell exec.
+
+**Subrequests bind ~5× before CPU.** An await-until-idle request tops out around
+**500 turns** (166 with four execs per turn) against CPU's ~2 800.
+
+**Wall time is not CPU.** The SDK's default `debounceMs: 500` turns ~9 ms of work
+into 1009 ms of wall; two debounce hops are 99% of a turn. Each scheduling hop
+costs `max(debounce, ~12 ms) + ~2 ms`, the floor being the DO's storage commit.
+
+### Concurrency
+
+Parallel agents overlap **for work that awaits** — 20 agents cost 1.46× one, with
+20 inferences counted open simultaneously inside the provider. For work that
+computes, peak concurrency is 1 and wall time is linear. Real inference is
+network-bound, so fanning out on one DO does buy speedup; prompt building,
+replay, tool bodies and zod do not.
+
+A DO took 448 live sessions with no measurable degradation and 128 concurrent
+shell execs with no queueing. `Session.spawnAgentManually` caps children at **20
+per parent**, hard-coded — the comment above it says "default: 20", but nothing
+reads a config.
+
+**Writes starve every timer in the isolate.** Both `SqliteEventStore` and
+computer's filesystem go through synchronous `sql.exec` (computer uses
+`transactionSync` throughout and rejects async transactions), so a loop of
+`await store.append(...)` resolves on the microtask queue and never yields. A
+400 ms burst of appends delivered **one** timer tick, 422 ms late — stalling
+every other agent's debounce for the length of the burst.
+
+### The agent loop escapes its invocation
+
+Measured three times: a request that enqueues a message and returns leaves at
++0–2 ms with one event, and 17–45 further events, 2–6 inferences and 2 agent
+spawns land afterwards with nothing in flight.
+
+That is deliberate runtime behaviour, not a dev-server artefact. In an actor
+every `setTimeout` registers a wait-until task so `IncomingRequest::drain()`
+waits for it (`io-context.c++:828`), and actor background work is cancelled only
+at actor shutdown, never on a per-request timeout (`io-context.c++:540`) — the
+asymmetry against stateless Workers, which get a 30 s drain.
+
+The catch is CPU accounting. An actor's budget is owned by its `IoContext` and
+refilled by `topUpActor()`, which only runs when a new event is *delivered*
+(`io-context.c++:271`). A timer callback never tops up, and an interval stops
+rescheduling once the budget is spent (`io-context.c++:793`) — silently. So an
+agent working autonomously with no incoming events draws down a budget nothing
+refills. A DO alarm *is* a delivered event (`worker-entrypoint.c++:670`), which
+is the second reason for the scheduler port in the plan's Phase 8.
+
+**So don't drive long sessions through an await-until-idle fetch.** Send and
+return, let the timers run the loop, subscribe or poll for state.
+
+### Two ways a session breaks that are worth guarding
+
+**An oversized event hangs the agent.** Past the 2.2 MB SQLite value limit the
+log stops at `tool_started` with no terminal event, no error event and no state
+change; the agent never goes idle, and replay carries a `tool_use` with no
+`tool_result`. Stock config never gets there — `read_file`'s own guard fires 25×
+earlier and fails cleanly with `recoverable: true` — but raising `maxTokens`, or
+any plugin putting an unbounded blob in an event, walks into it.
+
+**A DO degrades by lifetime, not by load.** Closing a session leaves its
+`/workspace/<sessionId>` directory and its event rows behind; one probe finished
+with 6 238 entries under `/workspace`. `createSession` goes from ~15 ms to
+~110 ms on a DO that has churned a few thousand sessions. A multi-session DO
+needs a reaper.
+
+Both probes saw creation degrade, and they disagree about why: the concurrency
+probe pins it on lifetime debris (32 live sessions on an aged DO were slower than
+448 on a fresh one), the memory probe on the per-session `git-status` interval
+(13 → 174 ms between 100 and 1000 live). Neither isolated the variable. Open.
+
+### Three SDK defects the probes turned up
+
+- **`SessionManager.shutdown()` never runs `onSessionClose` hooks** — it calls
+  `Session.shutdown()`, which only stops agents. `git-status` intervals outlive
+  it and keep the session object reachable: a timer *and* a memory leak per
+  session ever loaded.
+- **`EventAppendError` reports no reason.** The cause lives only in `cause`, and
+  all three logger serialisers take `{name, message, stack}`. An operator sees
+  "Failed to append event to session: X".
+- **`SessionFileStore.read` collapses every failure into `File not found`** —
+  `catch {}` with the error discarded, so a size or memory error reads as a
+  missing file.
+
+### What only a deploy can settle
+
+- **CPU under real streaming inference.** No API key here, so the provider is
+  mocked and SSE parsing, response assembly and the per-inference call-log writes
+  are all excluded.
+- **Which budget the timer-driven work is charged to in production.** The OSS
+  enforcer is a no-op and the real one is closed-source; this decides whether
+  send-and-return genuinely escapes the ceiling or only hides it.
+- **The 128 MB isolate ceiling.** Locally only V8's ~1.41 GB heap is reachable,
+  and it aborts the whole workerd process rather than evicting one isolate.
+  What transfers is the ratio: history costs ~2.1× its stored payload.
+- **Whether Dynamic Workers get cores independent of the calling DO.**
+
+One incidental finding worth carrying: **`await ctx.storage.put()` is not durable
+against an abort.** The write lands at the next I/O checkpoint, which an aborted
+isolate never reaches. A `await scheduler.wait(0)` after the put fixes it.
