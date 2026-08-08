@@ -30,7 +30,7 @@ shelling out has to move, be dropped, or be routed to a container.
 | 5 — transport in the DO | **done** | Workers WebSocket platform + DO wiring, hibernation proven |
 | 6 — roj-platform | deferred | Shape decided; integration deliberately not started |
 | 7 — limits | in flight | What standalone roj costs a Worker, and where it stops |
-| 8 — scheduler port | next | The agent loop's `setTimeout` has no durability on CF |
+| 8 — scheduler port | **done** | Agent loop rides DO alarms; `git-status` deliberately left out |
 
 ## Phase 0 — measured, verdict: go
 
@@ -208,12 +208,23 @@ Settled so far, all locally and without a deploy:
 
 ## Phase 8 — scheduler port
 
-`Agent.scheduleProcessing` re-enters through `setTimeout` (500 ms debounce), and
-nothing in the harness or the transport calls `waitUntil` or sets an alarm. A
-Worker keeps an isolate alive for a request in flight, a pending `waitUntil`, or
-an attached non-hibernated socket — a bare timer buys none of those. Locally the
-loop still finishes, because a dev server does not evict; that is exactly the
-class of bug that only appears in production.
+**Done.** The agent loop rides DO alarms; `git-status` deliberately does not.
+
+The original reasoning here was half wrong and the correction is what makes the
+port worth having. A bare timer *is* kept alive in a Durable Object: workerd
+registers a wait-until task for every actor timer (`io-context.c++:828`) and
+cancels actor background work only at actor shutdown, never on a per-request
+timeout (`io-context.c++:540`) — the asymmetry against stateless Workers, which
+get a 30 s drain. The loop escaping its invocation was measured three times, and
+it is deliberate runtime behaviour rather than a dev-server artefact.
+
+What a timer cannot do is pay for itself. An actor's CPU budget is owned by its
+`IoContext` and refilled by `topUpActor()`, which runs only when an event is
+*delivered* (`io-context.c++:271`). A timer callback never tops up, and an
+interval stops rescheduling once the budget is spent (`io-context.c++:793`) —
+silently. A DO alarm is a delivered event (`worker-entrypoint.c++:670`). So the
+port buys two things: surviving eviction, and being the only way an autonomously
+working agent refills CPU budget.
 
 The SDK's timers split cleanly in two:
 
@@ -237,9 +248,40 @@ export interface Scheduler {
 }
 ```
 
-Bun implements it with `setTimeout` and behaves as it does today. The CF
-implementation sets a DO alarm; the alarm handler boots and re-enters the keyed
-agent, which is what makes it survive eviction.
+A wake carries no closure, because the isolate that armed it may be gone when it
+comes due: the key is the whole routing table, and `SessionManager.dispatchWake`
+turns it back into a session by loading its event log. Keys are namespaced —
+`agent:<sessionId>:<agentId>:<debounce|retry>` and
+`plugin:<sessionId>:<pluginName>:<method>[:<agentId>]`.
+
+The one addition to the shape above: hosts whose process outlives the delay need
+somewhere to deliver their own wakes, which two methods cannot express. Rather
+than widen the interface for everyone, `LiveScheduler extends Scheduler` adds
+`onWake`. Bun implements it; a DO implements the plain interface and calls
+`dispatchWake` from `alarm()`.
+
+**Measured, with a negative control.** `/limits/scheduler?phase=run` sends a
+message, throws the booted SDK away as an eviction would, and returns at 3
+events. 22 more land across three alarms, the file is written, and the session
+settles 1068 ms after the response — one alarm drained two agents' keys at once.
+With `?keepWakes=0` the same run stays at 3 events, zero alarms, no file, never
+settling.
+
+**`git-status` was deliberately not migrated**, and the reason is not that 2 s is
+too fast for alarms. A poll is not a "wake me later" but an unbounded clock: as
+wakes it must re-arm from its own tick, and since dispatch loads a session from
+its event log, every session ever opened would replay its whole log every poll
+period and keep an alarm-driven host permanently awake. A longer interval only
+bills for that more slowly. The cost of saying no is that on an alarm-driven host
+the interval runs on a budget nothing refills, then stops without a signal and
+the snapshot goes stale silently. The fix is to stop being a server-side poll —
+a pull method plus a refresh at turn boundaries — which changes the RPC contract
+and the client.
+
+Two gaps the port does not cover: there is no "is this key armed?" query (the
+agent's error-retry flag works around it in memory, and resets in a fresh
+process), and no way to cancel a whole namespace, so `onSessionClose` has to
+enumerate agents.
 
 ## Open decisions
 
