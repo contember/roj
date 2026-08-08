@@ -45,6 +45,14 @@ function workspaceGit(workspace: Workspace): ComputerGitClient | undefined {
 }
 
 export { createComputerFileSystem, createComputerGitClient, createShellProcessRunner, createUnsupportedProcessRunner }
+export { createAlarmScheduler } from './alarm-scheduler.js'
+export type {
+	AlarmScheduler,
+	AlarmSchedulerHost,
+	AlarmSchedulerStats,
+	AlarmStorageLike,
+	SyncKvLike,
+} from './alarm-scheduler.js'
 export type { ShellProcessRunnerOptions } from './process.js'
 export { SqliteEventStore } from './sqlite-event-store.js'
 export type { SqlCursorLike, SqlStorageHost, SqlStorageLike } from './sqlite-event-store.js'
