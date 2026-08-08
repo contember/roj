@@ -13,6 +13,7 @@ import { COMMUNICATOR_ROLE, ORCHESTRATOR_ROLE } from '~/core/agents/agent-roles.
 import type { AgentId } from '~/core/agents/schema.js'
 import { generateAgentId } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
+import { parseAgentWakeKey } from '~/core/agents/wake-key.js'
 import { type DomainError, PresetErrors, SessionErrors, ValidationErrors } from '~/core/errors.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { DomainEvent } from '~/core/events/types.js'
@@ -32,6 +33,7 @@ import type { ArchiveLimitOverrides } from '~/lib/archive/index.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import { TeeLogger } from '~/lib/logger/tee.js'
 import type { Platform } from '~/platform/index.js'
+import { isLiveScheduler } from '~/platform/index.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { SpawnableAgentInfo } from '~/plugins/agents/index.js'
@@ -182,11 +184,60 @@ export class SessionManager {
 			}, sweepIntervalMs)
 			this.evictionSweepTimer.unref()
 		}
+
+		// A live-process scheduler has nowhere else to deliver to. Hosts that wake
+		// out-of-band (a DO alarm) call dispatchWake() from their own entry point.
+		const scheduler = this.platform.scheduler
+		if (isLiveScheduler(scheduler)) {
+			scheduler.onWake(async (key) => {
+				try {
+					await this.dispatchWake(key)
+				} catch (error) {
+					this.logger.error(
+						'Scheduler wake dispatch failed',
+						error instanceof Error ? error : new Error(String(error)),
+						{ key },
+					)
+				}
+			})
+		}
 	}
 
 	/** Expose platform adapters (used by Session for building contexts). */
 	getPlatform(): Platform {
 		return this.platform
+	}
+
+	/**
+	 * Deliver a scheduler wake that has come due.
+	 *
+	 * The host's entry point back into the SDK — on Cloudflare, called from
+	 * `alarm()` in an isolate that never armed the wake. SessionManager owns it
+	 * because it is the only thing that can turn a session id back into a live
+	 * session, so the key alone is enough input: nothing is read from memory that
+	 * a fresh process would not have.
+	 *
+	 * A key naming a session or agent that no longer exists is a no-op — wakes
+	 * outlive what they point at. Only genuinely unexpected failures (event store
+	 * IO) throw, so a host that retries alarms can retry those and only those.
+	 */
+	async dispatchWake(key: string): Promise<void> {
+		const wake = parseAgentWakeKey(key)
+		if (!wake) {
+			this.logger.debug('Ignoring unrecognized scheduler wake key', { key })
+			return
+		}
+
+		const sessionResult = await this.getSession(wake.sessionId)
+		if (!sessionResult.ok) {
+			this.logger.debug('Scheduler wake for a session that no longer loads', {
+				key,
+				error: sessionResult.error.type,
+			})
+			return
+		}
+
+		await sessionResult.value.dispatchAgentWake(wake.agentId, wake.kind)
 	}
 
 	/**

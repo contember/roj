@@ -179,8 +179,11 @@ export type {
 // Session environment
 export type { SessionEnvironment } from '~/core/sessions/session-environment.js'
 
-// Platform adapters (host-environment abstractions — filesystem, process)
+// Platform adapters (host-environment abstractions — filesystem, process, scheduler)
 // Interfaces only; concrete impls (createBunPlatform) live in @roj-ai/sdk/bun-platform.
+// createTimerScheduler is the exception: it needs nothing but setTimeout, so every
+// host with a live process reuses it instead of writing its own.
+export { createTimerScheduler, isLiveScheduler } from '~/platform/index.js'
 export type {
 	ChildProcess,
 	Dirent,
@@ -194,8 +197,11 @@ export type {
 	GitLogOptions,
 	GitRepoOptions,
 	GitStatusEntry,
+	LiveScheduler,
 	Platform,
 	ProcessRunner,
+	Scheduler,
 	SpawnOptions,
 	Stats,
+	WakeHandler,
 } from '~/platform/index.js'

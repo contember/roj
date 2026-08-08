@@ -145,7 +145,7 @@ export interface Services<TProfile extends PluginProfile = 'full'> {
 /**
  * Bootstrap all services based on configuration.
  *
- * `platform` provides runtime adapters (fs, process). Callers pass concrete
+ * `platform` provides runtime adapters (fs, process, scheduler). Callers pass concrete
  * impls from their runtime package (e.g. `createBunPlatform()` from
  * `@roj-ai/sdk/bun-platform`).
  *

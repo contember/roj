@@ -7,6 +7,7 @@
 
 import { tmpdir } from 'node:os'
 import type { Platform } from '../platform/index.js'
+import { createTimerScheduler } from '../platform/scheduler.js'
 import { createBunFileSystem } from './fs.js'
 import { createBunProcessRunner } from './process.js'
 
@@ -14,6 +15,7 @@ export function createBunPlatform(): Platform {
 	return {
 		fs: createBunFileSystem(),
 		process: createBunProcessRunner(),
+		scheduler: createTimerScheduler(),
 		tmpDir: tmpdir(),
 	}
 }

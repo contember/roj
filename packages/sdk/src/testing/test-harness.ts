@@ -18,6 +18,7 @@ import type { Session } from '~/core/sessions/session.js'
 import type { SessionOverridesPatch, SessionState } from '~/core/sessions/state.js'
 import { ToolExecutor } from '~/core/tools/executor.js'
 import { silentLogger } from '~/lib/logger/logger.js'
+import type { Platform } from '~/platform/index.js'
 import { createNodePlatform } from './node-platform.js'
 import type { Result } from '~/lib/utils/result.js'
 import { NotificationCollector } from './notification-collector.js'
@@ -60,6 +61,8 @@ export class TestHarness {
 		sessionIdleTimeoutMs?: number
 		/** Extra notification sink, run after the recorder. Throwing here simulates a hostile embedder. */
 		onUserOutput?: (notification: PluginNotification) => void
+		/** Optional platform override — e.g. a scheduler the test fires by hand instead of setTimeout */
+		platform?: Platform
 	}) {
 		this.eventStore = options.eventStore ?? new MemoryEventStore()
 
@@ -93,7 +96,7 @@ export class TestHarness {
 		const basePath = `/tmp/roj-test-${Math.random().toString(36).slice(2)}`
 		this.basePath = basePath
 		const toolExecutor = new ToolExecutor(silentLogger)
-		const platform = createNodePlatform()
+		const platform = options.platform ?? createNodePlatform()
 		const dataFileStore = new SessionFileStore(basePath, undefined, false, platform.fs, 'session')
 
 		// When llmLogger is provided, wrap the mock provider so calls get logged

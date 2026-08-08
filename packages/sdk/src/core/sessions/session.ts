@@ -12,6 +12,7 @@ import { COMMUNICATOR_ROLE, ORCHESTRATOR_ROLE } from '~/core/agents/agent-roles.
 import { AgentId, generateAgentId } from '~/core/agents/schema.js'
 import type { AgentState } from '~/core/agents/state.js'
 import { agentEvents, getChildren } from '~/core/agents/state.js'
+import type { AgentWakeKind } from '~/core/agents/wake-key.js'
 import { AgentErrors, type DomainError, MethodErrors, SessionErrors, ValidationErrors } from '~/core/errors.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { DomainEvent } from '~/core/events/types.js'
@@ -286,6 +287,16 @@ export class Session {
 		if (agent) {
 			agent.scheduleProcessing()
 		}
+	}
+
+	/**
+	 * Deliver a due scheduler wake to one of this session's agents.
+	 *
+	 * An agent named by a wake may be gone by the time it fires (session forked,
+	 * state rebuilt), so an unknown id is a no-op rather than an error.
+	 */
+	async dispatchAgentWake(agentId: AgentId, kind: AgentWakeKind): Promise<void> {
+		await this.agents.get(agentId)?.deliverWake(kind)
 	}
 
 	/**

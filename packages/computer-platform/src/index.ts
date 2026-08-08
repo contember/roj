@@ -7,7 +7,8 @@
 
 import type { Workspace } from '@cloudflare/computer'
 import type { GitClient as ComputerGitClient } from '@cloudflare/computer/git'
-import type { Platform } from '@roj-ai/sdk/platform'
+import { createTimerScheduler } from '@roj-ai/sdk/platform'
+import type { Platform, Scheduler } from '@roj-ai/sdk/platform'
 import { createComputerFileSystem } from './fs.js'
 import { createComputerGitClient } from './git.js'
 import { createShellProcessRunner, createUnsupportedProcessRunner } from './process.js'
@@ -15,6 +16,12 @@ import { createShellProcessRunner, createUnsupportedProcessRunner } from './proc
 export interface ComputerPlatformOptions {
 	/** Directory used for scratch files. Created lazily by callers, like `os.tmpdir()` on a host. */
 	tmpDir?: string
+	/**
+	 * Drives the agent loop's re-entry. Defaults to timers, which is what the SDK
+	 * did before the port existed — correct while the isolate lives, and lost when
+	 * it is evicted. A DO that wants wakes to survive passes an alarm-backed one.
+	 */
+	scheduler?: Scheduler
 }
 
 export function createComputerPlatform(workspace: Workspace, options: ComputerPlatformOptions = {}): Platform {
@@ -23,6 +30,7 @@ export function createComputerPlatform(workspace: Workspace, options: ComputerPl
 		fs: createComputerFileSystem(workspace.provider()),
 		process: createUnsupportedProcessRunner(),
 		git: git && createComputerGitClient(git),
+		scheduler: options.scheduler ?? createTimerScheduler(),
 		tmpDir: options.tmpDir ?? '/tmp',
 	}
 }
