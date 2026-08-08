@@ -21,10 +21,15 @@ makes the orchestrator spawn a `writer` agent, which writes a file via the
 filesystem plugin. The response reports timings, the event count, and the
 resulting workspace tree.
 
-Four things the DO wires that the SDK's own defaults do not:
+Five things the DO wires that the SDK's own defaults do not:
 
 - **`{ pluginProfile: 'isolate' }`** — drops `services`, `resources` and
   `uploads`, the three built-ins that need a process table.
+- **`createAlarmScheduler(ctx)`** as `Platform.scheduler`, in place of the SDK's
+  default timers. Every debounce and retry hop of the agent loop then re-enters
+  through `alarm()`, which is a *delivered* event — it tops the actor's CPU
+  budget up, and it outlives the isolate that armed it. See "A turn across an
+  alarm" below.
 - **`SqliteEventStore`** over `ctx.storage`, replacing the `FileEventStore`
   `bootstrap()` builds off `config.persistence`. Swapped in on the `Services`
   object, since `Config` has no third persistence mode.
@@ -254,10 +259,65 @@ refilled by `topUpActor()`, which only runs when a new event is *delivered*
 rescheduling once the budget is spent (`io-context.c++:793`) — silently. So an
 agent working autonomously with no incoming events draws down a budget nothing
 refills. A DO alarm *is* a delivered event (`worker-entrypoint.c++:670`), which
-is the second reason for the scheduler port in the plan's Phase 8.
+is the second reason for the scheduler port — now wired here, see below.
 
 **So don't drive long sessions through an await-until-idle fetch.** Send and
-return, let the timers run the loop, subscribe or poll for state.
+return, let the scheduler run the loop, subscribe or poll for state.
+
+### A turn across an alarm
+
+`Platform.scheduler` replaced the loop's bare `setTimeout`, and this DO
+implements it over its own storage: `createAlarmScheduler(ctx)` in
+`@roj-ai/computer-platform`, drained by `RojAgentDO.alarm()` into
+`SessionManager.dispatchWake`. Wakes live as `roj:wake:<key>` rows in the DO's
+synchronous KV, and the single alarm slot always holds the earliest of them.
+
+`/limits/scheduler?phase=run` sends a message and then throws the booted SDK
+away — SessionManager, sessions, agents, timers, all of it — before returning.
+What is left is one row and one alarm. From a real run:
+
+| | at return | after |
+|---|---:|---:|
+| events | 3 | 25 |
+| pending wakes | 1 | 0 |
+| alarm slot | `+507 ms` | none |
+| alarms drained / wakes delivered | 0 / 0 | 3 / 4 |
+
+The file the writer agent was asked for appeared at **+1 074 ms**, with no
+request in flight and nothing of the session in memory: each alarm reloaded it
+from its event log. `?phase=start` then `?phase=check` shows the same across two
+separate requests. Three alarms carried a turn whose two debounce hops belong to
+different agents — the second drain delivered `writer_1` and `orchestrator_1`
+together, which is what the one-slot-many-keys reconcile is for.
+
+Three things that took work, all reproducible from the probe:
+
+- **Nothing awaits arming.** `scheduleProcessing()` is synchronous, so
+  `wake()`/`cancel()` are called and dropped. The row and the in-memory map move
+  synchronously, where the SDK's cancel-then-arm pair cannot reorder; only the
+  alarm write is async, it is serialized, and it re-reads the map when it runs
+  rather than trusting the arguments that queued it. `DurableObjectState.waitUntil`
+  keeps it alive past the frame that issued it.
+- **`shutdown()` cancels wakes.** `SessionManager.shutdown()` walks every agent
+  and cancels both its keys, which is right for a session being torn down and
+  fatal for an isolate merely going away. `scheduler.suspend(fn)` is how the host
+  says which it is doing. The control run `?keepWakes=0` is the proof: pending
+  wakes 0, alarm slot empty, 3 events, no file, ever.
+- **A wake outlives the runtime.** Kill `wrangler dev` with a wake armed and the
+  row is still in `_cf_KV` and the alarm still in `_cf_METADATA`; the next
+  process hydrates the map from the rows and re-arms the slot from them.
+
+The cost is small: alarm delivery landed 1–16 ms after the scheduled time, and
+the two-agent smoke run takes the same ~1.6 s it did on timers. A request in
+flight does not keep its own alarm out either — `?phase=spin&pollMs=1` polls as
+tightly as anything here does and still takes the delivery.
+
+One consequence for the other probes. The alarm dispatches into the one
+SessionManager the DO booted, so a probe that builds a manager of its own —
+`turn-cost`, `concurrency`, `memory`, and `/bench` — would strand its agents on
+wakes nobody delivers. Those managers live only for their request, which is the
+case `LiveScheduler` exists for, so they take a timer scheduler through
+`withOwnScheduler()`.
 
 ### Two ways a session breaks that are worth guarding
 
@@ -304,6 +364,13 @@ probe pins it on lifetime debris (32 live sessions on an aged DO were slower tha
   and it aborts the whole workerd process rather than evicting one isolate.
   What transfers is the ratio: history costs ~2.1× its stored payload.
 - **Whether Dynamic Workers get cores independent of the calling DO.**
+- **Whether an alarm really refills the budget the loop spends.** The scheduler
+  port is built on `topUpActor()` running for delivered events; with the local
+  enforcer a no-op, that reading comes from the workerd source, not a
+  measurement.
+- **What an aborted isolate does to an arm in flight.** Nothing here can abort
+  one, so the synchronous KV row, the `waitUntil` tracking and the boot-time
+  re-arm are all designed against the failure rather than tested against it.
 
 One incidental finding worth carrying: **`await ctx.storage.put()` is not durable
 against an abort.** The write lands at the next I/O checkpoint, which an aborted

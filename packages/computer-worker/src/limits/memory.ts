@@ -23,6 +23,7 @@
 
 import { AgentId, SessionId, agentEvents, createSystemFromServices } from '@roj-ai/sdk'
 import type { DomainEvent, LLMMessage, Services, Session } from '@roj-ai/sdk'
+import { withOwnScheduler } from '../own-scheduler.js'
 import { isolatePreset } from '../preset.js'
 import type { LimitProbe, LimitProbeContext } from './context.js'
 
@@ -364,7 +365,7 @@ async function openLogSession(
 	const carried = reset ? null : await carriedSession(services, journal.previous)
 	if (carried) return { ...carried, created: false }
 
-	const system = createSystemFromServices(services)
+	const system = createSystemFromServices(withOwnScheduler(services))
 	const result = await system.sessionManager.createSession(isolatePreset.id)
 	if (!result.ok) throw new Error(`createSession failed: ${JSON.stringify(result.error)}`)
 	const session = result.value
@@ -540,7 +541,7 @@ async function probeLog(context: LimitProbeContext, dim: 'events' | 'history'): 
 
 			await journal.attempt(target, 'replay')
 			live = null
-			const system = createSystemFromServices(services)
+			const system = createSystemFromServices(withOwnScheduler(services))
 			const loadStart = await now()
 			// Only the count is kept: holding the array here would double the peak getSession pays.
 			const loadedCount = (await services.eventStore.load(sessionId)).length

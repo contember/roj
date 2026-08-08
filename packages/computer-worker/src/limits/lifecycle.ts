@@ -1,12 +1,13 @@
 /**
  * What keeps roj's agent loop running when no request is in flight.
  *
- * `Agent.scheduleProcessing` re-enters through `setTimeout` (500 ms debounce by
- * default). A Worker gives that no guarantees: the isolate lives while a request
- * is in flight, while `waitUntil` is pending, or while a non-hibernated
- * WebSocket is attached — a bare timer buys nothing, and neither this harness
- * nor the transport calls `waitUntil` or sets an alarm. So a session started by
- * a request that returns early may simply stop.
+ * `Agent.scheduleProcessing` re-enters through the `Platform.scheduler` port (500
+ * ms debounce by default). A Worker gives a bare timer no guarantees: the isolate
+ * lives while a request is in flight, while `waitUntil` is pending, or while a
+ * non-hibernated WebSocket is attached, and nothing here holds any of the three.
+ * This DO now arms a DO alarm instead, so what the phases below measure is the
+ * alarm carrying the loop — `limits/scheduler` asks the harder question of
+ * whether it survives the session leaving memory too.
  *
  * `?phase=` runs one half of the experiment:
  *
@@ -136,7 +137,7 @@ async function runStart(context: LimitProbeContext, message: string): Promise<un
 	return {
 		phase: 'start',
 		...run,
-		note: 'Returning now. Nothing holds the DO — no waitUntil, no alarm, no attached socket.',
+		note: 'Returning now. No request, no waitUntil and no socket hold the DO — only the scheduler alarm.',
 	}
 }
 

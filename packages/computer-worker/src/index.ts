@@ -12,7 +12,8 @@ import { Workspace, WorkspaceServiceProxy } from '@cloudflare/computer'
 import type { DurableObjectStorageLike, WorkspaceStub } from '@cloudflare/computer'
 import { WorkerShellBackend } from '@cloudflare/computer/backends/worker-shell'
 import { createGitClient } from '@cloudflare/computer/git'
-import { SqliteEventStore, createComputerPlatform, createShellProcessRunner } from '@roj-ai/computer-platform'
+import { SqliteEventStore, createAlarmScheduler, createComputerPlatform, createShellProcessRunner } from '@roj-ai/computer-platform'
+import type { AlarmScheduler } from '@roj-ai/computer-platform'
 import { FileEventStore, bootstrap, createSystemFromServices, isolatePlugins } from '@roj-ai/sdk'
 import type { Config, IsolateMethodSchemas, Services, Session, SessionId, System } from '@roj-ai/sdk'
 import type { Platform } from '@roj-ai/sdk/platform'
@@ -21,6 +22,7 @@ import { runBench } from './bench.js'
 import type { BenchResult } from './bench.js'
 import { createDoTransport } from './do-transport.js'
 import type { DoTransport } from './do-transport.js'
+import type { WakeLogEntry } from './limits/context.js'
 import { LIMIT_PROBES, LIMIT_PROBE_NAMES } from './limits/index.js'
 import { NOTE_PATH, scriptedHandler } from './mock-llm.js'
 import { isolatePreset } from './preset.js'
@@ -51,6 +53,9 @@ const DATA_ROOT = '/data'
 /** Selector the shell backend is registered under; `execFile` names it explicitly. */
 const SHELL_BACKEND = 'shell'
 
+/** Alarm drains kept for /limits/scheduler to read back. Bounded — this is a debug tail. */
+const WAKE_LOG_LIMIT = 50
+
 /** Repository /git builds in a session workspace — a commit, then a dirty file. */
 const GIT_SETUP = [
 	'git init',
@@ -78,8 +83,11 @@ export class RojAgentDO extends DurableObject<Env> {
 	readonly #platform: Platform
 	readonly #eventStore: SqliteEventStore
 	readonly #transport: DoTransport
+	readonly #scheduler: AlarmScheduler
 	/** Everything plugins have notified since boot — how /git observes git-status. */
 	readonly #notifications: { type: string; payload: unknown }[] = []
+	/** Tail of alarm drains, so a probe can show which wakes the alarm delivered. */
+	readonly #wakeLog: WakeLogEntry[] = []
 	#booted?: { services: Services<'isolate'>; system: IsolateSystem }
 
 	constructor(ctx: DurableObjectState, env: Env) {
@@ -104,8 +112,11 @@ export class RojAgentDO extends DurableObject<Env> {
 			// The isolate has no user, and a commit needs an author to attribute.
 			defaultGitIdentity: { name: 'roj', email: 'roj@example.invalid' },
 		})
+		// The agent loop re-enters through this instead of a timer, so a wake armed by
+		// one isolate is delivered by whichever one alarm() lands in — see alarm().
+		this.#scheduler = createAlarmScheduler(ctx)
 		this.#platform = {
-			...createComputerPlatform(this.#workspace),
+			...createComputerPlatform(this.#workspace, { scheduler: this.#scheduler }),
 			// createComputerPlatform defaults to ENOSYS; this workspace has a shell to run on.
 			process: createShellProcessRunner(this.#workspace, { backend: SHELL_BACKEND }),
 		}
@@ -115,6 +126,33 @@ export class RojAgentDO extends DurableObject<Env> {
 
 	fetch(request: Request): Promise<Response> {
 		return this.#transport.fetch(request)
+	}
+
+	/**
+	 * Deliver the agent-loop wakes that have come due.
+	 *
+	 * The reason the loop is on a scheduler at all: an alarm is a *delivered*
+	 * event, so workerd tops the actor's CPU budget up for it, while a timer
+	 * callback draws down a budget nothing refills. `dispatchWake` needs only the
+	 * key — the session behind it is loaded from its event log if this isolate has
+	 * never seen it.
+	 */
+	async alarm(): Promise<void> {
+		const { system } = this.#boot()
+		const errors: string[] = []
+		const keys = await this.#scheduler.deliverDue(async (key) => {
+			try {
+				await system.sessionManager.dispatchWake(key)
+			} catch (error) {
+				errors.push(`${key}: ${describeError(error).error}`)
+			}
+		})
+
+		this.#wakeLog.push({ at: Date.now(), keys, errors: errors.length > 0 ? errors : undefined })
+		if (this.#wakeLog.length > WAKE_LOG_LIMIT) this.#wakeLog.shift()
+
+		// The dispatch above armed the next hop and nothing else will wait for it.
+		await this.#scheduler.flush()
 	}
 
 	webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
@@ -154,6 +192,24 @@ export class RojAgentDO extends DurableObject<Env> {
 		const booted = { services, system }
 		this.#booted = booted
 		return booted
+	}
+
+	/**
+	 * Drop the booted SDK the way an eviction would — stop the old agents, forget
+	 * every loaded session — while keeping the pending wakes.
+	 *
+	 * `SessionManager.shutdown()` cancels each agent's wakes, which is right when a
+	 * session is being torn down and wrong when only the isolate is going away. The
+	 * SDK cannot tell the two apart; the host can, so the shutdown runs suspended.
+	 * `keepWakes: false` is the control — it shows what the unsuspended teardown costs.
+	 */
+	async #evictSdk(keepWakes: boolean): Promise<boolean> {
+		const booted = this.#booted
+		if (!booted) return false
+		this.#booted = undefined
+		const shutdown = () => booted.system.sessionManager.shutdown()
+		await (keepWakes ? this.#scheduler.suspend(shutdown) : shutdown())
+		return true
 	}
 
 	async run(message: string): Promise<Response> {
@@ -240,6 +296,9 @@ export class RojAgentDO extends DurableObject<Env> {
 				workspace: this.#workspace,
 				ctx: this.ctx,
 				boot: () => this.#boot(),
+				scheduler: this.#scheduler,
+				evictSdk: (keepWakes) => this.#evictSdk(keepWakes),
+				wakeLog: () => this.#wakeLog,
 				backend: SHELL_BACKEND,
 				params: new URLSearchParams(query),
 			})

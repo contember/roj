@@ -25,6 +25,7 @@ import { MockLLMProvider, ModelId, agentEvents, createOrchestrator, createPreset
 import type { AgentId, DomainEvent, MockInferenceHandler, Preset, Services, Session } from '@roj-ai/sdk'
 import { ToolCallId } from '@roj-ai/sdk/tools'
 import { filesystemPlugin } from '@roj-ai/sdk/tools/filesystem'
+import { withOwnScheduler } from '../own-scheduler.js'
 import type { IsolateSystem, LimitProbe, LimitProbeContext } from './context.js'
 
 const PRESET_ID = 'concurrency-probe'
@@ -274,7 +275,7 @@ function buildPreset(debounceMs: number): Preset {
 function systemFor(base: Services<'isolate'>, preset: Preset, handler: MockInferenceHandler): IsolateSystem {
 	const mock = new MockLLMProvider(handler)
 	return createSystemFromServices({
-		...base,
+		...withOwnScheduler(base),
 		llmProvider: mock,
 		llmProviders: new Map([['mock', mock]]),
 		presets: new Map([[preset.id, preset]]),

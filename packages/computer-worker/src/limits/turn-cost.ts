@@ -31,6 +31,7 @@ import {
 import type { AgentId, DomainEvent, LLMMessage, Preset, Result, Services, Session } from '@roj-ai/sdk'
 import type { InferenceContext, InferenceRequest, InferenceResponse, LLMError, LLMProvider } from '@roj-ai/sdk/llm/provider'
 import { ToolCallId, createTool } from '@roj-ai/sdk/tools'
+import { withOwnScheduler } from '../own-scheduler.js'
 import type { LimitProbe, LimitProbeContext } from './context.js'
 
 /** Paid-plan CPU per invocation; `limits.cpu_ms` raises it to 300 000. */
@@ -446,7 +447,7 @@ async function runCombination(options: RunOptions): Promise<CombinationResult> {
 		children: options.children,
 	})
 	const system = createSystemFromServices({
-		...services,
+		...withOwnScheduler(services),
 		presets: new Map([[preset.id, preset]]),
 		llmProvider: provider,
 		llmProviders: new Map([['mock', provider]]),
@@ -717,7 +718,7 @@ async function invocationStart(context: LimitProbeContext, services: Services<'i
 	})
 	const provider = new ScriptedProvider({ toolCalls, resultBytes: num(params, 'resultBytes', 512), children: num(params, 'agents', 0) })
 	const system = createSystemFromServices({
-		...services,
+		...withOwnScheduler(services),
 		presets: new Map([[preset.id, preset]]),
 		llmProvider: provider,
 		llmProviders: new Map([['mock', provider]]),

@@ -7,6 +7,7 @@
  */
 
 import type { Workspace } from '@cloudflare/computer'
+import type { AlarmScheduler } from '@roj-ai/computer-platform'
 import type { IsolateMethodSchemas, Services, System, isolatePlugins } from '@roj-ai/sdk'
 import type { Platform } from '@roj-ai/sdk/platform'
 
@@ -18,6 +19,13 @@ export interface Booted {
 	system: IsolateSystem
 }
 
+/** One alarm the DO served: which wakes it drained, and what dispatching them threw. */
+export interface WakeLogEntry {
+	at: number
+	keys: string[]
+	errors?: string[]
+}
+
 export interface LimitProbeContext {
 	platform: Platform
 	workspace: Workspace
@@ -25,6 +33,16 @@ export interface LimitProbeContext {
 	ctx: DurableObjectState
 	/** Boots the SDK on first call, then memoised — same instance the rest of the DO uses. */
 	boot: () => Booted
+	/** The alarm slot the agent loop's wakes ride on. */
+	scheduler: AlarmScheduler
+	/**
+	 * Drops the booted SDK as an eviction would. `keepWakes` suspends the scheduler
+	 * across the teardown, so `SessionManager.shutdown()` cannot cancel pending
+	 * wakes. Returns false when nothing was booted to drop.
+	 */
+	evictSdk: (keepWakes: boolean) => Promise<boolean>
+	/** Alarms this isolate has served, oldest first. */
+	wakeLog: () => readonly WakeLogEntry[]
 	/** Selector the shell backend is registered under. */
 	backend: string
 	/** Query string of the `/limits/<name>` request, so a probe can be tuned per run. */

@@ -12,6 +12,7 @@
 
 import { agentEvents, applyEvent, createSystemFromServices, reconstructSessionState } from '@roj-ai/sdk'
 import type { AgentId, DomainEvent, LLMMessage, Services, SessionId } from '@roj-ai/sdk'
+import { withOwnScheduler } from './own-scheduler.js'
 
 /** Events per synthetic turn — mirrors the shape of one real inference turn. */
 const EVENTS_PER_TURN = 5
@@ -131,7 +132,7 @@ export async function runBench(options: BenchOptions): Promise<BenchResult> {
 			throw new Error(`count ${target} is below the ${HEADER_EVENTS + SINGLE_APPEND_PROBE + EVENTS_PER_TURN} event floor`)
 		}
 
-		const seedSystem = createSystemFromServices(services)
+		const seedSystem = createSystemFromServices(withOwnScheduler(services))
 		const created = await seedSystem.sessionManager.createSession(presetId)
 		if (!created.ok) throw new Error(`createSession failed: ${JSON.stringify(created.error)}`)
 		const seed = created.value
@@ -165,7 +166,7 @@ export async function runBench(options: BenchOptions): Promise<BenchResult> {
 		const tailRange = await timed(() => services.eventStore.loadRange(sessionId, { since: loaded.value.length - 11 }))
 		const coreReplay = await timed(() => reconstructSessionState(loaded.value, applyEvent))
 
-		const benchSystem = createSystemFromServices(services)
+		const benchSystem = createSystemFromServices(withOwnScheduler(services))
 		const cold = await timed(() => benchSystem.sessionManager.getSession(sessionId))
 		const warm = await timed(() => benchSystem.sessionManager.getSession(sessionId))
 		if (!cold.value.ok) throw new Error(`getSession failed: ${JSON.stringify(cold.value.error)}`)
