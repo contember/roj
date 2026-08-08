@@ -15,13 +15,17 @@ import { AgentId, agentIdSchema, generateAgentId } from '~/core/agents/schema.js
 import { type AgentState, agentEvents } from '~/core/agents/state.js'
 import { AgentErrors, ValidationErrors } from '~/core/errors.js'
 import { definePlugin } from '~/core/plugins/index.js'
+import { pluginWakeKey } from '~/core/plugins/wake-key.js'
+import type { SessionContext } from '~/core/sessions/context.js'
 import type { SessionState } from '~/core/sessions/state.js'
 import { agentSequenceKey, getNextAgentSeq } from '~/core/sessions/state.js'
 import { createTool } from '~/core/tools/definition.js'
-import type { Logger } from '~/lib/logger/logger.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import { mailboxPlugin } from '~/plugins/mailbox/plugin.js'
 import { getAgentUnconsumedMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
+
+const PLUGIN_NAME = 'agents'
+const SUPERVISION_TICK_METHOD = '_supervisionTick'
 
 /**
  * Information about a spawnable agent, used to generate typed start_<name> tools.
@@ -56,18 +60,6 @@ export interface AgentsPluginConfig {
  * Each tick triggers a parent inference, keeping the prompt cache warm.
  */
 export const SUPERVISION_INTERVAL_CACHE_FRIENDLY = 240_000
-
-/** Per-session runtime state held in plugin context — timers + trigger callback. */
-interface AgentsPluginContext {
-	timers: Map<AgentId, ReturnType<typeof setTimeout>>
-	/** Runtime lease, taken per tick — null while the runtime is unloading. */
-	acquireLease: ((reason: string) => (() => void) | null) | null
-	/** Set in onSessionReady — calls agents._supervisionTick via callPluginMethod (fresh ctx). */
-	triggerTick: ((agentId: AgentId) => Promise<unknown>) | null
-	/** null = supervision disabled for this session. */
-	intervalMs: number | null
-	logger: Logger | null
-}
 
 /**
  * Get all direct children of an agent.
@@ -196,42 +188,35 @@ function buildChildrenStatus(sessionAgents: Map<AgentId, AgentState>, parentId: 
 	return `<children-status>\n${lines.join('\n')}\n</children-status>`
 }
 
+/** What arming a supervision wake needs, in every context that arms one. */
+type SupervisionScheduling = Pick<SessionContext, 'platform' | 'sessionId' | 'logger'>
+
 /**
- * (Re)schedule a supervision tick for an agent. Any existing timer is cleared first.
+ * (Re)schedule a supervision tick for an agent.
+ *
+ * The wake carries no closure — it comes back as `agents._supervisionTick` on a
+ * session loaded by id, so a process that never armed it can still deliver it.
+ * `wake()` replaces any pending wake for the same key, which is also how a
+ * natural inference pushes the next tick out.
  */
-function scheduleSupervisionTick(
-	pluginContext: AgentsPluginContext,
-	agentId: AgentId,
-	delayMs: number,
-): void {
-	const existing = pluginContext.timers.get(agentId)
-	if (existing) clearTimeout(existing)
+async function scheduleSupervisionTick(ctx: SupervisionScheduling, agentId: AgentId, delayMs: number): Promise<void> {
+	try {
+		await ctx.platform.scheduler.wake(supervisionWakeKey(ctx, agentId), delayMs)
+	} catch (err) {
+		ctx.logger.error('Failed to arm supervision wake', err instanceof Error ? err : undefined, { agentId })
+	}
+}
 
-	const timer = setTimeout(() => {
-		pluginContext.timers.delete(agentId)
-		const trigger = pluginContext.triggerTick
-		const acquireLease = pluginContext.acquireLease
-		if (!trigger || !acquireLease) return
-		// Lease the tick, not the wait before it — an idle session stays evictable
-		// between ticks, and onSessionReady re-arms after a reload.
-		const releaseLease = acquireLease(`supervision:${agentId}`)
-		if (!releaseLease) {
-			// Runtime is unloading — onSessionReady re-arms once it is rebuilt.
-			pluginContext.logger?.debug('Supervision tick skipped, runtime is unloading', { agentId })
-			return
-		}
-		trigger(agentId)
-			.catch((err) => {
-				pluginContext.logger?.error(
-					'Supervision tick failed',
-					err instanceof Error ? err : undefined,
-					{ agentId },
-				)
-			})
-			.finally(releaseLease)
-	}, delayMs)
+async function cancelSupervisionTick(ctx: SupervisionScheduling, agentId: AgentId): Promise<void> {
+	try {
+		await ctx.platform.scheduler.cancel(supervisionWakeKey(ctx, agentId))
+	} catch (err) {
+		ctx.logger.error('Failed to cancel supervision wake', err instanceof Error ? err : undefined, { agentId })
+	}
+}
 
-	pluginContext.timers.set(agentId, timer)
+function supervisionWakeKey(ctx: SupervisionScheduling, agentId: AgentId): string {
+	return pluginWakeKey(ctx.sessionId, PLUGIN_NAME, SUPERVISION_TICK_METHOD, agentId)
 }
 
 /**
@@ -250,16 +235,9 @@ function createStartAgentSchema(agent: SpawnableAgentInfo) {
 	})
 }
 
-export const agentsPlugin = definePlugin('agents')
+export const agentsPlugin = definePlugin(PLUGIN_NAME)
 	.pluginConfig<AgentsPluginConfig>()
 	.dependencies([mailboxPlugin])
-	.context(async (): Promise<AgentsPluginContext> => ({
-		timers: new Map(),
-		acquireLease: null,
-		triggerTick: null,
-		intervalMs: null,
-		logger: null,
-	}))
 	.isEnabled((ctx) => {
 		return ctx.agentConfig.spawnableAgents.length > 0
 	})
@@ -316,8 +294,9 @@ export const agentsPlugin = definePlugin('agents')
 			})
 
 			// Ensure parent has a supervision tick running now that it has a child.
-			if (ctx.pluginContext.intervalMs !== null) {
-				scheduleSupervisionTick(ctx.pluginContext, parentId, ctx.pluginContext.intervalMs)
+			const intervalMs = ctx.pluginConfig.superviseChildrenIntervalMs
+			if (intervalMs !== undefined) {
+				await scheduleSupervisionTick(ctx, parentId, intervalMs)
 			}
 
 			return Ok({ agentId })
@@ -408,11 +387,14 @@ export const agentsPlugin = definePlugin('agents')
 			return Ok({})
 		},
 	})
-	.method('_supervisionTick', {
+	.method(SUPERVISION_TICK_METHOD, {
 		input: z.object({ agentId: agentIdSchema }),
 		output: z.object({}),
 		handler: async (ctx, input) => {
 			const agentId = AgentId(input.agentId)
+
+			// A wake can outlive close(); the log is sealed, so a tick must not emit into it.
+			if (ctx.sessionState.status === 'closed') return Ok({})
 
 			// Self may already be gone (terminated mid-tick); just stop.
 			const agent = ctx.sessionState.agents.get(agentId)
@@ -441,59 +423,50 @@ export const agentsPlugin = definePlugin('agents')
 				}
 			}
 
-			// Reschedule the next tick from now (rolling), but only while something
-			// below is still working — otherwise the tick would re-arm forever.
+			// Re-arm the next tick from now (rolling), but only while something below
+			// is still working — otherwise the tick would re-arm forever.
 			// Read live state: the send above appended an event and dispatched
 			// listeners, so ctx.sessionState is already behind by the time we decide.
-			if (ctx.pluginContext.intervalMs !== null && hasWorkingDescendant(ctx.getSessionState(), agentId)) {
-				scheduleSupervisionTick(ctx.pluginContext, agentId, ctx.pluginContext.intervalMs)
+			const intervalMs = ctx.pluginConfig.superviseChildrenIntervalMs
+			if (intervalMs !== undefined && hasWorkingDescendant(ctx.getSessionState(), agentId)) {
+				await scheduleSupervisionTick(ctx, agentId, intervalMs)
 			}
 
 			return Ok({})
 		},
 	})
 	.sessionHook('onSessionReady', async (ctx) => {
+		// Supervision is disabled by default; spawn() and afterInference() check the
+		// same config and skip too.
 		const intervalMs = ctx.pluginConfig.superviseChildrenIntervalMs
-		if (intervalMs === undefined) {
-			// Supervision disabled (default). No timer wiring; spawn() and
-			// afterInference() check intervalMs === null and skip too.
-			ctx.pluginContext.intervalMs = null
-			return
-		}
-		ctx.pluginContext.intervalMs = intervalMs
-		ctx.pluginContext.logger = ctx.logger
-		const runtimeActivity = ctx.runtimeActivity
-		ctx.pluginContext.acquireLease = (reason) => runtimeActivity.tryAcquire(reason)
+		if (intervalMs === undefined) return
 
-		// Wire the trigger callback — calls back via self.* so each tick gets a
-		// fresh ctx (live sessionState/pluginState/deps).
-		const triggerTick = ctx.self._supervisionTick
-		ctx.pluginContext.triggerTick = (agentId) => triggerTick({ agentId })
-
-		// (Re-)schedule timers for every agent that currently has direct children.
-		// Covers initial session creation AND server-restart reload (onSessionReady
-		// fires in both paths). Worst-case drift after restart = intervalMs.
+		// (Re-)arm a wake for every agent that currently has direct children. Covers
+		// initial session creation AND server-restart reload (onSessionReady fires in
+		// both paths). Worst-case drift after restart = intervalMs.
 		// Not gated on live status: a reload resets 'inferring' back to 'pending',
 		// so the first tick — not this hook — decides whether to keep going.
 		for (const agent of ctx.sessionState.agents.values()) {
 			if (getDirectChildren(ctx.sessionState.agents, agent.id).length > 0) {
-				scheduleSupervisionTick(ctx.pluginContext, agent.id, intervalMs)
+				await scheduleSupervisionTick(ctx, agent.id, intervalMs)
 			}
 		}
 	})
 	.sessionHook('onSessionClose', async (ctx) => {
-		for (const t of ctx.pluginContext.timers.values()) clearTimeout(t)
-		ctx.pluginContext.timers.clear()
-		ctx.pluginContext.acquireLease = null
-		ctx.pluginContext.triggerTick = null
+		if (ctx.pluginConfig.superviseChildrenIntervalMs === undefined) return
+
+		// Nothing tracks which wakes are armed — a resumed process would not have it
+		// either — so clear one per agent. A key with no pending wake is a no-op.
+		for (const agent of ctx.sessionState.agents.values()) {
+			await cancelSupervisionTick(ctx, agent.id)
+		}
 	})
 	.hook('afterInference', async (ctx) => {
 		// Natural inference warmed the cache — push the next tick out by intervalMs
 		// so we don't double-charge for parents who are already actively interacting.
-		if (ctx.pluginContext.intervalMs !== null) {
-			if (hasWorkingDescendant(ctx.sessionState, ctx.agentId)) {
-				scheduleSupervisionTick(ctx.pluginContext, ctx.agentId, ctx.pluginContext.intervalMs)
-			}
+		const intervalMs = ctx.pluginConfig.superviseChildrenIntervalMs
+		if (intervalMs !== undefined && hasWorkingDescendant(ctx.sessionState, ctx.agentId)) {
+			await scheduleSupervisionTick(ctx, ctx.agentId, intervalMs)
 		}
 		return null
 	})
@@ -507,7 +480,7 @@ export const agentsPlugin = definePlugin('agents')
 
 		// Only include supervision instructions if supervision is actually enabled
 		// for this session — otherwise the section is misleading bloat.
-		if (ctx.pluginContext.intervalMs === null) return base
+		if (ctx.pluginConfig.superviseChildrenIntervalMs === undefined) return base
 
 		return `${base}
 

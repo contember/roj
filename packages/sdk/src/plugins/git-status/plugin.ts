@@ -11,6 +11,15 @@
  * Two ways to read that state. `platform.git` answers it directly, which is how
  * hosts with no process table (a Worker isolate over a VFS) take part; without
  * the port the plugin shells out to the `git` binary, as it always has.
+ *
+ * The poll deliberately stays on a raw `setInterval` rather than moving to
+ * `platform.scheduler`: it is not a "wake me later", it is an unbounded clock.
+ * As scheduler wakes it would re-arm itself forever, and because a wake is
+ * dispatched by loading its session from the event log, every session ever opened
+ * would replay its log every POLL_INTERVAL_MS and keep an alarm-driven host
+ * permanently awake. The fix is to stop being a server-side poll at all — a pull
+ * method plus a refresh at turn boundaries — which changes the client and worker
+ * contract, not just this file.
  */
 
 import z from 'zod/v4'

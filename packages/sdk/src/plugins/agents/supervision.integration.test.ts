@@ -3,10 +3,31 @@ import { AgentId } from '~/core/agents/schema.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import type { LLMError } from '~/core/llm/provider.js'
 import { definePlugin } from '~/core/plugins/index.js'
+import { pluginWakeKey } from '~/core/plugins/wake-key.js'
 import { ToolCallId } from '~/core/tools/schema.js'
+import type { Platform, Scheduler } from '~/platform/index.js'
 import { agentsPlugin } from '~/plugins/agents/plugin.js'
 import { generateTestMessageId, mailboxEvents } from '~/plugins/mailbox/index.js'
 import { createMultiAgentPreset, TestHarness, type TestSession } from '~/testing/index.js'
+import { createNodePlatform } from '~/testing/node-platform.js'
+
+/** Records wakes and never fires them — the shape of a host that wakes out-of-band. */
+class RecordingScheduler implements Scheduler {
+	readonly armed = new Map<string, number>()
+
+	async wake(key: string, delayMs: number): Promise<void> {
+		this.armed.set(key, delayMs)
+	}
+
+	async cancel(key: string): Promise<void> {
+		this.armed.delete(key)
+	}
+}
+
+const recordingPlatform = (): { platform: Platform; scheduler: RecordingScheduler } => {
+	const scheduler = new RecordingScheduler()
+	return { platform: { ...createNodePlatform(), scheduler }, scheduler }
+}
 
 /** Retryable, with a zero retry-after so the inner LLM retries burn no wall clock. */
 const RATE_LIMITED: LLMError = { type: 'rate_limit', message: 'slow down', retryAfterMs: 0 }
@@ -664,12 +685,12 @@ describe('agents plugin supervision', () => {
 		await harness.shutdown()
 	})
 
-	it('a tick that lands on an unloading runtime is skipped, not sent', async () => {
+	it('a tick that lands on an unloading runtime is delivered once it is rebuilt', async () => {
 		let orchestratorCalls = 0
 		let closeStarted = false
 
 		// Runs first in performDisposal's reversed plugin order, so the runtime sits in
-		// 'unloading' — timers not yet cleared — for as long as this blocks.
+		// 'unloading' — the wake still pending — for as long as this blocks.
 		const slowClosePlugin = definePlugin('test-slow-close')
 			.sessionHook('onSessionClose', async () => {
 				closeStarted = true
@@ -715,15 +736,77 @@ describe('agents plugin supervision', () => {
 		expect(closeStarted).toBe(true)
 		const duringUnload = await countSupervisorMessages(session)
 
-		const evictedBy = Date.now() + 5000
-		while (Date.now() < evictedBy && harness.sessionManager.getRuntimeCacheStats().loadedSessionCount > 0) {
+		// The wake carries no closure, so the runtime that armed it going away does not
+		// lose it: dispatch rebuilds the session from its log and the snapshot lands there.
+		const deadline = Date.now() + 5000
+		while (Date.now() < deadline && await countSupervisorMessages(session) <= duringUnload) {
 			await new Promise((r) => setTimeout(r, 10))
 		}
-		expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
-		// The tick armed for the middle of that window found no lease and dropped itself
-		// instead of appending a snapshot to a runtime that was being torn down.
-		expect(await countSupervisorMessages(session)).toBe(duringUnload)
+		expect(await countSupervisorMessages(session)).toBeGreaterThan(duringUnload)
 
 		await harness.shutdown()
+	})
+
+	it('a tick armed in one process is delivered by another, from the key alone', async () => {
+		const sharedEventStore = new (await import('~/core/events/memory.js')).MemoryEventStore()
+		let orchestratorCalls = 0
+
+		const buildHarness = (intervalMs: number | undefined, platform?: Platform) =>
+			new TestHarness({
+				eventStore: sharedEventStore,
+				...(platform && { platform }),
+				presets: [{
+					...createMultiAgentPreset([
+						{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+					], { orchestratorSystem: 'Orchestrator agent.' }),
+					...(intervalMs !== undefined && {
+						plugins: [{ pluginName: 'agents', definition: agentsPlugin, config: { superviseChildrenIntervalMs: intervalMs } }],
+					}),
+				}],
+				mockHandler: (request) => {
+					if (request.systemPrompt.includes('Orchestrator')) {
+						orchestratorCalls++
+						if (orchestratorCalls === 1) {
+							return {
+								content: null,
+								toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Long task' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						}
+						return { content: 'noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+					}
+					return { content: 'still working', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				},
+			})
+
+		// Process 1: supervision off, so it only leaves a parent with a child behind.
+		const first = buildHarness(undefined)
+		const session1 = await first.createSession('test')
+		await session1.sendAndWaitForIdle('Start')
+		const sessionId = session1.sessionId
+		await first.shutdown()
+
+		// Process 2: supervision on, wakes held by the host rather than by a timer.
+		const { platform, scheduler } = recordingPlatform()
+		const second = buildHarness(240_000, platform)
+		const session2 = await second.openSession(sessionId)
+		const orchestratorId = session2.getEntryAgentId()!
+
+		const key = pluginWakeKey(sessionId, 'agents', '_supervisionTick', orchestratorId)
+		expect(scheduler.armed.get(key)).toBe(240_000)
+
+		// Nothing but the key: dispatch re-derives the plugin, the method and the agent.
+		scheduler.armed.clear()
+		await second.sessionManager.dispatchWake(key)
+
+		const msg = await waitForSupervisorMessage(session2, orchestratorId, 500)
+		expect(msg).toBeDefined()
+		expect(msg!.message.content).toContain('worker_1')
+		// The worker is idle by now, so the re-arm gate closes. Rolling re-arm while a
+		// child is still working is covered by 'the tick keeps firing' above.
+		expect(scheduler.armed.has(key)).toBe(false)
+
+		await second.shutdown()
 	})
 })

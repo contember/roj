@@ -14,6 +14,7 @@ import type { AgentId } from '~/core/agents/schema.js'
 import { generateAgentId } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { parseAgentWakeKey } from '~/core/agents/wake-key.js'
+import { parsePluginWakeKey } from '~/core/plugins/wake-key.js'
 import { type DomainError, PresetErrors, SessionErrors, ValidationErrors } from '~/core/errors.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { DomainEvent } from '~/core/events/types.js'
@@ -21,6 +22,7 @@ import type { FileStore } from '~/core/file-store/types.js'
 import type { LLMLogger } from '~/core/llm/logger.js'
 import type { LLMProvider } from '~/core/llm/provider.js'
 import type { CallerContext, ConfiguredPlugin, ManagerMethodContext, PluginDefinition, SessionCloseReason } from '~/core/plugins/plugin-builder.js'
+import { SYSTEM_CALLER } from '~/core/plugins/plugin-builder.js'
 import type { Preset } from '~/core/preset/index.js'
 import { knownDefinitionNames, unknownOverrideTargets } from '~/core/preset/overrides.js'
 import type { SessionMetadata } from '~/core/sessions/schema.js'
@@ -152,6 +154,7 @@ export class SessionManager {
 	private cacheHits = 0
 	private cacheMisses = 0
 	private cacheEvictions = 0
+	/** Set by shutdown(). Also fences wakes: one armed before it must not reload a session after it. */
 	private shuttingDown = false
 
 	constructor(options: SessionManagerOptions) {
@@ -217,27 +220,53 @@ export class SessionManager {
 	 * session, so the key alone is enough input: nothing is read from memory that
 	 * a fresh process would not have.
 	 *
-	 * A key naming a session or agent that no longer exists is a no-op — wakes
+	 * Two vocabularies route here: `agent:` wakes re-enter the agent loop,
+	 * `plugin:` wakes call a plugin method. Anything else is a quiet no-op, and so
+	 * is a key naming a session, agent or plugin that no longer exists — wakes
 	 * outlive what they point at. Only genuinely unexpected failures (event store
 	 * IO) throw, so a host that retries alarms can retry those and only those.
 	 */
 	async dispatchWake(key: string): Promise<void> {
-		const wake = parseAgentWakeKey(key)
-		if (!wake) {
-			this.logger.debug('Ignoring unrecognized scheduler wake key', { key })
+		// Nothing armed before shutdown may load a session back in afterwards.
+		if (this.shuttingDown) return
+
+		const agentWake = parseAgentWakeKey(key)
+		if (agentWake) {
+			const session = await this.loadWakeTarget(key, agentWake.sessionId)
+			await session?.dispatchAgentWake(agentWake.agentId, agentWake.kind)
 			return
 		}
 
-		const sessionResult = await this.getSession(wake.sessionId)
-		if (!sessionResult.ok) {
-			this.logger.debug('Scheduler wake for a session that no longer loads', {
-				key,
-				error: sessionResult.error.type,
-			})
+		const pluginWake = parsePluginWakeKey(key)
+		if (pluginWake) {
+			const session = await this.loadWakeTarget(key, pluginWake.sessionId)
+			if (!session) return
+			const result = await session.callPluginMethod(
+				`${pluginWake.pluginName}.${pluginWake.method}`,
+				pluginWake.agentId === undefined ? {} : { agentId: pluginWake.agentId },
+				pluginWake.agentId,
+				SYSTEM_CALLER,
+			)
+			if (!result.ok) {
+				// A preset that no longer registers the plugin lands here, same as a
+				// missing agent does: the wake points at something that is gone.
+				this.logger.debug('Scheduler wake method rejected', { key, error: result.error.type })
+			}
 			return
 		}
 
-		await sessionResult.value.dispatchAgentWake(wake.agentId, wake.kind)
+		this.logger.debug('Ignoring unrecognized scheduler wake key', { key })
+	}
+
+	/** Session a due wake names, or null if it no longer loads. */
+	private async loadWakeTarget(key: string, sessionId: SessionId): Promise<Session | null> {
+		const sessionResult = await this.getSession(sessionId)
+		if (sessionResult.ok) return sessionResult.value
+		this.logger.debug('Scheduler wake for a session that no longer loads', {
+			key,
+			error: sessionResult.error.type,
+		})
+		return null
 	}
 
 	/**

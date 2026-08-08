@@ -137,6 +137,8 @@ export type CallerContext = {
 
 export const DEFAULT_CALLER: CallerContext = { source: 'client', meta: {} }
 export const AGENT_CALLER: CallerContext = { source: 'agent', meta: {} }
+/** The host itself — a due scheduler wake, not a user or an agent asking. */
+export const SYSTEM_CALLER: CallerContext = { source: 'system', meta: {} }
 
 // ============================================================================
 // Context types
