@@ -1,4 +1,13 @@
-import type { AssistantLLMMessage, LLMMessage, ReasoningDetails, SystemLLMMessage, ToolCall, ToolLLMMessage, UserLLMMessage } from '~/core/agents/state.js'
+import type {
+	AssistantLLMMessage,
+	LLMMessage,
+	ReasoningDetails,
+	SystemLLMMessage,
+	ThinkingBlocks,
+	ToolCall,
+	ToolLLMMessage,
+	UserLLMMessage,
+} from '~/core/agents/state.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { ToolDefinition } from '~/core/tools/definition.js'
@@ -7,7 +16,7 @@ import type { Result } from '~/lib/utils/result.js'
 import { ModelId } from './schema.js'
 
 // Re-export LLMMessage types from agents/state for backwards compatibility
-export type { AssistantLLMMessage, LLMMessage, ReasoningDetails, SystemLLMMessage, ToolCall, ToolLLMMessage, UserLLMMessage }
+export type { AssistantLLMMessage, LLMMessage, ReasoningDetails, SystemLLMMessage, ThinkingBlocks, ToolCall, ToolLLMMessage, UserLLMMessage }
 
 // ============================================================================
 // Request types
@@ -145,6 +154,8 @@ export interface InferenceResponse {
 	reasoning?: string
 	/** Opaque reasoning blocks to echo back on the next request. Absent for models that do not reason. */
 	reasoningDetails?: ReasoningDetails
+	/** Anthropic thinking blocks to replay on the next request. Absent unless extended thinking is enabled. */
+	thinkingBlocks?: ThinkingBlocks
 }
 
 /**

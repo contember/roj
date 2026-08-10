@@ -58,6 +58,8 @@ export const compactedConversationMessageSchema: z4.ZodType<LLMMessage> = z4.dis
 		})).optional(),
 		/** Opaque provider reasoning blocks — retained turns keep them, see ReasoningDetails. */
 		reasoningDetails: z4.array(z4.unknown()).optional(),
+		/** Anthropic thinking blocks — same. */
+		thinkingBlocks: z4.array(z4.unknown()).optional(),
 		cacheControl: cacheControlSchema.optional(),
 	}),
 	z4.object({

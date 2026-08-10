@@ -48,8 +48,8 @@ export type LLMMetrics = {
 // LLM events
 // ============================================================================
 
-/** Opaque by design — the blocks are stored and echoed verbatim, never inspected. */
-const reasoningDetailsSchema = z4.array(z4.unknown())
+/** Opaque by design — provider chain-of-thought blocks are stored and echoed verbatim, never inspected. */
+const opaqueBlocksSchema = z4.array(z4.unknown())
 
 const llmMetricsSchema = z4.object({
 	promptTokens: z4.number(),
@@ -86,7 +86,9 @@ export const llmEvents = createEventsFactory({
 				 * log would otherwise resume without the chain of thought the provider
 				 * expects to get back.
 				 */
-				reasoningDetails: reasoningDetailsSchema.optional(),
+				reasoningDetails: opaqueBlocksSchema.optional(),
+				/** Anthropic thinking blocks (see ThinkingBlocks). Carried for the same reason. */
+				thinkingBlocks: opaqueBlocksSchema.optional(),
 			}),
 			metrics: llmMetricsSchema,
 			llmCallId: llmCallIdSchema.optional(),

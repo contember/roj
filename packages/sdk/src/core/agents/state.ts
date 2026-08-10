@@ -147,6 +147,18 @@ export interface UserLLMMessage {
 export type ReasoningDetails = unknown[]
 
 /**
+ * Anthropic extended-thinking blocks (`thinking` and `redacted_thinking`), kept opaque
+ * for the same reason as {@link ReasoningDetails}: each carries a `signature` the API
+ * verifies, so an edited block is worse than a missing one.
+ *
+ * Deliberately a separate field rather than sharing `reasoningDetails`. A session can
+ * change model mid-conversation, so one field would eventually put Anthropic-shaped
+ * blocks in front of OpenRouter or the reverse. Two fields make that case degrade to
+ * "absent", which both providers accept, instead of "wrong shape", which neither does.
+ */
+export type ThinkingBlocks = unknown[]
+
+/**
  * Assistant message - LLM response.
  */
 export interface AssistantLLMMessage {
@@ -155,6 +167,8 @@ export interface AssistantLLMMessage {
 	toolCalls?: ToolCall[]
 	/** Reasoning blocks to echo back on later requests, so the model keeps its chain of thought across tool calls. */
 	reasoningDetails?: ReasoningDetails
+	/** Anthropic thinking blocks to replay on later requests. Required by the API during tool use. */
+	thinkingBlocks?: ThinkingBlocks
 	/** Marks this message as a prompt cache breakpoint. */
 	cacheControl?: LLMMessageCacheControl
 }
