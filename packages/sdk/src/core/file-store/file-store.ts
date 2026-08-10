@@ -68,8 +68,11 @@ export class SessionFileStore implements FileStore {
 				return Ok(await this.fs.readFile(resolved.value))
 			}
 			return Ok(await this.fs.readFile(resolved.value, 'utf-8'))
-		} catch {
-			return Err(`File not found: ${path}`)
+		} catch (err) {
+			// A missing file is the common case and reads best plain; anything else
+			// (too large, out of memory, permission denied) must keep its reason.
+			if (isNotFound(err)) return Err(`File not found: ${path}`)
+			return Err(`Failed to read file: ${path}: ${describeError(err)}`)
 		}
 	}
 
@@ -298,4 +301,14 @@ export class SessionFileStore implements FileStore {
 		// Path is outside known roots - return as-is
 		return realPath
 	}
+}
+
+/** ENOENT from any of the FileSystem adapters (node, bun, VFS). */
+function isNotFound(err: unknown): boolean {
+	return typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOENT'
+}
+
+function describeError(err: unknown): string {
+	if (err instanceof Error) return err.message
+	return String(err)
 }
