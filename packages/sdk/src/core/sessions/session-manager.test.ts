@@ -84,3 +84,28 @@ describe('SessionManager cold load', () => {
 		await harness.shutdown()
 	})
 })
+
+describe('SessionManager session counts', () => {
+	it('counts stored sessions without loading any of them', async () => {
+		const eventStore = new CountingEventStore()
+		const seedHarness = new TestHarness({ presets: [createTestPreset()], eventStore })
+		await seedHarness.createSession('test')
+		await seedHarness.createSession('test')
+		await seedHarness.shutdown()
+
+		// A manager that has never seen either session — the state a Durable Object
+		// wakes up in. getStats() reports its own memory; the count reports the store.
+		const harness = newHarness(eventStore)
+		eventStore.loadCalls = 0
+
+		const stats = await harness.sessionManager.getStats()
+		expect(stats.sessionCount).toBe(0)
+		expect(stats.lastActivityAt).toBeNull()
+
+		expect(await harness.sessionManager.countStoredSessions()).toBe(2)
+		// Replay is the expensive operation; counting must never pay for it.
+		expect(eventStore.loadCalls).toBe(0)
+
+		await harness.shutdown()
+	})
+})

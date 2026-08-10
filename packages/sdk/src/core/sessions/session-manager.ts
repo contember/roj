@@ -784,7 +784,26 @@ export class SessionManager {
 	}
 
 	/**
+	 * How many sessions the event store holds, whether or not any of them is loaded.
+	 *
+	 * Ids only — no metadata read and no replay. On the file store that is one
+	 * directory listing: 1.6 ms per 2 500 sessions, against 84 ms for the same
+	 * sessions' metadata. Callers that need status or metrics per session use the
+	 * `sessions.list` manager method, which filters and pages.
+	 */
+	async countStoredSessions(): Promise<number> {
+		return (await this.eventStore.listSessions()).length
+	}
+
+	/**
 	 * Get runtime stats including last activity timestamp and per-session metrics.
+	 *
+	 * **Live sessions only** — what this instance currently holds in memory. On a
+	 * host that evicts (a Durable Object) that is whatever survived the last
+	 * eviction, so `sessionCount` is a fraction of what exists and `lastActivityAt`
+	 * is null when nothing is loaded. `countStoredSessions()` is the durable
+	 * counterpart; `/status` reports both, and nothing here walks the store, because
+	 * the preview proxy calls this per proxied request.
 	 *
 	 * Only open (non-closed) sessions contribute to activity metrics. Closed sessions
 	 * are immutable artifacts — their event log timestamps must not be interpreted as

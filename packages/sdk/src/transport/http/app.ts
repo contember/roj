@@ -52,11 +52,32 @@ export function createApp(services: AppServices<PluginProfile>): Hono<AppEnv> {
 	// Bearer auth for protected routes
 	const bearerAuth = createBearerAuth(services.agentToken)
 
-	// Activity status for DO polling (protected)
-	// Returns lastActivityAt timestamp for the caller to determine if agent is active
+	/**
+	 * Activity status for DO polling (protected).
+	 *
+	 * Two kinds of number, deliberately named apart:
+	 *
+	 * - **Live** — `lastActivityAt`, `stats.sessionCount`, `pendingAgents`,
+	 *   `processingAgents` and `sessions[]` describe what this instance holds in
+	 *   memory *now*. On a host that can be evicted (a Durable Object) that is
+	 *   whatever survived the last eviction, so they move with isolate lifetime,
+	 *   and `lastActivityAt` is null whenever nothing is loaded. A liveness
+	 *   signal, not a history.
+	 * - **Durable** — `stats.storedSessionCount` is every session the event store
+	 *   holds, of any status, and does not move when the isolate is recycled.
+	 *
+	 * So `storedSessionCount > 0 && sessionCount === 0` reads as "sessions exist,
+	 * none are loaded" rather than as "there are no sessions". Per-session detail
+	 * beyond the live set — status, metrics, paging — is what the `sessions.list`
+	 * RPC is for; it costs one metadata read per session, which this endpoint is
+	 * polled too often to pay.
+	 */
 	app.get('/status', bearerAuth, async (c) => {
 		const { sessionRuntime, config } = getServices(c)
-		const stats = await sessionRuntime.getStats()
+		const [stats, storedSessionCount] = await Promise.all([
+			sessionRuntime.getStats(),
+			sessionRuntime.countStoredSessions(),
+		])
 
 		return c.json({
 			lastActivityAt: stats.lastActivityAt,
@@ -69,6 +90,7 @@ export function createApp(services: AppServices<PluginProfile>): Hono<AppEnv> {
 				loadedSessionCount: stats.loadedSessionCount,
 				pendingAgents: stats.pendingAgents,
 				processingAgents: stats.processingAgents,
+				storedSessionCount,
 			},
 			sessions: stats.sessions.map(s => ({
 				id: s.id,
@@ -81,17 +103,19 @@ export function createApp(services: AppServices<PluginProfile>): Hono<AppEnv> {
 	})
 
 	// Protected routes
-	const rpcRoutes = createRpcRoutes()
-	const uploadRoutes = createUploadRoutes()
-	const resourceRoutes = createResourceRoutes()
-	const fileRoutes = createFileRoutes()
-
 	app.use('/rpc/*', bearerAuth)
 	app.use('/sessions/*', bearerAuth)
-	app.route('/rpc', rpcRoutes)
-	app.route('/sessions', uploadRoutes)
-	app.route('/sessions', resourceRoutes)
-	app.route('/sessions', fileRoutes)
+	app.route('/rpc', createRpcRoutes())
+
+	// Uploads and resources are thin shells over their plugins, and the isolate
+	// profile registers neither — mounted there they answer 400 "Unknown plugin"
+	// at request time where the route simply does not exist. File routes read
+	// through platform.fs, so they mount under every profile.
+	if (services.pluginProfile === 'full') {
+		app.route('/sessions', createUploadRoutes())
+		app.route('/sessions', createResourceRoutes())
+	}
+	app.route('/sessions', createFileRoutes())
 
 	// 404 handler
 	app.notFound((c) => {
