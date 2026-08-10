@@ -230,6 +230,81 @@ wall per child agent, +5–6 ms per warm shell exec.
 into 1009 ms of wall; two debounce hops are 99% of a turn. Each scheduling hop
 costs `max(debounce, ~12 ms) + ~2 ms`, the floor being the DO's storage commit.
 
+### What a turn writes to the filesystem (`/limits/fs-traffic`)
+
+`SqliteEventStore` took the event log off the filesystem. What is left is one
+file, and it is not the agent's. `/limits/fs-traffic` *is* the `FileSystem` the
+SDK boots on — it wraps `platform.fs` before `boot()`, so every call the
+composition root hands out is counted with its path and its bytes.
+
+One two-agent smoke turn (4 inferences, 25 events) makes **32 `platform.fs`
+calls, 24 of them writes, 4 453 B**. Identical across four runs:
+
+| path | op | count | bytes |
+|---|---|---:|---:|
+| `/data/sessions/<id>/session.log` | `appendFile` | **23** | **4 377** |
+| `/workspace/<id>/note.md` | `writeFile` | 1 | 76 |
+| both trees | `readdir` / `stat` / `mkdir` | 8 | 0 |
+
+`createSession` adds two `mkdir` and nothing else. **The agent's actual work
+product is one write of 76 B; the other 23 are the session log.**
+
+Per-operation cost — 600 operations per figure, bracketed by scheduler yields,
+never one call timed alone:
+
+| operation | ms/op |
+|---|---:|
+| `appendFile`, 190 B line, onto 0 B / 64 KiB / 1 MiB | 0.90 / 1.21 / 0.62 |
+| `writeFile`, whole file, 4 KiB / 64 KiB | 0.50 / 0.53 |
+| one bound `INSERT`, clustered `(session_id, seq)` `WITHOUT ROWID` | **0.053** |
+
+The append is flat in file size — chunk-local, as `/limits/payload` found — and
+costs ~2 VFS operations, because the adapter emulates it as `lstat` +
+`writeRangeSync` at the current end. Against a row it is **12–27×**. Absolute
+figures move ±30% between runs on a contended box; the ratio does not, and the
+`INSERT` held at 0.05–0.065 ms across five runs.
+
+So the session log costs **~19–21 ms of CPU per turn** where the same 23 lines
+as rows would cost ~1.4 ms. Against the loop it records: this turn runs 4
+inferences, so that is ~5 ms of log per inference, while `/limits/turn-cost` on
+the same box does 8–12 ms of `workMs` across 2 inferences — 4–6 ms each.
+**The session log costs about what the agent loop it is logging costs.**
+
+Two things make that easy to miss:
+
+- **`FileLogger` never awaits its append** — `fs.appendFile(...).catch(() => {})`.
+  The work lands on the microtask queue and runs during the debounce the wall
+  figure already contains, so `turn-cost`'s `workMs` cannot see it. `?ab=N` runs
+  N rounds of one turn in a fresh session with the writes suppressed at the
+  adapter against one with them: 1 557 ms vs 1 546 ms over 4 rounds. Half the
+  projection, in the right direction — the other half hid in the debounce. CPU
+  is metered in production; wall is not.
+- **`config.logLevel` does not reach it.** `FileLogger.level` is hard-coded to
+  `debug`, and `SessionManager` tees it into every session logger
+  unconditionally, so `logLevel: 'info'` still writes all 23 lines. **20 of the
+  23 are `debug`**, and nine distinct messages account for every one of them —
+  `Executing beforeInference handlers`, `Running inference`,
+  `Executing afterToolCall handlers` and the like, ~190 B each.
+
+**The LLM call log is a second file-shaped table, and this harness never writes
+it**: `bootstrap` skips `LLMLogger` entirely whenever `config.llmMock` is set.
+The probe sizes it instead, from the `InferenceRequest`s the SDK really built —
+4 inferences per turn at 8.5–10.5 KB each (system prompt ~5 KB, tool JSON
+schemas ~5 KB), **34.8 KB per turn**. `LLMLogger` writes each entry once on
+`createCall` and rewrites it whole on `completeCall`, having read it back first:
+**8 `writeFile` + 4 `readFile` and ~70 KB per turn**, pretty-printed so larger
+still. `listCalls` paginates by listing the whole directory and sorting the
+filenames, then reading the page's files one at a time — an `ORDER BY … LIMIT`
+spelled out in `readdir`.
+
+Neither log goes through `SessionFileStore`. `FileLogger` and `LLMLogger` both
+hold `platform.fs` directly, which is why the census had to sit on the port
+rather than on the store. Both are read only over RPC: `logs.tail`, which cursors
+`session.log` by **byte offset**, for the debug UI's Logs page; and
+`llm.getCalls` / `getCall` / `getCurlCommand` for its LLM Calls page and
+`@roj-ai/cli`. Nothing outside the SDK opens either file, and both are reclaimed
+today by the reaper's `rm -r /data/sessions/<id>`, on the files-only path.
+
 ### Concurrency
 
 Parallel agents overlap **for work that awaits** — 20 agents cost 1.46× one, with

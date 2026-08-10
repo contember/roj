@@ -24,6 +24,8 @@ export const LIMIT_PROBES: Record<string, () => Promise<LimitProbe>> = {
 	idle: async () => (await import('./idle.js')).idleProbe,
 	/** What a closed session leaves behind, and what reclaiming it buys back. */
 	reaper: async () => (await import('./reaper.js')).reaperProbe,
+	/** Every platform.fs call a session makes, and what one of them costs. */
+	'fs-traffic': async () => (await import('./fs-traffic.js')).fsTrafficProbe,
 }
 
 export const LIMIT_PROBE_NAMES = Object.keys(LIMIT_PROBES)
