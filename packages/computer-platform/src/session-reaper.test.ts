@@ -7,6 +7,7 @@ import { createSessionReaper } from './session-reaper.js'
 import type { ReapableEventStore, ReapableFileSystem } from './session-reaper.js'
 import { SqliteEventStore } from './sqlite-event-store.js'
 import type { SqlCursorLike, SqlStorageHost, SqlStorageLike } from './sqlite-event-store.js'
+import { SqliteLLMCallLog } from './sqlite-llm-call-log.js'
 import { SqliteSessionLog } from './sqlite-session-log.js'
 
 function toBinding(value: unknown): SQLQueryBindings {
@@ -158,6 +159,7 @@ describe('createSessionReaper', () => {
 		const report = await reaper.reap()
 
 		expect(report.reaped[0]?.removedLogLines).toBe(0)
+		expect(report.reaped[0]?.removedLlmCalls).toBe(0)
 	})
 
 	// The log lives under dataDir on a file host, so a store-backed one has to reclaim
@@ -218,6 +220,77 @@ describe('createSessionReaper', () => {
 
 			expect(report.reaped[0]?.removedLogLines).toBe(0)
 			expect((await sessionLog.read(sessionId, 0)).lines).toHaveLength(3)
+		})
+	})
+
+	// `sessions/<id>/calls` is a files-side directory wherever it is not a table,
+	// so the same branch owns it — a call log is ~17 KB a call and leaks fastest.
+	describe('with an LLM call-log store', () => {
+		let llmCallLog: SqliteLLMCallLog
+
+		beforeEach(() => {
+			llmCallLog = new SqliteLLMCallLog(storage)
+		})
+
+		const seedCalls = async (sessionId: SessionId, calls: number) => {
+			for (let index = 0; index < calls; index++) {
+				await llmCallLog.create(sessionId, {
+					callId: `0199a1b2-c3d4-7000-8000-${String(index).padStart(12, '0')}`,
+					agentId: 'agent-1',
+					createdAt: 1000 + index,
+					status: 'success',
+					model: 'anthropic/claude',
+					request: '{"messages":[]}',
+				})
+			}
+		}
+
+		const remaining = async (sessionId: SessionId) => (await llmCallLog.list(sessionId, { limit: 100, offset: 0 })).total
+
+		test('reclaims the calls with the files, without being asked for the events', async () => {
+			const sessionId = await seed()
+			await seedCalls(sessionId, 4)
+			const reaper = createSessionReaper({ eventStore: store, fs, dataDir: DATA_DIR, llmCallLog })
+
+			const report = await reaper.reap()
+
+			expect(report.reaped[0]?.removedLlmCalls).toBe(4)
+			expect(await remaining(sessionId)).toBe(0)
+			expect(await store.exists(sessionId)).toBe(true)
+		})
+
+		test('leaves other sessions their calls', async () => {
+			const reaped = await seed()
+			const live = await seed({ closed: false })
+			await seedCalls(reaped, 2)
+			await seedCalls(live, 2)
+			const reaper = createSessionReaper({ eventStore: store, fs, dataDir: DATA_DIR, llmCallLog })
+
+			await reaper.reap()
+
+			expect(await remaining(live)).toBe(2)
+		})
+
+		test('does not re-count calls it already took', async () => {
+			const sessionId = await seed()
+			await seedCalls(sessionId, 3)
+			const reaper = createSessionReaper({ eventStore: store, fs, dataDir: DATA_DIR, llmCallLog })
+
+			await reaper.reap()
+			const second = await reaper.reap({ events: true })
+
+			expect(second.reaped[0]).toMatchObject({ removedLlmCalls: 0, removedEvents: 3 })
+		})
+
+		test('removes nothing on a dry run', async () => {
+			const sessionId = await seed()
+			await seedCalls(sessionId, 3)
+			const reaper = createSessionReaper({ eventStore: store, fs, dataDir: DATA_DIR, llmCallLog })
+
+			const report = await reaper.reap({ dryRun: true })
+
+			expect(report.reaped[0]?.removedLlmCalls).toBe(0)
+			expect(await remaining(sessionId)).toBe(3)
 		})
 	})
 

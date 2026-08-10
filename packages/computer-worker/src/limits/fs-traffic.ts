@@ -26,12 +26,14 @@
  *   operations bracketed by scheduler yields and divided, the way `/bench` and
  *   `/git?rounds=` already measure.
  * - **llm** — the call log the mocked provider hides. `bootstrap` skips
- *   `LLMLogger` entirely when `config.llmMock` is set, so this harness never
- *   writes `sessions/<id>/calls/*.json`. This phase runs a turn against a
- *   provider that records the exact `InferenceRequest` it is handed, which sizes
- *   what a deployed host with an API key would write twice per inference.
- *   It builds its own manager, so it runs on a `LiveScheduler` — a Bun-shaped
- *   host — and its traffic is reported separately for that reason.
+ *   `LLMLogger` entirely when `config.llmMock` is set, so nothing here writes it
+ *   by default. This phase constructs the logger itself and runs the same turn
+ *   through it twice: once with the files it has always written and once with
+ *   `platform.llmCallLog`, so the before and the after are two measurements on
+ *   one box rather than a projection. Its provider also records the exact
+ *   `InferenceRequest` the SDK built, which sizes what is being stored. Each arm
+ *   builds its own manager, so it runs on a `LiveScheduler` — a Bun-shaped host —
+ *   and its traffic is reported separately for that reason.
  *
  * `?ab=N` adds an A/B: N rounds, each running one turn in a fresh session with
  * the `session.log` writes suppressed at the adapter and one with them, as a
@@ -41,7 +43,7 @@
  * there is nothing left for it to suppress and both arms are the same turn.
  */
 
-import { SessionId, createSystemFromServices } from '@roj-ai/sdk'
+import { LLMLogger, LoggingLLMProvider, SessionId, createSystemFromServices } from '@roj-ai/sdk'
 import type { Result, Services, Session } from '@roj-ai/sdk'
 import type { InferenceContext, InferenceRequest, InferenceResponse, LLMError, LLMProvider } from '@roj-ai/sdk/llm/provider'
 import type { Dirent, FileSystem, ReadableFileHandle, Stats } from '@roj-ai/sdk/platform'
@@ -487,6 +489,17 @@ async function appendCost(fs: FileSystem, line: string, seedBytes: number, ops: 
 	return { what: `appendFile onto a ${seedBytes} B file`, ops, bytesPerOp: byteLength(line), msPerOp: ms / ops }
 }
 
+/** What reading a whole entry back costs — what `completeCall` does before rewriting it. */
+async function readCost(fs: FileSystem, bytes: number, ops: number): Promise<CostRow> {
+	const path = `${COST_DIR}/read-${bytes}.json`
+	await fs.writeFile(path, 'x'.repeat(bytes))
+	const ms = await timedBlock(async () => {
+		for (let i = 0; i < ops; i++) await fs.readFile(path, 'utf-8')
+	})
+	await fs.rm(path, { force: true })
+	return { what: `readFile of ${bytes} B, whole file`, ops, bytesPerOp: bytes, msPerOp: ms / ops }
+}
+
 async function writeCost(fs: FileSystem, bytes: number, ops: number): Promise<CostRow> {
 	const path = `${COST_DIR}/write-${bytes}.json`
 	const payload = 'x'.repeat(bytes)
@@ -521,7 +534,43 @@ async function sqlInsertCost(context: LimitProbeContext, line: string, ops: numb
 		}
 	})
 	sql.exec('DROP TABLE probe_fs_traffic')
-	return { what: 'INSERT one row into DO SQLite', ops, bytesPerOp: byteLength(line), msPerOp: ms / ops }
+	return { what: `INSERT one row of ${byteLength(line)} B into DO SQLite`, ops, bytesPerOp: byteLength(line), msPerOp: ms / ops }
+}
+
+/**
+ * What completing a call costs as a row: a keyed `UPDATE` of the small columns.
+ *
+ * The blob is in the row being updated, because SQLite rewrites the whole record
+ * either way — the split saves the read, the parse and the re-serialize, and this
+ * figure says whether it also saves the write. Keyed on a unique index over
+ * `(session_id, seq)`, as `SqliteLLMCallLog` is.
+ */
+async function sqlUpdateCost(context: LimitProbeContext, blob: string, ops: number): Promise<CostRow> {
+	const sql = context.ctx.storage.sql
+	sql.exec(
+		`CREATE TABLE IF NOT EXISTS probe_fs_update (
+			session_id TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			request TEXT NOT NULL,
+			response TEXT
+		)`,
+	)
+	sql.exec('CREATE UNIQUE INDEX IF NOT EXISTS probe_fs_update_key ON probe_fs_update (session_id, seq)')
+	sql.exec('DELETE FROM probe_fs_update')
+	sql.exec('INSERT INTO probe_fs_update (session_id, seq, request) VALUES (?, ?, ?)', 'probe', 0, blob)
+	const response = JSON.stringify({ content: 'x'.repeat(400), finishReason: 'stop' })
+	const ms = await timedBlock(async () => {
+		for (let i = 0; i < ops; i++) {
+			sql.exec('UPDATE probe_fs_update SET response = ? WHERE session_id = ? AND seq = ?', response, 'probe', 0)
+		}
+	})
+	sql.exec('DROP TABLE probe_fs_update')
+	return {
+		what: `UPDATE the response columns beside a ${byteLength(blob)} B request`,
+		ops,
+		bytesPerOp: byteLength(response),
+		msPerOp: ms / ops,
+	}
 }
 
 // ============================================================================
@@ -539,11 +588,9 @@ interface InferenceSize {
 /**
  * Sizes the request the SDK hands a provider.
  *
- * `LLMLogger` writes exactly this — system prompt, messages, every tool's JSON
- * schema — pretty-printed, once when the call starts and again when it
- * completes. This harness never sees it: `bootstrap` returns early on
- * `config.llmMock` and never constructs the logger, so the only way to price
- * the traffic a deployed host would carry is to size what it would have written.
+ * `LLMLogger` stores exactly this — system prompt, messages, every tool's JSON
+ * schema. The sizes say what a call is made of; the arms below say what storing
+ * it costs.
  */
 class SizingProvider implements LLMProvider {
 	readonly name: string
@@ -608,18 +655,26 @@ export const fsTrafficProbe: LimitProbe = async (context) => {
 		await writeCost(raw, 64 * 1024, costOps),
 		await sqlInsertCost(context, line, costOps),
 	]
-	await raw.rm(COST_DIR, { recursive: true, force: true })
 
 	const appendMs = cost[0]?.msPerOp ?? 0
 	const insertMs = cost[cost.length - 1]?.msPerOp ?? 0
+
+	// The call log's own sizes, taken after the session-log projection has its figures:
+	// one ~17 KB entry written whole and read back, against one row created and updated.
+	const callBlob = 'x'.repeat(17 * 1024)
+	cost.push(
+		await writeCost(raw, callBlob.length, costOps),
+		await readCost(raw, callBlob.length, costOps),
+		await sqlInsertCost(context, callBlob, costOps),
+		await sqlUpdateCost(context, callBlob, costOps),
+	)
+	await raw.rm(COST_DIR, { recursive: true, force: true })
 
 	// --- phase: A/B --------------------------------------------------------
 	const ab = abRounds > 0 ? await runAb(booted, census, abRounds) : null
 
 	// --- phase: llm --------------------------------------------------------
-	census.reset()
-	const llm = await measureLlmCallLog(context, booted.services)
-	const llmTraffic = readTraffic(census)
+	const llm = await measureLlmCallLog(context, booted.services, census, raw)
 
 	return {
 		what: 'every platform.fs call the isolate profile makes during one real session, with what one call costs',
@@ -648,7 +703,7 @@ export const fsTrafficProbe: LimitProbe = async (context) => {
 			reads: 'count x calibrated ms/op. The turn itself costs ~10 ms of CPU (see /limits/turn-cost).',
 		},
 		ab,
-		llm: { ...llm, traffic: llmTraffic },
+		llm,
 		caveats: [
 			'wrangler dev enforces no CPU budget; these are local millisecond costs, a magnitude not a quota.',
 			'The llm phase builds its own SessionManager, so it runs on a LiveScheduler — git-status polls there and this host does not.',
@@ -701,31 +756,122 @@ async function runAb(booted: Booted, census: FsCensus, rounds: number): Promise<
 	}
 }
 
-/** One turn against a request-sizing provider, on a manager of this phase's own. */
-async function measureLlmCallLog(context: LimitProbeContext, services: Services<'isolate'>): Promise<Record<string, unknown>> {
+interface LlmArm {
+	sink: 'files' | 'rows'
+	sessionId: string
+	settled: boolean
+	inferences: number
+	sizes: InferenceSize[]
+	/** Compact bytes of the requests the SDK built — what the sink was asked to hold. */
+	requestBytesTotal: number
+	/** Wall time of the turn. Debounce dominates it, so read the traffic, not this. */
+	ms: number
+	traffic: TrafficReport
+	/** Rows and bytes the store ended up holding. Null on the files arm. */
+	stored: { rows: number; bytes: number } | null
+	/** What `listCalls` gives back, read through the same sink that just wrote it. */
+	page: { total: number; calls: { id: string; status: string; model: string; tools: number; totalTokens: number }[] }
+}
+
+/**
+ * One turn with the call log written, on a manager of this phase's own.
+ *
+ * The logger is constructed here rather than taken from `services`, because
+ * `bootstrap` never builds one under `config.llmMock` — the guard is in the
+ * composition root, not in `LLMLogger`, so the mock provider still produces real
+ * `InferenceRequest`s to log. `services.platform.fs` is the counted wrapper, so
+ * the files arm lands in the census as the `llm call log` path class.
+ */
+async function runLlmArm(context: LimitProbeContext, services: Services<'isolate'>, census: FsCensus, useStore: boolean): Promise<LlmArm> {
+	const store = useStore ? context.platform.llmCallLog : undefined
+	const logger = new LLMLogger({ basePath: services.config.dataPath, enabled: true, fs: services.platform.fs, store })
 	const provider = new SizingProvider(services.llmProvider)
-	const system = createSystemFromServices(withOwnScheduler({ ...services, llmProvider: provider }))
+	const withLogging = new LoggingLLMProvider(provider, logger)
+	const system = createSystemFromServices(withOwnScheduler({ ...services, llmProvider: withLogging, llmLogger: logger }))
 	const created = await system.sessionManager.createSession(isolatePreset.id)
 	if (!created.ok) throw new Error(`llm phase createSession failed: ${JSON.stringify(created.error)}`)
 
-	await sendMessage(created.value, 'Please write a note file.')
-	const settled = await settle(created.value, SETTLE_TIMEOUT_MS)
+	const sessionId = String(created.value.id)
+	census.reset()
+	let settled = false
+	const ms = await timedBlock(async () => {
+		await sendMessage(created.value, 'Please write a note file.')
+		settled = await settle(created.value, SETTLE_TIMEOUT_MS)
+	})
+	const traffic = readTraffic(census)
+	// Read back through the same sink, uncounted, so the paging contract is checked on
+	// the host rather than only in a unit test: newest first, `total` before the page.
+	const listed = await logger.listCalls(SessionId(sessionId), { limit: 3, offset: 0 })
 	await created.value.close()
 	await system.shutdown()
 
-	const entryBytes = provider.sizes.map((size) => size.systemPromptBytes + size.messagesBytes + size.toolSchemaBytes)
-	const total = entryBytes.reduce((sum, bytes) => sum + bytes, 0)
-
 	return {
-		what: 'what LLMLogger would write, sized from the requests the SDK actually built',
-		note: 'not written in this harness: bootstrap skips LLMLogger whenever config.llmMock is set',
+		sink: useStore ? 'rows' : 'files',
+		sessionId,
 		settled,
 		inferences: provider.sizes.length,
 		sizes: provider.sizes,
-		requestBytesTotal: total,
-		// createCall writes the entry, completeCall reads it back and rewrites it whole.
-		fileOpsPerInference: { writeFile: 2, readFile: 1 },
-		writtenBytesPerTurn: total * 2,
-		reads: 'sizes are compact JSON; LLMLogger stringifies with two-space indent, so the files are larger still.',
+		requestBytesTotal: provider.sizes.reduce((sum, size) => sum + size.systemPromptBytes + size.messagesBytes + size.toolSchemaBytes, 0),
+		ms,
+		traffic,
+		stored: useStore ? storedCalls(context, sessionId) : null,
+		page: {
+			total: listed.total,
+			calls: listed.calls.map((call) => ({
+				id: call.id,
+				status: call.status,
+				model: call.request.model,
+				tools: call.request.tools?.length ?? 0,
+				totalTokens: call.metrics?.totalTokens ?? 0,
+			})),
+		},
+	}
+}
+
+/** What the call-log table ended up holding, read straight off the DO's own SQL. */
+function storedCalls(context: LimitProbeContext, sessionId: string): { rows: number; bytes: number } {
+	const rows = context.ctx.storage.sql
+		.exec<{ request: string; response: string | null; metrics: string | null }>(
+			'SELECT request, response, metrics FROM roj_llm_call WHERE session_id = ?',
+			sessionId,
+		)
+		.toArray()
+
+	let bytes = 0
+	for (const row of rows) {
+		bytes += byteLength(row.request) + byteLength(row.response ?? '') + byteLength(row.metrics ?? '')
+	}
+	return { rows: rows.length, bytes }
+}
+
+/**
+ * Both sinks for the same turn, and the difference between them.
+ *
+ * The files arm is a fresh session each time, so its `calls/` directory is its
+ * own; it is removed through the raw filesystem afterwards, uncounted, so the
+ * probe does not leave 70 KB behind per run.
+ */
+async function measureLlmCallLog(
+	context: LimitProbeContext,
+	services: Services<'isolate'>,
+	census: FsCensus,
+	raw: FileSystem,
+): Promise<Record<string, unknown>> {
+	const files = await runLlmArm(context, services, census, false)
+	const rows = context.platform.llmCallLog === undefined ? null : await runLlmArm(context, services, census, true)
+
+	await raw.rm(`${services.config.dataPath}/sessions/${files.sessionId}`, { recursive: true, force: true })
+
+	return {
+		what: 'the LLM call log written twice — as files, then as rows — on one box',
+		note: 'bootstrap skips LLMLogger under config.llmMock; this phase constructs it, so the guard is not in the way',
+		files,
+		rows,
+		saved: rows === null ? null : {
+			fsOps: files.traffic.totals.ops - rows.traffic.totals.ops,
+			writeOps: files.traffic.totals.writeOps - rows.traffic.totals.writeOps,
+			writeBytes: files.traffic.totals.writeBytes - rows.traffic.totals.writeBytes,
+		},
+		reads: 'sizes are compact JSON; the files sink stringifies with two-space indent, so the files are larger than the sizes say.',
 	}
 }

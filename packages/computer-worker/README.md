@@ -295,30 +295,121 @@ Two things made that easy to miss:
   `Executing afterToolCall handlers` and the like, ~190 B each. The point of the
   move to rows is to keep that detail and make it cheap, not to drop it.
 
-**The LLM call log is a second file-shaped table, and this harness never writes
-it**: `bootstrap` skips `LLMLogger` entirely whenever `config.llmMock` is set.
-The probe sizes it instead, from the `InferenceRequest`s the SDK really built —
-4 inferences per turn at 8.5–10.5 KB each (system prompt ~5 KB, tool JSON
-schemas ~5 KB), **34.8 KB per turn**. `LLMLogger` writes each entry once on
-`createCall` and rewrites it whole on `completeCall`, having read it back first:
-**8 `writeFile` + 4 `readFile` and ~70 KB per turn**, pretty-printed so larger
-still. `listCalls` paginates by listing the whole directory and sorting the
-filenames, then reading the page's files one at a time — an `ORDER BY … LIMIT`
-spelled out in `readdir`.
-
 Neither log goes through `SessionFileStore`. `FileLogger` and `LLMLogger` both
 hold `platform.fs` directly, which is why the census had to sit on the port
 rather than on the store. Both are read only over RPC: `logs.tail` for the debug
 UI's Logs page, and `llm.getCalls` / `getCall` / `getCurlCommand` for its LLM
-Calls page and `@roj-ai/cli`. Nothing outside the SDK opens either.
+Calls page and `@roj-ai/cli`. No code outside the SDK opens either — though
+webmaster's sandbox skills do `cat` the call JSONs by hand, which is one reason a
+file host stays on files.
 
 `logs.tail`'s cursor stays a plain number and stays opaque: a byte offset where
 the log is a file, a row seq where it is a table. Every reader already treats it
 as a token to hand back — the debug UI stores `offset` in state, and webmaster's
 worker only proxies the method by name — so no reader changed. Reclamation moved
 with it: the reaper drops the rows on its **files** branch, beside
-`rm -r /data/sessions/<id>`, and reports them as `removedLogLines`. The LLM call
-log is still files, still reaped with the directory.
+`rm -r /data/sessions/<id>`, and reports them as `removedLogLines`.
+
+### The LLM call log (`/limits/fs-traffic`, `llm` phase)
+
+The second file-shaped table, and the larger one. `bootstrap` skips `LLMLogger`
+entirely whenever `config.llmMock` is set, so this harness never used to write
+it. The `llm` phase constructs the logger itself — the guard is in the
+composition root, not in `LLMLogger`, so the mock provider still produces real
+`InferenceRequest`s — and runs the same turn twice: once into files, once into
+`platform.llmCallLog`. Identical across four runs:
+
+| sink | `platform.fs` calls | writes | bytes written | stored |
+|---|---:|---:|---:|---:|
+| files | **20** | **9** | **110 950** | — |
+| rows | **7** | **1** | **76** | 4 rows, **42 044 B** |
+
+The 13 calls that went were the call log's: **8 `writeFile` (110 874 B), 4
+`readFile` (54 620 B)** and one `mkdir`. What is left is the seven the turn phase
+already makes — the agent's own note. The same four calls sit in the table in
+42 044 B, 38% of the bytes, because a file is written twice and pretty-printed
+where a row is written once and compact.
+
+The requests behind that, sized off the `InferenceRequest`s the SDK really built:
+4 inferences, **34 634 B** compact per turn — system prompt 3.5–5.0 KB, tool JSON
+schemas 2.4–5.1 KB, messages 0.3–1.0 KB and growing with the turn count.
+
+Per-operation cost at the size a call actually is, same method as the table
+above — 200 operations per figure, bracketed by scheduler yields:
+
+| operation on a ~17 KB entry | ms/op |
+|---|---:|
+| `writeFile`, whole file | 0.90–0.97 |
+| `readFile`, whole file | 0.17–0.18 |
+| `INSERT` one row | 0.11–0.14 |
+| `UPDATE` the response columns beside the request | **0.065–0.07** |
+
+So a turn's call log costs **~7.9 ms** as files — eight writes and four reads —
+against **~0.8 ms** as rows: **10×**, on a loop that does 8–12 ms of `workMs` per
+two inferences. Wall time cannot see it, 1 553 ms against 1 555 ms, for the same
+reason the session log's A/B could not: two debounce hops are 99% of a turn.
+
+Both arms then read their own page back through `listCalls`, which is how the
+paging contract is checked on the host and not only in a unit test: `total: 4`
+and the same three entries newest first, with the same statuses, models, tool
+counts and token totals from either sink.
+
+**The row is columns, not one entry blob.** `completeCall` is a read-modify-write
+— read the whole entry, parse, mutate, re-serialize, write — and a single JSON
+column would have kept every step of that and merely moved it off the VFS. With
+response, metrics and error as their own columns, completing a call is a keyed
+`UPDATE` of a few hundred bytes at 0.065 ms; SQLite rewrites the record either
+way, so what the split buys is the read, the parse and the re-serialize.
+`request` stays one blob because nothing queries inside it; `call_id`,
+`agent_id`, `created_at`, `status` and `model` are real columns because listing
+does. It is a rowid table, unlike the session log's `WITHOUT ROWID`, which keeps
+the whole row in the index b-tree and is meant for rows well under a page.
+
+`request` is also the one column with no bound of its own — the message history
+grows with the session and a tool result can be megabytes — so `LLMLogger`
+clamps it to the store's declared `maxBlobBytes` (2 199 994 B here, see
+`/limits/payload`) and drops the history rather than letting an oversized prompt
+turn a logged call into a failed inference.
+
+**`listCalls` is a paging contract, not an opaque cursor** — the difference from
+`logs.tail`, and the risk in this change. It was a `readdir`, a filename sort and
+one `readFile` per row of the page; it is now
+`WHERE session_id = ? ORDER BY call_id DESC LIMIT ? OFFSET ?` with `total` a
+`COUNT(*)`. Ordering on `call_id` rather than `created_at` is what keeps it
+identical: `call_id` is UUIDv7, so its lexicographic order is its chronological
+one — the order the sorted filenames gave — and unlike a millisecond timestamp it
+is total, so two calls in the same millisecond cannot overlap or skip across a
+page boundary. Every reader, and what each assumes:
+
+| reader | assumes |
+|---|---|
+| debug UI `LLMCallsPage` | fetches `limit: 1000, offset: 0` and pages **client-side**, re-sorting by its own column — so it does not depend on server order at all. `total` is only the "N / total" label; `call.id` is an opaque link segment |
+| debug UI `LLMCallDetail` / `LLMCallPage` | `getCall` by id; `callId.slice(0, 12)` for a breadcrumb, i.e. long uuid-ish ids |
+| `@roj-ai/cli` `llm-calls` | server order, top down, with `--limit`; prints `total` |
+| webmaster's worker | proxies `llm.getCalls` / `llm.getCall` by name; its trace attributes read `calls.length` and `total` and nothing else |
+| webmaster's admin routes | `:callId` is one URL-safe path segment |
+| `llm.getCurlCommand` | rebuilds the HTTP request out of the stored entry, so it needs `request.messages` and `request.tools` back whole — which is why the blob round-trips instead of the listing being narrowed to what a table view shows |
+
+Nothing assumes an id format beyond "opaque, one URL segment", and nothing pages
+against `createdAt`. One behaviour did change and is worth naming: the file path
+counted unparsable files in `total` and then skipped them, so a page could come
+back shorter than it was asked for; a row either exists or does not.
+
+**Retention is explicit here, not inherited.** At ~17 KB a call and four calls a
+turn this is the storage consumer of the two logs, and the blob grows with the
+conversation, so an uncapped table is superlinear in turns — inside an object
+shared by every session it ever ran. `SqliteLLMCallLog` keeps the newest **200
+calls per session**, ~50 turns of complete request/response audit, dropping the
+rest on insert with one statement that walks the index to the cut-off; raise
+`maxCallsPerSession` where audit depth matters more than storage. A file host is
+unchanged and still keeps every call. Reclamation sits beside the session log's:
+the reaper drops the rows on its **files** branch, next to
+`rm -r /data/sessions/<id>`, and reports them as `removedLlmCalls`, so
+`events: false` still frees them.
+
+A host with real files is untouched by any of this — same `calls/` directory,
+same one JSON file per call, same pretty-printed content — which matters because
+the E2B sandbox skills read those files off disk directly.
 
 ### Concurrency
 

@@ -12,7 +12,7 @@ import { Workspace, WorkspaceServiceProxy } from '@cloudflare/computer'
 import type { DurableObjectStorageLike, WorkspaceStub } from '@cloudflare/computer'
 import { WorkerShellBackend } from '@cloudflare/computer/backends/worker-shell'
 import { createGitClient } from '@cloudflare/computer/git'
-import { SqliteEventStore, SqliteSessionLog, createAlarmScheduler, createComputerPlatform, createSessionReaper, createShellProcessRunner } from '@roj-ai/computer-platform'
+import { SqliteEventStore, SqliteLLMCallLog, SqliteSessionLog, createAlarmScheduler, createComputerPlatform, createSessionReaper, createShellProcessRunner } from '@roj-ai/computer-platform'
 import type { AlarmScheduler, ReapOptions, SessionReaper } from '@roj-ai/computer-platform'
 import { FileEventStore, JsonLogger, bootstrap, createSystemFromServices, isolatePlugins } from '@roj-ai/sdk'
 import type { Config, IsolateMethodSchemas, Services, Session, SessionId, System } from '@roj-ai/sdk'
@@ -98,6 +98,7 @@ export class RojAgentDO extends DurableObject<Env> {
 	readonly #platform: Platform
 	readonly #eventStore: SqliteEventStore
 	readonly #sessionLog: SqliteSessionLog
+	readonly #llmCallLog: SqliteLLMCallLog
 	readonly #reaper: SessionReaper
 	readonly #transport: DoTransport
 	readonly #scheduler: AlarmScheduler
@@ -141,11 +142,15 @@ export class RojAgentDO extends DurableObject<Env> {
 		// This filesystem is SQLite already, so the session log costs 12-27x less as
 		// rows than as appends onto a file — see /limits/fs-traffic.
 		this.#sessionLog = new SqliteSessionLog(storage)
+		// ~17 KB per call, written twice as a file and read back in between — see
+		// /limits/fs-traffic. Rows also give listCalls an ORDER BY instead of a readdir.
+		this.#llmCallLog = new SqliteLLMCallLog(storage)
 		this.#platform = {
 			...createComputerPlatform(this.#workspace, { scheduler: this.#scheduler }),
 			// createComputerPlatform defaults to ENOSYS; this workspace has a shell to run on.
 			process: createShellProcessRunner(this.#workspace, { backend: SHELL_BACKEND }),
 			sessionLog: this.#sessionLog,
+			llmCallLog: this.#llmCallLog,
 		}
 		this.#eventStore = new SqliteEventStore(storage)
 		// Reclaiming is the host's call, not a session hook's — see session-reaper.ts.
@@ -155,6 +160,7 @@ export class RojAgentDO extends DurableObject<Env> {
 			fs: this.#platform.fs,
 			dataDir: DATA_ROOT,
 			sessionLog: this.#sessionLog,
+			llmCallLog: this.#llmCallLog,
 		})
 		// The transport is built before the boot that produces `services.logger`, and
 		// sockets already open, close and lose frames by then — so it gets its own.

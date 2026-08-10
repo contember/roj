@@ -3,6 +3,7 @@ import z from 'zod/v4'
 import { LLMLogger } from '~/core/llm/logger.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { ToolCallId } from '~/core/tools/schema.js'
+import { MemoryLLMCallStore } from '~/testing/memory-llm-call-store.js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 
@@ -52,9 +53,14 @@ const getCallSchema = z.object({
 	}).passthrough(),
 }).passthrough()
 
-function createHarnessWithLogger(options: { llmProvider?: MockLLMProvider } = {}) {
+function createHarnessWithLogger(options: { llmProvider?: MockLLMProvider; store?: boolean } = {}) {
 	const basePath = `/tmp/roj-test-llm-debug-${Math.random().toString(36).slice(2)}`
-	const llmLogger = new LLMLogger({ basePath, enabled: true, fs: createNodeFileSystem() })
+	const llmLogger = new LLMLogger({
+		basePath,
+		enabled: true,
+		fs: createNodeFileSystem(),
+		store: options.store === true ? new MemoryLLMCallStore() : undefined,
+	})
 	const harness = new TestHarness({
 		presets: [createTestPreset()],
 		llmProvider: options.llmProvider,
@@ -67,126 +73,137 @@ function createHarnessWithLogger(options: { llmProvider?: MockLLMProvider } = {}
 // Tests
 // ============================================================================
 
-describe('llm-debug plugin', () => {
-	it('after inference → getCalls returns at least one call entry', async () => {
-		const harness = createHarnessWithLogger({
-			llmProvider: MockLLMProvider.withFixedResponse({ content: 'Hello!', toolCalls: [] }),
+/**
+ * `llm.getCalls` is a paging contract, not an opaque cursor: every reader assumes
+ * newest-first and a `total` taken before the page. Both sinks answer it here,
+ * because the debug UI and the CLI cannot tell which one a host runs.
+ */
+for (const sink of ['files', 'store']) {
+	describe(`llm-debug plugin (${sink})`, () => {
+		it('after inference → getCalls returns at least one call entry', async () => {
+			const harness = createHarnessWithLogger({
+				store: sink === 'store',
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Hello!', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Hi')
+
+			const result = await session.callPluginMethod('llm.getCalls', {})
+			const data = okValue(result, getCallsSchema)
+
+			expect(data.total).toBeGreaterThanOrEqual(1)
+			expect(data.calls.length).toBeGreaterThanOrEqual(1)
+
+			await harness.shutdown()
 		})
 
-		const session = await harness.createSession('test')
-		await session.sendAndWaitForIdle('Hi')
+		it('getCall with specific callId → returns request, response, metrics', async () => {
+			const harness = createHarnessWithLogger({
+				store: sink === 'store',
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Response text', toolCalls: [] }),
+			})
 
-		const result = await session.callPluginMethod('llm.getCalls', {})
-		const data = okValue(result, getCallsSchema)
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Test message')
 
-		expect(data.total).toBeGreaterThanOrEqual(1)
-		expect(data.calls.length).toBeGreaterThanOrEqual(1)
+			// Get calls to find a callId
+			const listResult = await session.callPluginMethod('llm.getCalls', {})
+			const listData = okValue(listResult, getCallsSchema)
+			expect(listData.calls.length).toBeGreaterThanOrEqual(1)
 
-		await harness.shutdown()
-	})
+			const callId = listData.calls[0].id
 
-	it('getCall with specific callId → returns request, response, metrics', async () => {
-		const harness = createHarnessWithLogger({
-			llmProvider: MockLLMProvider.withFixedResponse({ content: 'Response text', toolCalls: [] }),
+			// Get specific call
+			const callResult = await session.callPluginMethod('llm.getCall', { callId })
+			const callData = okValue(callResult, getCallSchema)
+
+			expect(callData.id).toBe(callId)
+			expect(callData.status).toBe('success')
+
+			// Check request
+			expect(callData.request.model).toBe('mock')
+			expect(typeof callData.request.systemPrompt).toBe('string')
+			expect(Array.isArray(callData.request.messages)).toBe(true)
+
+			// Check response
+			expect(callData.response.content).toBe('Response text')
+			expect(callData.response.finishReason).toBe('stop')
+
+			// Check metrics
+			expect(typeof callData.metrics.promptTokens).toBe('number')
+			expect(typeof callData.metrics.completionTokens).toBe('number')
+			expect(typeof callData.metrics.totalTokens).toBe('number')
+			expect(typeof callData.metrics.latencyMs).toBe('number')
+
+			await harness.shutdown()
 		})
 
-		const session = await harness.createSession('test')
-		await session.sendAndWaitForIdle('Test message')
+		it('multiple inferences → getCalls returns all in order', async () => {
+			const harness = createHarnessWithLogger({
+				store: sink === 'store',
+				llmProvider: MockLLMProvider.withSequence([
+					{ content: null, toolCalls: [{ id: ToolCallId('tc1'), name: 'tell_user', input: { message: 'Hi' } }] },
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
 
-		// Get calls to find a callId
-		const listResult = await session.callPluginMethod('llm.getCalls', {})
-		const listData = okValue(listResult, getCallsSchema)
-		expect(listData.calls.length).toBeGreaterThanOrEqual(1)
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Hello')
 
-		const callId = listData.calls[0].id
+			const result = await session.callPluginMethod('llm.getCalls', {})
+			const data = okValue(result, getCallsSchema)
 
-		// Get specific call
-		const callResult = await session.callPluginMethod('llm.getCall', { callId })
-		const callData = okValue(callResult, getCallSchema)
+			// Two inferences: first returns tool call, second returns text
+			expect(data.total).toBe(2)
+			expect(data.calls).toHaveLength(2)
 
-		expect(callData.id).toBe(callId)
-		expect(callData.status).toBe('success')
+			// listCalls returns most recent first, so calls[0] is the second inference
+			const secondCall = data.calls[0]
+			const firstCall = data.calls[1]
 
-		// Check request
-		expect(callData.request.model).toBe('mock')
-		expect(typeof callData.request.systemPrompt).toBe('string')
-		expect(Array.isArray(callData.request.messages)).toBe(true)
+			expect(firstCall.response.content).toBeNull()
+			expect(firstCall.response.toolCalls.length).toBe(1)
 
-		// Check response
-		expect(callData.response.content).toBe('Response text')
-		expect(callData.response.finishReason).toBe('stop')
+			expect(secondCall.response.content).toBe('Done')
 
-		// Check metrics
-		expect(typeof callData.metrics.promptTokens).toBe('number')
-		expect(typeof callData.metrics.completionTokens).toBe('number')
-		expect(typeof callData.metrics.totalTokens).toBe('number')
-		expect(typeof callData.metrics.latencyMs).toBe('number')
-
-		await harness.shutdown()
-	})
-
-	it('multiple inferences → getCalls returns all in order', async () => {
-		const harness = createHarnessWithLogger({
-			llmProvider: MockLLMProvider.withSequence([
-				{ content: null, toolCalls: [{ id: ToolCallId('tc1'), name: 'tell_user', input: { message: 'Hi' } }] },
-				{ content: 'Done', toolCalls: [] },
-			]),
+			await harness.shutdown()
 		})
 
-		const session = await harness.createSession('test')
-		await session.sendAndWaitForIdle('Hello')
+		it('getCalls with limit/offset → pagination', async () => {
+			const harness = createHarnessWithLogger({
+				store: sink === 'store',
+				llmProvider: MockLLMProvider.withSequence([
+					{ content: null, toolCalls: [{ id: ToolCallId('tc1'), name: 'tell_user', input: { message: 'A' } }] },
+					{ content: null, toolCalls: [{ id: ToolCallId('tc2'), name: 'tell_user', input: { message: 'B' } }] },
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
 
-		const result = await session.callPluginMethod('llm.getCalls', {})
-		const data = okValue(result, getCallsSchema)
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Go')
 
-		// Two inferences: first returns tool call, second returns text
-		expect(data.total).toBe(2)
-		expect(data.calls).toHaveLength(2)
+			// Total should be 3
+			const allResult = await session.callPluginMethod('llm.getCalls', {})
+			const allData = okValue(allResult, getCallsSchema)
+			expect(allData.total).toBe(3)
 
-		// listCalls returns most recent first, so calls[0] is the second inference
-		const secondCall = data.calls[0]
-		const firstCall = data.calls[1]
+			// Limit to 1
+			const limitResult = await session.callPluginMethod('llm.getCalls', { limit: 1 })
+			const limitData = okValue(limitResult, getCallsSchema)
+			expect(limitData.total).toBe(3)
+			expect(limitData.calls.length).toBe(1)
 
-		expect(firstCall.response.content).toBeNull()
-		expect(firstCall.response.toolCalls.length).toBe(1)
+			// Offset 1, limit 1
+			const offsetResult = await session.callPluginMethod('llm.getCalls', { limit: 1, offset: 1 })
+			const offsetData = okValue(offsetResult, getCallsSchema)
+			expect(offsetData.total).toBe(3)
+			expect(offsetData.calls.length).toBe(1)
 
-		expect(secondCall.response.content).toBe('Done')
+			// The offset call should return a different call than limit-only
+			expect(limitData.calls[0].id).not.toBe(offsetData.calls[0].id)
 
-		await harness.shutdown()
-	})
-
-	it('getCalls with limit/offset → pagination', async () => {
-		const harness = createHarnessWithLogger({
-			llmProvider: MockLLMProvider.withSequence([
-				{ content: null, toolCalls: [{ id: ToolCallId('tc1'), name: 'tell_user', input: { message: 'A' } }] },
-				{ content: null, toolCalls: [{ id: ToolCallId('tc2'), name: 'tell_user', input: { message: 'B' } }] },
-				{ content: 'Done', toolCalls: [] },
-			]),
+			await harness.shutdown()
 		})
-
-		const session = await harness.createSession('test')
-		await session.sendAndWaitForIdle('Go')
-
-		// Total should be 3
-		const allResult = await session.callPluginMethod('llm.getCalls', {})
-		const allData = okValue(allResult, getCallsSchema)
-		expect(allData.total).toBe(3)
-
-		// Limit to 1
-		const limitResult = await session.callPluginMethod('llm.getCalls', { limit: 1 })
-		const limitData = okValue(limitResult, getCallsSchema)
-		expect(limitData.total).toBe(3)
-		expect(limitData.calls.length).toBe(1)
-
-		// Offset 1, limit 1
-		const offsetResult = await session.callPluginMethod('llm.getCalls', { limit: 1, offset: 1 })
-		const offsetData = okValue(offsetResult, getCallsSchema)
-		expect(offsetData.total).toBe(3)
-		expect(offsetData.calls.length).toBe(1)
-
-		// The offset call should return a different call than limit-only
-		expect(limitData.calls[0].id).not.toBe(offsetData.calls[0].id)
-
-		await harness.shutdown()
 	})
-})
+}

@@ -9,6 +9,7 @@
 import type { FileSystem } from './fs.js'
 import type { FsRevision } from './fs-revision.js'
 import type { GitClient } from './git.js'
+import type { LLMCallStore } from './llm-call-log.js'
 import type { ProcessRunner } from './process.js'
 import type { Scheduler } from './scheduler.js'
 import type { SessionLogStore } from './session-log.js'
@@ -16,6 +17,7 @@ import type { SessionLogStore } from './session-log.js'
 export type { Dirent, FileHandle, FileSystem, ReadableFileHandle, Stats } from './fs.js'
 export type { FsRevision } from './fs-revision.js'
 export type { GitClient, GitCommit, GitCountAheadOptions, GitLogOptions, GitRepoOptions, GitStatusEntry } from './git.js'
+export type { LLMCallOutcome, LLMCallPage, LLMCallRow, LLMCallStatus, LLMCallStore } from './llm-call-log.js'
 export type { ChildProcess, ExecFileOptions, ExecFileResult, ProcessRunner, SpawnOptions } from './process.js'
 export type { SessionLogPage, SessionLogStore } from './session-log.js'
 export { createTimerScheduler, isLiveScheduler } from './scheduler.js'
@@ -39,6 +41,11 @@ export interface Platform {
 	 * writing `sessions/<id>/session.log` and cursoring it by byte offset.
 	 */
 	sessionLog?: SessionLogStore
+	/**
+	 * Rows for the LLM call log. Absent on hosts with real files, which keep
+	 * writing `sessions/<id>/calls/<callId>.json` and listing that directory.
+	 */
+	llmCallLog?: LLMCallStore
 	/** Delayed re-entry into the agent loop. Required: every host can schedule. */
 	scheduler: Scheduler
 	/** Absolute path to the OS temp directory (equivalent to `os.tmpdir()` on Node/Bun). */

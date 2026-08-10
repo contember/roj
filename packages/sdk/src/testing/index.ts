@@ -1,4 +1,5 @@
 export { bootstrapForTesting } from './bootstrap-for-testing.js'
+export { MemoryLLMCallStore } from './memory-llm-call-store.js'
 export { createNodeFileSystem, createNodePlatform, createNodeProcessRunner } from './node-platform.js'
 export { NotificationCollector } from './notification-collector.js'
 export { createMultiAgentPreset, createTestPreset } from './preset-helpers.js'

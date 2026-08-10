@@ -5,13 +5,19 @@
  * Per spec.md 9.1: "Pro debugging a audit se bude logovat kompletní LLM komunikace"
  *
  * Calls are stored in the session folder: {dataPath}/sessions/{sessionId}/calls/
+ *
+ * A host that has a table for them ({@link LLMCallStore}) gets rows instead: the
+ * same entries, but `completeCall` stops reading the whole entry back to rewrite
+ * it and `listCalls` stops being a `readdir` plus one read per row of the page.
+ * Without a store nothing changes — same directory, same files, same content.
  */
 
 import { join } from 'node:path'
-import type { AgentId } from '~/core/agents/schema.js'
+import { AgentId } from '~/core/agents/schema.js'
 import { generateLLMCallId, LLMCallId } from '~/core/llm/schema.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import type { FileSystem } from '~/platform/fs.js'
+import type { LLMCallRow, LLMCallStore } from '~/platform/llm-call-log.js'
 import type { LLMCallError, LLMCallLogEntry, LLMCallMessage, LLMCallMetrics, LLMCallRequest, LLMCallResponse } from './llm-log-types.js'
 import type { InferenceRequest, InferenceResponse, LLMError } from './provider.js'
 
@@ -27,6 +33,57 @@ export interface LLMLoggerConfig {
 	basePath: string
 	enabled: boolean
 	fs: FileSystem
+	/** Rows instead of files, where the host has a table for them. */
+	store?: LLMCallStore
+}
+
+const ENCODER = new TextEncoder()
+
+/** UTF-8 length; the SDK cannot assume `Buffer`. */
+function byteLength(text: string): number {
+	return ENCODER.encode(text).byteLength
+}
+
+/**
+ * Fit a request inside the host's column ceiling.
+ *
+ * Everything in a request is bounded by the agent definition except the message
+ * history, which grows with the session and carries whole tool results — a
+ * `read_file` of a few MB lands here. Over the ceiling the store would reject the
+ * row and, because `createCall` is awaited on the inference path, turn a logged
+ * call into a failed one. Dropping the history keeps the call listed, its metrics
+ * intact and the failure out of the agent loop.
+ */
+function clampRequest(request: LLMCallRequest, maxBytes: number | undefined): string {
+	const json = JSON.stringify(request)
+	// UTF-8 is at most 3 bytes per UTF-16 unit, so the common case never encodes.
+	if (maxBytes === undefined || json.length * 3 <= maxBytes) return json
+
+	const bytes = byteLength(json)
+	if (bytes <= maxBytes) return json
+
+	const dropped: LLMCallRequest = {
+		...request,
+		messages: [{
+			role: 'system',
+			content: `[${request.messages.length} messages, ${bytes} B, dropped: over the host's ${maxBytes} B column limit]`,
+		}],
+		tools: undefined,
+	}
+	const withoutMessages = JSON.stringify(dropped)
+	if (byteLength(withoutMessages) <= maxBytes) return withoutMessages
+
+	// A system prompt alone past the ceiling is pathological, but the row still has to fit.
+	return JSON.stringify({ ...dropped, systemPrompt: `[${byteLength(request.systemPrompt)} B, dropped]` })
+}
+
+/** JSON this logger wrote itself; annotated rather than cast, and never validated on read. */
+function parseJson<T>(json: string): T {
+	return JSON.parse(json)
+}
+
+function parseOptionalJson<T>(json: string | undefined): T | undefined {
+	return json === undefined ? undefined : parseJson<T>(json)
 }
 
 // ============================================================================
@@ -35,14 +92,17 @@ export interface LLMLoggerConfig {
 
 /**
  * Logger for LLM requests and responses.
- * Stores individual JSON files per LLM call in the session folder.
+ * One JSON file per call in the session folder, or one row per call in a
+ * {@link LLMCallStore} where the host has one.
  */
 export class LLMLogger {
 	private dirCache = new Set<string>()
 	private readonly fs: FileSystem
+	private readonly store?: LLMCallStore
 
 	constructor(private config: LLMLoggerConfig) {
 		this.fs = config.fs
+		this.store = config.store
 	}
 
 	/**
@@ -138,6 +198,18 @@ export class LLMLogger {
 			providerOptions,
 		}
 
+		if (this.store !== undefined) {
+			await this.store.create(sessionId, {
+				callId,
+				agentId,
+				createdAt: now,
+				status: 'running',
+				model: request.model,
+				request: clampRequest(callRequest, this.store.maxBlobBytes),
+			})
+			return callId
+		}
+
 		const entry: LLMCallLogEntry = {
 			id: callId,
 			sessionId,
@@ -163,17 +235,6 @@ export class LLMLogger {
 		response: InferenceResponse,
 		durationMs: number,
 	): Promise<void> {
-		const filePath = this.getCallFilePath(sessionId, callId)
-
-		let entry: LLMCallLogEntry
-		try {
-			const content = await this.fs.readFile(filePath, 'utf-8')
-			entry = JSON.parse(content) as LLMCallLogEntry
-		} catch {
-			// File doesn't exist or is invalid - skip update
-			return
-		}
-
 		const callResponse: LLMCallResponse = {
 			content: response.content,
 			toolCalls: response.toolCalls.map((tc) => ({
@@ -199,6 +260,25 @@ export class LLMLogger {
 			reasoningTokens: response.metrics.reasoningTokens,
 		}
 
+		if (this.store !== undefined) {
+			// The whole reason for splitting the row: no read-back, and the ~17 KB
+			// request column is not in the SET list.
+			await this.store.complete(sessionId, callId, {
+				status: 'success',
+				completedAt: Date.now(),
+				durationMs,
+				providerRequestId: response.providerRequestId,
+				response: JSON.stringify(callResponse),
+				metrics: JSON.stringify(callMetrics),
+			})
+			return
+		}
+
+		const filePath = this.getCallFilePath(sessionId, callId)
+		const entry = await this.readEntry(filePath)
+		// File doesn't exist or is invalid - skip update
+		if (entry === null) return
+
 		entry.status = 'success'
 		entry.completedAt = Date.now()
 		entry.durationMs = durationMs
@@ -218,17 +298,6 @@ export class LLMLogger {
 		error: LLMError,
 		durationMs: number,
 	): Promise<void> {
-		const filePath = this.getCallFilePath(sessionId, callId)
-
-		let entry: LLMCallLogEntry
-		try {
-			const content = await this.fs.readFile(filePath, 'utf-8')
-			entry = JSON.parse(content) as LLMCallLogEntry
-		} catch {
-			// File doesn't exist or is invalid - skip update
-			return
-		}
-
 		const callError: LLMCallError = {
 			type: error.type,
 			message: error.message,
@@ -236,6 +305,21 @@ export class LLMLogger {
 			statusCode: error.statusCode,
 			responseBody: error.responseBody,
 		}
+
+		if (this.store !== undefined) {
+			await this.store.complete(sessionId, callId, {
+				status: 'error',
+				completedAt: Date.now(),
+				durationMs,
+				error: JSON.stringify(callError),
+			})
+			return
+		}
+
+		const filePath = this.getCallFilePath(sessionId, callId)
+		const entry = await this.readEntry(filePath)
+		// File doesn't exist or is invalid - skip update
+		if (entry === null) return
 
 		entry.status = 'error'
 		entry.completedAt = Date.now()
@@ -252,11 +336,18 @@ export class LLMLogger {
 		sessionId: SessionId,
 		callId: LLMCallId,
 	): Promise<LLMCallLogEntry | null> {
-		const filePath = this.getCallFilePath(sessionId, callId)
+		if (this.store !== undefined) {
+			const row = await this.store.get(sessionId, callId)
+			return row === null ? null : toEntry(sessionId, row)
+		}
 
+		return this.readEntry(this.getCallFilePath(sessionId, callId))
+	}
+
+	/** One stored entry, or null when the file has gone or stopped being JSON. */
+	private async readEntry(filePath: string): Promise<LLMCallLogEntry | null> {
 		try {
-			const content = await this.fs.readFile(filePath, 'utf-8')
-			return JSON.parse(content) as LLMCallLogEntry
+			return parseJson<LLMCallLogEntry>(await this.fs.readFile(filePath, 'utf-8'))
 		} catch {
 			return null
 		}
@@ -269,6 +360,17 @@ export class LLMLogger {
 		sessionId: SessionId,
 		options?: { limit?: number; offset?: number },
 	): Promise<{ calls: LLMCallLogEntry[]; total: number }> {
+		const offset = options?.offset ?? 0
+		const limit = options?.limit ?? 100
+
+		if (this.store !== undefined) {
+			// One indexed query where the file path listed a directory, sorted the
+			// names and read the page's files one at a time. Same order, same page
+			// boundaries — see LLMCallStore.list.
+			const page = await this.store.list(sessionId, { limit, offset })
+			return { calls: page.calls.map((row) => toEntry(sessionId, row)), total: page.total }
+		}
+
 		const callsDir = join(this.config.basePath, 'sessions', sessionId, 'calls')
 
 		let files: string[]
@@ -286,21 +388,39 @@ export class LLMLogger {
 			.reverse() // Most recent first
 
 		const total = jsonFiles.length
-		const offset = options?.offset ?? 0
-		const limit = options?.limit ?? 100
 		const paginated = jsonFiles.slice(offset, offset + limit)
 
 		const calls: LLMCallLogEntry[] = []
 		for (const file of paginated) {
-			try {
-				const filePath = join(callsDir, file)
-				const content = await this.fs.readFile(filePath, 'utf-8')
-				calls.push(JSON.parse(content) as LLMCallLogEntry)
-			} catch {
-				// Skip invalid files
-			}
+			const entry = await this.readEntry(join(callsDir, file))
+			// Skip invalid files
+			if (entry !== null) calls.push(entry)
 		}
 
 		return { calls, total }
+	}
+}
+
+/**
+ * Reassemble a stored row into the entry every reader is typed against.
+ *
+ * `sessionId` comes from the key rather than the row: it is what the caller
+ * looked the row up by, so storing it again would only be a second copy to keep
+ * consistent.
+ */
+function toEntry(sessionId: SessionId, row: LLMCallRow): LLMCallLogEntry {
+	return {
+		id: LLMCallId(row.callId),
+		sessionId,
+		agentId: AgentId(row.agentId),
+		createdAt: row.createdAt,
+		completedAt: row.completedAt,
+		durationMs: row.durationMs,
+		status: row.status,
+		request: parseJson<LLMCallRequest>(row.request),
+		response: parseOptionalJson<LLMCallResponse>(row.response),
+		metrics: parseOptionalJson<LLMCallMetrics>(row.metrics),
+		error: parseOptionalJson<LLMCallError>(row.error),
+		providerRequestId: row.providerRequestId,
 	}
 }

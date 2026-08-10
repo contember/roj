@@ -49,7 +49,7 @@ function workspaceGit(workspace: Workspace): ComputerGitClient | undefined {
 
 export { createComputerFileSystem, createComputerGitClient, createShellProcessRunner, createUnsupportedProcessRunner }
 export { createVfsRevision, type VfsRevisionSource } from './fs-revision.js'
-export { createSessionReaper, type ReapableEventStore, type ReapableFileSystem, type ReapableSessionLog, type ReapedSession, type ReapOptions, type ReapReport, type ReapSkipped, type SessionReaper, type SessionReaperOptions } from './session-reaper.js'
+export { createSessionReaper, type ReapableEventStore, type ReapableFileSystem, type ReapableLLMCallLog, type ReapableSessionLog, type ReapedSession, type ReapOptions, type ReapReport, type ReapSkipped, type SessionReaper, type SessionReaperOptions } from './session-reaper.js'
 export { createAlarmScheduler } from './alarm-scheduler.js'
 export type {
 	AlarmScheduler,
@@ -62,3 +62,4 @@ export type { ShellProcessRunnerOptions } from './process.js'
 export { SqliteEventStore } from './sqlite-event-store.js'
 export type { SqlCursorLike, SqlStorageHost, SqlStorageLike } from './sqlite-event-store.js'
 export { SqliteSessionLog } from './sqlite-session-log.js'
+export { SqliteLLMCallLog, type SqliteLLMCallLogOptions } from './sqlite-llm-call-log.js'

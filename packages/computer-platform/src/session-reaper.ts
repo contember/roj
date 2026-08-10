@@ -62,6 +62,11 @@ export interface ReapableSessionLog {
 	delete(sessionId: SessionId): Promise<number>
 }
 
+/** The one LLM-call-log call a reap makes. `Platform['llmCallLog']` satisfies it. */
+export interface ReapableLLMCallLog {
+	delete(sessionId: SessionId): Promise<number>
+}
+
 export interface SessionReaperOptions {
 	eventStore: ReapableEventStore
 	fs: ReapableFileSystem
@@ -77,6 +82,12 @@ export interface SessionReaperOptions {
 	 * without it, moving the log into a table would just move the leak.
 	 */
 	sessionLog?: ReapableSessionLog
+	/**
+	 * Where the host keeps the LLM call log in rows instead of under `dataDir`.
+	 * Same branch and same reason as `sessionLog`: `sessions/<id>/calls` is a
+	 * files-side directory wherever it is not a table.
+	 */
+	llmCallLog?: ReapableLLMCallLog
 	/**
 	 * Sessions the host is still using. A closed session is not in SessionManager's
 	 * cache, so this is for the case the store cannot see: a host holding a closed
@@ -104,6 +115,8 @@ export interface ReapedSession {
 	removedDataDir: boolean
 	/** Log entries dropped from the session-log store. Always 0 on a host that has none. */
 	removedLogLines: number
+	/** Calls dropped from the LLM-call-log store. Always 0 on a host that has none. */
+	removedLlmCalls: number
 	removedEvents: number
 	error?: string
 }
@@ -174,7 +187,7 @@ function describe(error: unknown): string {
 }
 
 export function createSessionReaper(options: SessionReaperOptions): SessionReaper {
-	const { eventStore, fs, dataDir, sessionLog, isProtected } = options
+	const { eventStore, fs, dataDir, sessionLog, llmCallLog, isProtected } = options
 
 	return {
 		async reap(reapOptions: ReapOptions = {}): Promise<ReapReport> {
@@ -237,6 +250,7 @@ export function createSessionReaper(options: SessionReaperOptions): SessionReape
 					removedWorkspace: false,
 					removedDataDir: false,
 					removedLogLines: 0,
+					removedLlmCalls: 0,
 					removedEvents: 0,
 				}
 				if (dryRun) {
@@ -259,6 +273,10 @@ export function createSessionReaper(options: SessionReaperOptions): SessionReape
 					// and not with the event rows — `events: false` must still reclaim it.
 					if (sessionLog !== undefined && !isAlreadyReaped(metadata)) {
 						entry.removedLogLines = await sessionLog.delete(sessionId)
+					}
+					// Same branch for the same reason: `sessions/<id>/calls` is files elsewhere.
+					if (llmCallLog !== undefined && !isAlreadyReaped(metadata)) {
+						entry.removedLlmCalls = await llmCallLog.delete(sessionId)
 					}
 					if (dropEvents) {
 						if (await stillClosed(eventStore, sessionId)) {
