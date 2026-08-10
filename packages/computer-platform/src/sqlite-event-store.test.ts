@@ -339,8 +339,33 @@ describe('SqliteEventStore', () => {
 			for (const id of ids) expect(sessions).toContain(id)
 		})
 
+		test('returns them in id order', async () => {
+			const ids = [
+				SessionId('01900000-0000-7000-8000-00000000000c'),
+				SessionId('01900000-0000-7000-8000-00000000000a'),
+				SessionId('01900000-0000-7000-8000-00000000000b'),
+			]
+			for (const id of ids) await store.append(id, sessionCreated(id, 'test'))
+
+			expect(await store.listSessions()).toEqual([...ids].sort())
+		})
+
 		test('includes a session that only has metadata', async () => {
 			await store.updateMetadata(sessionId, { name: 'metadata only' })
+			expect(await store.listSessions()).toEqual([sessionId])
+		})
+
+		test('includes a session whose metadata write failed after its events landed', async () => {
+			// The events insert is synchronous and the metadata write that follows it is
+			// not, so a metadata failure leaves the log as the only record of the session.
+			storage.failOn = (query) => query.startsWith('INSERT INTO roj_session_metadata')
+
+			await expect(store.append(sessionId, sessionCreated(sessionId, 'test-preset')))
+				.rejects.toThrow(EventAppendError)
+
+			storage.failOn = null
+			expect(await store.getMetadata(sessionId)).toBeNull()
+			expect(await store.load(sessionId)).toHaveLength(1)
 			expect(await store.listSessions()).toEqual([sessionId])
 		})
 	})
