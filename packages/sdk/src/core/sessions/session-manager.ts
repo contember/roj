@@ -30,9 +30,9 @@ import { generateSessionId, isValidSessionId, SessionId } from '~/core/sessions/
 import type { SessionCreatedEvent, SessionOverridesPatch } from '~/core/sessions/state.js'
 import { checkRecoveryNeeded, isSessionCreatedEvent, reconstructSessionState, sessionEvents } from '~/core/sessions/state.js'
 import type { ToolExecutor } from '~/core/tools'
-import { FileLogger } from '~/lib/logger/file.js'
 import type { ArchiveLimitOverrides } from '~/lib/archive/index.js'
 import type { Logger } from '~/lib/logger/logger.js'
+import { createSessionLogger } from '~/lib/logger/session-log.js'
 import { TeeLogger } from '~/lib/logger/tee.js'
 import type { Platform } from '~/platform/index.js'
 import { isLiveScheduler } from '~/platform/index.js'
@@ -1126,7 +1126,7 @@ export class SessionManager {
 		const sessionDir = this.getSessionDir(store.sessionId)
 		const sessionLogger = new TeeLogger([
 			this.logger.child({ sessionId: store.sessionId }),
-			new FileLogger(join(sessionDir, 'session.log'), this.platform.fs, { sessionId: String(store.sessionId) }),
+			createSessionLogger(this.platform, String(store.sessionId), join(sessionDir, 'session.log')),
 		])
 
 		// Create session

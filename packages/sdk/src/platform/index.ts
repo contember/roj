@@ -11,11 +11,13 @@ import type { FsRevision } from './fs-revision.js'
 import type { GitClient } from './git.js'
 import type { ProcessRunner } from './process.js'
 import type { Scheduler } from './scheduler.js'
+import type { SessionLogStore } from './session-log.js'
 
 export type { Dirent, FileHandle, FileSystem, ReadableFileHandle, Stats } from './fs.js'
 export type { FsRevision } from './fs-revision.js'
 export type { GitClient, GitCommit, GitCountAheadOptions, GitLogOptions, GitRepoOptions, GitStatusEntry } from './git.js'
 export type { ChildProcess, ExecFileOptions, ExecFileResult, ProcessRunner, SpawnOptions } from './process.js'
+export type { SessionLogPage, SessionLogStore } from './session-log.js'
 export { createTimerScheduler, isLiveScheduler } from './scheduler.js'
 export type { LiveScheduler, Scheduler, WakeHandler } from './scheduler.js'
 
@@ -32,6 +34,11 @@ export interface Platform {
 	 * answer it, which then recompute whatever they would have gated on.
 	 */
 	fsRevision?: FsRevision
+	/**
+	 * Rows for the per-session log. Absent on hosts with real files, which keep
+	 * writing `sessions/<id>/session.log` and cursoring it by byte offset.
+	 */
+	sessionLog?: SessionLogStore
 	/** Delayed re-entry into the agent loop. Required: every host can schedule. */
 	scheduler: Scheduler
 	/** Absolute path to the OS temp directory (equivalent to `os.tmpdir()` on Node/Bun). */

@@ -12,7 +12,7 @@ import { Workspace, WorkspaceServiceProxy } from '@cloudflare/computer'
 import type { DurableObjectStorageLike, WorkspaceStub } from '@cloudflare/computer'
 import { WorkerShellBackend } from '@cloudflare/computer/backends/worker-shell'
 import { createGitClient } from '@cloudflare/computer/git'
-import { SqliteEventStore, createAlarmScheduler, createComputerPlatform, createSessionReaper, createShellProcessRunner } from '@roj-ai/computer-platform'
+import { SqliteEventStore, SqliteSessionLog, createAlarmScheduler, createComputerPlatform, createSessionReaper, createShellProcessRunner } from '@roj-ai/computer-platform'
 import type { AlarmScheduler, ReapOptions, SessionReaper } from '@roj-ai/computer-platform'
 import { FileEventStore, JsonLogger, bootstrap, createSystemFromServices, isolatePlugins } from '@roj-ai/sdk'
 import type { Config, IsolateMethodSchemas, Services, Session, SessionId, System } from '@roj-ai/sdk'
@@ -97,6 +97,7 @@ export class RojAgentDO extends DurableObject<Env> {
 	readonly #workspace: Workspace
 	readonly #platform: Platform
 	readonly #eventStore: SqliteEventStore
+	readonly #sessionLog: SqliteSessionLog
 	readonly #reaper: SessionReaper
 	readonly #transport: DoTransport
 	readonly #scheduler: AlarmScheduler
@@ -137,15 +138,24 @@ export class RojAgentDO extends DurableObject<Env> {
 		// The agent loop re-enters through this instead of a timer, so a wake armed by
 		// one isolate is delivered by whichever one alarm() lands in — see alarm().
 		this.#scheduler = createAlarmScheduler(ctx)
+		// This filesystem is SQLite already, so the session log costs 12-27x less as
+		// rows than as appends onto a file — see /limits/fs-traffic.
+		this.#sessionLog = new SqliteSessionLog(storage)
 		this.#platform = {
 			...createComputerPlatform(this.#workspace, { scheduler: this.#scheduler }),
 			// createComputerPlatform defaults to ENOSYS; this workspace has a shell to run on.
 			process: createShellProcessRunner(this.#workspace, { backend: SHELL_BACKEND }),
+			sessionLog: this.#sessionLog,
 		}
 		this.#eventStore = new SqliteEventStore(storage)
 		// Reclaiming is the host's call, not a session hook's — see session-reaper.ts.
 		// Nothing calls this on its own; /reap and /limits/reaper are the two triggers.
-		this.#reaper = createSessionReaper({ eventStore: this.#eventStore, fs: this.#platform.fs, dataDir: DATA_ROOT })
+		this.#reaper = createSessionReaper({
+			eventStore: this.#eventStore,
+			fs: this.#platform.fs,
+			dataDir: DATA_ROOT,
+			sessionLog: this.#sessionLog,
+		})
 		// The transport is built before the boot that produces `services.logger`, and
 		// sockets already open, close and lose frames by then — so it gets its own.
 		this.#transport = createDoTransport(ctx, () => this.#boot(), new JsonLogger(config.logLevel))

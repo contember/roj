@@ -232,13 +232,13 @@ costs `max(debounce, ~12 ms) + ~2 ms`, the floor being the DO's storage commit.
 
 ### What a turn writes to the filesystem (`/limits/fs-traffic`)
 
-`SqliteEventStore` took the event log off the filesystem. What is left is one
-file, and it is not the agent's. `/limits/fs-traffic` *is* the `FileSystem` the
+`SqliteEventStore` took the event log off the filesystem. What was left was one
+file, and it was not the agent's. `/limits/fs-traffic` *is* the `FileSystem` the
 SDK boots on — it wraps `platform.fs` before `boot()`, so every call the
 composition root hands out is counted with its path and its bytes.
 
-One two-agent smoke turn (4 inferences, 25 events) makes **32 `platform.fs`
-calls, 24 of them writes, 4 453 B**. Identical across four runs:
+One two-agent smoke turn (4 inferences, 25 events) used to make **32
+`platform.fs` calls, 24 of them writes, 4 453 B**. Identical across four runs:
 
 | path | op | count | bytes |
 |---|---|---:|---:|
@@ -247,7 +247,14 @@ calls, 24 of them writes, 4 453 B**. Identical across four runs:
 | both trees | `readdir` / `stat` / `mkdir` | 8 | 0 |
 
 `createSession` adds two `mkdir` and nothing else. **The agent's actual work
-product is one write of 76 B; the other 23 are the session log.**
+product is one write of 76 B; the other 23 were the session log.**
+
+The log now goes to rows instead — `platform.sessionLog`, an optional port whose
+absence is the old behaviour, backed here by `SqliteSessionLog`. The same turn
+makes **7 `platform.fs` calls, 1 of them a write, 76 B**: the agent's note and
+nothing else. The 23 lines and their 4 377 B are unchanged, and
+`turn.sessionLog.store` in the probe's report is where they went. A host with
+real files is untouched: same file, same bytes, same byte-offset cursor.
 
 Per-operation cost — 600 operations per figure, bracketed by scheduler yields,
 never one call timed alone:
@@ -264,13 +271,13 @@ costs ~2 VFS operations, because the adapter emulates it as `lstat` +
 figures move ±30% between runs on a contended box; the ratio does not, and the
 `INSERT` held at 0.05–0.065 ms across five runs.
 
-So the session log costs **~19–21 ms of CPU per turn** where the same 23 lines
-as rows would cost ~1.4 ms. Against the loop it records: this turn runs 4
-inferences, so that is ~5 ms of log per inference, while `/limits/turn-cost` on
-the same box does 8–12 ms of `workMs` across 2 inferences — 4–6 ms each.
-**The session log costs about what the agent loop it is logging costs.**
+So the session log cost **~19–21 ms of CPU per turn** where the same 23 lines as
+rows cost ~1.4 ms. Against the loop it records: this turn runs 4 inferences, so
+that was ~5 ms of log per inference, while `/limits/turn-cost` on the same box
+does 8–12 ms of `workMs` across 2 inferences — 4–6 ms each. **The session log
+cost about what the agent loop it is logging costs.**
 
-Two things make that easy to miss:
+Two things made that easy to miss:
 
 - **`FileLogger` never awaits its append** — `fs.appendFile(...).catch(() => {})`.
   The work lands on the microtask queue and runs during the debounce the wall
@@ -279,12 +286,13 @@ Two things make that easy to miss:
   adapter against one with them: 1 557 ms vs 1 546 ms over 4 rounds. Half the
   projection, in the right direction — the other half hid in the debounce. CPU
   is metered in production; wall is not.
-- **`config.logLevel` does not reach it.** `FileLogger.level` is hard-coded to
-  `debug`, and `SessionManager` tees it into every session logger
-  unconditionally, so `logLevel: 'info'` still writes all 23 lines. **20 of the
-  23 are `debug`**, and nine distinct messages account for every one of them —
+- **`config.logLevel` does not reach it, on purpose.** The session logger is
+  fixed at `debug` — it is the detailed record, the console logger is the
+  filtered one — so `logLevel: 'info'` still writes all 23 lines. **20 of the 23
+  are `debug`**, and nine distinct messages account for every one of them —
   `Executing beforeInference handlers`, `Running inference`,
-  `Executing afterToolCall handlers` and the like, ~190 B each.
+  `Executing afterToolCall handlers` and the like, ~190 B each. The point of the
+  move to rows is to keep that detail and make it cheap, not to drop it.
 
 **The LLM call log is a second file-shaped table, and this harness never writes
 it**: `bootstrap` skips `LLMLogger` entirely whenever `config.llmMock` is set.
@@ -299,11 +307,17 @@ spelled out in `readdir`.
 
 Neither log goes through `SessionFileStore`. `FileLogger` and `LLMLogger` both
 hold `platform.fs` directly, which is why the census had to sit on the port
-rather than on the store. Both are read only over RPC: `logs.tail`, which cursors
-`session.log` by **byte offset**, for the debug UI's Logs page; and
-`llm.getCalls` / `getCall` / `getCurlCommand` for its LLM Calls page and
-`@roj-ai/cli`. Nothing outside the SDK opens either file, and both are reclaimed
-today by the reaper's `rm -r /data/sessions/<id>`, on the files-only path.
+rather than on the store. Both are read only over RPC: `logs.tail` for the debug
+UI's Logs page, and `llm.getCalls` / `getCall` / `getCurlCommand` for its LLM
+Calls page and `@roj-ai/cli`. Nothing outside the SDK opens either.
+
+`logs.tail`'s cursor stays a plain number and stays opaque: a byte offset where
+the log is a file, a row seq where it is a table. Every reader already treats it
+as a token to hand back — the debug UI stores `offset` in state, and webmaster's
+worker only proxies the method by name — so no reader changed. Reclamation moved
+with it: the reaper drops the rows on its **files** branch, beside
+`rm -r /data/sessions/<id>`, and reports them as `removedLogLines`. The LLM call
+log is still files, still reaped with the directory.
 
 ### Concurrency
 

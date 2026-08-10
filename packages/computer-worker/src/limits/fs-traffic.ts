@@ -15,9 +15,12 @@
  * Three phases, in order:
  *
  * - **turn** — one real two-agent turn on the DO's own SessionManager, i.e. the
- *   alarm scheduler, which is what this host actually runs. Appends to
- *   `session.log` are additionally tallied by their JSON `level`/`message`, so
- *   the traffic can be read as "what is being logged", not just "how much".
+ *   alarm scheduler, which is what this host actually runs. The session log is
+ *   additionally tallied by its JSON `level`/`message`, so the traffic can be
+ *   read as "what is being logged", not just "how much" — off the appends on a
+ *   host that writes a file, and off the rows on one with `platform.sessionLog`,
+ *   which this DO has. On that host the log costs no `platform.fs` call at all;
+ *   `turn.sessionLog.store` is where it went.
  * - **cost** — per-operation calibration. workerd freezes `Date.now()` between
  *   I/O, so nothing here times a single call: each figure is a loop of N
  *   operations bracketed by scheduler yields and divided, the way `/bench` and
@@ -34,6 +37,8 @@
  * the `session.log` writes suppressed at the adapter and one with them, as a
  * check on the projection the cost phase multiplies out. Debounce dominates a
  * turn's wall time, so read it as a check on the sign, not as the measurement.
+ * It suppresses at the *filesystem*, so on a host with `platform.sessionLog`
+ * there is nothing left for it to suppress and both arms are the same turn.
  */
 
 import { SessionId, createSystemFromServices } from '@roj-ai/sdk'
@@ -415,6 +420,45 @@ function tallyOf(report: TrafficReport, pathClass: string, op: FsOp): OpTally {
 		?? { pathClass, op, count: 0, bytes: 0, maxBytes: 0 }
 }
 
+interface StoredLog {
+	rows: number
+	bytes: number
+	distinctMessages: number
+	topLines: { line: string; count: number }[]
+}
+
+/**
+ * Where the session log went once it stopped being a file.
+ *
+ * The census cannot see it: a store-backed log never reaches `platform.fs`, which
+ * is the whole point. Read straight off the DO's own SQL, so the two halves of the
+ * before/after sit in one report — appends that vanished, rows that appeared — and
+ * so the "what is being logged" tally survives the move.
+ */
+function storedLog(context: LimitProbeContext, sessionId: string): StoredLog | null {
+	if (context.platform.sessionLog === undefined) return null
+
+	const rows = context.ctx.storage.sql
+		.exec<{ line: string }>('SELECT line FROM roj_session_log WHERE session_id = ? ORDER BY seq', sessionId)
+		.toArray()
+
+	const tally = new Map<string, number>()
+	let bytes = 0
+	for (const row of rows) {
+		// +1 for the newline the file sink wrote, so the byte figures compare.
+		bytes += byteLength(row.line) + 1
+		const key = describeLogLine(row.line)
+		tally.set(key, (tally.get(key) ?? 0) + 1)
+	}
+
+	const topLines = [...tally.entries()]
+		.map(([line, count]) => ({ line, count }))
+		.sort((a, b) => b.count - a.count)
+		.slice(0, 20)
+
+	return { rows: rows.length, bytes, distinctMessages: tally.size, topLines }
+}
+
 // ============================================================================
 // Cost calibration
 // ============================================================================
@@ -543,11 +587,16 @@ export const fsTrafficProbe: LimitProbe = async (context) => {
 	const turnTraffic = readTraffic(census)
 	// Snapshotted here, not at return: the phases below keep writing log lines.
 	const logLines = { distinct: census.logLines.size, top: topLogLines(census, 20) }
+	const stored = storedLog(context, sessionId)
 	const events = (await booted.services.eventStore.load(SessionId(sessionId))).length
 
 	// --- phase: cost -------------------------------------------------------
 	const logAppend = tallyOf(turnTraffic, 'session.log', 'appendFile')
-	const meanLineBytes = logAppend.count > 0 ? Math.round(logAppend.bytes / logAppend.count) : FALLBACK_LINE_BYTES
+	// The same lines either way; only the sink moved. Taking the count from whichever
+	// sink this host used keeps the projection pricing the log after the move.
+	const logCount = logAppend.count > 0 ? logAppend.count : stored?.rows ?? 0
+	const logBytes = logAppend.count > 0 ? logAppend.bytes : stored?.bytes ?? 0
+	const meanLineBytes = logCount > 0 ? Math.round(logBytes / logCount) : FALLBACK_LINE_BYTES
 	const line = 'x'.repeat(Math.max(meanLineBytes - 1, 1)) + '\n'
 
 	await raw.mkdir(COST_DIR, { recursive: true })
@@ -581,18 +630,21 @@ export const fsTrafficProbe: LimitProbe = async (context) => {
 		turn: {
 			traffic: turnTraffic,
 			sessionLog: {
+				lines: logCount,
+				bytes: logBytes,
 				appends: logAppend.count,
-				bytes: logAppend.bytes,
 				meanLineBytes,
-				distinctMessages: logLines.distinct,
-				topLines: logLines.top,
+				distinctMessages: stored?.distinctMessages ?? logLines.distinct,
+				topLines: stored?.topLines ?? logLines.top,
+				// Null where the host has no store, and the appends above are the whole log.
+				store: stored,
 			},
 		},
 		cost,
 		projection: {
-			sessionLogMsPerTurn: logAppend.count * appendMs,
-			sessionLogMsPerTurnAsRows: logAppend.count * insertMs,
-			savedMsPerTurn: logAppend.count * (appendMs - insertMs),
+			sessionLogMsPerTurn: logCount * appendMs,
+			sessionLogMsPerTurnAsRows: logCount * insertMs,
+			savedMsPerTurn: logCount * (appendMs - insertMs),
 			reads: 'count x calibrated ms/op. The turn itself costs ~10 ms of CPU (see /limits/turn-cost).',
 		},
 		ab,

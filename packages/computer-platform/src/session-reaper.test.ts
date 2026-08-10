@@ -7,6 +7,7 @@ import { createSessionReaper } from './session-reaper.js'
 import type { ReapableEventStore, ReapableFileSystem } from './session-reaper.js'
 import { SqliteEventStore } from './sqlite-event-store.js'
 import type { SqlCursorLike, SqlStorageHost, SqlStorageLike } from './sqlite-event-store.js'
+import { SqliteSessionLog } from './sqlite-session-log.js'
 
 function toBinding(value: unknown): SQLQueryBindings {
 	if (
@@ -148,6 +149,76 @@ describe('createSessionReaper', () => {
 		await reaper.reap()
 
 		expect(fs.removed).toEqual([`${WORKSPACE_ROOT}/${sessionId}`, `${DATA_DIR}/sessions/${sessionId}`])
+	})
+
+	test('reports no log lines on a host that keeps the log in files', async () => {
+		await seed()
+		const reaper = createSessionReaper({ eventStore: store, fs, dataDir: DATA_DIR })
+
+		const report = await reaper.reap()
+
+		expect(report.reaped[0]?.removedLogLines).toBe(0)
+	})
+
+	// The log lives under dataDir on a file host, so a store-backed one has to reclaim
+	// it on the same branch — otherwise moving it into a table just moves the leak.
+	describe('with a session-log store', () => {
+		let sessionLog: SqliteSessionLog
+
+		beforeEach(() => {
+			sessionLog = new SqliteSessionLog(storage)
+		})
+
+		const seedLog = (sessionId: SessionId, lines: number) => {
+			for (let index = 0; index < lines; index++) sessionLog.append(sessionId, `{"message":"line ${index}"}`)
+		}
+
+		test('reclaims the log with the files, without being asked for the events', async () => {
+			const sessionId = await seed()
+			seedLog(sessionId, 3)
+			const reaper = createSessionReaper({ eventStore: store, fs, dataDir: DATA_DIR, sessionLog })
+
+			const report = await reaper.reap()
+
+			expect(report.reaped[0]?.removedLogLines).toBe(3)
+			expect(await sessionLog.read(sessionId, 0)).toEqual({ lines: [], offset: 0 })
+			// The event log is the only record a session ran, and this sweep did not ask for it.
+			expect(await store.exists(sessionId)).toBe(true)
+		})
+
+		test('leaves other sessions logging', async () => {
+			const reaped = await seed()
+			const live = await seed({ closed: false })
+			seedLog(reaped, 2)
+			seedLog(live, 2)
+			const reaper = createSessionReaper({ eventStore: store, fs, dataDir: DATA_DIR, sessionLog })
+
+			await reaper.reap()
+
+			expect((await sessionLog.read(live, 0)).lines).toHaveLength(2)
+		})
+
+		test('does not re-count a log it already took', async () => {
+			const sessionId = await seed()
+			seedLog(sessionId, 3)
+			const reaper = createSessionReaper({ eventStore: store, fs, dataDir: DATA_DIR, sessionLog })
+
+			await reaper.reap()
+			const second = await reaper.reap({ events: true })
+
+			expect(second.reaped[0]).toMatchObject({ removedLogLines: 0, removedEvents: 3 })
+		})
+
+		test('removes nothing on a dry run', async () => {
+			const sessionId = await seed()
+			seedLog(sessionId, 3)
+			const reaper = createSessionReaper({ eventStore: store, fs, dataDir: DATA_DIR, sessionLog })
+
+			const report = await reaper.reap({ dryRun: true })
+
+			expect(report.reaped[0]?.removedLogLines).toBe(0)
+			expect((await sessionLog.read(sessionId, 0)).lines).toHaveLength(3)
+		})
 	})
 
 	test('never touches a session that is not closed', async () => {

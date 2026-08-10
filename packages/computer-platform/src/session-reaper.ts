@@ -57,6 +57,11 @@ export interface ReapableFileSystem {
 	rm(path: string, options?: { recursive?: boolean; force?: boolean }): Promise<void>
 }
 
+/** The one session-log call a reap makes. `Platform['sessionLog']` satisfies it. */
+export interface ReapableSessionLog {
+	delete(sessionId: SessionId): Promise<number>
+}
+
 export interface SessionReaperOptions {
 	eventStore: ReapableEventStore
 	fs: ReapableFileSystem
@@ -66,6 +71,12 @@ export interface SessionReaperOptions {
 	 * Omit it and only the workspace goes.
 	 */
 	dataDir?: string
+	/**
+	 * Where the host keeps `session.log` in rows instead of under `dataDir`.
+	 * Reaped on the files branch, because that is where those bytes used to live —
+	 * without it, moving the log into a table would just move the leak.
+	 */
+	sessionLog?: ReapableSessionLog
 	/**
 	 * Sessions the host is still using. A closed session is not in SessionManager's
 	 * cache, so this is for the case the store cannot see: a host holding a closed
@@ -91,6 +102,8 @@ export interface ReapedSession {
 	workspaceDir: string | null
 	removedWorkspace: boolean
 	removedDataDir: boolean
+	/** Log entries dropped from the session-log store. Always 0 on a host that has none. */
+	removedLogLines: number
 	removedEvents: number
 	error?: string
 }
@@ -161,7 +174,7 @@ function describe(error: unknown): string {
 }
 
 export function createSessionReaper(options: SessionReaperOptions): SessionReaper {
-	const { eventStore, fs, dataDir, isProtected } = options
+	const { eventStore, fs, dataDir, sessionLog, isProtected } = options
 
 	return {
 		async reap(reapOptions: ReapOptions = {}): Promise<ReapReport> {
@@ -223,6 +236,7 @@ export function createSessionReaper(options: SessionReaperOptions): SessionReape
 					workspaceDir: target.kind === 'own' ? target.dir : null,
 					removedWorkspace: false,
 					removedDataDir: false,
+					removedLogLines: 0,
 					removedEvents: 0,
 				}
 				if (dryRun) {
@@ -240,6 +254,11 @@ export function createSessionReaper(options: SessionReaperOptions): SessionReape
 					if (dataDir !== undefined && !isAlreadyReaped(metadata)) {
 						await fs.rm(`${dataDir}/sessions/${sessionId}`, { recursive: true, force: true })
 						entry.removedDataDir = true
+					}
+					// The log is a data-dir file wherever it is not a table, so it goes here
+					// and not with the event rows — `events: false` must still reclaim it.
+					if (sessionLog !== undefined && !isAlreadyReaped(metadata)) {
+						entry.removedLogLines = await sessionLog.delete(sessionId)
 					}
 					if (dropEvents) {
 						if (await stillClosed(eventStore, sessionId)) {
