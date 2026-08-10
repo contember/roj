@@ -41,6 +41,7 @@ import { ToolCallId } from '@roj-ai/sdk/tools'
 import { filesystemPlugin } from '@roj-ai/sdk/tools/filesystem'
 import type { HibernatableWebSocket } from '@roj-ai/transport/workers'
 import { createWorkersWebSocketHandlers } from '@roj-ai/transport/workers'
+import { withOwnScheduler } from '../own-scheduler.js'
 import type { LimitProbe, LimitProbeContext } from './context.js'
 
 const DIMENSIONS = ['sqlite', 'ws', 'fs', 'cascade'] as const
@@ -783,10 +784,14 @@ async function probeCascade(context: LimitProbeContext, journal: Journal): Promi
 	const limits = bounds(params, 'cascade', { min: 64 * 1024, max: 32 * 1024 * 1024, tol: 256 * 1024 })
 
 	const preset = cascadePreset(maxReadSize, maxTokens)
+	const mock = new MockLLMProvider(cascadeHandler)
+	// Own manager, so own scheduler: the DO's alarm dispatches into the manager it
+	// booted, and this one's agents would wait on wakes nobody delivers.
 	const services: Services<'isolate'> = {
-		...boot().services,
+		...withOwnScheduler(boot().services),
 		presets: new Map([[preset.id, preset]]),
-		llmProvider: new MockLLMProvider(cascadeHandler),
+		llmProvider: mock,
+		llmProviders: new Map([['mock', mock]]),
 	}
 
 	let harness: SocketHarness | null = null

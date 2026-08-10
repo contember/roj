@@ -206,7 +206,8 @@ V8's, not Cloudflare's.
 | Script size | 7.2 MB raw / **1.57 MB gzip** | Real — under the 10 MB paid *and* 3 MB free limits |
 | Startup CPU | **~103 ms** of 400 ms | Real limit, local CPU — a magnitude, not headroom |
 | Event payload (DO SQLite value) | **2 199 994 B** | Real — same workerd binary |
-| `read_file` result | 10 MiB | roj's own guard, not the platform's |
+| `read_file` result, stock config | **~85 KB** persisted, at any file size | roj's own `maxTokens` truncation |
+| `read_file` file size | **10 485 760 B**, exactly | roj's own `maxReadSize` guard, not the platform's |
 | WebSocket frame | **32 MiB** over a real hop | Real. An in-isolate `WebSocketPair` has no limit — a loopback artefact |
 | Workspace file | 384 MiB round-tripped | Local only — production is bounded by isolate memory |
 | Isolate memory | ~1.41 GB (V8 heap) | Local only — production is 128 MB, ~11× lower |
@@ -412,10 +413,11 @@ tightly as anything here does and still takes the delivery.
 
 One consequence for the other probes. The alarm dispatches into the one
 SessionManager the DO booted, so a probe that builds a manager of its own —
-`turn-cost`, `concurrency`, `memory`, and `/bench` — would strand its agents on
-wakes nobody delivers. Those managers live only for their request, which is the
-case `LiveScheduler` exists for, so they take a timer scheduler through
-`withOwnScheduler()`.
+`turn-cost`, `concurrency`, `memory`, `payload`'s cascade, and `/bench` — would
+strand its agents on wakes nobody delivers. Those managers live only for their
+request, which is the case `LiveScheduler` exists for, so they take a timer
+scheduler through `withOwnScheduler()`. The cascade was missed when the port
+landed and hung silently until it was fixed; it is the only one that was.
 
 ### An idle DO (`/limits/idle`)
 
@@ -467,14 +469,89 @@ so this is the precondition for hibernation, not hibernation. The transport
 already uses hibernatable WebSockets; whether the object actually sleeps can only
 be settled on a deploy.
 
+### The read-file cascade (`/limits/payload?dims=cascade`)
+
+The realistic chain, at one file size: an agent is told to `read_file` a file in
+its workspace, the tool result becomes an event, and that event is persisted and
+broadcast. The dimension bisects for the largest file the whole chain survives and
+names the link that gave way — `read`, `persist`, `broadcast` or `idle`.
+
+**Everything in this section is a new measurement.** The dimension built its own
+`SessionManager` without `withOwnScheduler()`, so its agents waited on wakes the
+DO's `alarm()` was delivering to a different manager; every run timed out at 3
+events and `brokeAt: 'persist'`. Nothing it reported before this was a payload
+ceiling.
+
+Stock config (`maxReadSize: 10 485 760`, `maxTokens: 20 000`):
+
+| file | persisted `tool_completed` | outcome |
+|---:|---:|---|
+| 65 536 B | 67 800 B | whole chain, agent idle |
+| 86 016 B | 88 921 B | last size read whole |
+| 87 040 B | 85 307 B | truncated — and flat from here up |
+| 10 485 760 B | 85 318 B | still fine |
+| 10 485 761 B | — | `tool_failed`, agent idle |
+
+**Two roj guards, on opposite sides of the store's ceiling.** `maxTokens`
+truncates the *result*: from ~86 KB of file upward every read persists the same
+~85 KB event, whatever the file weighs — **~26× under** the store's 2.2 MB. Only
+`maxReadSize` rejects the *file*, and only at **4.8× over** it: 10 485 760 B
+reads, 10 485 761 B comes back as `File is too large (10485761 bytes, max
+10485760). Use offset and maxLines to read specific sections.` — one `tool_failed`
+event, agent idle, session usable. That is the `recoverable: true` path, and the
+only cascade failure that ends cleanly.
+
+The earlier reading of this — "`read_file`'s own guard fires 25× earlier and fails
+cleanly with `recoverable: true`" — named one guard for two. The 25× is the
+truncation, the clean failure is the size guard, and the size guard never protects
+the store. What keeps stock config away from the value limit is truncation alone.
+
+With truncation off (`?cascadeMaxTokens=1000000000`), the persist link binds — and
+it binds twice:
+
+| file | events | largest event | what happened |
+|---:|---:|---:|---|
+| 2 132 961 B | 12 | 2 199 956 B | whole chain, agent idle |
+| 2 132 962 B | 10 | 2 199 835 B | `tool_completed` landed, the event after it did not |
+| 2 133 080 B | 9 | 448 B | log stops at `tool_started` |
+
+The result goes into the log **twice** — as `tool_completed`, then again inside the
+`inference_started` that carries it into the next inference, 122 B larger. So
+there is a ~120 B wide band of file sizes where the tool result is on record and
+the turn hangs anyway, and above it the tool event itself is refused and the log
+ends at `tool_started`. Both hang identically; only the second leaves no trace of
+what the tool answered. Underneath both is the store's own ceiling, re-measured in
+the same run: `sql.exec` takes a 2 199 994 B TEXT value and answers 2 199 995 B
+with `SQLITE_TOOBIG`.
+
+**Broadcast is never the link that breaks.** At every size above, the only frames
+the session pushed were `agentStatus` notifications of ~209 B — none buffered,
+none dropped. This preset's tool results never reach a client, so the WebSocket
+frame ceiling in the Limits table comes from `?dims=ws`, not from here.
+
+**Raise `maxReadSize` and the binding constraint becomes CPU, not payload.** At
+`maxReadSize: 128 MiB` with stock `maxTokens`, the persisted event stays flat
+while the turn's wall time grows linearly with the file:
+
+| file | attempt | persisted event |
+|---:|---:|---:|
+| 16 MiB | 4 519 ms | 85 318 B |
+| 32 MiB | 7 966 ms | 85 318 B |
+| 64 MiB | 14 494 ms | 85 322 B |
+
+~0.2 s per MiB over a ~1.3 s turn floor — and not on the filesystem: writing
+64 MiB through `platform.fs` and reading it whole back is 161 ms + 107 ms in the
+same isolate. The rest is `read_file`'s own path over a string that big — the
+binary sniff, the `split('\n')`, and `tokenx`'s estimate and slice.
+
 ### Two ways a session breaks that are worth guarding
 
 **An oversized event hangs the agent.** Past the 2.2 MB SQLite value limit the
 log stops at `tool_started` with no terminal event, no error event and no state
 change; the agent never goes idle, and replay carries a `tool_use` with no
-`tool_result`. Stock config never gets there — `read_file`'s own guard fires 25×
-earlier and fails cleanly with `recoverable: true` — but raising `maxTokens`, or
-any plugin putting an unbounded blob in an event, walks into it.
+`tool_result`. Stock config cannot get there through `read_file` — truncation caps
+the result ~26× short, see the cascade above — but raising `maxTokens`, or any
+plugin putting an unbounded blob in an event, walks into it in one turn.
 
 **A DO accumulates for its whole lifetime.** Closing a session leaves its
 `/workspace/<sessionId>` directory, its `/data/sessions/<sessionId>` log
