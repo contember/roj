@@ -58,6 +58,7 @@ export type { ChatMessageContentItem, LLMCallLogEntry, LLMCallMessage, ToolResul
 export { contentToString } from '~/core/llm/llm-log-types.js'
 export { applyMiddleware, useProvider, withAnthropic, withMaxTokens, withOpenRouter, withTemperature } from '~/core/llm/middleware.js'
 export type { InferenceNext, LLMMiddleware } from '~/core/llm/middleware.js'
+export type { OpenRouterProviderRouting, OpenRouterReasoningOptions, OpenRouterRequestOptions } from '~/core/llm/provider.js'
 export { ModelId } from '~/core/llm/schema.js'
 export type { LLMCallId } from '~/core/llm/schema.js'
 export type { InferenceCompletedEvent, InferenceFailedEvent, InferenceStartedEvent } from '~/core/llm/state.js'
