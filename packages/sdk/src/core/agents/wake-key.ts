@@ -9,6 +9,7 @@
 
 import type { SessionId } from '~/core/sessions/schema.js'
 import { SessionId as toSessionId } from '~/core/sessions/schema.js'
+import { decodeWakeSegment, encodeWakeSegment } from '~/core/wake-key-codec.js'
 import type { AgentId } from './schema.js'
 import { AgentId as toAgentId } from './schema.js'
 
@@ -25,7 +26,7 @@ export interface AgentWake {
 }
 
 export function agentWakeKey(sessionId: SessionId, agentId: AgentId, kind: AgentWakeKind): string {
-	return `${AGENT_NAMESPACE}:${sessionId}:${agentId}:${kind}`
+	return `${AGENT_NAMESPACE}:${encodeWakeSegment(sessionId)}:${encodeWakeSegment(agentId)}:${kind}`
 }
 
 /**
@@ -35,9 +36,12 @@ export function agentWakeKey(sessionId: SessionId, agentId: AgentId, kind: Agent
 export function parseAgentWakeKey(key: string): AgentWake | undefined {
 	const parts = key.split(':')
 	if (parts.length !== 4) return undefined
-	const [namespace, sessionId, agentId, kind] = parts
+	const [namespace, rawSessionId, rawAgentId, kind] = parts
 	if (namespace !== AGENT_NAMESPACE) return undefined
 	if (kind !== 'debounce' && kind !== 'retry') return undefined
-	if (!sessionId || !agentId) return undefined
+	if (!rawSessionId || !rawAgentId) return undefined
+	const sessionId = decodeWakeSegment(rawSessionId)
+	const agentId = decodeWakeSegment(rawAgentId)
+	if (sessionId === undefined || agentId === undefined) return undefined
 	return { sessionId: toSessionId(sessionId), agentId: toAgentId(agentId), kind }
 }

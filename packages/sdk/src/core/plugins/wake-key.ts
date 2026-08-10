@@ -7,13 +7,14 @@
  * loaded from its event log, already given a fresh context per call — plus the
  * agent the wake is about, if any.
  *
- * No segment may contain `:`; a key built from one would never parse back.
+ * Segments are percent-encoded, so one containing `:` still parses back.
  */
 
 import type { AgentId } from '~/core/agents/schema.js'
 import { AgentId as toAgentId } from '~/core/agents/schema.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import { SessionId as toSessionId } from '~/core/sessions/schema.js'
+import { decodeWakeSegment, encodeWakeSegment } from '~/core/wake-key-codec.js'
 
 /** Namespace prefix, so other subsystems can mint keys without colliding. */
 const PLUGIN_NAMESPACE = 'plugin'
@@ -27,8 +28,8 @@ export interface PluginWake {
 }
 
 export function pluginWakeKey(sessionId: SessionId, pluginName: string, method: string, agentId?: AgentId): string {
-	const base = `${PLUGIN_NAMESPACE}:${sessionId}:${pluginName}:${method}`
-	return agentId === undefined ? base : `${base}:${agentId}`
+	const base = `${PLUGIN_NAMESPACE}:${encodeWakeSegment(sessionId)}:${encodeWakeSegment(pluginName)}:${encodeWakeSegment(method)}`
+	return agentId === undefined ? base : `${base}:${encodeWakeSegment(agentId)}`
 }
 
 /**
@@ -38,10 +39,16 @@ export function pluginWakeKey(sessionId: SessionId, pluginName: string, method: 
 export function parsePluginWakeKey(key: string): PluginWake | undefined {
 	const parts = key.split(':')
 	if (parts.length !== 4 && parts.length !== 5) return undefined
-	const [namespace, sessionId, pluginName, method, agentId] = parts
+	const [namespace, rawSessionId, rawPluginName, rawMethod, rawAgentId] = parts
 	if (namespace !== PLUGIN_NAMESPACE) return undefined
-	if (!sessionId || !pluginName || !method) return undefined
-	if (parts.length === 5 && !agentId) return undefined
+	if (!rawSessionId || !rawPluginName || !rawMethod) return undefined
+	if (parts.length === 5 && !rawAgentId) return undefined
+	const sessionId = decodeWakeSegment(rawSessionId)
+	const pluginName = decodeWakeSegment(rawPluginName)
+	const method = decodeWakeSegment(rawMethod)
+	const agentId = rawAgentId === undefined ? undefined : decodeWakeSegment(rawAgentId)
+	if (sessionId === undefined || pluginName === undefined || method === undefined) return undefined
+	if (rawAgentId !== undefined && agentId === undefined) return undefined
 	return {
 		sessionId: toSessionId(sessionId),
 		pluginName,

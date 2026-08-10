@@ -19,6 +19,14 @@ describe('plugin wake keys', () => {
 			.toBe(`plugin:${sessionId}:agents:_supervisionTick:${agentId}`)
 	})
 
+	it('round-trips segments containing the separator', () => {
+		const awkward = SessionId('tenant:acme')
+		const key = pluginWakeKey(awkward, 'git:status', 'refresh:now', AgentId('worker:2'))
+		expect(key.split(':')).toHaveLength(5)
+		expect(parsePluginWakeKey(key))
+			.toEqual({ sessionId: awkward, pluginName: 'git:status', method: 'refresh:now', agentId: AgentId('worker:2') })
+	})
+
 	it('rejects keys it did not mint', () => {
 		const notOurs = [
 			'',
@@ -30,6 +38,7 @@ describe('plugin wake keys', () => {
 			'plugin:s1::tick',
 			'plugin:s1:agents:',
 			'plugin:s1:agents:tick:',
+			'plugin:%E0%A4%A:agents:tick',
 		]
 		for (const key of notOurs) {
 			expect(parsePluginWakeKey(key)).toBeUndefined()

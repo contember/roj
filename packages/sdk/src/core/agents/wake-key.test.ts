@@ -18,6 +18,14 @@ describe('agent wake keys', () => {
 		expect(agentWakeKey(sessionId, agentId, 'debounce')).toBe(`agent:${sessionId}:${agentId}:debounce`)
 	})
 
+	it('round-trips ids containing the separator', () => {
+		// createSession takes any string as a sessionId, so a `:` reaches this code.
+		const awkward = SessionId('tenant:acme/session 1')
+		const key = agentWakeKey(awkward, AgentId('worker:2'), 'retry')
+		expect(key.split(':')).toHaveLength(4)
+		expect(parseAgentWakeKey(key)).toEqual({ sessionId: awkward, agentId: AgentId('worker:2'), kind: 'retry' })
+	})
+
 	it('rejects keys it did not mint', () => {
 		const notOurs = [
 			'',
@@ -28,6 +36,7 @@ describe('agent wake keys', () => {
 			'agent:s1:a1:supervise',
 			'agent::a1:debounce',
 			'agent:s1::debounce',
+			'agent:%E0%A4%A:a1:debounce',
 		]
 		for (const key of notOurs) {
 			expect(parseAgentWakeKey(key)).toBeUndefined()
