@@ -82,6 +82,72 @@ export const shouldLog = (messageLevel: LogLevel, configuredLevel: LogLevel): bo
 	LOG_LEVEL_PRIORITY[messageLevel] >= LOG_LEVEL_PRIORITY[configuredLevel]
 
 /**
+ * Serialized error written into log context.
+ */
+export interface SerializedError {
+	name: string
+	message: string
+	stack?: string
+	/** Nested Error, or a description of a non-Error cause */
+	cause?: SerializedError | string
+}
+
+/** Depth cap for the `cause` chain — long chains are noise, not diagnostics. */
+const MAX_CAUSE_DEPTH = 5
+
+/**
+ * Flatten an error for structured logging.
+ *
+ * Includes `cause`, which is where wrapper errors keep the actual reason
+ * (EventAppendError says "failed to append", its cause says SQLITE_TOOBIG).
+ * Never throws: a cyclic, deep or exotic cause degrades to a placeholder.
+ */
+export const serializeError = (error: Error): SerializedError => serializeErrorAt(error, new Set(), 0)
+
+const serializeErrorAt = (error: Error, seen: Set<unknown>, depth: number): SerializedError => {
+	seen.add(error)
+
+	const serialized: SerializedError = {
+		name: error.name,
+		message: error.message,
+		stack: error.stack,
+	}
+
+	const cause = readCause(error)
+	if (cause !== undefined) {
+		serialized.cause = serializeCause(cause, seen, depth + 1)
+	}
+
+	return serialized
+}
+
+/** `cause` may be an accessor on a custom Error — reading it must not break logging. */
+const readCause = (error: Error): unknown => {
+	try {
+		return error.cause
+	} catch {
+		return '[unreadable cause]'
+	}
+}
+
+const serializeCause = (cause: unknown, seen: Set<unknown>, depth: number): SerializedError | string => {
+	if (depth > MAX_CAUSE_DEPTH) return '[cause chain truncated]'
+	if (typeof cause === 'object' && cause !== null && seen.has(cause)) return '[circular cause]'
+	if (cause instanceof Error) return serializeErrorAt(cause, seen, depth)
+	return describeCause(cause)
+}
+
+const describeCause = (cause: unknown): string => {
+	try {
+		if (typeof cause === 'string') return cause
+		if (typeof cause === 'object' && cause !== null) return JSON.stringify(cause) ?? String(cause)
+		return String(cause)
+	} catch {
+		return '[unserializable cause]'
+	}
+}
+
+/**
  * Standardní kontext pro agent operace
  */
 export interface AgentLogContext extends LogContext {
@@ -146,16 +212,7 @@ export abstract class BaseLogger implements Logger {
 	}
 
 	error(message: string, error?: Error, context?: LogContext): void {
-		const errorContext = error
-			? {
-				...context,
-				error: {
-					name: error.name,
-					message: error.message,
-					stack: error.stack,
-				},
-			}
-			: context
+		const errorContext = error ? { ...context, error: serializeError(error) } : context
 
 		this.log('error', message, errorContext)
 	}

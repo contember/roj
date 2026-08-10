@@ -140,6 +140,18 @@ describe('ConsoleLogger', () => {
 			expect(call).toContain('userId=123')
 			expect(call).toContain('error=')
 		})
+
+		it('should include the cause of a wrapper error', () => {
+			const logger = new ConsoleLogger({ level: 'error', colors: false, timestamps: false })
+			const error = new Error('Failed to append event to session: s1', {
+				cause: new Error('SQLITE_TOOBIG: too big'),
+			})
+
+			logger.error('append failed', error)
+
+			const call = consoleSpy.error.mock.calls[0][0] as string
+			expect(call).toContain('SQLITE_TOOBIG: too big')
+		})
 	})
 
 	describe('child loggers', () => {
@@ -309,6 +321,30 @@ describe('JsonLogger', () => {
 			const parsed = JSON.parse(call)
 			expect(parsed.requestId).toBe('abc')
 			expect(parsed.error).toBeDefined()
+		})
+
+		it('should include the nested cause chain', () => {
+			const logger = new JsonLogger('error')
+			const root = new Error('SQLITE_TOOBIG: too big')
+			const error = new Error('Failed to append event to session: s1', { cause: root })
+
+			logger.error('failed', error)
+
+			const call = consoleSpy.error.mock.calls[0][0] as string
+			const parsed = JSON.parse(call)
+			expect(parsed.error.cause.name).toBe('Error')
+			expect(parsed.error.cause.message).toBe('SQLITE_TOOBIG: too big')
+		})
+
+		it('should stay serializable when the cause chain is cyclic', () => {
+			const logger = new JsonLogger('error')
+			const error = new Error('outer')
+			error.cause = error
+
+			expect(() => logger.error('failed', error)).not.toThrow()
+
+			const call = consoleSpy.error.mock.calls[0][0] as string
+			expect(() => JSON.parse(call)).not.toThrow()
 		})
 	})
 
