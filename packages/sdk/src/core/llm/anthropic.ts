@@ -48,6 +48,14 @@ interface AnthropicTextBlock {
 interface AnthropicThinkingBlock {
 	type: 'thinking'
 	thinking: string
+	/** Verified by the API when the block is replayed. An edited block is rejected. */
+	signature: string
+}
+
+/** Thinking the API withheld. Opaque, and must still be replayed — see AnthropicThinkingBlock. */
+interface AnthropicRedactedThinkingBlock {
+	type: 'redacted_thinking'
+	data: string
 }
 
 interface AnthropicToolUseBlock {
@@ -57,7 +65,29 @@ interface AnthropicToolUseBlock {
 	input: unknown
 }
 
-type AnthropicContentBlock = AnthropicTextBlock | AnthropicThinkingBlock | AnthropicToolUseBlock
+type AnthropicContentBlock =
+	| AnthropicTextBlock
+	| AnthropicThinkingBlock
+	| AnthropicRedactedThinkingBlock
+	| AnthropicToolUseBlock
+
+const isThinkingBlock = (block: AnthropicContentBlock): block is AnthropicThinkingBlock | AnthropicRedactedThinkingBlock =>
+	block.type === 'thinking' || block.type === 'redacted_thinking'
+
+/**
+ * Narrow a stored block back to a thinking block on the way out.
+ *
+ * `AssistantLLMMessage.thinkingBlocks` is `unknown[]` — the domain layer does not model
+ * provider shapes. This provider wrote those blocks, so it is entitled to recognise them,
+ * but it validates every field it declares rather than assuming. Anything else the API
+ * added travels along untouched, because the block is passed by reference and never rebuilt.
+ */
+const isEchoableThinkingBlock = (value: unknown): value is AnthropicThinkingBlock | AnthropicRedactedThinkingBlock => {
+	if (typeof value !== 'object' || value === null || !('type' in value)) return false
+	if (value.type === 'thinking') return 'thinking' in value && 'signature' in value && typeof value.signature === 'string'
+	if (value.type === 'redacted_thinking') return 'data' in value && typeof value.data === 'string'
+	return false
+}
 
 interface AnthropicMessageResponse {
 	id: string
@@ -121,11 +151,20 @@ interface AnthropicToolResultBlockParam {
 	cache_control?: AnthropicCacheControl
 }
 
-type AnthropicContentBlockParam =
+/** Blocks the API accepts `cache_control` on — everything except a replayed thinking block. */
+type AnthropicCacheableBlockParam =
 	| AnthropicTextBlockParam
 	| AnthropicImageBlockParam
 	| AnthropicToolUseBlockParam
 	| AnthropicToolResultBlockParam
+
+type AnthropicContentBlockParam =
+	| AnthropicCacheableBlockParam
+	| AnthropicThinkingBlock
+	| AnthropicRedactedThinkingBlock
+
+const isCacheableBlock = (block: AnthropicContentBlockParam): block is AnthropicCacheableBlockParam =>
+	block.type !== 'thinking' && block.type !== 'redacted_thinking'
 
 interface AnthropicMessageParam {
 	role: 'user' | 'assistant'
@@ -133,19 +172,25 @@ interface AnthropicMessageParam {
 }
 
 /**
- * Add `cache_control` to the LAST content block of an AnthropicMessageParam,
- * regardless of block type. Converts string content to a single text block
- * first so the mark has a place to live. Mutates in place so the cache
- * breakpoint survives subsequent `mergeConsecutiveMessages`.
+ * Add `cache_control` to the LAST content block of an AnthropicMessageParam that can carry
+ * it. Converts string content to a single text block first so the mark has a place to live.
+ * Mutates in place so the cache breakpoint survives subsequent `mergeConsecutiveMessages`.
+ *
+ * Thinking blocks are skipped: they are replayed byte-for-byte and the API rejects an extra
+ * key on them. They lead the assistant message, so the only case where none of the blocks is
+ * cacheable is a message made of nothing but thinking — which then gets no breakpoint.
  */
 function applyCacheControlToLastBlock(msg: AnthropicMessageParam, cacheControl: AnthropicCacheControl): void {
 	if (typeof msg.content === 'string') {
 		msg.content = [{ type: 'text', text: msg.content, cache_control: cacheControl }]
 		return
 	}
-	if (msg.content.length === 0) return
-	const lastIdx = msg.content.length - 1
-	msg.content[lastIdx] = { ...msg.content[lastIdx], cache_control: cacheControl }
+	for (let i = msg.content.length - 1; i >= 0; i--) {
+		const block = msg.content[i]
+		if (!isCacheableBlock(block)) continue
+		msg.content[i] = { ...block, cache_control: cacheControl }
+		return
+	}
 }
 
 interface AnthropicToolParam {
@@ -283,7 +328,11 @@ export class AnthropicProvider implements RoutableLLMProvider {
 				.map((block) => block.text)
 				.join('')
 
-			const reasoning = data.content
+			// Kept whole, in order, signatures included: the API verifies them on replay.
+			// `redacted_thinking` has no readable text but still has to travel.
+			const thinkingBlocks = data.content.filter(isThinkingBlock)
+
+			const reasoning = thinkingBlocks
 				.filter((block): block is AnthropicThinkingBlock => block.type === 'thinking')
 				.map((block) => block.thinking)
 				.join('')
@@ -315,6 +364,8 @@ export class AnthropicProvider implements RoutableLLMProvider {
 				metrics,
 				providerRequestId: data.id,
 				reasoning: reasoning || undefined,
+				// Normalized to undefined so an empty array never reaches the wire on the way back.
+				thinkingBlocks: thinkingBlocks.length > 0 ? thinkingBlocks : undefined,
 			})
 		} catch (error) {
 			return Err(this.mapError(error))
@@ -399,6 +450,16 @@ export class AnthropicProvider implements RoutableLLMProvider {
 			}
 			case 'assistant': {
 				const contentBlocks: AnthropicContentBlockParam[] = []
+				// Thinking goes first — the API requires the block order the model produced, and
+				// during tool use it requires the blocks to be there at all. All or nothing: a
+				// partial sequence is rejected, so anything unrecognisable drops the whole set
+				// rather than sending a truncated one.
+				const thinking = msg.thinkingBlocks ?? []
+				if (thinking.length > 0 && thinking.every(isEchoableThinkingBlock)) {
+					contentBlocks.push(...thinking)
+				} else if (thinking.length > 0) {
+					this.logger?.warn('Dropping unrecognisable thinking blocks from an assistant message', { count: thinking.length })
+				}
 				if (msg.content) {
 					contentBlocks.push({ type: 'text', text: msg.content })
 				}

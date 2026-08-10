@@ -1,4 +1,4 @@
-import type { ToolCall } from '~/core/agents/state.js'
+import type { ReasoningDetails, ToolCall } from '~/core/agents/state.js'
 import type { ImageProcessor } from '~/core/image/types.js'
 import type { ChatMessageContentItem } from '~/core/llm/llm-log-types.js'
 import { ToolCallId } from '~/core/tools/schema.js'
@@ -52,6 +52,9 @@ interface OpenRouterChoice {
 	message: {
 		content: string | null | Array<{ type: string; text?: string }>
 		tool_calls?: OpenRouterToolCall[]
+		/** Plaintext chain of thought, when the model exposes one. Display only — the round trip goes through reasoning_details. */
+		reasoning?: string
+		reasoning_details?: ReasoningDetails
 	}
 	finish_reason: string | null
 }
@@ -107,6 +110,7 @@ interface OpenRouterMessage {
 	content: string | OpenRouterContentItem[]
 	tool_calls?: OpenRouterToolCall[]
 	tool_call_id?: string
+	reasoning_details?: ReasoningDetails
 }
 
 /**
@@ -273,6 +277,9 @@ export class OpenRouterProvider implements LLMProvider {
 				finishReason: this.mapFinishReason(choice.finish_reason),
 				metrics,
 				providerRequestId: data.id,
+				reasoning: choice.message.reasoning || undefined,
+				// Normalized to undefined here so an empty array never reaches the wire on the way back.
+				reasoningDetails: choice.message.reasoning_details?.length ? choice.message.reasoning_details : undefined,
 			})
 		} catch (error) {
 			return Err(this.mapError(error))
@@ -366,19 +373,22 @@ export class OpenRouterProvider implements LLMProvider {
 					tool_call_id: msg.toolCallId,
 				}
 			}
-			case 'assistant':
+			case 'assistant': {
+				const mapped: OpenRouterMessage = { role: 'assistant', content: msg.content }
 				if (msg.toolCalls?.length) {
-					return {
-						role: 'assistant',
-						content: msg.content,
-						tool_calls: msg.toolCalls.map((tc): OpenRouterToolCall => ({
-							id: tc.id,
-							type: 'function',
-							function: { name: tc.name, arguments: JSON.stringify(tc.input) },
-						})),
-					}
+					mapped.tool_calls = msg.toolCalls.map((tc): OpenRouterToolCall => ({
+						id: tc.id,
+						type: 'function',
+						function: { name: tc.name, arguments: JSON.stringify(tc.input) },
+					}))
 				}
-				return { role: 'assistant', content: msg.content }
+				// Echoed verbatim and only when present: the provider rejects an edited or reordered
+				// sequence, and adding the key for a non-reasoning model would rewrite the cached prefix.
+				if (msg.reasoningDetails?.length) {
+					mapped.reasoning_details = msg.reasoningDetails
+				}
+				return mapped
+			}
 			case 'system':
 				return { role: 'system', content: msg.content }
 			case 'user':

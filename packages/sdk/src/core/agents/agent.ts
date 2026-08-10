@@ -10,7 +10,7 @@
 import z from 'zod/v4'
 import { DebounceCallback } from '~/core/agents/debounce.js'
 import type { AgentId } from '~/core/agents/schema.js'
-import type { AgentState, HandlerResult } from '~/core/agents/state.js'
+import type { AgentState, HandlerResult, ReasoningDetails, ThinkingBlocks } from '~/core/agents/state.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { FileStore } from '~/core/file-store/types.js'
@@ -810,7 +810,7 @@ export class Agent {
 		if (afterResult !== null) {
 			if (afterResult.action === 'pause') {
 				// Commit the turn before pausing so pendingMessages move to conversationHistory.
-				await this.emitInferenceCompleted(response, llmCallId, llmResponse.value.metrics)
+				await this.emitInferenceCompleted(response, llmCallId, llmResponse.value.metrics, llmResponse.value.reasoningDetails, llmResponse.value.thinkingBlocks)
 				await this.consumeDequeuedTokens(pluginDequeued)
 				await this.emitHandlerPause(afterResult.reason)
 				return
@@ -844,7 +844,9 @@ export class Agent {
 
 		// 4d. Inference completed
 		// Tool calls will be executed in the next continue() cycle
-		await this.emitInferenceCompleted(response, llmCallId, llmResponse.value.metrics)
+		// Reasoning travels beside `response`, not inside it: an afterInference handler may
+		// rewrite the text, but the blocks stay the model's own and go back untouched.
+		await this.emitInferenceCompleted(response, llmCallId, llmResponse.value.metrics, llmResponse.value.reasoningDetails, llmResponse.value.thinkingBlocks)
 
 		// Consume dequeue tokens after the commit: a crash in the gap re-delivers the
 		// message on restart (at-least-once) instead of dropping it (consume-first
@@ -869,6 +871,8 @@ export class Agent {
 			cachedTokens?: number
 			cacheWriteTokens?: number
 		},
+		reasoningDetails?: ReasoningDetails,
+		thinkingBlocks?: ThinkingBlocks,
 	): Promise<void> {
 		await this.store.emit(withSessionId(
 			this.store.sessionId,
@@ -882,6 +886,8 @@ export class Agent {
 						name: tc.name,
 						input: tc.input,
 					})),
+					reasoningDetails,
+					thinkingBlocks,
 				},
 				metrics: metrics ?? {
 					promptTokens: 0,
