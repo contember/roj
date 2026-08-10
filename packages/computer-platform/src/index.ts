@@ -10,6 +10,7 @@ import type { GitClient as ComputerGitClient } from '@cloudflare/computer/git'
 import { createTimerScheduler } from '@roj-ai/sdk/platform'
 import type { Platform, Scheduler } from '@roj-ai/sdk/platform'
 import { createComputerFileSystem } from './fs.js'
+import { createVfsRevision } from './fs-revision.js'
 import { createComputerGitClient } from './git.js'
 import { createShellProcessRunner, createUnsupportedProcessRunner } from './process.js'
 
@@ -30,6 +31,8 @@ export function createComputerPlatform(workspace: Workspace, options: ComputerPl
 		fs: createComputerFileSystem(workspace.provider()),
 		process: createUnsupportedProcessRunner(),
 		git: git && createComputerGitClient(git),
+		// Whole-DO counter, so it is a gate against unnecessary reads, not a scope.
+		fsRevision: createVfsRevision(workspace.db),
 		scheduler: options.scheduler ?? createTimerScheduler(),
 		tmpDir: options.tmpDir ?? '/tmp',
 	}
@@ -45,6 +48,7 @@ function workspaceGit(workspace: Workspace): ComputerGitClient | undefined {
 }
 
 export { createComputerFileSystem, createComputerGitClient, createShellProcessRunner, createUnsupportedProcessRunner }
+export { createVfsRevision, type VfsRevisionSource } from './fs-revision.js'
 export { createAlarmScheduler } from './alarm-scheduler.js'
 export type {
 	AlarmScheduler,

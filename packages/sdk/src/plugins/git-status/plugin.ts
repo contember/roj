@@ -24,6 +24,13 @@
  * to keep the actor from ever going idle. So on those hosts the plugin arms
  * nothing at all: it refreshes at the turn boundary that follows a tool call,
  * and otherwise answers `git-status.refresh` when a client pulls.
+ *
+ * Pulls are the one caller nothing rate-limits — every open tab asks — so where
+ * `platform.fsRevision` exists the answer in hand is reused while that counter
+ * stands still. The counter covers the whole host filesystem, not this workspace,
+ * so a write in a neighbouring session costs this one a recomputation it did not
+ * need; the trade only ever errs that way, which is the only direction a cache
+ * over a working tree may err.
  */
 
 import { definePlugin } from '~/core/plugins/index.js'
@@ -31,6 +38,7 @@ import type { SessionId } from '~/core/sessions/schema.js'
 import { sessionIdSchema } from '~/core/sessions/schema.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import { Ok } from '~/lib/utils/result.js'
+import type { FsRevision } from '~/platform/fs-revision.js'
 import type { GitClient } from '~/platform/git.js'
 import type { ProcessRunner } from '~/platform/process.js'
 import { isLiveScheduler } from '~/platform/scheduler.js'
@@ -62,6 +70,13 @@ interface SessionGitStatus {
 	/** The 2 s interval, on polling hosts only. */
 	interval?: NodeJS.Timeout
 	lastSnapshot?: GitStatusSnapshot
+	/**
+	 * What the last completed read answered, and the filesystem revision it read
+	 * at. Replayed verbatim while that revision stands still — including the null
+	 * a workspace with no repository yields, since a still filesystem cannot have
+	 * grown one. Absent on hosts that report no revision, which never gate.
+	 */
+	gated?: { revision: number; snapshot: GitStatusSnapshot | null }
 	defaultBranch?: string
 	/** A tool wrote in this workspace since the last read. */
 	touched: boolean
@@ -82,7 +97,7 @@ interface GitStatusPluginContext {
 interface GitStatusCallContext {
 	sessionId: SessionId
 	sessionState: { workspaceDir?: string }
-	platform: { git?: GitClient; process: ProcessRunner }
+	platform: { git?: GitClient; process: ProcessRunner; fsRevision?: FsRevision }
 	logger: Logger
 	notify: (type: 'git_status_changed', payload: GitStatusChanged) => void
 	pluginContext: GitStatusPluginContext
@@ -156,6 +171,13 @@ async function readSnapshot(ctx: GitStatusCallContext, entry: SessionGitStatus):
 	const processRunner = ctx.platform.process
 
 	try {
+		// Read before the git calls, never after: a write that lands while they run
+		// belongs to the next answer, and stamping the revision they produced would
+		// bury it. Same reason the value is stamped only once a read completes.
+		const revision = await currentRevision(ctx)
+		const gated = entry.gated
+		if (revision !== undefined && gated?.revision === revision) return gated.snapshot
+
 		let baseBranch = entry.defaultBranch
 		if (!baseBranch) {
 			const detected = git
@@ -173,6 +195,7 @@ async function readSnapshot(ctx: GitStatusCallContext, entry: SessionGitStatus):
 			// cheaply; only the shell-out path, where a failure means the binary
 			// itself misbehaved, is worth a warning.
 			if (!git) ctx.logger.warn('git-status: snapshot failed', { sessionId, workdir, baseBranch })
+			entry.gated = revision === undefined ? undefined : { revision, snapshot: null }
 			return null
 		}
 
@@ -182,6 +205,7 @@ async function readSnapshot(ctx: GitStatusCallContext, entry: SessionGitStatus):
 
 		const last = entry.lastSnapshot
 		entry.lastSnapshot = snapshot
+		entry.gated = revision === undefined ? undefined : { revision, snapshot }
 		if (!last || !snapshotsEqual(last, snapshot)) {
 			ctx.notify('git_status_changed', { sessionId, ...snapshot, updatedAt: Date.now() })
 		}
@@ -197,6 +221,20 @@ async function readSnapshot(ctx: GitStatusCallContext, entry: SessionGitStatus):
 		}
 		ctx.logger.warn('git-status refresh failed', { sessionId, err: err instanceof Error ? err.message : String(err) })
 		return null
+	}
+}
+
+/**
+ * The host's filesystem revision, or `undefined` when there is none to read.
+ *
+ * Defensive beyond the port's contract on purpose: this is an optimisation, and
+ * a host that answers badly must lose the optimisation, not the feature.
+ */
+async function currentRevision(ctx: GitStatusCallContext): Promise<number | undefined> {
+	try {
+		return await ctx.platform.fsRevision?.current()
+	} catch {
+		return undefined
 	}
 }
 

@@ -8,7 +8,7 @@ import type { Session } from '~/core/sessions/session.js'
 import { ToolExecutor } from '~/core/tools/executor.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import type { Logger } from '~/lib/logger/logger.js'
-import type { ExecFileResult, GitClient, Platform, ProcessRunner, Scheduler } from '~/platform/index.js'
+import type { ExecFileResult, FsRevision, GitClient, Platform, ProcessRunner, Scheduler } from '~/platform/index.js'
 import { createNodePlatform } from '~/testing/node-platform.js'
 import { createTestPreset } from '~/testing/preset-helpers.js'
 import { TestHarness } from '~/testing/test-harness.js'
@@ -258,5 +258,89 @@ describe('git-status on a host that is evicted between wakes', () => {
 		} finally {
 			await harness.shutdown()
 		}
+	})
+})
+
+describe('git-status gated on the host filesystem revision', () => {
+	/** `status` is the call the gate exists to skip, so count it. */
+	function countingGitClient(overrides: Partial<GitClient> = {}): { client: GitClient; reads: () => number } {
+		let reads = 0
+		const base = fakeGitClient(overrides)
+		return {
+			client: {
+				...base,
+				status: (options) => {
+					reads += 1
+					return base.status(options)
+				},
+			},
+			reads: () => reads,
+		}
+	}
+
+	const gatedPlatform = (git: GitClient, fsRevision?: FsRevision): Platform => ({
+		...createNodePlatform(),
+		process: enosysProcessRunner(),
+		git,
+		fsRevision,
+		scheduler: new RecordingScheduler(),
+	})
+
+	const pull = (session: Session) => session.callPluginMethod('git-status.refresh', { sessionId: String(session.id) })
+
+	test('replays the last answer while the revision stands still', async () => {
+		const git = countingGitClient()
+		const { session } = await bootSession(gatedPlatform(git.client, { current: async () => 7 }), recordingLogger([]))
+
+		const first = await pull(session)
+		const second = await pull(session)
+		expect(git.reads()).toBe(1)
+		expect(second).toEqual(first)
+	})
+
+	test('reads again once the revision moves', async () => {
+		let revision = 1
+		let committedAhead = 2
+		const git = countingGitClient({ countAhead: async () => committedAhead })
+		const { session, notifications } = await bootSession(
+			gatedPlatform(git.client, { current: async () => revision }),
+			recordingLogger([]),
+		)
+
+		await pull(session)
+		committedAhead = 5
+		revision = 2
+		await pull(session)
+
+		expect(git.reads()).toBe(2)
+		const changes = notifications.filter((entry) => entry.type === 'git_status_changed')
+		expect(changes).toHaveLength(2)
+		expect(changes[1]?.payload).toMatchObject({ committedAhead: 5 })
+	})
+
+	test('reads on every pull where the host reports no revision', async () => {
+		const git = countingGitClient()
+		const { session } = await bootSession(gatedPlatform(git.client), recordingLogger([]))
+
+		await pull(session)
+		await pull(session)
+		expect(git.reads()).toBe(2)
+	})
+
+	test('reads on every pull where the host answers badly', async () => {
+		const warnings: string[] = []
+		const git = countingGitClient()
+		const unknown: FsRevision = { current: async () => undefined }
+		const broken: FsRevision = { current: () => Promise.reject(new Error('no such table: vfs_meta')) }
+
+		for (const fsRevision of [unknown, broken]) {
+			const { session } = await bootSession(gatedPlatform(git.client, fsRevision), recordingLogger(warnings))
+			await pull(session)
+			await pull(session)
+		}
+
+		// Two sessions, two pulls each, and not one of them gated.
+		expect(git.reads()).toBe(4)
+		expect(warnings).toEqual([])
 	})
 })
