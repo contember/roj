@@ -52,7 +52,7 @@ export { createRouter, MessageRouter } from './core/router.js'
 export type { MessageSender, RawMessageListener, RouterErrorHandler, RouterErrorType } from './core/router.js'
 
 export { Connection } from './core/connection.js'
-export type { ConnectionConfig } from './core/connection.js'
+export type { ConnectionConfig, SendOutcome } from './core/connection.js'
 
 // ============================================================================
 // Platform Exports
@@ -77,4 +77,4 @@ export { createServerConnection, ServerConnection } from './server/server-connec
 export type { ServerConnectionConfig, ServerHandlerContext } from './server/server-connection.js'
 
 export { ConnectionManager } from './server/connection-manager.js'
-export type { ConnectionStats } from './server/connection-manager.js'
+export type { BroadcastResult, ConnectionStats } from './server/connection-manager.js'

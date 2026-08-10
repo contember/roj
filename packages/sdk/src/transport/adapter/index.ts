@@ -5,7 +5,7 @@
  * User messages and answers are handled via REST API.
  */
 
-export type { IAgentTransport, PluginNotification } from './types.js'
+export type { IAgentTransport, NotificationDelivery, PluginNotification } from './types.js'
 
 export { ServerAdapter } from './server-adapter.js'
 export type { ServerAdapterConfig } from './server-adapter.js'

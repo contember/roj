@@ -14,7 +14,7 @@ import { WorkerShellBackend } from '@cloudflare/computer/backends/worker-shell'
 import { createGitClient } from '@cloudflare/computer/git'
 import { SqliteEventStore, createAlarmScheduler, createComputerPlatform, createSessionReaper, createShellProcessRunner } from '@roj-ai/computer-platform'
 import type { AlarmScheduler, ReapOptions, SessionReaper } from '@roj-ai/computer-platform'
-import { FileEventStore, bootstrap, createSystemFromServices, isolatePlugins } from '@roj-ai/sdk'
+import { FileEventStore, JsonLogger, bootstrap, createSystemFromServices, isolatePlugins } from '@roj-ai/sdk'
 import type { Config, IsolateMethodSchemas, Services, Session, SessionId, System } from '@roj-ai/sdk'
 import type { Platform } from '@roj-ai/sdk/platform'
 import { DurableObject } from 'cloudflare:workers'
@@ -102,6 +102,12 @@ export class RojAgentDO extends DurableObject<Env> {
 	readonly #scheduler: AlarmScheduler
 	/** Everything plugins have notified since boot — how /git observes git-status. */
 	readonly #notifications: { type: string; payload: unknown }[] = []
+	/**
+	 * What the transport did with those notifications, since it cannot be read back
+	 * off a socket: `dropped` is data the WebSocket layer threw away, and used to be
+	 * invisible from anywhere. `/run` reports it.
+	 */
+	readonly #delivery = { broadcasts: 0, peers: 0, delivered: 0, buffered: 0, dropped: 0 }
 	/** Tail of alarm drains, so a probe can show which wakes the alarm delivered. */
 	readonly #wakeLog: WakeLogEntry[] = []
 	#booted?: { services: Services<'isolate'>; system: IsolateSystem }
@@ -140,7 +146,9 @@ export class RojAgentDO extends DurableObject<Env> {
 		// Reclaiming is the host's call, not a session hook's — see session-reaper.ts.
 		// Nothing calls this on its own; /reap and /limits/reaper are the two triggers.
 		this.#reaper = createSessionReaper({ eventStore: this.#eventStore, fs: this.#platform.fs, dataDir: DATA_ROOT })
-		this.#transport = createDoTransport(ctx, () => this.#boot())
+		// The transport is built before the boot that produces `services.logger`, and
+		// sockets already open, close and lose frames by then — so it gets its own.
+		this.#transport = createDoTransport(ctx, () => this.#boot(), new JsonLogger(config.logLevel))
 	}
 
 	fetch(request: Request): Promise<Response> {
@@ -205,7 +213,12 @@ export class RojAgentDO extends DurableObject<Env> {
 			onUserOutput: (notification) => {
 				// Collected for /git to assert on, and fanned out to subscribed sockets.
 				this.#notifications.push({ type: notification.type, payload: notification.payload })
-				this.#transport.broadcast(notification)
+				const delivery = this.#transport.broadcast(notification)
+				this.#delivery.broadcasts += 1
+				this.#delivery.peers += delivery.peers
+				this.#delivery.delivered += delivery.delivered
+				this.#delivery.buffered += delivery.buffered
+				this.#delivery.dropped += delivery.dropped
 			},
 		})
 		const booted = { services, system }
@@ -275,6 +288,7 @@ export class RojAgentDO extends DurableObject<Env> {
 			stages,
 			agents: [...session.state.agents.values()].map((agent) => ({ name: agent.definitionName, status: agent.status })),
 			eventCount: events.length,
+			notifications: { ...this.#delivery },
 			data: await this.#tree(DATA_ROOT),
 			workspace: await this.#tree('/workspace'),
 			note: await this.#readNote(session.id),

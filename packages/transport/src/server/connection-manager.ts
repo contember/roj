@@ -12,6 +12,20 @@ import type { ServerConnection } from './server-connection.js'
 // ============================================================================
 
 /**
+ * What one broadcast did. `delivered + buffered + dropped === subscribers`.
+ */
+export interface BroadcastResult {
+	/** Live connections subscribed to the session — how many the message was routed to. */
+	subscribers: number
+	/** Subscribers whose socket took the frame. */
+	delivered: number
+	/** Subscribers that parked it in their send buffer (socket not open). */
+	buffered: number
+	/** Subscribers that discarded it — a full send buffer. Data loss. */
+	dropped: number
+}
+
+/**
  * Connection statistics.
  */
 export interface ConnectionStats {
@@ -191,18 +205,30 @@ export class ConnectionManager<
 
 	/**
 	 * Broadcast a raw message to all subscribers of a session.
+	 *
+	 * Returns what happened to every subscriber rather than just a delivered
+	 * count: a frame the buffer discarded is data loss, and a caller that only
+	 * sees "0 delivered" cannot tell it from "nobody was listening".
 	 */
-	broadcast(sessionId: string, message: string): number {
+	broadcast(sessionId: string, message: string): BroadcastResult {
 		const subscribers = this.getSubscribers(sessionId)
-		let sent = 0
+		const result: BroadcastResult = { subscribers: subscribers.length, delivered: 0, buffered: 0, dropped: 0 }
 
 		for (const connection of subscribers) {
-			if (connection.send(message)) {
-				sent++
+			switch (connection.trySend(message)) {
+				case 'sent':
+					result.delivered++
+					break
+				case 'buffered':
+					result.buffered++
+					break
+				case 'dropped':
+					result.dropped++
+					break
 			}
 		}
 
-		return sent
+		return result
 	}
 
 	/**

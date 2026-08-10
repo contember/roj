@@ -22,6 +22,15 @@ export interface ConnectionConfig<TReceive extends ProtocolDef, TSend extends Pr
 }
 
 /**
+ * What a send did.
+ *
+ * - `sent` — handed to an open socket.
+ * - `buffered` — parked to bridge a disconnect; delivered only if the socket opens again.
+ * - `dropped` — discarded, the buffer was full. Data loss.
+ */
+export type SendOutcome = 'sent' | 'buffered' | 'dropped'
+
+/**
  * Abstract base class for WebSocket connections.
  * State transitions: disconnected ↔ connecting ↔ connected ↔ reconnecting
  */
@@ -93,6 +102,31 @@ export abstract class Connection<TReceive extends ProtocolDef, TSend extends Pro
 	private sendBuffer: string[] = []
 	private readonly maxBufferSize: number = 500
 	private droppedSinceLastFlush = 0
+	private droppedMessages = 0
+
+	/**
+	 * Send, saying which of the three things happened.
+	 *
+	 * `send()` collapses `buffered` and `dropped` into `false`, which is how a full
+	 * buffer discarded messages with nothing upstream able to tell. Callers that
+	 * care about the loss use this; the boolean stays for callers that do not.
+	 */
+	trySend(data: string): SendOutcome {
+		if (!this.ws || this.ws.readyState !== WebSocketReadyState.OPEN) {
+			return this.buffer(data)
+		}
+		this.flushSendBuffer()
+		try {
+			this.ws.send(data)
+			return 'sent'
+		} catch {
+			return this.buffer(data)
+		}
+	}
+
+	send(data: string): boolean {
+		return this.trySend(data) === 'sent'
+	}
 
 	/**
 	 * Buffer one message, dropping the OLDEST on overflow.
@@ -102,31 +136,23 @@ export abstract class Connection<TReceive extends ProtocolDef, TSend extends Pro
 	 * 500 obsolete updates. Overflow is logged once per episode rather than per
 	 * message: silently vanishing notifications leave a "the UI stopped
 	 * updating" report with no server-side trace at all.
+	 *
+	 * Overflow reports 'dropped' even though this message was kept: the connection
+	 * lost a notification either way, and a caller reading that as "no loss" is
+	 * back to not being told.
 	 */
-	private buffer(data: string): void {
-		if (this.sendBuffer.length >= this.maxBufferSize) {
+	private buffer(data: string): SendOutcome {
+		const overflowed = this.sendBuffer.length >= this.maxBufferSize
+		if (overflowed) {
 			this.sendBuffer.shift()
 			if (this.droppedSinceLastFlush === 0) {
 				console.warn(`[transport] send buffer full (${this.maxBufferSize}), dropping oldest notifications`)
 			}
 			this.droppedSinceLastFlush++
+			this.droppedMessages++
 		}
 		this.sendBuffer.push(data)
-	}
-
-	send(data: string): boolean {
-		if (!this.ws || this.ws.readyState !== WebSocketReadyState.OPEN) {
-			this.buffer(data)
-			return false
-		}
-		this.flushSendBuffer()
-		try {
-			this.ws.send(data)
-			return true
-		} catch {
-			this.buffer(data)
-			return false
-		}
+		return overflowed ? 'dropped' : 'buffered'
 	}
 
 	flushSendBuffer(): void {
@@ -152,6 +178,11 @@ export abstract class Connection<TReceive extends ProtocolDef, TSend extends Pro
 
 	get bufferedMessageCount(): number {
 		return this.sendBuffer.length
+	}
+
+	/** Messages this connection discarded because its send buffer was full. */
+	get droppedMessageCount(): number {
+		return this.droppedMessages
 	}
 
 	on(listener: TransportEventListener): () => void {

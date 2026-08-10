@@ -49,4 +49,4 @@ export type { MessageSender } from './router.js'
 
 // Connection Base
 export { Connection } from './connection.js'
-export type { ConnectionConfig } from './connection.js'
+export type { ConnectionConfig, SendOutcome } from './connection.js'

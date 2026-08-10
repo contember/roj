@@ -12,7 +12,7 @@
 import type { IWebSocketFactory, ProtocolDef, ReconnectOptions } from '@roj-ai/transport'
 import { ClientConnection } from '@roj-ai/transport/client'
 import type { Logger } from '../../lib/logger/logger.js'
-import type { IAgentTransport, PluginNotification } from './types.js'
+import type { IAgentTransport, NotificationDelivery, PluginNotification } from './types.js'
 
 export interface ClientAdapterConfig {
 	url: string
@@ -70,12 +70,30 @@ export class ClientAdapter implements IAgentTransport {
 		}
 	}
 
-	broadcast(notification: PluginNotification): void {
+	broadcast(notification: PluginNotification): NotificationDelivery {
 		// Send as wire message — protocol validation happens at the DO side
-		this.connection.send(JSON.stringify({
+		const wireMessage = JSON.stringify({
 			type: notification.type,
 			payload: notification.payload,
 			ts: Date.now(),
-		}))
+		})
+		// One peer: the DO, which fans out from there.
+		const delivery: NotificationDelivery = { bytes: wireMessage.length, peers: 1, delivered: 0, buffered: 0, dropped: 0 }
+
+		switch (this.connection.trySend(wireMessage)) {
+			case 'sent':
+				delivery.delivered = 1
+				break
+			case 'buffered':
+				// The client reconnects, so a buffered frame still has a chance.
+				delivery.buffered = 1
+				break
+			case 'dropped':
+				delivery.dropped = 1
+				this.logger?.warn('Notification discarded: send buffer full', { type: notification.type, bytes: delivery.bytes })
+				break
+		}
+
+		return delivery
 	}
 }

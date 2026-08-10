@@ -15,7 +15,7 @@
  * a 101 `Response` carrying the client half of a `WebSocketPair`.
  */
 
-import type { PluginNotification, Services, SessionManager } from '@roj-ai/sdk'
+import type { Logger, NotificationDelivery, PluginNotification, Services, SessionManager } from '@roj-ai/sdk'
 import { ServerAdapter } from '@roj-ai/sdk'
 import { createApp } from '@roj-ai/sdk/transport/http/app'
 import type { HibernatableWebSocket, WorkersWebSocketHandlers } from '@roj-ai/transport/workers'
@@ -42,9 +42,10 @@ interface SocketData {
 export interface DoTransport {
 	/**
 	 * Pass as `onUserOutput` to `createSystemFromServices` — routes each plugin
-	 * notification to the sockets subscribed to its session.
+	 * notification to the sockets subscribed to its session, and answers what
+	 * became of it (nothing upstream has to read that, the adapter also logs).
 	 */
-	readonly broadcast: (notification: PluginNotification) => void
+	readonly broadcast: (notification: PluginNotification) => NotificationDelivery
 	/** Mount in `DurableObject.fetch`. Serves `/rpc`, `/health`, `/status`, `/sessions/*` and `GET /ws`. */
 	fetch(request: Request): Promise<Response>
 	/** Mount in `DurableObject.webSocketMessage`. */
@@ -91,9 +92,13 @@ function upgrade(ctx: DurableObjectState, handlers: WorkersWebSocketHandlers<Soc
 /**
  * Build the DO's transport. `boot` is the DO's own lazy SDK boot — it is called
  * on the first HTTP request, never during hibernation restore.
+ *
+ * `logger` is not optional the way `ServerAdapterConfig` makes it: sockets open,
+ * close and lose frames before anything boots, and an adapter with no logger
+ * reports none of it.
  */
-export function createDoTransport(ctx: DurableObjectState, boot: () => DoTransportHost): DoTransport {
-	const serverAdapter = new ServerAdapter()
+export function createDoTransport(ctx: DurableObjectState, boot: () => DoTransportHost, logger: Logger): DoTransport {
+	const serverAdapter = new ServerAdapter({ logger })
 
 	const handlers = createWorkersWebSocketHandlers<SocketData>({
 		onOpen: (ws) => serverAdapter.handleOpen(ws, ws.data.sessionId ?? undefined),

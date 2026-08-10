@@ -8,7 +8,7 @@ export { createServerConnection, ServerConnection } from './server-connection.js
 export type { ServerConnectionConfig, ServerHandlerContext } from './server-connection.js'
 
 export { ConnectionManager } from './connection-manager.js'
-export type { ConnectionStats } from './connection-manager.js'
+export type { BroadcastResult, ConnectionStats } from './connection-manager.js'
 
 // Re-export core types commonly used with server
 export type {

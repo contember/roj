@@ -32,7 +32,7 @@ export type { LocalResource, RojConfig } from './user-config.js'
 
 // Transport adapters
 export { ClientAdapter, createAgentTransport, ServerAdapter } from './transport/adapter/index.js'
-export type { AgentTransportConfig, IAgentTransport, PluginNotification } from './transport/adapter/index.js'
+export type { AgentTransportConfig, IAgentTransport, NotificationDelivery, PluginNotification } from './transport/adapter/index.js'
 
 // Runtime
 export { Agent } from '~/core/agents/agent.js'
