@@ -35,7 +35,7 @@ import {
 	ServerAdapter,
 	SessionId,
 } from '@roj-ai/sdk'
-import type { DomainEvent, LLMMessage, MockInferenceHandler, PluginNotification, Preset, Services, Session } from '@roj-ai/sdk'
+import type { DomainEvent, LLMMessage, Logger, MockInferenceHandler, NotificationDelivery, PluginNotification, Preset, Services, Session } from '@roj-ai/sdk'
 import type { Platform } from '@roj-ai/sdk/platform'
 import { ToolCallId } from '@roj-ai/sdk/tools'
 import { filesystemPlugin } from '@roj-ai/sdk/tools/filesystem'
@@ -220,8 +220,8 @@ function openJournal(ctx: DurableObjectState): Journal {
 // ============================================================================
 
 interface SocketHarness {
-	/** `ServerAdapter.broadcast`, exactly as `createSystemFromServices` calls it. */
-	broadcast(notification: PluginNotification): void
+	/** `ServerAdapter.broadcast`, exactly as `createSystemFromServices` calls it — and what it answered. */
+	broadcast(notification: PluginNotification): NotificationDelivery
 	/** Wire bytes of every frame the client half actually received. */
 	readonly received: number[]
 	readonly closes: { code: number; reason: string }[]
@@ -246,9 +246,13 @@ function frameBytes(data: unknown): number {
  * `do-transport` does, `standard` is the plain `accept()` a non-DO host would
  * use — worth separating, since only the first goes through the runtime's
  * hibernation machinery.
+ *
+ * The adapter gets the SDK's own logger, as `do-transport` gives it one: a frame
+ * over the large-frame threshold and a frame the send buffer discarded are both
+ * warnings, and an adapter built without a logger reports neither.
  */
-function openSocket(ctx: DurableObjectState, sessionId: string, mode: 'hibernatable' | 'standard'): SocketHarness {
-	const adapter = new ServerAdapter()
+function openSocket(ctx: DurableObjectState, sessionId: string, mode: 'hibernatable' | 'standard', logger: Logger): SocketHarness {
+	const adapter = new ServerAdapter({ logger })
 	const pair = new WebSocketPair()
 	const client = pair[0]
 	const server = pair[1]
@@ -307,8 +311,10 @@ function openSocket(ctx: DurableObjectState, sessionId: string, mode: 'hibernata
 /**
  * What roj does with notifications for a session whose socket has gone.
  *
- * `ServerAdapter.broadcast` returns void, so nothing upstream can tell: frames
- * queue in `ServerConnection`'s send buffer and are dropped once it is full.
+ * Frames queue in `ServerConnection`'s send buffer and are discarded once it is
+ * full. `broadcast` says so per call — `delivered + buffered + dropped === peers`
+ * — so the loss is summed off the transport rather than derived from the frames
+ * that failed to arrive.
  */
 async function measureDropAfterClose(harness: SocketHarness, sessionId: string): Promise<unknown> {
 	harness.closePeer()
@@ -316,8 +322,14 @@ async function measureDropAfterClose(harness: SocketHarness, sessionId: string):
 	const before = harness.buffered()
 	const delivered = harness.received.length
 	const attempts = 600
+	const reported = { bytes: 0, peers: 0, delivered: 0, buffered: 0, dropped: 0 }
 	for (let i = 0; i < attempts; i++) {
-		harness.broadcast({ pluginName: 'payload-probe', type: 'payload_probe', payload: { sessionId, content: `drop-${i}` } })
+		const delivery = harness.broadcast({ pluginName: 'payload-probe', type: 'payload_probe', payload: { sessionId, content: `drop-${i}` } })
+		reported.bytes += delivery.bytes
+		reported.peers += delivery.peers
+		reported.delivered += delivery.delivered
+		reported.buffered += delivery.buffered
+		reported.dropped += delivery.dropped
 	}
 	await scheduler.wait(50)
 	return {
@@ -326,6 +338,8 @@ async function measureDropAfterClose(harness: SocketHarness, sessionId: string):
 		bufferedBefore: before,
 		bufferedAfter: harness.buffered(),
 		newFramesDelivered: harness.received.length - delivered,
+		/** Summed from what each broadcast returned — the drops are counted, not inferred. */
+		reported,
 	}
 }
 
@@ -480,7 +494,7 @@ async function wsAttempt(harness: SocketHarness, sessionId: string, bytes: numbe
 	const before = harness.received.length
 	const bufferedBefore = harness.buffered()
 	const start = await now()
-	harness.broadcast(notification)
+	const reported = harness.broadcast(notification)
 	const delivered = await awaitFrame(harness, before, waitMs)
 	const ms = (await now()) - start
 	const wire = content.length + envelope
@@ -493,6 +507,9 @@ async function wsAttempt(harness: SocketHarness, sessionId: string, bytes: numbe
 		detail: {
 			requestedBytes: bytes,
 			deliveredBytes: delivered ? arrived : null,
+			// What the adapter said became of this frame: a send the socket refused counts
+			// as buffered, not delivered, whether it threw or the socket was simply not open.
+			reported,
 			// A frame the adapter could not hand to the socket lands in the send buffer.
 			bufferedDelta: harness.buffered() - bufferedBefore,
 			clientOpen: harness.clientOpen(),
@@ -547,7 +564,9 @@ async function networkFrameAttempt(origin: string, bytes: number, waitMs: number
 }
 
 async function probeWs(context: LimitProbeContext, journal: Journal): Promise<unknown> {
-	const { ctx, params } = context
+	const { ctx, params, boot } = context
+	// The adapter's own warnings are half the answer here, so it takes the SDK's logger.
+	const logger = boot().services.logger
 	const modes: ('hibernatable' | 'standard')[] = (params.get('wsModes') ?? 'hibernatable,standard')
 		.split(',')
 		.filter((mode): mode is 'hibernatable' | 'standard' => mode === 'hibernatable' || mode === 'standard')
@@ -557,7 +576,7 @@ async function probeWs(context: LimitProbeContext, journal: Journal): Promise<un
 	const results: Record<string, unknown> = {}
 	for (const mode of modes) {
 		const sessionId = `payload-ws-${mode}`
-		let harness = openSocket(ctx, sessionId, mode)
+		let harness = openSocket(ctx, sessionId, mode, logger)
 		let reopened = 0
 		try {
 			const search = await findCeiling(limits, (bytes) =>
@@ -566,15 +585,15 @@ async function probeWs(context: LimitProbeContext, journal: Journal): Promise<un
 					// bisect down to the floor — so start each attempt on a live socket.
 					if (!harness.clientOpen()) {
 						harness.close()
-						harness = openSocket(ctx, sessionId, mode)
+						harness = openSocket(ctx, sessionId, mode, logger)
 						reopened += 1
 					}
 					return wsAttempt(harness, sessionId, bytes, waitMs)
 				}))
 
-			// Per-attempt `bufferedDelta` and `closes` already say whether a frame threw
-			// or killed the socket. What they cannot show is the other half of the story:
-			// what roj does with notifications once the peer is gone.
+			// Per-attempt `reported`, `bufferedDelta` and `closes` already say whether a
+			// frame threw or killed the socket. What they cannot show is the other half of
+			// the story: what roj does with notifications once the peer is gone.
 			const afterPeerClose = await measureDropAfterClose(harness, sessionId)
 
 			results[mode] = { search, socketsKilledDuringSearch: reopened, afterPeerClose }
@@ -787,7 +806,7 @@ async function probeCascade(context: LimitProbeContext, journal: Journal): Promi
 		}
 		const session = created.value
 		const sessionId = String(session.id)
-		const socket = openSocket(ctx, sessionId, 'hibernatable')
+		const socket = openSocket(ctx, sessionId, 'hibernatable', services.logger)
 		harness = socket
 		notified.length = 0
 
