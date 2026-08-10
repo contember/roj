@@ -319,7 +319,7 @@ export class RojAgentDO extends DurableObject<Env> {
 	/**
 	 * End-to-end check of the git port: build a repo in a live session's workspace
 	 * through the shell's `git`, then read it back both directly off `platform.git`
-	 * and through the `git-status` plugin's polled notification.
+	 * and through the `git-status` plugin.
 	 */
 	async git(): Promise<Response> {
 		const { system } = this.#boot()
@@ -331,8 +331,6 @@ export class RojAgentDO extends DurableObject<Env> {
 		const workdir = `/workspace/${session.id}`
 
 		try {
-			// git-status' first tick lands before any of this — an empty workspace is
-			// the "no repository yet" case, which must stay quiet rather than warn.
 			const shell: { command: string; exitCode: number; stdout: string; stderr: string }[] = []
 			for (const command of GIT_SETUP) {
 				const handle = await this.#workspace.runtime.exec(command, { backend: SHELL_BACKEND, encoding: 'utf8', cwd: workdir })
@@ -352,22 +350,23 @@ export class RojAgentDO extends DurableObject<Env> {
 				defaultBranch: await git.defaultBranch({ dir: workdir }) ?? null,
 			}
 
-			const snapshot = await this.#awaitGitStatus()
-			return Response.json({ ok: true, sessionId: String(session.id), workdir, shell, port, snapshot })
+			// Nothing wrote through a tool call here, and an alarm-driven host runs no
+			// poll — so the harness pulls, exactly as a client would.
+			const pulled = await session.callPluginMethod('git-status.refresh', { sessionId: String(session.id) })
+			const notified = this.#notifications.filter((entry) => entry.type === 'git_status_changed').at(-1)?.payload ?? null
+
+			return Response.json({
+				ok: true,
+				sessionId: String(session.id),
+				workdir,
+				shell,
+				port,
+				refresh: pulled.ok ? pulled.value : { error: pulled.error },
+				notified,
+			})
 		} catch (error) {
 			return Response.json({ ok: false, ...describeError(error) }, { status: 500 })
 		}
-	}
-
-	/** git-status polls every 2s, so give it a couple of ticks to see the new repo. */
-	async #awaitGitStatus(timeoutMs = 10_000): Promise<unknown> {
-		const deadline = Date.now() + timeoutMs
-		while (Date.now() < deadline) {
-			const latest = this.#notifications.filter((entry) => entry.type === 'git_status_changed').at(-1)
-			if (latest) return latest.payload
-			await scheduler.wait(250)
-		}
-		return null
 	}
 
 	/** Bytes the store under test holds for one session — a JSONL file, or event rows. */

@@ -30,7 +30,7 @@ shelling out has to move, be dropped, or be routed to a container.
 | 5 — transport in the DO | **done** | Workers WebSocket platform + DO wiring, hibernation proven |
 | 6 — roj-platform | deferred | Shape decided; integration deliberately not started |
 | 7 — limits | in flight | What standalone roj costs a Worker, and where it stops |
-| 8 — scheduler port | **done** | Agent loop rides DO alarms; `git-status` deliberately left out |
+| 8 — scheduler port | **done** | Agent loop rides DO alarms; `git-status` stopped being a clock instead |
 
 ## Phase 0 — measured, verdict: go
 
@@ -65,7 +65,8 @@ contract stays pinned to the full set; only *registration* is a runtime choice.
 `isolatePlugins` is declared `satisfies` a subset of `fullPlugins`, so it cannot
 name a plugin the contract does not know.
 
-The isolate profile drops `services`, `resources`, `uploads` and `git-status`.
+The isolate profile drops `services`, `resources` and `uploads`. (`git-status`
+was dropped originally and moved back in phase 4, once it could read a port.)
 
 Correction to the original plan: **`shell` and `snapshotting` are not in scope
 for a profile.** Neither was ever a built-in — they register through
@@ -208,7 +209,8 @@ Settled so far, all locally and without a deploy:
 
 ## Phase 8 — scheduler port
 
-**Done.** The agent loop rides DO alarms; `git-status` deliberately does not.
+**Done.** The agent loop rides DO alarms. `git-status` deliberately does not — it
+stopped being a clock instead, which is what lets the DO go idle at all.
 
 The original reasoning here was half wrong and the correction is what makes the
 port worth having. A bare timer *is* kept alive in a Durable Object: workerd
@@ -231,12 +233,13 @@ The SDK's timers split cleanly in two:
 | Class | Sites | Needs a port? |
 |---|---|---|
 | Timeout inside a call in flight | `anthropic`/`openrouter` fetch abort, `retry.ts` backoff sleep, `workers` 5 s shutdown race | No — the invocation is alive because something awaits it |
-| "Wake me later" | `agent.debounceTimer`, `agent.errorRetryTimer`, `agents.scheduleSupervisionTick`, `git-status` poll interval | **Yes** |
+| "Wake me later" | `agent.debounceTimer`, `agent.errorRetryTimer`, `agents.scheduleSupervisionTick` | **Yes** |
+| Unbounded clock | `git-status` poll interval | No — it stopped being a clock, see below |
 
-Every one of the four in the second class is *wake this agent and let it
-recompute*, not *run this closure*: they call `continue()`, `scheduleProcessing()`,
-`trigger(agentId)` and `tick()` respectively, and none carries data in its
-closure. So the port does not have to serialise anything.
+Every one of the three in the second class is *wake this agent and let it
+recompute*, not *run this closure*: they call `continue()`, `scheduleProcessing()`
+and `trigger(agentId)` respectively, and none carries data in its closure. So the
+port does not have to serialise anything.
 
 **Decided shape:**
 
@@ -272,11 +275,21 @@ too fast for alarms. A poll is not a "wake me later" but an unbounded clock: as
 wakes it must re-arm from its own tick, and since dispatch loads a session from
 its event log, every session ever opened would replay its whole log every poll
 period and keep an alarm-driven host permanently awake. A longer interval only
-bills for that more slowly. The cost of saying no is that on an alarm-driven host
-the interval runs on a budget nothing refills, then stops without a signal and
-the snapshot goes stale silently. The fix is to stop being a server-side poll —
-a pull method plus a refresh at turn boundaries — which changes the RPC contract
-and the client.
+bills for that more slowly.
+
+**It stopped being a clock instead.** Leaving it on `setInterval` was not free
+either: an armed actor timer registers a wait-until task `drain()` waits for, so
+one live session kept the object from ever going idle — the poll, not the loop,
+was what made hibernation impossible. The plugin now decides from the host.
+Where `platform.scheduler` is a `LiveScheduler` the process outlives a wake, the
+workspace has writers roj never sees (the user's editor, a dev server under
+`services`), and the 2 s clock runs exactly as it always has. Where it is not,
+nothing is armed: the plugin refreshes at the turn boundary after a tool call —
+`afterToolCall` marks the workspace touched, `onComplete` reads it — and answers
+`git-status.refresh` when a client pulls. That is one added session method, so
+`BuiltinMethodSchemas` and every client's RPC types grow by one; no existing
+shape changes, and no Bun host behaves differently. `/limits/idle` is the proof,
+with a `LiveScheduler` control that shows the same census catching the interval.
 
 Two gaps the port does not cover: there is no "is this key armed?" query (the
 agent's error-retry flag works around it in memory, and resets in a fresh

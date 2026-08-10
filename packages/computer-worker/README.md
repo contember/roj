@@ -50,7 +50,10 @@ Five things the DO wires that the SDK's own defaults do not:
 - `execFile` works over the shell backend; `spawn` does not (see below).
 - Git runs with no binary and no process table. `/git` runs `git init`, `add`
   and `commit` through the shell, then reads the same repo back off
-  `platform.git` and out of the `git-status` plugin's notification.
+  `platform.git` and through `git-status.refresh`, whose answer and whose
+  notification must agree.
+- **Nothing roj owns is armed once a session settles** — no timer, no wake, no
+  alarm. `/limits/idle` counts all three; see "An idle DO" below.
 
 ## Wiring the shell backend
 
@@ -319,6 +322,56 @@ wakes nobody delivers. Those managers live only for their request, which is the
 case `LiveScheduler` exists for, so they take a timer scheduler through
 `withOwnScheduler()`.
 
+### An idle DO (`/limits/idle`)
+
+A DO may only be evicted when it has nothing outstanding, and workerd counts an
+armed actor timer as outstanding: each one registers a wait-until task that
+`IncomingRequest::drain()` waits for (`io-context.c++:828`), and a repeating
+timer arms a fresh one per tick (`io-context.c++:793`). `git-status` used to arm
+a 2 s `setInterval` per live session, so one open session was enough to keep this
+object awake for good.
+
+It no longer arms one here. The plugin now decides from the host: where
+`platform.scheduler` is a `LiveScheduler` — a Bun host, whose process outlives a
+wake and whose workspace has writers roj never sees — the 2 s clock runs exactly
+as before; where it is not, the plugin arms nothing and refreshes at the turn
+boundary after a tool call, plus whenever a client calls `git-status.refresh`.
+
+`/limits/idle` censuses all three ways this DO can be held, by wrapping the timer
+globals before the SDK boots. From a real run — one two-agent turn, a 6 s quiet
+window, the SDK dropped as an eviction would, then a second message that can only
+be served by replaying the event log:
+
+| checkpoint | timers armed / cleared / outstanding | pending wakes | alarm slot | events |
+|---|---|---:|---:|---:|
+| settled | 1 / 1 / **0** | 0 | none | 25 |
+| quiet +6 000 ms | 1 / 1 / **0** | 0 | none | 25 |
+| SDK evicted | 1 / 1 / **0** | 0 | none | 25 |
+| settled again | 1 / 1 / **0** | 0 | none | 30 |
+| after a `git-status` pull | 1 / 1 / **0** | 0 | none | 30 |
+
+The one timer ever armed is the probe's own self-check, which exists so that a
+zero means the census works rather than that it is broken. Over the whole run roj
+armed **no timer at all**.
+
+The control is what makes that readable. The same probe then builds a manager
+through `withOwnScheduler()` — a `LiveScheduler`, i.e. a Bun host — and the
+census immediately holds one `interval, delayMs: 2000` armed from
+`Object.onSessionReady`, which `session.close()` clears. Same census, same
+isolate, opposite answer.
+
+What the poll bought is priced in the same run. The probe writes a file straight
+through `platform.fs`, with no tool call and no request behind it: the snapshot
+stays at `uncommittedFiles: 1` across the 6 s window and only moves to 2 when
+something pulls. That is the whole behavioural cost, and it is a class of writer
+that exists on a Bun host (an editor, a dev server under `services`) and not in
+an isolate, where every byte arrives through a tool call or an inbound request.
+
+**Eviction itself is unobserved.** `wrangler dev` never evicts a Durable Object,
+so this is the precondition for hibernation, not hibernation. The transport
+already uses hibernatable WebSockets; whether the object actually sleeps can only
+be settled on a deploy.
+
 ### Two ways a session breaks that are worth guarding
 
 **An oversized event hangs the agent.** Past the 2.2 MB SQLite value limit the
@@ -337,14 +390,18 @@ needs a reaper.
 Both probes saw creation degrade, and they disagree about why: the concurrency
 probe pins it on lifetime debris (32 live sessions on an aged DO were slower than
 448 on a fresh one), the memory probe on the per-session `git-status` interval
-(13 → 174 ms between 100 and 1000 live). Neither isolated the variable. Open.
+(13 → 174 ms between 100 and 1000 live). Neither isolated the variable. Open —
+and still open in those two probes specifically, because both build their own
+manager through `withOwnScheduler()`, which is a `LiveScheduler`, so `git-status`
+does still poll there. The DO's own sessions no longer have that interval at all.
 
 ### Three SDK defects the probes turned up
 
 - **`SessionManager.shutdown()` never runs `onSessionClose` hooks** — it calls
-  `Session.shutdown()`, which only stops agents. `git-status` intervals outlive
-  it and keep the session object reachable: a timer *and* a memory leak per
-  session ever loaded.
+  `Session.shutdown()`, which only stops agents. On a host with a live scheduler
+  `git-status` intervals therefore outlive it and keep the session object
+  reachable: a timer *and* a memory leak per session ever loaded. On this DO only
+  the memory leak is left, since the plugin arms no timer here.
 - **`EventAppendError` reports no reason.** The cause lives only in `cause`, and
   all three logger serialisers take `{name, message, stack}`. An operator sees
   "Failed to append event to session: X".
