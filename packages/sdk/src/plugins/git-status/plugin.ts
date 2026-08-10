@@ -1,153 +1,204 @@
 /**
  * Git Status Plugin
  *
- * Polls git state (commits ahead of the default branch, uncommitted files,
- * last commit metadata) inside the session's workspace directory every few
- * seconds and emits a `git_status_changed` notification when the snapshot
- * changes. The worker DO persists the last snapshot into its session table so
- * versions sidebar and publish bars can render without reaching into the
- * sandbox on every page view.
+ * Reports the git state of a session's workspace — commits ahead of the default
+ * branch, uncommitted files, last commit metadata — as a `git_status_changed`
+ * notification whenever the snapshot moves. The worker DO persists the last one
+ * into its session table so versions sidebars and publish bars render without
+ * reaching into the sandbox on every page view.
  *
  * Two ways to read that state. `platform.git` answers it directly, which is how
  * hosts with no process table (a Worker isolate over a VFS) take part; without
  * the port the plugin shells out to the `git` binary, as it always has.
  *
- * The poll deliberately stays on a raw `setInterval` rather than moving to
- * `platform.scheduler`: it is not a "wake me later", it is an unbounded clock.
- * As scheduler wakes it would re-arm itself forever, and because a wake is
- * dispatched by loading its session from the event log, every session ever opened
- * would replay its log every POLL_INTERVAL_MS and keep an alarm-driven host
- * permanently awake. The fix is to stop being a server-side poll at all — a pull
- * method plus a refresh at turn boundaries — which changes the client and worker
- * contract, not just this file.
+ * *When* it reads is a host question, because who may write the workspace is.
+ * Where the process outlives a wake — `platform.scheduler` delivers its own —
+ * roj is not the only writer: the user has the directory open in an editor, and
+ * `services` runs dev servers inside it. Nothing but a clock sees those, so one
+ * still runs there, at the 2 s it always has.
+ *
+ * A host that is evicted between wakes has no such writer: every byte arrives
+ * through a tool call or an inbound request. And there a clock is ruinous — in
+ * workerd every armed timer registers a wait-until task that `drain()` waits on,
+ * and a repeating one arms a fresh task per tick, so one live session is enough
+ * to keep the actor from ever going idle. So on those hosts the plugin arms
+ * nothing at all: it refreshes at the turn boundary that follows a tool call,
+ * and otherwise answers `git-status.refresh` when a client pulls.
  */
 
-import z from 'zod/v4'
 import { definePlugin } from '~/core/plugins/index.js'
+import type { SessionId } from '~/core/sessions/schema.js'
 import { sessionIdSchema } from '~/core/sessions/schema.js'
+import type { Logger } from '~/lib/logger/logger.js'
+import { Ok } from '~/lib/utils/result.js'
 import type { GitClient } from '~/platform/git.js'
 import type { ProcessRunner } from '~/platform/process.js'
+import { isLiveScheduler } from '~/platform/scheduler.js'
+import z from 'zod/v4'
 
 const POLL_INTERVAL_MS = 2000
 const GIT_TIMEOUT_MS = 5000
 const DEFAULT_BRANCH_FALLBACK = 'main'
 
-interface GitStatusSnapshot {
-	committedAhead: number
-	uncommittedFiles: number
-	lastCommitAt: number | null
-	lastCommitMessage: string | null
+const gitStatusSnapshotSchema = z.object({
+	committedAhead: z.number(),
+	uncommittedFiles: z.number(),
+	lastCommitAt: z.number().nullable(),
+	lastCommitMessage: z.string().nullable(),
+})
+
+const gitStatusChangedSchema = z.object({
+	sessionId: sessionIdSchema,
+	...gitStatusSnapshotSchema.shape,
+	updatedAt: z.number(),
+})
+
+type GitStatusSnapshot = z.infer<typeof gitStatusSnapshotSchema>
+type GitStatusChanged = z.infer<typeof gitStatusChangedSchema>
+
+interface SessionGitStatus {
+	/** Whether this host has a clock of its own; false means nothing may be armed. */
+	polls: boolean
+	/** The 2 s interval, on polling hosts only. */
+	interval?: NodeJS.Timeout
+	lastSnapshot?: GitStatusSnapshot
+	defaultBranch?: string
+	/** A tool wrote in this workspace since the last read. */
+	touched: boolean
+	/** Neither a git port nor a process table — no read can ever succeed here. */
+	unsupported: boolean
+	/** Shared by overlapping callers, so one turn boundary costs one git read. */
+	inFlight?: Promise<GitStatusSnapshot | null>
 }
 
 interface GitStatusPluginContext {
-	intervals: Map<string, NodeJS.Timeout>
-	lastSnapshots: Map<string, GitStatusSnapshot>
-	defaultBranches: Map<string, string>
-	active: boolean
+	sessions: Map<string, SessionGitStatus>
+}
+
+/**
+ * The slice of a hook or method context a read needs. Session hooks, agent hooks
+ * and method handlers all satisfy it, so all three share one code path.
+ */
+interface GitStatusCallContext {
+	sessionId: SessionId
+	sessionState: { workspaceDir?: string }
+	platform: { git?: GitClient; process: ProcessRunner }
+	logger: Logger
+	notify: (type: 'git_status_changed', payload: GitStatusChanged) => void
+	pluginContext: GitStatusPluginContext
 }
 
 export const gitStatusPlugin = definePlugin('git-status')
-	.notification('git_status_changed', {
-		schema: z.object({
-			sessionId: sessionIdSchema,
-			committedAhead: z.number(),
-			uncommittedFiles: z.number(),
-			lastCommitAt: z.number().nullable(),
-			lastCommitMessage: z.string().nullable(),
-			updatedAt: z.number(),
-		}),
+	.notification('git_status_changed', { schema: gitStatusChangedSchema })
+	.context(async (): Promise<GitStatusPluginContext> => ({ sessions: new Map() }))
+	.method('refresh', {
+		input: z.object({ sessionId: sessionIdSchema }),
+		output: z.object({ snapshot: gitStatusSnapshotSchema.nullable() }),
+		// The pull half of the contract: a client that just wrote, or just opened the
+		// session, asks for the snapshot instead of waiting for a poll to notice.
+		handler: async (ctx) => Ok({ snapshot: await refresh(ctx) }),
 	})
-	.context(async (): Promise<GitStatusPluginContext> => ({
-		intervals: new Map(),
-		lastSnapshots: new Map(),
-		defaultBranches: new Map(),
-		active: true,
-	}))
 	.sessionHook('onSessionReady', async (ctx) => {
 		const workdir = ctx.sessionState.workspaceDir
 		if (!workdir) return
 
-		const sessionId = ctx.sessionId
-		const pluginCtx = ctx.pluginContext
-		const git = ctx.platform.git
-		const processRunner = ctx.platform.process
-		const logger = ctx.logger
-		const notify = ctx.notify
-		pluginCtx.active = true
+		const polls = isLiveScheduler(ctx.platform.scheduler)
+		const entry: SessionGitStatus = { polls, touched: false, unsupported: false }
+		ctx.pluginContext.sessions.set(ctx.sessionId, entry)
+		if (!polls) return
 
-		const stop = () => {
-			const interval = pluginCtx.intervals.get(sessionId)
-			if (interval) clearInterval(interval)
-			pluginCtx.intervals.delete(sessionId)
-		}
-
-		const tick = async () => {
-			if (!pluginCtx.active) return
-			let baseBranch = pluginCtx.defaultBranches.get(sessionId)
-			if (!baseBranch) {
-				const detected = git
-					? await detectDefaultBranchOverPort(git, workdir)
-					: await detectDefaultBranch(processRunner, workdir)
-				baseBranch = detected ?? DEFAULT_BRANCH_FALLBACK
-				if (!pluginCtx.active) return
-				pluginCtx.defaultBranches.set(sessionId, baseBranch)
-			}
-
-			const snapshot = git
-				? await computeGitStatusOverPort(git, workdir, baseBranch)
-				: await computeGitStatus(processRunner, workdir, baseBranch)
-			if (!pluginCtx.active) return
-			if (!snapshot) {
-				// A workspace with no repository is an ordinary state the port reports
-				// cheaply; only the shell-out path, where a failure means the binary
-				// itself misbehaved, is worth a warning.
-				if (!git) logger.warn('git-status: snapshot failed', { sessionId, workdir, baseBranch })
-				return
-			}
-
-			const last = pluginCtx.lastSnapshots.get(sessionId)
-			if (last && snapshotsEqual(last, snapshot)) return
-
-			pluginCtx.lastSnapshots.set(sessionId, snapshot)
-			notify('git_status_changed', {
-				sessionId,
-				committedAhead: snapshot.committedAhead,
-				uncommittedFiles: snapshot.uncommittedFiles,
-				lastCommitAt: snapshot.lastCommitAt,
-				lastCommitMessage: snapshot.lastCommitMessage,
-				updatedAt: Date.now(),
-			})
-		}
-
-		const runTick = () => {
-			tick().catch((err) => {
-				if (isUnsupported(err)) {
-					// Neither a git port nor a process table — no tick can ever succeed here.
-					stop()
-					logger.debug('git-status: disabled, host cannot run git', { sessionId, workdir })
-					return
-				}
-				logger.warn('git-status tick failed', { sessionId, err: err instanceof Error ? err.message : String(err) })
-			})
-		}
-
-		// Registered before the first tick so its failure handler can stop the timer.
-		pluginCtx.intervals.set(sessionId, setInterval(runTick, POLL_INTERVAL_MS))
-		runTick()
+		// Armed before the first read, so an ENOSYS read can stop the timer it is in.
+		entry.interval = setInterval(() => void refresh(ctx), POLL_INTERVAL_MS)
+		void refresh(ctx)
+	})
+	.hook('afterToolCall', async (ctx) => {
+		// Cheap: the read itself waits for the turn to end, and is skipped if no tool ran.
+		const entry = ctx.pluginContext.sessions.get(ctx.sessionId)
+		if (entry) entry.touched = true
+		return null
+	})
+	.hook('onComplete', async (ctx) => {
+		const entry = ctx.pluginContext.sessions.get(ctx.sessionId)
+		// On a polling host the clock already covers this; elsewhere the turn boundary
+		// is the one moment the workspace demonstrably changed and nothing is armed.
+		if (!entry || entry.polls || !entry.touched) return null
+		entry.touched = false
+		await refresh(ctx)
+		return null
 	})
 	.sessionHook('onSessionClose', async (ctx) => {
-		const sessionId = ctx.sessionId
-		const pluginCtx = ctx.pluginContext
-		pluginCtx.active = false
-		const interval = pluginCtx.intervals.get(sessionId)
-		if (interval) {
-			clearInterval(interval)
-			pluginCtx.intervals.delete(sessionId)
-		}
-		pluginCtx.lastSnapshots.delete(sessionId)
-		pluginCtx.defaultBranches.delete(sessionId)
+		const entry = ctx.pluginContext.sessions.get(ctx.sessionId)
+		if (entry?.interval) clearInterval(entry.interval)
+		ctx.pluginContext.sessions.delete(ctx.sessionId)
 	})
 	.build()
+
+/** Read the workspace's git state, notifying if it moved. Never rejects. */
+async function refresh(ctx: GitStatusCallContext): Promise<GitStatusSnapshot | null> {
+	const entry = ctx.pluginContext.sessions.get(ctx.sessionId)
+	if (!entry || entry.unsupported) return null
+
+	const existing = entry.inFlight
+	if (existing) return existing
+
+	const run = readSnapshot(ctx, entry).finally(() => {
+		if (entry.inFlight === run) entry.inFlight = undefined
+	})
+	entry.inFlight = run
+	return run
+}
+
+async function readSnapshot(ctx: GitStatusCallContext, entry: SessionGitStatus): Promise<GitStatusSnapshot | null> {
+	const sessionId = ctx.sessionId
+	const workdir = ctx.sessionState.workspaceDir
+	if (!workdir) return null
+	const git = ctx.platform.git
+	const processRunner = ctx.platform.process
+
+	try {
+		let baseBranch = entry.defaultBranch
+		if (!baseBranch) {
+			const detected = git
+				? await detectDefaultBranchOverPort(git, workdir)
+				: await detectDefaultBranch(processRunner, workdir)
+			baseBranch = detected ?? DEFAULT_BRANCH_FALLBACK
+			entry.defaultBranch = baseBranch
+		}
+
+		const snapshot = git
+			? await computeGitStatusOverPort(git, workdir, baseBranch)
+			: await computeGitStatus(processRunner, workdir, baseBranch)
+		if (!snapshot) {
+			// A workspace with no repository is an ordinary state the port reports
+			// cheaply; only the shell-out path, where a failure means the binary
+			// itself misbehaved, is worth a warning.
+			if (!git) ctx.logger.warn('git-status: snapshot failed', { sessionId, workdir, baseBranch })
+			return null
+		}
+
+		// The runtime may have begun unloading during the reads above — onSessionClose
+		// drops the entry — and a notification then lands on nobody.
+		if (ctx.pluginContext.sessions.get(sessionId) !== entry) return null
+
+		const last = entry.lastSnapshot
+		entry.lastSnapshot = snapshot
+		if (!last || !snapshotsEqual(last, snapshot)) {
+			ctx.notify('git_status_changed', { sessionId, ...snapshot, updatedAt: Date.now() })
+		}
+		return snapshot
+	} catch (err) {
+		if (isUnsupported(err)) {
+			// Neither a git port nor a process table — no read can ever succeed here.
+			entry.unsupported = true
+			if (entry.interval) clearInterval(entry.interval)
+			entry.interval = undefined
+			ctx.logger.debug('git-status: disabled, host cannot run git', { sessionId, workdir })
+			return null
+		}
+		ctx.logger.warn('git-status refresh failed', { sessionId, err: err instanceof Error ? err.message : String(err) })
+		return null
+	}
+}
 
 function snapshotsEqual(a: GitStatusSnapshot, b: GitStatusSnapshot): boolean {
 	return a.committedAhead === b.committedAhead

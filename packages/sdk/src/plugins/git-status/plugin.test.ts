@@ -4,16 +4,19 @@ import { SessionFileStore } from '~/core/file-store/file-store.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import type { PluginNotification } from '~/core/plugins/plugin-builder.js'
 import { SessionManager } from '~/core/sessions/session-manager.js'
+import type { Session } from '~/core/sessions/session.js'
 import { ToolExecutor } from '~/core/tools/executor.js'
+import { ToolCallId } from '~/core/tools/schema.js'
 import type { Logger } from '~/lib/logger/logger.js'
-import type { ExecFileResult, GitClient, Platform, ProcessRunner } from '~/platform/index.js'
+import type { ExecFileResult, GitClient, Platform, ProcessRunner, Scheduler } from '~/platform/index.js'
 import { createNodePlatform } from '~/testing/node-platform.js'
 import { createTestPreset } from '~/testing/preset-helpers.js'
+import { TestHarness } from '~/testing/test-harness.js'
 import { gitStatusPlugin } from './plugin.js'
 
 const COMMIT_SECONDS = 1_700_000_000
 
-/** The first tick runs at session ready; this only has to outlast its awaits. */
+/** The first read runs at session ready; this only has to outlast its awaits. */
 const SETTLE_MS = 300
 
 /** Mirrors the plugin's own poll interval — the suite cannot import it. */
@@ -75,10 +78,26 @@ function enosysProcessRunner(): ProcessRunner {
 	}
 }
 
+/**
+ * The shape of an evictable host: wakes are armed here and delivered by whatever
+ * process is alive when they come due, so nothing fires on its own.
+ */
+class RecordingScheduler implements Scheduler {
+	readonly armed = new Map<string, number>()
+
+	async wake(key: string, delayMs: number): Promise<void> {
+		this.armed.set(key, delayMs)
+	}
+
+	async cancel(key: string): Promise<void> {
+		this.armed.delete(key)
+	}
+}
+
 const managers: SessionManager[] = []
 
-/** Boot a session with only `git-status` registered and return its first snapshot, if any. */
-async function firstSnapshot(platform: Platform, logger: Logger, settleMs = SETTLE_MS): Promise<unknown | null> {
+/** Boot a session with only `git-status` registered, collecting its notifications. */
+async function bootSession(platform: Platform, logger: Logger): Promise<{ session: Session; notifications: PluginNotification[] }> {
 	const notifications: PluginNotification[] = []
 	const basePath = `/tmp/roj-git-status-${Math.random().toString(36).slice(2)}`
 	// The session really creates its workspace, so it has to be somewhere writable.
@@ -100,16 +119,26 @@ async function firstSnapshot(platform: Platform, logger: Logger, settleMs = SETT
 
 	const created = await manager.createSession(preset.id)
 	if (!created.ok) throw new Error(`createSession failed: ${created.error.message}`)
-	await Bun.sleep(settleMs)
 
+	return { session: created.value, notifications }
+}
+
+function snapshotOf(notifications: readonly PluginNotification[]): unknown | null {
 	return notifications.find((entry) => entry.type === 'git_status_changed')?.payload ?? null
+}
+
+/** Boot a session and return the snapshot its poll produced, if any. */
+async function firstSnapshot(platform: Platform, logger: Logger, settleMs = SETTLE_MS): Promise<unknown | null> {
+	const { notifications } = await bootSession(platform, logger)
+	await Bun.sleep(settleMs)
+	return snapshotOf(notifications)
 }
 
 afterEach(async () => {
 	for (const manager of managers.splice(0)) await manager.shutdown()
 })
 
-describe('git-status', () => {
+describe('git-status on a host with a live process', () => {
 	test('reads the snapshot off platform.git when the host has one', async () => {
 		const platform: Platform = { ...createNodePlatform(), process: enosysProcessRunner(), git: fakeGitClient() }
 
@@ -153,5 +182,81 @@ describe('git-status', () => {
 		// Past one poll interval: without the ENOSYS stop this warns on every tick.
 		expect(await firstSnapshot(platform, recordingLogger(warnings), POLL_INTERVAL_MS + SETTLE_MS)).toBeNull()
 		expect(warnings).toEqual([])
+	})
+})
+
+describe('git-status on a host that is evicted between wakes', () => {
+	const evictablePlatform = (git: GitClient): Platform => ({
+		...createNodePlatform(),
+		process: enosysProcessRunner(),
+		git,
+		scheduler: new RecordingScheduler(),
+	})
+
+	test('arms nothing, so an idle session holds no timer', async () => {
+		const { notifications } = await bootSession(evictablePlatform(fakeGitClient()), recordingLogger([]))
+
+		// Well past a poll period: on a live host this is where the first tick landed.
+		await Bun.sleep(POLL_INTERVAL_MS + SETTLE_MS)
+		expect(snapshotOf(notifications)).toBeNull()
+	})
+
+	test('answers a pull with the snapshot, and notifies once per change', async () => {
+		const { session, notifications } = await bootSession(evictablePlatform(fakeGitClient()), recordingLogger([]))
+
+		const pulled = await session.callPluginMethod('git-status.refresh', { sessionId: String(session.id) })
+		expect(pulled.ok).toBe(true)
+		if (!pulled.ok) return
+		expect(pulled.value).toEqual({
+			snapshot: { committedAhead: 2, uncommittedFiles: 2, lastCommitAt: COMMIT_SECONDS * 1000, lastCommitMessage: 'add note' },
+		})
+		expect(snapshotOf(notifications)).toMatchObject({ committedAhead: 2, uncommittedFiles: 2 })
+
+		// An unchanged snapshot is not news; the client already has this one.
+		await session.callPluginMethod('git-status.refresh', { sessionId: String(session.id) })
+		expect(notifications.filter((entry) => entry.type === 'git_status_changed')).toHaveLength(1)
+	})
+
+	test('refreshes at the turn boundary that follows a tool call', async () => {
+		const scheduler = new RecordingScheduler()
+		// Only a second read can see this move, so a notification proves one happened.
+		let committedAhead = 0
+		const platform: Platform = {
+			...createNodePlatform(),
+			process: enosysProcessRunner(),
+			git: fakeGitClient({ countAhead: async () => committedAhead }),
+			scheduler,
+		}
+
+		const workspaceDir = `/tmp/roj-git-status-turn-${Math.random().toString(36).slice(2)}/workspace`
+		const harness = new TestHarness({
+			presets: [createTestPreset({ workspaceDir })],
+			platform,
+			llmProvider: MockLLMProvider.withSequence([
+				{ content: null, toolCalls: [{ id: ToolCallId('tc1'), name: 'tell_user', input: { message: 'working' } }] },
+				{ content: 'done', toolCalls: [] },
+			]),
+		})
+
+		try {
+			const session = await harness.createSession('test')
+			await session.sendMessage('go')
+			committedAhead = 3
+
+			// Nothing runs on its own here: each hop is a wake this test delivers.
+			for (let hop = 0; hop < 10 && scheduler.armed.size > 0; hop++) {
+				const keys = [...scheduler.armed.keys()]
+				scheduler.armed.clear()
+				for (const key of keys) await harness.sessionManager.dispatchWake(key)
+			}
+
+			const notified = harness.notifications.getByType('git-status', 'git_status_changed')
+			expect(notified).toHaveLength(1)
+			expect(notified[0]?.payload).toMatchObject({ committedAhead: 3 })
+			// The turn is over and the loop is done — a refresh must not have re-armed anything.
+			expect([...scheduler.armed.keys()]).toEqual([])
+		} finally {
+			await harness.shutdown()
+		}
 	})
 })

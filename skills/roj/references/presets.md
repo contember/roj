@@ -205,7 +205,7 @@ Bootstrap registers these in every session. Use `.configureAgent({...})` for per
 | `filesystemPlugin` (`@roj-ai/sdk/tools/filesystem`) | `read_file`, `write_file`, `edit_file`, `list_directory`, glob |
 | `servicePlugin` | Picks up `services: [...]` per agent |
 | `sessionStatePlugin` | Typed KV session state |
-| `gitStatusPlugin` | Polls `git status`; notifies on change |
+| `gitStatusPlugin` | Workspace `git status`; notifies on change. Polls only where the host has a live process, otherwise refreshes at turn boundaries and on `git-status.refresh` |
 | `logsPlugin` | `logs.tail()` |
 | `llmDebugPlugin` | `llm.getCalls()` |
 | `sessionStatsPlugin` | Token / cost / call counters |

@@ -89,8 +89,8 @@ describe('plugin profiles', () => {
 			expect(found.ok).toBe(true)
 			if (!found.ok) return
 
-			// Only these two are observable here: git-status exposes no RPC methods and
-			// services is skipped by isSessionEnabled when the preset configures none.
+			// Only these two are observable here: services is skipped by isSessionEnabled
+			// when the preset configures none.
 			const methodPlugins = new Set([...found.value.getPluginMethods().keys()].map(m => m.slice(0, m.indexOf('.'))))
 			for (const name of ['uploads', 'resources']) {
 				expect(methodPlugins.has(name)).toBe(true)
