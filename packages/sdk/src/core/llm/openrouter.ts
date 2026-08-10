@@ -14,6 +14,7 @@ import type {
 	LLMMetrics,
 	LLMProvider,
 	OpenRouterProviderRouting,
+	OpenRouterReasoningOptions,
 	ProviderHttpRequest,
 	RawInferenceRequest,
 } from './provider.js'
@@ -164,6 +165,8 @@ interface OpenRouterRequestBody {
 	stream_options: { include_usage: true }
 	/** Provider routing preferences */
 	provider?: OpenRouterProviderRouting
+	/** Reasoning budget */
+	reasoning?: OpenRouterReasoningOptions
 	/** Routing strategy */
 	route?: 'fallback'
 	/** Model transforms */
@@ -323,6 +326,9 @@ export class OpenRouterProvider implements LLMProvider {
 		if (orOpts) {
 			if (orOpts.providers) {
 				body.provider = orOpts.providers
+			}
+			if (orOpts.reasoning) {
+				body.reasoning = orOpts.reasoning
 			}
 			if (orOpts.route) {
 				body.route = orOpts.route

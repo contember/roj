@@ -208,3 +208,27 @@ describe('OpenRouterProvider buildHttpRequest', () => {
 		}
 	})
 })
+
+// ============================================================================
+// Reasoning budget
+// ============================================================================
+
+describe('OpenRouterProvider reasoning budget', () => {
+	test('forwards the reasoning budget', async () => {
+		const request = buildRequest([{ role: 'user', content: 'Hello' }])
+		request.openrouter = { reasoning: { effort: 'low' } }
+
+		const http = await createProvider().buildHttpRequest(request)
+
+		expect(http.body).toEqual(expect.objectContaining({ reasoning: { effort: 'low' } }))
+	})
+
+	// Omitted, not defaulted: the model's own default applies, and adding the key would
+	// rewrite the cached prefix for every request that does not want to set it. Asserted on
+	// the serialized body — an undefined-valued key is still a present key on the object.
+	test('omits reasoning when unset', async () => {
+		const http = await createProvider().buildHttpRequest(buildRequest([{ role: 'user', content: 'Hello' }]))
+
+		expect(JSON.stringify(http.body)).not.toContain('"reasoning"')
+	})
+})

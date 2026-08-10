@@ -50,9 +50,37 @@ export interface OpenRouterProviderRouting {
 	quantizations?: string[]
 }
 
+/**
+ * Reasoning controls.
+ *
+ * Without these the model's own default applies, and several of the defaults are expensive:
+ * `high` on Claude Sonnet 5, Opus 5 and Grok 4.5, `max` on Kimi K3. Reasoning is also
+ * `mandatory` on Gemini 3.6 Flash, Grok 4.5 and Kimi K2.7 Code — those cannot be turned off,
+ * only turned down.
+ *
+ * **Which efforts a model accepts differs per model.** The catalog's
+ * `reasoning.supported_efforts` is the authority: Kimi K3 has no `medium`, `minimal` exists
+ * only on Gemini, `xhigh`/`none` only on the OpenAI and newer Anthropic models. The union here
+ * is every value seen across them, not a set any single model takes.
+ *
+ * @see https://openrouter.ai/docs/use-cases/reasoning-tokens
+ */
+export interface OpenRouterReasoningOptions {
+	/** Relative budget. Mutually exclusive with `max_tokens` — set one. */
+	effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+	/** Absolute token budget, for models that take one instead of an effort. */
+	max_tokens?: number
+	/** Explicitly enable reasoning at the model's default effort. */
+	enabled?: boolean
+	/** Reason, but omit the blocks from the response. Note this breaks the round trip. */
+	exclude?: boolean
+}
+
 export interface OpenRouterRequestOptions {
 	/** Provider routing preferences */
 	providers?: OpenRouterProviderRouting
+	/** Reasoning budget. Omitted: the model's own default, which is often `high`. */
+	reasoning?: OpenRouterReasoningOptions
 	/** Routing strategy */
 	route?: 'fallback'
 	/** Model transforms */
