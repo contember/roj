@@ -427,6 +427,67 @@ describe('core: plugin hooks', () => {
 			expect(calls).toEqual(['onSessionClose'])
 		})
 
+		it('close() and dispose() both wait for a teardown already in flight', async () => {
+			let release: (() => void) | undefined
+			let released = false
+
+			const slowPlugin = definePlugin('slow-teardown')
+				.sessionHook('onSessionClose', async () => {
+					await new Promise<void>((resolve) => {
+						release = resolve
+					})
+					released = true
+				})
+				.build()
+
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				systemPlugins: [slowPlugin],
+			})
+
+			const session = await harness.createSession('test')
+			// Taken while the session is still cached: closing evicts it, and a later
+			// lookup would load a second instance with nothing to wait for.
+			const cached = await harness.sessionManager.getSession(session.sessionId)
+			expect(cached.ok).toBe(true)
+			if (!cached.ok) return
+
+			let closeReturned = false
+			const closing = session.close().then((result) => {
+				closeReturned = true
+				return result
+			})
+			while (!release) await new Promise((resolve) => setTimeout(resolve, 1))
+
+			// The manager evicted the session on session_closed, so this is also the
+			// case where it has to have kept a handle on the teardown.
+			let shutdownReturned = false
+			const shuttingDown = harness.shutdown().then(() => {
+				shutdownReturned = true
+			})
+			// ...and a second entry into the shared teardown joins it rather than
+			// reporting done off a flag the first caller set before its first await.
+			let disposeReturned = false
+			const disposing = cached.value.dispose().then(() => {
+				disposeReturned = true
+			})
+
+			await new Promise((resolve) => setTimeout(resolve, 20))
+			expect(shutdownReturned).toBe(false)
+			expect(disposeReturned).toBe(false)
+			// close() reports done only once the hook it triggered has finished.
+			expect(closeReturned).toBe(false)
+			expect(released).toBe(false)
+
+			release()
+			await disposing
+			await shuttingDown
+			await closing
+			expect(released).toBe(true)
+			expect(closeReturned).toBe(true)
+		})
+
 		describe('beforeMethod', () => {
 			it('returning { action: "deny" } → method call rejected and handler not run', async () => {
 				let handlerCalls = 0
