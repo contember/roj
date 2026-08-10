@@ -472,6 +472,62 @@ describe('SqliteEventStore', () => {
 		})
 	})
 
+	describe('deleteSession', () => {
+		const other = SessionId('01900000-0000-7000-8000-0000000000c1')
+
+		test('removes the events and the metadata of one session', async () => {
+			await store.appendBatch(sessionId, [sessionCreated(sessionId, 'test'), agentSpawned(sessionId, 'a')])
+
+			expect(await store.deleteSession(sessionId)).toBe(2)
+			expect(await store.load(sessionId)).toEqual([])
+			expect(await store.exists(sessionId)).toBe(false)
+			expect(await store.getMetadata(sessionId)).toBeNull()
+			expect(await store.listSessions()).toEqual([])
+		})
+
+		test('leaves every other session alone', async () => {
+			await store.appendBatch(sessionId, [sessionCreated(sessionId, 'test'), agentSpawned(sessionId, 'a')])
+			await store.appendBatch(other, [sessionCreated(other, 'test'), agentSpawned(other, 'b')])
+
+			await store.deleteSession(sessionId)
+
+			expect(await store.load(other)).toHaveLength(2)
+			expect(await store.getMetadata(other)).toMatchObject({ sessionId: other })
+			expect(await store.listSessions()).toEqual([other])
+		})
+
+		test('reports zero for a session that was never stored', async () => {
+			expect(await store.deleteSession(SessionId('missing'))).toBe(0)
+		})
+
+		test('removes a session that only has metadata', async () => {
+			await store.updateMetadata(sessionId, { name: 'metadata only' })
+
+			expect(await store.deleteSession(sessionId)).toBe(0)
+			expect(await store.listSessions()).toEqual([])
+		})
+
+		test('numbers a later append from zero again', async () => {
+			await store.appendBatch(sessionId, [sessionCreated(sessionId, 'test'), agentSpawned(sessionId, 'a')])
+			await store.deleteSession(sessionId)
+
+			await store.append(sessionId, sessionCreated(sessionId, 'reused'))
+
+			const range = await store.loadRange(sessionId)
+			expect(range.fromIndex).toBe(0)
+			expect(range.toIndex).toBe(0)
+		})
+
+		test('does not split a batch that is already in flight', async () => {
+			const append = store.appendBatch(sessionId, [sessionCreated(sessionId, 'test'), agentSpawned(sessionId, 'a')])
+			const deleted = store.deleteSession(sessionId)
+
+			await append
+			expect(await deleted).toBe(2)
+			expect(await store.load(sessionId)).toEqual([])
+		})
+	})
+
 	describe('error handling', () => {
 		test('throws EventStoreError when a stored event is not JSON', async () => {
 			await store.append(sessionId, sessionCreated(sessionId, 'test-preset'))

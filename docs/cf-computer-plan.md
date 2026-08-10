@@ -139,6 +139,27 @@ Two corrections to what this plan originally claimed:
 
 `snapshotting` uses the `jj` binary and has no equivalent. It stays out.
 
+**A pull is now gated on a filesystem revision.** Nothing rate-limits
+`git-status.refresh` — every open tab pulls — and each pull was a full
+`status` + `log` + `countAhead` over the VFS. `Platform` gained a second
+optional port, `fsRevision`, answering one question: has anything changed. On
+computer it reads the counter dofs bumps on every mutation (`vfs_meta.rev`), so
+`git-status` replays the answer it holds while that number stands still:
+**0.07 ms against 9 ms** per pull, measured over `/git?rounds=40`.
+
+Three things that shape it:
+
+- **The counter is a gate, not a source.** `uncommittedFiles` and
+  `committedAhead` are comparisons against the index and HEAD; a revision can
+  only say whether the previous comparison still stands.
+- **It is filesystem-wide, and this DO holds every session.** A write in one
+  session invalidates the others' cached answers. Deliberate: the error is
+  always an unnecessary recomputation, never a stale one, and scoping it would
+  mean walking `vfs_dirents` — more private schema, for less certainty.
+- **`vfs_*` is private schema** (five migrations already), so the read lives in
+  exactly one file and every failure degrades to `undefined`, which reads as
+  "recompute". A host whose schema has moved behaves as it did before the port.
+
 ## Phase 5 — transport in the DO
 
 **SDK half done.** `AppServices` is generic over the plugin profile, defaulting

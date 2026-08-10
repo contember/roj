@@ -7,7 +7,7 @@
  */
 
 import type { Workspace } from '@cloudflare/computer'
-import type { AlarmScheduler } from '@roj-ai/computer-platform'
+import type { AlarmScheduler, SessionReaper } from '@roj-ai/computer-platform'
 import type { IsolateMethodSchemas, Services, System, isolatePlugins } from '@roj-ai/sdk'
 import type { Platform } from '@roj-ai/sdk/platform'
 
@@ -35,6 +35,8 @@ export interface LimitProbeContext {
 	boot: () => Booted
 	/** The alarm slot the agent loop's wakes ride on. */
 	scheduler: AlarmScheduler
+	/** Reclaims closed sessions. The DO's own — a probe cannot widen what it may delete. */
+	reaper: SessionReaper
 	/**
 	 * Drops the booted SDK as an eviction would. `keepWakes` suspends the scheduler
 	 * across the teardown, so `SessionManager.shutdown()` cannot cancel pending

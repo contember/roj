@@ -233,6 +233,35 @@ export class SqliteEventStore extends BaseEventStore {
 	}
 
 	// =========================================================================
+	// Deletion
+	// =========================================================================
+
+	/**
+	 * Drop every row this store holds for one session, and report how many events went.
+	 *
+	 * Deliberately outside the `EventStore` contract: the log is the only record a
+	 * session existed, so nothing in the SDK can reach this by accident. Whether a
+	 * session may be dropped is the caller's policy — see `createSessionReaper`,
+	 * which only calls it for a session the store itself reports as closed.
+	 */
+	async deleteSession(sessionId: SessionId): Promise<number> {
+		let events = 0
+
+		// Serialized with appends, so a delete cannot land between a batch's
+		// sequence claim and its inserts and leave the tail of that batch behind.
+		await this.appendSerialized(sessionId, async () => {
+			events = this.countRows(EVENTS_TABLE, sessionId)
+			// SQLite frees the pages but does not shrink the file, so databaseSize holds.
+			this.storage.sql.exec(`DELETE FROM ${EVENTS_TABLE} WHERE session_id = ?`, sessionId)
+			this.storage.sql.exec(`DELETE FROM ${METADATA_TABLE} WHERE session_id = ?`, sessionId)
+		})
+
+		// The chain's tail is per-session state; a deleted session must not keep one.
+		this.appendTails.delete(sessionId)
+		return events
+	}
+
+	// =========================================================================
 	// Metadata storage primitives
 	// =========================================================================
 
@@ -265,6 +294,15 @@ export class SqliteEventStore extends BaseEventStore {
 	// =========================================================================
 	// Internals
 	// =========================================================================
+
+	/** Rows one table holds for a session. */
+	private countRows(table: string, sessionId: SessionId): number {
+		const rows = this.storage.sql
+			.exec<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table} WHERE session_id = ?`, sessionId)
+			.toArray()
+
+		return rows[0]?.count ?? 0
+	}
 
 	/** Index of the last stored event, -1 when the session has none. */
 	private lastSeq(sessionId: SessionId): number {

@@ -12,8 +12,8 @@ import { Workspace, WorkspaceServiceProxy } from '@cloudflare/computer'
 import type { DurableObjectStorageLike, WorkspaceStub } from '@cloudflare/computer'
 import { WorkerShellBackend } from '@cloudflare/computer/backends/worker-shell'
 import { createGitClient } from '@cloudflare/computer/git'
-import { SqliteEventStore, createAlarmScheduler, createComputerPlatform, createShellProcessRunner } from '@roj-ai/computer-platform'
-import type { AlarmScheduler } from '@roj-ai/computer-platform'
+import { SqliteEventStore, createAlarmScheduler, createComputerPlatform, createSessionReaper, createShellProcessRunner } from '@roj-ai/computer-platform'
+import type { AlarmScheduler, ReapOptions, SessionReaper } from '@roj-ai/computer-platform'
 import { FileEventStore, bootstrap, createSystemFromServices, isolatePlugins } from '@roj-ai/sdk'
 import type { Config, IsolateMethodSchemas, Services, Session, SessionId, System } from '@roj-ai/sdk'
 import type { Platform } from '@roj-ai/sdk/platform'
@@ -30,6 +30,15 @@ import { runShellProbes } from './shell-probe.js'
 
 /** The SDK's System narrowed to the plugin set the isolate profile registers. */
 type IsolateSystem = System<IsolateMethodSchemas, typeof isolatePlugins>
+
+/** workerd freezes its clock between I/O, so a timer yield is what advances it (see bench.ts). */
+async function timedBlock(fn: () => Promise<void>): Promise<number> {
+	await scheduler.wait(0)
+	const start = Date.now()
+	await fn()
+	await scheduler.wait(0)
+	return Date.now() - start
+}
 
 /** EventStore errors wrap the real failure in `cause`, which stringifies to nothing. */
 function describeError(error: unknown): { error: string; cause?: string; stack?: string } {
@@ -55,6 +64,12 @@ const SHELL_BACKEND = 'shell'
 
 /** Alarm drains kept for /limits/scheduler to read back. Bounded — this is a debug tail. */
 const WAKE_LOG_LIMIT = 50
+
+/** Pulls per phase in the git-status gate measurement. */
+const GATE_ROUNDS = 25
+
+/** A gated pull is far too cheap to time once, so its phase runs this many times more. */
+const GATED_MULTIPLIER = 20
 
 /** Repository /git builds in a session workspace — a commit, then a dirty file. */
 const GIT_SETUP = [
@@ -82,6 +97,7 @@ export class RojAgentDO extends DurableObject<Env> {
 	readonly #workspace: Workspace
 	readonly #platform: Platform
 	readonly #eventStore: SqliteEventStore
+	readonly #reaper: SessionReaper
 	readonly #transport: DoTransport
 	readonly #scheduler: AlarmScheduler
 	/** Everything plugins have notified since boot — how /git observes git-status. */
@@ -121,6 +137,9 @@ export class RojAgentDO extends DurableObject<Env> {
 			process: createShellProcessRunner(this.#workspace, { backend: SHELL_BACKEND }),
 		}
 		this.#eventStore = new SqliteEventStore(storage)
+		// Reclaiming is the host's call, not a session hook's — see session-reaper.ts.
+		// Nothing calls this on its own; /reap and /limits/reaper are the two triggers.
+		this.#reaper = createSessionReaper({ eventStore: this.#eventStore, fs: this.#platform.fs, dataDir: DATA_ROOT })
 		this.#transport = createDoTransport(ctx, () => this.#boot())
 	}
 
@@ -283,6 +302,38 @@ export class RojAgentDO extends DurableObject<Env> {
 		}
 	}
 
+	/**
+	 * Reclaim what closed sessions left behind.
+	 *
+	 * The trigger lives on the host, not on `session.close()`: a closed session can
+	 * still be reopened, its log is the only record it ever ran, and the SDK's close
+	 * hooks fire for an isolate going away too. So the host says when — from an
+	 * operator call like this one, or from a maintenance alarm on a deploy.
+	 * `?events=1` opts into dropping the log as well; without it only files go.
+	 */
+	async reap(query: string): Promise<Response> {
+		const params = new URLSearchParams(query)
+		const optionalInt = (name: string): number | undefined => {
+			const raw = params.get(name)
+			if (raw === null) return undefined
+			const value = Number(raw)
+			if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be a number >= 0`)
+			return Math.floor(value)
+		}
+
+		try {
+			const options: ReapOptions = {
+				events: params.get('events') === '1',
+				dryRun: params.get('dryRun') === '1',
+				minAgeMs: optionalInt('minAgeMs'),
+				limit: optionalInt('limit'),
+			}
+			return Response.json({ ok: true, report: await this.#reaper.reap(options) })
+		} catch (error) {
+			return Response.json({ ok: false, ...describeError(error) }, { status: 500 })
+		}
+	}
+
 	/** Runs one probe from src/limits/ — see LIMIT_PROBES for the roster. */
 	async limits(name: string, query: string): Promise<Response> {
 		const load = LIMIT_PROBES[name]
@@ -297,6 +348,7 @@ export class RojAgentDO extends DurableObject<Env> {
 				ctx: this.ctx,
 				boot: () => this.#boot(),
 				scheduler: this.#scheduler,
+				reaper: this.#reaper,
 				evictSdk: (keepWakes) => this.#evictSdk(keepWakes),
 				wakeLog: () => this.#wakeLog,
 				backend: SHELL_BACKEND,
@@ -319,9 +371,9 @@ export class RojAgentDO extends DurableObject<Env> {
 	/**
 	 * End-to-end check of the git port: build a repo in a live session's workspace
 	 * through the shell's `git`, then read it back both directly off `platform.git`
-	 * and through the `git-status` plugin.
+	 * and through the `git-status` plugin, and measure what the revision gate saves.
 	 */
-	async git(): Promise<Response> {
+	async git(rounds: number): Promise<Response> {
 		const { system } = this.#boot()
 		const created = await system.sessionManager.createSession(isolatePreset.id)
 		if (!created.ok) {
@@ -363,9 +415,59 @@ export class RojAgentDO extends DurableObject<Env> {
 				port,
 				refresh: pulled.ok ? pulled.value : { error: pulled.error },
 				notified,
+				gate: rounds > 0 ? await this.#measureGate(session, workdir, rounds) : null,
 			})
 		} catch (error) {
 			return Response.json({ ok: false, ...describeError(error) }, { status: 500 })
+		}
+	}
+
+	/**
+	 * What `git-status`'s revision gate is worth: a pull that replays the answer it
+	 * has against one that recomputes it.
+	 *
+	 * Phases are bracketed once and divided rather than timed per pull — workerd
+	 * freezes the clock between I/O, so every reading costs a scheduler yield (see
+	 * bench.ts). The write that forces a recomputation is timed on its own and
+	 * subtracted, so `ungatedMs` is the pull alone in both rows.
+	 */
+	async #measureGate(session: Session, workdir: string, rounds: number): Promise<Record<string, number | null>> {
+		const revision = async (): Promise<number | null> => await this.#platform.fsRevision?.current() ?? null
+		const pull = async () => {
+			await session.callPluginMethod('git-status.refresh', { sessionId: String(session.id) })
+		}
+		const write = (round: number) => this.#platform.fs.writeFile(`${workdir}/scratch.txt`, `round ${round}\n`)
+
+		// The first pull after the shell setup also detects the default branch.
+		await pull()
+
+		const gatedRounds = rounds * GATED_MULTIPLIER
+		const before = await revision()
+		const gatedMs = await timedBlock(async () => {
+			for (let i = 0; i < gatedRounds; i++) await pull()
+		})
+		// Equal to `before` iff nothing wrote — the precondition the gate needs, and
+		// the check that the git read itself is not quietly touching the workspace.
+		const after = await revision()
+
+		const writeMs = await timedBlock(async () => {
+			for (let i = 0; i < rounds; i++) await write(i)
+		})
+		const bothMs = await timedBlock(async () => {
+			for (let i = 0; i < rounds; i++) {
+				await write(rounds + i)
+				await pull()
+			}
+		})
+
+		return {
+			rounds,
+			gatedRounds,
+			gatedMs: gatedMs / gatedRounds,
+			ungatedMs: (bothMs - writeMs) / rounds,
+			writeMs: writeMs / rounds,
+			revisionBefore: before,
+			revisionAfter: after,
 		}
 	}
 
@@ -467,7 +569,15 @@ export default {
 			return stub.shell(url.searchParams.get('cmd'))
 		}
 		if (url.pathname === '/git') {
-			return stub.git()
+			const rounds = Number(url.searchParams.get('rounds') ?? GATE_ROUNDS)
+			if (!Number.isSafeInteger(rounds) || rounds < 0) {
+				return new Response('rounds must be a non-negative integer\n', { status: 400 })
+			}
+			// Each run leaves a repo behind, so give every one its own DO.
+			return env.AGENT.get(env.AGENT.idFromName(`git:${crypto.randomUUID()}`)).git(rounds)
+		}
+		if (url.pathname === '/reap') {
+			return stub.reap(url.search)
 		}
 		if (url.pathname === '/limits') {
 			return Response.json({ probes: LIMIT_PROBE_NAMES })
@@ -480,7 +590,7 @@ export default {
 			return probeStub.limits(name, url.search)
 		}
 		if (url.pathname === '/') {
-			return new Response('GET /run?message=... | GET /bench?counts=100,500&stores=sqlite,file | GET /shell?cmd=... | GET /git | GET /limits\n', { status: 404 })
+			return new Response('GET /run?message=... | GET /bench?counts=100,500&stores=sqlite,file | GET /shell?cmd=... | GET /git?rounds=25 | GET /reap?events=1 | GET /limits\n', { status: 404 })
 		}
 		// Everything else is the SDK's own transport surface: /rpc, /health, /status, /sessions/*, /ws.
 		return stub.fetch(request)

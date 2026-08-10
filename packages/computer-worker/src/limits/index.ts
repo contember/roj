@@ -22,6 +22,8 @@ export const LIMIT_PROBES: Record<string, () => Promise<LimitProbe>> = {
 	scheduler: async () => (await import('./scheduler.js')).schedulerProbe,
 	/** What is still armed once a session settles — the precondition for hibernation. */
 	idle: async () => (await import('./idle.js')).idleProbe,
+	/** What a closed session leaves behind, and what reclaiming it buys back. */
+	reaper: async () => (await import('./reaper.js')).reaperProbe,
 }
 
 export const LIMIT_PROBE_NAMES = Object.keys(LIMIT_PROBES)

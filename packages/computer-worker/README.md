@@ -10,6 +10,8 @@ curl localhost:8787/run         # boot the SDK, run a two-agent session
 curl localhost:8787/bench       # replay scaling: ?counts=100,500&stores=sqlite,file
 curl localhost:8787/shell       # probe what just-bash implements; ?cmd=... for one command
 curl localhost:8787/git         # build a repo in a session workspace, read it back three ways
+                                # ?rounds=N also times the git-status revision gate (0 skips it)
+curl localhost:8787/reap        # reclaim closed sessions; ?events=1 drops their logs too
 curl localhost:8787/limits      # roster; /limits/<name> runs one probe — see "Limits" below
 ```
 
@@ -52,6 +54,10 @@ Five things the DO wires that the SDK's own defaults do not:
   and `commit` through the shell, then reads the same repo back off
   `platform.git` and through `git-status.refresh`, whose answer and whose
   notification must agree.
+- A `git-status` pull that the filesystem revision gates costs ~0.07 ms against
+  ~9 ms for one that recomputes — `/git?rounds=N` times both. `revisionBefore`
+  and `revisionAfter` bracket the gated phase and must be equal: they are the
+  proof that the git read itself writes nothing back into the workspace.
 - **Nothing roj owns is armed once a session settles** — no timer, no wake, no
   alarm. `/limits/idle` counts all three; see "An idle DO" below.
 
@@ -381,19 +387,96 @@ change; the agent never goes idle, and replay carries a `tool_use` with no
 earlier and fails cleanly with `recoverable: true` — but raising `maxTokens`, or
 any plugin putting an unbounded blob in an event, walks into it.
 
-**A DO degrades by lifetime, not by load.** Closing a session leaves its
-`/workspace/<sessionId>` directory and its event rows behind; one probe finished
-with 6 238 entries under `/workspace`. `createSession` goes from ~15 ms to
-~110 ms on a DO that has churned a few thousand sessions. A multi-session DO
-needs a reaper.
+**A DO accumulates for its whole lifetime.** Closing a session leaves its
+`/workspace/<sessionId>` directory, its `/data/sessions/<sessionId>` log
+directory and its event rows behind; one probe finished with 6 238 entries under
+`/workspace`. Nothing in the SDK reclaims any of it, so a long-lived object grows
+without bound — 2 500 sessions of the shape `/limits/reaper` creates cost 25.8 MB
+of DO SQLite and 10 000 filesystem entries. A multi-session DO needs a reaper;
+`/reap` and `/limits/reaper` are both below.
 
-Both probes saw creation degrade, and they disagree about why: the concurrency
-probe pins it on lifetime debris (32 live sessions on an aged DO were slower than
-448 on a fresh one), the memory probe on the per-session `git-status` interval
-(13 → 174 ms between 100 and 1000 live). Neither isolated the variable. Open —
-and still open in those two probes specifically, because both build their own
-manager through `withOwnScheduler()`, which is a `LiveScheduler`, so `git-status`
-does still poll there. The DO's own sessions no longer have that interval at all.
+### Reaping a closed session (`/reap`, `/limits/reaper`)
+
+**Nothing reaps on close.** `session.close()` seals the log but the session can
+still be `reopen()`ed, and `Session.shutdown()` runs the very same
+`onSessionClose` hooks when the *isolate* goes away — so a plugin hook cannot
+tell "this session is over" from "this object is being evicted", and one that
+deleted data would empty every loaded session's workspace on an eviction. The
+event log is also the only record the session ever ran. Reclaiming is therefore a
+host call, with the host's own retention policy: `createSessionReaper` in
+`@roj-ai/computer-platform`, wired in `RojAgentDO`'s constructor and reachable
+only from `GET /reap` and the probe.
+
+What it will and will not touch:
+
+| Guard | Rule |
+|---|---|
+| Closed only | It reaps what `SessionMetadata.status` says is `closed`, re-read per session and again after the files go, because the listing is a snapshot and `reopen()` can land between two awaits. |
+| Files by default | Only the workspace and the data directory. `?events=1` adds the rows, and `SqliteEventStore.deleteSession` is deliberately outside the `EventStore` contract so nothing in the SDK can reach it. |
+| Owned directories only | A `workspaceDir` whose last segment is not the session id came from a preset that shares one directory between sessions; it is reported, never removed — and its rows stay too, or nothing would name the directory again. |
+| Through the VFS | `fs.rm(dir, { recursive: true })`. `vfs_blobs` is content-addressed with no refcount, so hand-written SQL would either leak every blob or corrupt the files that share one. |
+| Idempotent | A files-only reap stamps `custom.reapedAt` on the rows it leaves. Without it the session still reads as closed and every later sweep re-walks it — 10 200 removals across 50 sweeps of 400 sessions, before the stamp existed. |
+
+`/limits/reaper` churns the same sessions six ways and reaps three of them, all
+inside one request so a shared box loads every arm equally. Each arm is preceded
+by a full reap, so all six start from the same clean object; `-do` arms drive the
+DO's own SessionManager on the alarm scheduler, the others build their own on a
+`LiveScheduler` the way every other probe does. `createSession` is the mean of
+the last window against the first, inside one arm.
+
+400 sessions per arm, 3 files and 27 events each:
+
+| arm | close | reap | createSession first → last | growth | entries left |
+|---|:--|:--|---:|---:|---:|
+| `all` | yes | files + rows | 9.8 → 9.9 ms | **1.01** | 0 |
+| `workspace` | yes | files | 9.7 → 9.4 ms | **0.96** | 0 |
+| `off` | yes | — | 10.0 → 12.7 ms | **1.27** | 1 600 |
+| `off-do` | yes | — | 4.6 → 4.3 ms | **0.94** | 1 600 |
+| `hold` | no | — | 8.6 → 25.4 ms | **2.96** | 1 600 |
+| `hold-do` | no | — | 7.4 → 4.6 ms | **0.61** | 1 600 |
+
+2 500 sessions per arm, the regime the ~110 ms observation came from:
+
+| arm | createSession first → last | growth | entries left | DO SQLite |
+|---|---:|---:|---:|---:|
+| `all` | 11.2 → 10.2 ms | **0.91** | 0 | 3.8 MB |
+| `off` | 11.2 → 32.8 ms | **2.93** | 10 000 | 25.8 MB |
+| `off-do` | 5.3 → 4.7 ms | **0.89** | 10 000 | 25.8 MB |
+
+**Which of the two explanations the numbers support: both, and they are the same
+one.** `off` degrades with a live count of 1, which rules out the interval as
+such — but `off-do` holds the identical 10 000 entries and stays flat, which
+rules out the debris as such. What costs is `git-status`'s `LiveScheduler` branch,
+whose per-session work grows with the accumulated filesystem; the debris is what
+makes it grow. `hold` at 300 live and `off` at 2 500 lifetime are the two faces
+of that, which is why the concurrency probe (aged DO) and the memory probe (many
+live) each saw one and neither saw the other. Both of them build their manager
+through `withOwnScheduler()`, so both were measuring that branch.
+
+Three consequences, in the order they matter:
+
+- **This DO already avoids the latency.** Its scheduler is the alarm scheduler,
+  so `git-status` takes neither branch: `off-do` and `hold-do` are flat, and
+  roughly 2× cheaper in absolute terms than the same work with the plugin live.
+  On this host the reaper's case is **storage**, not latency.
+- **On a Bun host the reaper is the latency fix too.** `all` stays flat at 2 500
+  where `off` is 2.9× worse, on the same `LiveScheduler` — reclaiming the debris
+  removes the growth without touching the plugin.
+- **Reaping is not free.** A sweep of 8 sessions costs ~120 ms, about 15 ms per
+  session against `createSession`'s ~10 ms, nearly all of it the recursive
+  removes. Sweep on a schedule with a grace period, not on every close.
+
+Two things the probe cannot see. `sql.databaseSize` never falls — SQLite frees
+pages on `DELETE` but does not shrink the file — so only the row counts and the
+entry counts show a reap landing. And a bare `mkdir` under `/workspace` is flat
+at ~0.4 ms whether the directory holds 4 siblings or 2 500, so whatever
+`git-status` pays for is not directory creation.
+
+One caveat on provenance: these runs were taken while `git-status` was being
+changed in the same tree, so the `own`-manager arms (`all`, `workspace`, `off`,
+`hold`) price whatever the plugin did at that moment. Re-run them once the
+revision gate settles — the `-do` arms and the storage figures do not depend on
+it.
 
 ### Three SDK defects the probes turned up
 

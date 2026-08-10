@@ -49,6 +49,7 @@ function workspaceGit(workspace: Workspace): ComputerGitClient | undefined {
 
 export { createComputerFileSystem, createComputerGitClient, createShellProcessRunner, createUnsupportedProcessRunner }
 export { createVfsRevision, type VfsRevisionSource } from './fs-revision.js'
+export { createSessionReaper, type ReapableEventStore, type ReapableFileSystem, type ReapedSession, type ReapOptions, type ReapReport, type ReapSkipped, type SessionReaper, type SessionReaperOptions } from './session-reaper.js'
 export { createAlarmScheduler } from './alarm-scheduler.js'
 export type {
 	AlarmScheduler,
