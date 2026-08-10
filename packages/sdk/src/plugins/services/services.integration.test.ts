@@ -1377,6 +1377,8 @@ describe('services plugin', () => {
 			expect(stateAfter?.status).toBe('stopped')
 			expect(stateAfter?.port).toBe(orphanPort)
 			expect(stateAfter?.pid).toBeUndefined()
+
+			await harness1.sessionManager.shutdown()
 		})
 
 		it('reclaims a failed entry a previous runtime left owning a process', async () => {

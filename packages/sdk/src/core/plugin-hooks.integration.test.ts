@@ -376,6 +376,57 @@ describe('core: plugin hooks', () => {
 			await harness.shutdown()
 		})
 
+		it('onSessionClose fires on manager shutdown, without closing the session', async () => {
+			const calls: string[] = []
+
+			const trackingPlugin = definePlugin('tracking')
+				.sessionHook('onSessionClose', async () => {
+					calls.push('onSessionClose')
+				})
+				.build()
+
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				systemPlugins: [trackingPlugin],
+			})
+
+			const session = await harness.createSession('test')
+			await harness.shutdown()
+
+			// Plugins must get to release their resources when the host goes away
+			expect(calls).toEqual(['onSessionClose'])
+
+			// ...but the session itself is not closed — nothing is written to the log
+			const closedEvents = await harness.eventStore.getEventsByType(session.sessionId, 'session_closed')
+			expect(closedEvents).toHaveLength(0)
+
+			const metadata = await harness.eventStore.getMetadata(session.sessionId)
+			expect(metadata?.status).toBe('active')
+		})
+
+		it('onSessionClose runs once when a closed session is shut down', async () => {
+			const calls: string[] = []
+
+			const trackingPlugin = definePlugin('tracking')
+				.sessionHook('onSessionClose', async () => {
+					calls.push('onSessionClose')
+				})
+				.build()
+
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				systemPlugins: [trackingPlugin],
+			})
+
+			const session = await harness.createSession('test')
+			await session.close()
+			await harness.shutdown()
+
+			expect(calls).toEqual(['onSessionClose'])
+		})
+
 		describe('beforeMethod', () => {
 			it('returning { action: "deny" } → method call rejected and handler not run', async () => {
 				let handlerCalls = 0
