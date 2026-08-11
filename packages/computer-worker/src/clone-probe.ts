@@ -12,6 +12,8 @@
 
 import type { Workspace } from '@cloudflare/computer'
 import type { Platform } from '@roj-ai/sdk/platform'
+import { runNativeStatusProbe } from './native-status-probe.js'
+import type { NativeStatusResult, SqlSource } from './native-status-probe.js'
 
 export interface CloneProbeResult {
 	url: string
@@ -39,6 +41,8 @@ export interface CloneProbeResult {
 	deltaPaths?: string[] | null
 	statusAfterEditMs?: number
 	statusAfterEditEntries?: number
+	/** The same questions asked of SQLite instead of of git — see native-status-probe.ts. */
+	native?: NativeStatusResult
 }
 
 interface WalkTotals {
@@ -78,8 +82,12 @@ export async function runCloneProbe(options: {
 	depth: number
 	token?: string
 	dbSize?: () => number | undefined
+	/** Workspace SQLite, for the native-status half. Omit to skip it. */
+	db?: SqlSource
+	/** Files the native probe rewrites before measuring the delta. */
+	touch?: number
 }): Promise<CloneProbeResult> {
-	const { platform, workspace, url, dir, ref, depth, token, dbSize } = options
+	const { platform, workspace, url, dir, ref, depth, token, dbSize, db, touch } = options
 
 	const dbBytesBefore = dbSize?.()
 	// workerd freezes its clock between I/O, so yield before reading it.
@@ -151,6 +159,12 @@ export async function runCloneProbe(options: {
 	await scheduler.wait(0)
 	result.statusAfterEditMs = Date.now() - afterEditStart
 	result.statusAfterEditEntries = afterEdit.length
+
+	// Runs last: it dirties the tree on purpose, so every measurement above is
+	// taken against the tree the clone produced.
+	if (db !== undefined) {
+		result.native = await runNativeStatusProbe({ platform, workspace, db, dir, touch: touch ?? 200 })
+	}
 
 	return result
 }

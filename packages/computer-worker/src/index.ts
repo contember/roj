@@ -394,7 +394,7 @@ export class RojAgentDO extends DurableObject<Env> {
 	}
 
 	/** Measure what a real repo costs to land in this filesystem. See clone-probe.ts. */
-	async clone(url: string, ref: string | null, depth: number): Promise<Response> {
+	async clone(url: string, ref: string | null, depth: number, touch: number): Promise<Response> {
 		try {
 			const result = await runCloneProbe({
 				platform: this.#platform,
@@ -405,6 +405,8 @@ export class RojAgentDO extends DurableObject<Env> {
 				depth,
 				...(this.env.GITHUB_TOKEN === undefined ? {} : { token: this.env.GITHUB_TOKEN }),
 				dbSize: () => this.ctx.storage.sql.databaseSize,
+				db: this.#workspace.db,
+				touch,
 			})
 			return Response.json({ ok: true, ...result })
 		} catch (error) {
@@ -637,9 +639,13 @@ export default {
 			if (!Number.isSafeInteger(depth) || depth < 0) {
 				return new Response('depth must be a non-negative integer\n', { status: 400 })
 			}
+			const touch = Number(url.searchParams.get('touch') ?? 200)
+			if (!Number.isSafeInteger(touch) || touch < 0) {
+				return new Response('touch must be a non-negative integer\n', { status: 400 })
+			}
 			// A clone is not repeatable in a workspace that already holds one.
 			return env.AGENT.get(env.AGENT.idFromName(`clone:${crypto.randomUUID()}`))
-				.clone(repo, url.searchParams.get('ref'), depth)
+				.clone(repo, url.searchParams.get('ref'), depth, touch)
 		}
 		if (url.pathname === '/reap') {
 			return stub.reap(url.search)
