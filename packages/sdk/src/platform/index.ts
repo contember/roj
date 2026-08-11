@@ -15,7 +15,7 @@ import type { Scheduler } from './scheduler.js'
 import type { SessionLogStore } from './session-log.js'
 
 export type { Dirent, FileHandle, FileSystem, ReadableFileHandle, Stats } from './fs.js'
-export type { FsRevision } from './fs-revision.js'
+export type { ChangedSinceOptions, FsChange, FsRevision } from './fs-revision.js'
 export type { GitClient, GitCommit, GitCountAheadOptions, GitLogOptions, GitRepoOptions, GitStatusEntry } from './git.js'
 export type { LLMCallOutcome, LLMCallPage, LLMCallRow, LLMCallStatus, LLMCallStore } from './llm-call-log.js'
 export type { ChildProcess, ExecFileOptions, ExecFileResult, ProcessRunner, SpawnOptions } from './process.js'
