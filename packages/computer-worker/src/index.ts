@@ -20,6 +20,7 @@ import type { Platform } from '@roj-ai/sdk/platform'
 import { DurableObject } from 'cloudflare:workers'
 import { runBench } from './bench.js'
 import type { BenchResult } from './bench.js'
+import { runCloneProbe } from './clone-probe.js'
 import { createDoTransport } from './do-transport.js'
 import type { DoTransport } from './do-transport.js'
 import type { WakeLogEntry } from './limits/context.js'
@@ -54,6 +55,8 @@ function describeError(error: unknown): { error: string; cause?: string; stack?:
 interface Env {
 	AGENT: DurableObjectNamespace<RojAgentDO>
 	LOADER: WorkerLoader
+	/** Read-only PAT for /clone against a private repo. Absent in normal runs. */
+	GITHUB_TOKEN?: string
 }
 
 /** Roj writes sessions, events and agent files below this root in the workspace. */
@@ -390,6 +393,25 @@ export class RojAgentDO extends DurableObject<Env> {
 		}
 	}
 
+	/** Measure what a real repo costs to land in this filesystem. See clone-probe.ts. */
+	async clone(url: string, ref: string | null, depth: number): Promise<Response> {
+		try {
+			const result = await runCloneProbe({
+				platform: this.#platform,
+				workspace: this.#workspace,
+				url,
+				dir: '/site',
+				...(ref === null ? {} : { ref }),
+				depth,
+				...(this.env.GITHUB_TOKEN === undefined ? {} : { token: this.env.GITHUB_TOKEN }),
+				dbSize: () => this.ctx.storage.sql.databaseSize,
+			})
+			return Response.json({ ok: true, ...result })
+		} catch (error) {
+			return Response.json({ ok: false, ...describeError(error) }, { status: 500 })
+		}
+	}
+
 	async shell(command: string | null): Promise<Response> {
 		try {
 			return Response.json({ ok: true, ...await runShellProbes({ platform: this.#platform, workspace: this.#workspace, backend: SHELL_BACKEND, command }) })
@@ -605,6 +627,19 @@ export default {
 			}
 			// Each run leaves a repo behind, so give every one its own DO.
 			return env.AGENT.get(env.AGENT.idFromName(`git:${crypto.randomUUID()}`)).git(rounds)
+		}
+		if (url.pathname === '/clone') {
+			const repo = url.searchParams.get('url')
+			if (repo === null) {
+				return new Response('url is required\n', { status: 400 })
+			}
+			const depth = Number(url.searchParams.get('depth') ?? 1)
+			if (!Number.isSafeInteger(depth) || depth < 0) {
+				return new Response('depth must be a non-negative integer\n', { status: 400 })
+			}
+			// A clone is not repeatable in a workspace that already holds one.
+			return env.AGENT.get(env.AGENT.idFromName(`clone:${crypto.randomUUID()}`))
+				.clone(repo, url.searchParams.get('ref'), depth)
 		}
 		if (url.pathname === '/reap') {
 			return stub.reap(url.search)
