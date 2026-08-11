@@ -22,15 +22,10 @@
  */
 
 import type { ChangedSinceOptions, FsChange, FsRevision } from '@roj-ai/sdk/platform'
+import type { VfsSource } from './vfs-source.js'
 
-/**
- * The queries this needs, as a structural type — `Workspace['db']` satisfies it.
- * Rows are `unknown` because their shape is the installed schema's business, not ours.
- */
-export interface VfsRevisionSource {
-	one(query: string, ...bindings: unknown[]): unknown
-	all(query: string, ...bindings: unknown[]): unknown[]
-}
+/** The queries this needs — `Workspace['db']` satisfies it. See vfs-source.ts. */
+export type VfsRevisionSource = VfsSource
 
 const REVISION_QUERY = "SELECT v FROM vfs_meta WHERE k = 'rev'"
 

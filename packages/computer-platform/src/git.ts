@@ -9,11 +9,25 @@
 
 import type { CommitView, GitClient as ComputerGitClient } from '@cloudflare/computer/git'
 import type { GitClient, GitCommit } from '@roj-ai/sdk/platform'
+import type { NativeGitStatus } from './git-status/status.js'
 
-export function createComputerGitClient(git: ComputerGitClient): GitClient {
+export interface ComputerGitClientOptions {
+	/**
+	 * Answers `status` from the workspace's SQLite where it can, and `undefined`
+	 * where it cannot. Without it every status is the binding's tree walk, which
+	 * on a real site repository is ~9.7 s — see git-status/status.ts.
+	 */
+	nativeStatus?: NativeGitStatus
+}
+
+export function createComputerGitClient(git: ComputerGitClient, clientOptions: ComputerGitClientOptions = {}): GitClient {
+	const { nativeStatus } = clientOptions
 	return {
 		// StatusEntry is already the port's XY shape — same codes, same meaning.
-		status: (options) => git.status({ dir: options.dir }),
+		async status(options) {
+			const native = await nativeStatus?.(options.dir)
+			return native ?? await git.status({ dir: options.dir })
+		},
 
 		async log(options) {
 			const commits = await git.log({ dir: options.dir, ref: options.ref, depth: options.depth })

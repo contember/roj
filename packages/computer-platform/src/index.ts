@@ -12,6 +12,7 @@ import type { Platform, Scheduler } from '@roj-ai/sdk/platform'
 import { createComputerFileSystem } from './fs.js'
 import { createVfsRevision } from './fs-revision.js'
 import { createComputerGitClient } from './git.js'
+import { createNativeGitStatus } from './git-status/status.js'
 import { createShellProcessRunner, createUnsupportedProcessRunner } from './process.js'
 
 export interface ComputerPlatformOptions {
@@ -27,10 +28,13 @@ export interface ComputerPlatformOptions {
 
 export function createComputerPlatform(workspace: Workspace, options: ComputerPlatformOptions = {}): Platform {
 	const git = workspaceGit(workspace)
+	const fs = createComputerFileSystem(workspace.provider())
 	return {
-		fs: createComputerFileSystem(workspace.provider()),
+		fs,
 		process: createUnsupportedProcessRunner(),
-		git: git && createComputerGitClient(git),
+		// The binding's own status walks every node in the tree — 9.7 s on a real
+		// site repository — so it answers only what the SQLite path will not.
+		git: git && createComputerGitClient(git, { nativeStatus: createNativeGitStatus({ db: workspace.db, git, fs }) }),
 		// Whole-DO counter, so it is a gate against unnecessary reads, not a scope.
 		fsRevision: createVfsRevision(workspace.db),
 		scheduler: options.scheduler ?? createTimerScheduler(),
@@ -48,7 +52,11 @@ function workspaceGit(workspace: Workspace): ComputerGitClient | undefined {
 }
 
 export { createComputerFileSystem, createComputerGitClient, createShellProcessRunner, createUnsupportedProcessRunner }
+export type { ComputerGitClientOptions } from './git.js'
+export { createNativeGitStatus } from './git-status/status.js'
+export type { NativeGitStatus, NativeGitStatusOptions } from './git-status/status.js'
 export { createVfsRevision, type VfsRevisionSource } from './fs-revision.js'
+export type { VfsSource } from './vfs-source.js'
 export { createSessionReaper, type ReapableEventStore, type ReapableFileSystem, type ReapableLLMCallLog, type ReapableSessionLog, type ReapedSession, type ReapOptions, type ReapReport, type ReapSkipped, type SessionReaper, type SessionReaperOptions } from './session-reaper.js'
 export { createAlarmScheduler } from './alarm-scheduler.js'
 export type {
