@@ -288,9 +288,12 @@ describe('git-status gated on the host filesystem revision', () => {
 
 	const pull = (session: Session) => session.callPluginMethod('git-status.refresh', { sessionId: String(session.id) })
 
+	/** A host with the counter but no delta — every recomputation is a full read. */
+	const noDelta = { changedSince: async (): Promise<undefined> => undefined }
+
 	test('replays the last answer while the revision stands still', async () => {
 		const git = countingGitClient()
-		const { session } = await bootSession(gatedPlatform(git.client, { current: async () => 7 }), recordingLogger([]))
+		const { session } = await bootSession(gatedPlatform(git.client, { ...noDelta, current: async () => 7 }), recordingLogger([]))
 
 		const first = await pull(session)
 		const second = await pull(session)
@@ -303,7 +306,7 @@ describe('git-status gated on the host filesystem revision', () => {
 		let committedAhead = 2
 		const git = countingGitClient({ countAhead: async () => committedAhead })
 		const { session, notifications } = await bootSession(
-			gatedPlatform(git.client, { current: async () => revision }),
+			gatedPlatform(git.client, { ...noDelta, current: async () => revision }),
 			recordingLogger([]),
 		)
 
@@ -330,8 +333,8 @@ describe('git-status gated on the host filesystem revision', () => {
 	test('reads on every pull where the host answers badly', async () => {
 		const warnings: string[] = []
 		const git = countingGitClient()
-		const unknown: FsRevision = { current: async () => undefined }
-		const broken: FsRevision = { current: () => Promise.reject(new Error('no such table: vfs_meta')) }
+		const unknown: FsRevision = { ...noDelta, current: async () => undefined }
+		const broken: FsRevision = { ...noDelta, current: () => Promise.reject(new Error('no such table: vfs_meta')) }
 
 		for (const fsRevision of [unknown, broken]) {
 			const { session } = await bootSession(gatedPlatform(git.client, fsRevision), recordingLogger(warnings))
@@ -342,5 +345,82 @@ describe('git-status gated on the host filesystem revision', () => {
 		// Two sessions, two pulls each, and not one of them gated.
 		expect(git.reads()).toBe(4)
 		expect(warnings).toEqual([])
+	})
+
+	/** Reports whatever the caller stages, under whichever workdir the session got. */
+	function deltaPort(revision: () => number, paths: () => string[]): FsRevision {
+		return {
+			current: async () => revision(),
+			changedSince: async (_since, options) => paths().map((path) => ({ path: `${options?.under ?? ''}/${path}`, deleted: false })),
+		}
+	}
+
+	function uncommittedCounts(notifications: readonly PluginNotification[]): number[] {
+		return notifications
+			.filter((entry) => entry.type === 'git_status_changed')
+			.map((entry) => (entry.payload as { uncommittedFiles: number }).uncommittedFiles)
+	}
+
+	test('extends the known set from the delta instead of walking the tree again', async () => {
+		let revision = 1
+		let changed: string[] = []
+		const git = countingGitClient()
+		const { session, notifications } = await bootSession(
+			gatedPlatform(git.client, deltaPort(() => revision, () => changed)),
+			recordingLogger([]),
+		)
+
+		await pull(session)
+		revision = 2
+		changed = ['added.txt']
+		await pull(session)
+
+		// One full read to seed the set; the second answer came from the delta.
+		expect(git.reads()).toBe(1)
+		expect(uncommittedCounts(notifications)).toEqual([2, 3])
+	})
+
+	test('re-reads in full when a commit moves HEAD', async () => {
+		let revision = 1
+		let oid = 'abc123'
+		const git = countingGitClient({ log: async () => [{ oid, message: 'add note\n', committedAt: COMMIT_SECONDS * 1000 }] })
+		const { session } = await bootSession(
+			gatedPlatform(git.client, deltaPort(() => revision, () => ['added.txt'])),
+			recordingLogger([]),
+		)
+
+		await pull(session)
+		revision = 2
+		oid = 'def456'
+		await pull(session)
+
+		// A commit is what makes files clean again, and no delta can report that.
+		expect(git.reads()).toBe(2)
+	})
+
+	test('ignores git\'s own bookkeeping and anything outside the working tree', async () => {
+		let revision = 1
+		const git = countingGitClient()
+		const { session, notifications } = await bootSession(
+			gatedPlatform(
+				git.client,
+				{
+					current: async () => revision,
+					changedSince: async (_since, options) => [
+						{ path: `${options?.under ?? ''}/.git/index`, deleted: false },
+						{ path: '/data/sessions/other/session.log', deleted: false },
+					],
+				},
+			),
+			recordingLogger([]),
+		)
+
+		await pull(session)
+		revision = 2
+		await pull(session)
+
+		expect(git.reads()).toBe(1)
+		// Neither path is an edit, so the count never moved and nothing was notified twice.
+		expect(uncommittedCounts(notifications)).toEqual([2])
 	})
 })

@@ -31,6 +31,15 @@
  * so a write in a neighbouring session costs this one a recomputation it did not
  * need; the trade only ever errs that way, which is the only direction a cache
  * over a working tree may err.
+ *
+ * The recomputation that follows is the expensive half, and on a real site it is
+ * ruinous: `git status` hashes every tracked file, ~1.2 ms each, so a 7,600-file
+ * repository answers in ~9.4 s — for one saved paragraph. So where the host can
+ * also say *what* moved, the count of uncommitted paths is seeded once by a full
+ * read and then carried forward by that delta, which is proportional to the edit
+ * rather than to the repository: the same measurement puts it at 2 ms. A commit
+ * moves HEAD and makes files clean again, which no delta can report, so that is
+ * where the full read runs again.
  */
 
 import { definePlugin } from '~/core/plugins/index.js'
@@ -38,7 +47,7 @@ import type { SessionId } from '~/core/sessions/schema.js'
 import { sessionIdSchema } from '~/core/sessions/schema.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import { Ok } from '~/lib/utils/result.js'
-import type { FsRevision } from '~/platform/fs-revision.js'
+import type { FsChange, FsRevision } from '~/platform/fs-revision.js'
 import type { GitClient } from '~/platform/git.js'
 import type { ProcessRunner } from '~/platform/process.js'
 import { isLiveScheduler } from '~/platform/scheduler.js'
@@ -47,6 +56,11 @@ import z from 'zod/v4'
 const POLL_INTERVAL_MS = 2000
 const GIT_TIMEOUT_MS = 5000
 const DEFAULT_BRANCH_FALLBACK = 'main'
+/**
+ * Past this many moved paths the delta stops being the cheaper question and the
+ * full read takes over — a checkout or a clone lands here, an edit never does.
+ */
+const CHANGE_SCAN_LIMIT = 1000
 
 const gitStatusSnapshotSchema = z.object({
 	committedAhead: z.number(),
@@ -78,6 +92,16 @@ interface SessionGitStatus {
 	 */
 	gated?: { revision: number; snapshot: GitStatusSnapshot | null }
 	defaultBranch?: string
+	/**
+	 * Which paths are known to differ from HEAD, carried forward across reads.
+	 *
+	 * `git status` costs a hash of every tracked file — ~1.2 ms each, so ~9.5 s on
+	 * a 7,600-file site — and an editor asks after every keystroke's save. So the
+	 * set is computed once and then extended by whatever the filesystem says moved,
+	 * which is proportional to the edit. `revision` is how far it has been carried;
+	 * `headOid` invalidates it, since a commit is what makes files clean again.
+	 */
+	dirty?: { paths: Set<string>; revision: number; headOid: string | null }
 	/** A tool wrote in this workspace since the last read. */
 	touched: boolean
 	/** Neither a git port nor a process table — no read can ever succeed here. */
@@ -188,7 +212,7 @@ async function readSnapshot(ctx: GitStatusCallContext, entry: SessionGitStatus):
 		}
 
 		const snapshot = git
-			? await computeGitStatusOverPort(git, workdir, baseBranch)
+			? await computeGitStatusOverPort(ctx, entry, git, workdir, baseBranch, revision)
 			: await computeGitStatus(processRunner, workdir, baseBranch)
 		if (!snapshot) {
 			// A workspace with no repository is an ordinary state the port reports
@@ -245,24 +269,98 @@ function snapshotsEqual(a: GitStatusSnapshot, b: GitStatusSnapshot): boolean {
 		&& a.lastCommitMessage === b.lastCommitMessage
 }
 
-async function computeGitStatusOverPort(git: GitClient, workdir: string, baseBranch: string): Promise<GitStatusSnapshot | null> {
+async function computeGitStatusOverPort(
+	ctx: GitStatusCallContext,
+	entry: SessionGitStatus,
+	git: GitClient,
+	workdir: string,
+	baseBranch: string,
+	revision: number | undefined,
+): Promise<GitStatusSnapshot | null> {
 	try {
-		const [committedAhead, entries, commits] = await Promise.all([
+		const [committedAhead, commits] = await Promise.all([
 			git.countAhead({ dir: workdir, base: baseBranch }),
-			git.status({ dir: workdir }),
 			git.log({ dir: workdir, depth: 1 }),
 		])
 
 		const head = commits[0]
+		const uncommittedFiles = await countUncommitted(ctx, entry, git, workdir, revision, head?.oid ?? null)
 		return {
 			committedAhead,
-			uncommittedFiles: entries.length,
+			uncommittedFiles,
 			lastCommitAt: head?.committedAt ?? null,
 			// The shell path reads `%s`, the subject — so take the same first line here.
 			lastCommitMessage: head ? subjectOf(head.message) : null,
 		}
 	} catch {
 		return null
+	}
+}
+
+/** `.git` is git's own bookkeeping, and a commit rewrites all of it. */
+function isRepoInternal(relative: string): boolean {
+	return relative === '.git' || relative.startsWith('.git/')
+}
+
+/** Absolute host path to the repo-relative one `git status` speaks, or null if outside. */
+function relativeTo(workdir: string, path: string): string | null {
+	const root = workdir.endsWith('/') ? workdir.slice(0, -1) : workdir
+	if (root === '' || root === '/') return path.replace(/^\//, '')
+	if (!path.startsWith(`${root}/`)) return null
+	return path.slice(root.length + 1)
+}
+
+/**
+ * How many paths differ from HEAD, extending the known set where the host can
+ * say what moved and recomputing in full where it cannot.
+ *
+ * The full read is still what seeds the set, and what a commit falls back to —
+ * clean-ness only resets when HEAD moves, and no delta can report that. Between
+ * commits the count can only ever be too high: a file rewritten with the bytes
+ * it already had moves the revision without differing from HEAD. Over-reporting
+ * an edit that was made is the direction this may err; hiding one is not.
+ */
+async function countUncommitted(
+	ctx: GitStatusCallContext,
+	entry: SessionGitStatus,
+	git: GitClient,
+	workdir: string,
+	revision: number | undefined,
+	headOid: string | null,
+): Promise<number> {
+	const fsRevision = ctx.platform.fsRevision
+	const tracked = entry.dirty
+
+	if (fsRevision && revision !== undefined && tracked && tracked.headOid === headOid) {
+		const changes = await changedSince(ctx, fsRevision, tracked.revision, workdir)
+		if (changes !== undefined) {
+			for (const change of changes) {
+				const relative = relativeTo(workdir, change.path)
+				if (relative === null || relative === '' || isRepoInternal(relative)) continue
+				tracked.paths.add(relative)
+			}
+			tracked.revision = revision
+			return tracked.paths.size
+		}
+	}
+
+	const entries = await git.status({ dir: workdir })
+	const paths = new Set(entries.map((status) => status.path))
+	entry.dirty = fsRevision && revision !== undefined ? { paths, revision, headOid } : undefined
+	return paths.size
+}
+
+/** Same contract as the port: a host that cannot answer costs a full recomputation, not a failure. */
+async function changedSince(
+	ctx: GitStatusCallContext,
+	fsRevision: FsRevision,
+	since: number,
+	workdir: string,
+): Promise<FsChange[] | undefined> {
+	try {
+		return await fsRevision.changedSince(since, { under: workdir, limit: CHANGE_SCAN_LIMIT })
+	} catch {
+		return undefined
 	}
 }
 

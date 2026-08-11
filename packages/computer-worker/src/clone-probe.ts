@@ -34,6 +34,9 @@ export interface CloneProbeResult {
 	statusRunsMs: number[]
 	/** Write one file, then ask for status — the loop a human is waiting on. */
 	editWriteMs?: number
+	/** The same edit answered from the filesystem revision instead of from git. */
+	deltaMs?: number
+	deltaPaths?: string[] | null
 	statusAfterEditMs?: number
 	statusAfterEditEntries?: number
 }
@@ -127,10 +130,21 @@ export async function runCloneProbe(options: {
 	}
 
 	// One edit, then the status the editor is waiting on — the actual feedback loop.
+	const revisionBeforeEdit = await platform.fsRevision?.current()
 	const editStart = Date.now()
 	await platform.fs.writeFile(`${dir}/roj-probe.txt`, 'edit\n')
 	await scheduler.wait(0)
 	result.editWriteMs = Date.now() - editStart
+
+	// The same question `git status` answers, asked of the filesystem instead:
+	// what moved. Reported verbatim so the paths can be checked, not just timed.
+	if (platform.fsRevision !== undefined && revisionBeforeEdit !== undefined) {
+		const deltaStart = Date.now()
+		const changes = await platform.fsRevision.changedSince(revisionBeforeEdit, { under: dir })
+		await scheduler.wait(0)
+		result.deltaMs = Date.now() - deltaStart
+		result.deltaPaths = changes?.map((change) => (change.deleted ? `- ${change.path}` : change.path)) ?? null
+	}
 
 	const afterEditStart = Date.now()
 	const afterEdit = await workspace.git.status({ dir })
