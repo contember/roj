@@ -170,6 +170,11 @@ function compilePattern(line: string): CompiledPattern | undefined {
 	}
 	if (pattern === '') return undefined
 
+	// A POSIX class is valid in a gitignore and means something else inside a JS
+	// character class, so the pattern is dropped rather than mistranslated into
+	// one that silently matches the wrong paths.
+	if (/\[:[a-z]+:\]/.test(pattern)) return undefined
+
 	// A separator anywhere but the (already stripped) end anchors the pattern to
 	// the directory its `.gitignore` sits in; otherwise it matches at any depth.
 	const anchored = pattern.includes('/')

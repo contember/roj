@@ -111,6 +111,15 @@ describe('createIgnoreMatcher', () => {
 		expect(await ignore.isIgnored('src/deep/generated/a.ts')).toBe(true)
 	})
 
+	// `[[:alpha:]]` is a class of letters to git and a class of `[`, `:` and those
+	// letters to a JS regex — a silently different answer, so the line is dropped.
+	test('drops a POSIX class rather than translating it into a different one', async () => {
+		const ignore = matcher({ [IGNORE_FILE]: '[[:alpha:]].md\n*.log\n' })
+		expect(await ignore.isIgnored('a.md')).toBe(false)
+		expect(await ignore.isIgnored('[.md')).toBe(false)
+		expect(await ignore.isIgnored('a.log')).toBe(true)
+	})
+
 	test('drops a pattern it cannot express rather than the file it came in', async () => {
 		const ignore = matcher({ [IGNORE_FILE]: '[unclosed\n*.log\n' })
 		expect(await ignore.isIgnored('a.log')).toBe(true)
