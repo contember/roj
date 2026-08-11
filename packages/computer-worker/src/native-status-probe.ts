@@ -50,6 +50,34 @@ export interface NativeStatusResult {
 	verifyMs: number
 	verifyDiffers: number
 	verifyError?: string
+	/** HEAD's own file list — what an exact index-vs-HEAD comparison would cost. */
+	lsFilesMs: number
+	lsFilesCount: number
+	/** The same tree read recursively, so the blob oid of every path is known. */
+	treeMs: number
+	treeBlobs: number
+	treeDirs: number
+	treeError?: string
+	/** The shipped native status against the binding it replaces, on a clean tree. */
+	clean: StatusComparison
+	/** The same pair after the probe's edits, an untracked file and an ignored one. */
+	dirty: StatusComparison
+	/** Repo-relative path of the file written into an ignored directory. */
+	ignored: string | null
+}
+
+/** One question, asked of both implementations. */
+export interface StatusComparison {
+	nativeMs: number
+	nativeEntries: number | null
+	bindingMs: number
+	bindingEntries: number
+	/** Do the two report the same paths? Null when the native side declined. */
+	agrees: boolean | null
+	/** Paths one reported and the other did not, capped for readability. */
+	nativeOnly?: string[]
+	bindingOnly?: string[]
+	error?: string
 }
 
 const ENUM_QUERY = `
@@ -80,6 +108,12 @@ const PARENT_QUERY = 'SELECT parent_inode AS parent FROM vfs_dirents WHERE child
 /** Candidates hashed against HEAD, enough to price one and not enough to dominate the run. */
 const VERIFY_SAMPLE = 25
 
+/** Disagreeing paths reported verbatim; past a handful the pattern is already clear. */
+const DIFF_SAMPLE = 10
+
+/** Directories a site repository almost certainly ignores; the first that takes a write wins. */
+const IGNORED_DIRS = ['node_modules', 'dist', '.astro', 'build'] as const
+
 function stringField(row: unknown, key: string): string | undefined {
 	if (typeof row !== 'object' || row === null || !(key in row)) return undefined
 	const value = Reflect.get(row, key)
@@ -108,6 +142,57 @@ function topLevelInode(db: SqlSource, name: string): number | null {
 	return null
 }
 
+/**
+ * The port's status against the binding's, on whatever the tree currently is.
+ *
+ * `platform.git` is the roj port, which answers from SQLite where it can;
+ * `workspace.git` is the isomorphic-git binding it replaces. Both are asked the
+ * same question, and the paths are compared rather than only the counts — two
+ * implementations that disagree by one addition and one omission would otherwise
+ * look identical.
+ */
+async function compareStatus(platform: Platform, workspace: Workspace, dir: string): Promise<StatusComparison> {
+	try {
+		await scheduler.wait(0)
+		const nativeStart = Date.now()
+		const native = await platform.git?.status({ dir })
+		await scheduler.wait(0)
+		const nativeMs = Date.now() - nativeStart
+
+		const bindingStart = Date.now()
+		const binding = await workspace.git.status({ dir })
+		await scheduler.wait(0)
+		const bindingMs = Date.now() - bindingStart
+
+		if (native === undefined) {
+			return { nativeMs, nativeEntries: null, bindingMs, bindingEntries: binding.length, agrees: null }
+		}
+
+		const nativePaths = new Set(native.map((entry) => entry.path))
+		const bindingPaths = new Set(binding.map((entry) => entry.path))
+		const nativeOnly = [...nativePaths].filter((path) => !bindingPaths.has(path))
+		const bindingOnly = [...bindingPaths].filter((path) => !nativePaths.has(path))
+		return {
+			nativeMs,
+			nativeEntries: native.length,
+			bindingMs,
+			bindingEntries: binding.length,
+			agrees: nativeOnly.length === 0 && bindingOnly.length === 0,
+			...(nativeOnly.length === 0 ? {} : { nativeOnly: nativeOnly.slice(0, DIFF_SAMPLE) }),
+			...(bindingOnly.length === 0 ? {} : { bindingOnly: bindingOnly.slice(0, DIFF_SAMPLE) }),
+		}
+	} catch (error) {
+		return {
+			nativeMs: 0,
+			nativeEntries: null,
+			bindingMs: 0,
+			bindingEntries: 0,
+			agrees: null,
+			error: error instanceof Error ? error.message : String(error),
+		}
+	}
+}
+
 export async function runNativeStatusProbe(options: {
 	platform: Platform
 	workspace: Workspace
@@ -117,6 +202,7 @@ export async function runNativeStatusProbe(options: {
 }): Promise<NativeStatusResult> {
 	const { platform, workspace, db, dir, touch } = options
 	const rootInode = topLevelInode(db, dir.replace(/^\//, ''))
+	const clean = await compareStatus(platform, workspace, dir)
 
 	// workerd freezes its clock between I/O, so every reading is bracketed by a yield.
 	await scheduler.wait(0)
@@ -173,6 +259,13 @@ export async function runNativeStatusProbe(options: {
 	const statusMs = Date.now() - statusStart
 
 	const verification = await verifyCandidates(platform, workspace, dir, targets.slice(0, VERIFY_SAMPLE))
+	const head = await readHeadTree(workspace, dir)
+
+	// An untracked file and one the repository's own .gitignore covers, so the
+	// comparison also exercises the half that has no index entry to lean on.
+	await platform.fs.writeFile(`${dir}/roj-untracked.txt`, 'untracked\n')
+	const ignored = await writeIgnored(platform, dir)
+	const dirty = await compareStatus(platform, workspace, dir)
 
 	return {
 		rootInode,
@@ -189,6 +282,71 @@ export async function runNativeStatusProbe(options: {
 		statusMs,
 		statusEntries: status.length,
 		...verification,
+		...head,
+		clean,
+		dirty,
+		ignored,
+	}
+}
+
+/**
+ * A file under whichever directory the repository's own `.gitignore` covers.
+ *
+ * Returns the path written, so the comparison below can be read against it —
+ * neither implementation should report it, and the one that does is wrong.
+ */
+async function writeIgnored(platform: Platform, dir: string): Promise<string | null> {
+	for (const candidate of IGNORED_DIRS) {
+		try {
+			await platform.fs.mkdir(`${dir}/${candidate}`, { recursive: true })
+			const path = `${candidate}/roj-ignored.txt`
+			await platform.fs.writeFile(`${dir}/${path}`, 'ignored\n')
+			return path
+		} catch {
+			// This repository does not have that directory; try the next candidate.
+		}
+	}
+	return null
+}
+
+/**
+ * What HEAD costs to read as a path list and as a path→oid map.
+ *
+ * The index says what is staged but not how that differs from HEAD, so an exact
+ * status has to read HEAD's tree at least once per commit. This prices both
+ * shapes of that read: the flat list isomorphic-git already walks for `ls-files`,
+ * and the recursive `ls-tree` that also yields every blob's oid.
+ */
+async function readHeadTree(
+	workspace: Workspace,
+	dir: string,
+): Promise<{ lsFilesMs: number; lsFilesCount: number; treeMs: number; treeBlobs: number; treeDirs: number; treeError?: string }> {
+	try {
+		await scheduler.wait(0)
+		const listStart = Date.now()
+		const listed = await workspace.git.lsFiles({ dir, ref: 'HEAD' })
+		await scheduler.wait(0)
+		const lsFilesMs = Date.now() - listStart
+
+		const treeStart = Date.now()
+		const oids = new Map<string, string>()
+		let dirs = 0
+		const stack = ['']
+		while (stack.length > 0) {
+			const prefix = stack.pop()
+			if (prefix === undefined) break
+			dirs += 1
+			const entries = await workspace.git.lsTree({ dir, ref: 'HEAD', ...(prefix === '' ? {} : { path: prefix }) })
+			for (const entry of entries) {
+				const path = prefix === '' ? entry.path : `${prefix}/${entry.path}`
+				if (entry.type === 'tree') stack.push(path)
+				else oids.set(path, entry.oid)
+			}
+		}
+		await scheduler.wait(0)
+		return { lsFilesMs, lsFilesCount: listed.length, treeMs: Date.now() - treeStart, treeBlobs: oids.size, treeDirs: dirs }
+	} catch (error) {
+		return { lsFilesMs: 0, lsFilesCount: 0, treeMs: 0, treeBlobs: 0, treeDirs: 0, treeError: error instanceof Error ? error.message : String(error) }
 	}
 }
 
