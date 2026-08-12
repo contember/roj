@@ -77,12 +77,16 @@ export async function withRetry<T, E>(
 		}
 
 		lastError = result.error
+		attempt++
 
-		if (!options.isRetryable(lastError)) {
+		if (options.signal?.aborted) {
+			return Err(options.abortError ?? lastError)
+		}
+
+		if (attempt >= opts.maxAttempts || !options.isRetryable(lastError)) {
 			return result
 		}
 
-		attempt++
 		const delay = calculateDelay(attempt, lastError, opts, options.getRetryDelay)
 
 		if (options.logger) {
