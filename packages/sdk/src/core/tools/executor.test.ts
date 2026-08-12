@@ -45,6 +45,7 @@ const createTestContext = (): ToolContext => {
 		platform: createNodePlatform(),
 		logger: silentLogger,
 		emitEvent: async () => {},
+		emitEvents: async () => {},
 		notify: () => {},
 		agentId,
 		agentState,

@@ -1081,6 +1081,7 @@ export class Agent {
 			platform: this.sessionContext.platform,
 			logger: this.logger,
 			emitEvent: this.sessionContext.emitEvent,
+			emitEvents: this.sessionContext.emitEvents,
 			notify: this.sessionContext.notify,
 			// AgentContext fields
 			agentId: this.id,

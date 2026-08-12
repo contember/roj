@@ -18,11 +18,15 @@ export const uploadEvents = createEventsFactory({
 			agentId: z4.string(),
 			uploadIds: z4.array(uploadIdSchema),
 		}),
+		attachment_deletion_completed: z4.object({
+			uploadId: uploadIdSchema,
+		}),
 	},
 })
 
 export type AttachmentUploadedEvent = (typeof uploadEvents)['Events']['attachment_uploaded']
 export type AttachmentsConsumedEvent = (typeof uploadEvents)['Events']['attachments_consumed']
+export type AttachmentDeletionCompletedEvent = (typeof uploadEvents)['Events']['attachment_deletion_completed']
 
 /** A pending upload tracked in session state */
 export interface PendingUpload {

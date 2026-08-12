@@ -95,6 +95,9 @@ async function createTestAgent(
 		emitEvent: async (event) => {
 			await store.emit(withSessionId(TEST_SESSION_ID, event))
 		},
+		emitEvents: async (events) => {
+			await store.emitBatch(events.map((event) => withSessionId(TEST_SESSION_ID, event)))
+		},
 		notify: () => {},
 	}
 

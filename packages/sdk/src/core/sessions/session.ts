@@ -598,6 +598,9 @@ export class Session {
 				emitEvent: async (event) => {
 					await this.store.emit(withSessionId(this.id, event))
 				},
+				emitEvents: async (events) => {
+					await this.store.emitBatch(events.map((event) => withSessionId(this.id, event)))
+				},
 				notify: (type, payload) => {
 					this.onUserOutput?.({ pluginName: '_agent', type, payload })
 				},
@@ -749,6 +752,9 @@ export class Session {
 			logger: this.logger,
 			emitEvent: async (event) => {
 				await this.store.emit(withSessionId(this.id, event))
+			},
+			emitEvents: async (events) => {
+				await this.store.emitBatch(events.map((event) => withSessionId(this.id, event)))
 			},
 			notify: (type, payload) => {
 				this.onUserOutput?.({ pluginName: '_session', type, payload })
