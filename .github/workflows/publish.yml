@@ -12,6 +12,10 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: publish-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -20,6 +24,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Verify release ancestry
+        run: git merge-base --is-ancestor "${{ github.sha }}" origin/main
 
       - uses: actions/setup-node@v4
         with:
@@ -45,11 +52,19 @@ jobs:
       - name: TypeScript build
         run: bun run ts:build
 
+      - name: Type-check SDK tests
+        run: bunx tsc -p packages/sdk/tsconfig.test.json --noEmit
+
       - name: Run tests
         run: bun run test
 
+      - name: Run release tooling tests
+        run: bun run test:release
+
       - name: Prepare package manifests
-        run: node ./scripts/npm-publish/prepare-packages.mjs "${{ github.ref_name }}"
+        run: node ./scripts/npm-publish/prepare-packages.mjs "$RELEASE_VERSION"
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
 
       - name: Pack and validate published artifacts
         run: node ./scripts/npm-publish/pack-and-validate.mjs
