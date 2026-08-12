@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import { ChildProcess } from 'node:child_process'
-import { Writable } from 'node:stream'
+import { PassThrough, Writable } from 'node:stream'
 import type { SessionEnvironment } from '~/core/sessions/session-environment.js'
 import type { ExecFileResult, ProcessRunner } from '~/platform/process.js'
 import { createNodePlatform } from '~/testing/node-platform.js'
@@ -221,7 +221,7 @@ describe('ShellExecutor', () => {
 		expect(result.value.exitCode).toBe(0)
 	})
 
-	it('contains stdin EPIPE errors inside the tool call', async () => {
+	it('returns an error when stdin delivery fails before a zero exit', async () => {
 		const stdin = new Writable({
 			write(_chunk, _encoding, callback) {
 				const error = new Error('broken pipe')
@@ -255,9 +255,212 @@ describe('ShellExecutor', () => {
 			createTestEnvironment(),
 		)
 
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.message).toContain('Failed to deliver command stdin')
+		expect(result.error.message).toContain('broken pipe')
+		expect(result.error.details).toEqual(expect.objectContaining({ exitCode: 0 }))
+	})
+
+	it('returns success when stdin delivery finishes before a zero exit', async () => {
+		let written = ''
+		const stdin = new Writable({
+			write(chunk, _encoding, callback) {
+				written += chunk.toString()
+				callback()
+			},
+		})
+		const child = new ChildProcess()
+		Object.defineProperties(child, {
+			pid: { value: 424_244 },
+			stdin: { value: stdin },
+			stdout: { value: null },
+			stderr: { value: null },
+		})
+		const processRunner: ProcessRunner = {
+			spawn: () => {
+				setTimeout(() => child.emit('close', 0, null), 0)
+				return child
+			},
+			execFile: async (): Promise<ExecFileResult> => {
+				throw new Error('Unexpected execFile call')
+			},
+		}
+		const executor = new ShellExecutor(defaultConfig, {
+			fs: testPlatform.fs,
+			process: processRunner,
+		})
+
+		const result = await executor.execute(
+			{ command: 'reads-stdin', stdin: 'delivered input' },
+			createTestEnvironment(),
+		)
+
 		expect(result.ok).toBe(true)
 		if (!result.ok) return
 		expect(result.value.exitCode).toBe(0)
+		expect(written).toBe('delivered input')
+	})
+
+	it('gives stdin delivery failure precedence over a nonzero exit', async () => {
+		const stdout = new PassThrough()
+		const stderr = new PassThrough()
+		const stdin = new Writable({
+			write(_chunk, _encoding, callback) {
+				callback(new Error('stdin rejected'))
+			},
+		})
+		const child = new ChildProcess()
+		Object.defineProperties(child, {
+			pid: { value: 424_245 },
+			stdin: { value: stdin },
+			stdout: { value: stdout },
+			stderr: { value: stderr },
+		})
+		const processRunner: ProcessRunner = {
+			spawn: () => {
+				stdout.end('partial output\n')
+				stderr.end('command diagnostics\n')
+				setTimeout(() => child.emit('close', 17, 'SIGTERM'), 0)
+				return child
+			},
+			execFile: async (): Promise<ExecFileResult> => {
+				throw new Error('Unexpected execFile call')
+			},
+		}
+		const executor = new ShellExecutor(defaultConfig, {
+			fs: testPlatform.fs,
+			process: processRunner,
+		})
+
+		const result = await executor.execute(
+			{ command: 'rejects-stdin', stdin: 'undelivered input' },
+			createTestEnvironment(),
+		)
+
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.message).toContain('stdin rejected')
+		expect(result.error.details).toEqual(expect.objectContaining({
+			stdout: 'partial output',
+			stderr: 'command diagnostics',
+			exitCode: 17,
+			signal: 'SIGTERM',
+			timedOut: false,
+			durationMs: expect.any(Number),
+		}))
+	})
+
+	it('waits for close after a process error and keeps timeout termination active', async () => {
+		const killSignals: NodeJS.Signals[] = []
+		const child = new ChildProcess()
+		Object.defineProperties(child, {
+			pid: { value: 424_246 },
+			stdin: { value: null },
+			stdout: { value: null },
+			stderr: { value: null },
+			kill: {
+				value: (signal: NodeJS.Signals) => {
+					killSignals.push(signal)
+					return true
+				},
+			},
+		})
+		const processRunner: ProcessRunner = {
+			spawn: () => child,
+			execFile: async (): Promise<ExecFileResult> => {
+				throw new Error('Unexpected execFile call')
+			},
+		}
+		const executor = new ShellExecutor({ ...defaultConfig, timeout: 10 }, {
+			fs: testPlatform.fs,
+			process: processRunner,
+		})
+		let completed = false
+		const resultPromise = executor.execute({ command: 'runtime-error' }, createTestEnvironment())
+		resultPromise.then(() => {
+			completed = true
+		})
+
+		child.emit('error', new Error('runtime process error'))
+		await Bun.sleep(30)
+		expect(completed).toBe(false)
+		expect(killSignals).toEqual(['SIGTERM'])
+
+		child.emit('close', null, 'SIGTERM')
+		const result = await resultPromise
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.message).toContain('runtime process error')
+	})
+
+	it('fails when a child closes before stdin settles', async () => {
+		let finishWrite: (() => void) | undefined
+		const stdin = new Writable({
+			write(_chunk, _encoding, callback) {
+				finishWrite = callback
+			},
+		})
+		const child = new ChildProcess()
+		Object.defineProperties(child, {
+			pid: { value: 424_247 },
+			stdin: { value: stdin },
+			stdout: { value: null },
+			stderr: { value: null },
+		})
+		const processRunner: ProcessRunner = {
+			spawn: () => child,
+			execFile: async (): Promise<ExecFileResult> => {
+				throw new Error('Unexpected execFile call')
+			},
+		}
+		const executor = new ShellExecutor(defaultConfig, {
+			fs: testPlatform.fs,
+			process: processRunner,
+		})
+		const resultPromise = executor.execute(
+			{ command: 'closes-early', stdin: 'pending input' },
+			createTestEnvironment(),
+		)
+
+		child.emit('close', 0, null)
+		const result = await resultPromise
+		finishWrite?.()
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.message).toContain('closed before accepting all stdin input')
+	})
+
+	it('fails when requested stdin is unavailable', async () => {
+		const child = new ChildProcess()
+		Object.defineProperties(child, {
+			pid: { value: 424_248 },
+			stdin: { value: null },
+			stdout: { value: null },
+			stderr: { value: null },
+		})
+		const processRunner: ProcessRunner = {
+			spawn: () => {
+				setTimeout(() => child.emit('close', 0, null), 0)
+				return child
+			},
+			execFile: async (): Promise<ExecFileResult> => {
+				throw new Error('Unexpected execFile call')
+			},
+		}
+		const executor = new ShellExecutor(defaultConfig, {
+			fs: testPlatform.fs,
+			process: processRunner,
+		})
+
+		const result = await executor.execute(
+			{ command: 'missing-stdin', stdin: 'input' },
+			createTestEnvironment(),
+		)
+
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.message).toContain('stdin is unavailable')
 	})
 
 	it(
