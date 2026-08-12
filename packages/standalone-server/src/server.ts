@@ -16,7 +16,7 @@ import type { Config, LLMMiddleware, LocalResource, Logger, Preset, SessionId, S
 import { bootstrap, createSystemFromServices, loadConfig, validateConfig } from '@roj-ai/sdk'
 import { createApp } from '@roj-ai/sdk/transport/http/app'
 import { createAgentTransport, ServerAdapter } from '@roj-ai/sdk/transport/adapter'
-import { createBunPlatform } from '@roj-ai/sdk/bun-platform'
+import { createBunPlatform, createServerLifecycle, runServerStartup, shutdownFromSignal } from '@roj-ai/sdk/bun-platform'
 import { createBunWebSocketHandlers } from '@roj-ai/transport/bun'
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
@@ -54,20 +54,6 @@ export interface StandaloneHandle {
 	/** Underlying session manager. Exposed for tests that need to assert on session state. */
 	sessionManager: SessionManager
 	shutdown(): Promise<void>
-}
-
-export async function shutdownFromSignal(
-	shutdown: () => Promise<void>,
-	reportError: (message: string, error: unknown) => void = (message, error) => console.error(message, error),
-	exit: (code: number) => void = (code) => process.exit(code),
-): Promise<void> {
-	try {
-		await shutdown()
-	} catch (error) {
-		reportError('Shutdown failed', error)
-	} finally {
-		exit(0)
-	}
 }
 
 export async function startStandaloneServer(options: StartStandaloneOptions): Promise<StandaloneHandle> {
@@ -189,18 +175,36 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 
 	const server = startBunServer(config, outerApp, serverAdapter)
 	publicPort = server.port ?? config.port
-
-	try {
-		await sessionManager.loadAllSessions()
-	} catch (err) {
-		logger.error('Failed to load persisted sessions', err instanceof Error ? err : new Error(String(err)))
+	let transportStopPromise: Promise<void> | undefined
+	let transportStopErrorReported = false
+	const stopTransportOnce = async () => {
+		transportStopPromise ??= Promise.resolve().then(() => transport.stop())
+		try {
+			await transportStopPromise
+		} catch (error) {
+			if (transportStopErrorReported) return
+			transportStopErrorReported = true
+			throw error
+		}
 	}
 
-	try {
-		await transport.start()
-	} catch (err) {
-		logger.error('Transport start failed', err instanceof Error ? err : new Error(String(err)))
-	}
+	const lifecycle = createServerLifecycle({
+		stopIngress: () => server.stop(true),
+		cleanupSteps: [
+			...options.onShutdown ? [options.onShutdown] : [],
+			() => sessionManager.shutdown(),
+			stopTransportOnce,
+		],
+		runSignalShutdown: shutdown => {
+			void shutdownFromSignal(shutdown)
+		},
+	})
+
+	await runServerStartup(lifecycle, [
+		{ run: () => sessionManager.loadAllSessions() },
+		// A pending connection is canceled before the remaining ordered cleanup.
+		{ run: () => transport.start(), cancel: stopTransportOnce },
+	])
 
 	logger.info('Standalone server started', {
 		host: config.host,
@@ -209,24 +213,7 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 		url: getPublicBaseUrl(),
 	})
 
-	const shutdown = async () => {
-		logger.info('Shutting down standalone server...')
-		if (options.onShutdown) {
-			await options.onShutdown()
-		}
-		await sessionManager.shutdown()
-		await transport.stop()
-		server.stop()
-	}
-
-	process.on('SIGINT', () => {
-		void shutdownFromSignal(shutdown)
-	})
-	process.on('SIGTERM', () => {
-		void shutdownFromSignal(shutdown)
-	})
-
-	return { config, logger, instance, port: publicPort, sessionManager, shutdown }
+	return { config, logger, instance, port: publicPort, sessionManager, shutdown: lifecycle.shutdown }
 }
 
 export function resolveStandaloneHost(configHost: string | undefined, envHost: string | undefined): string {

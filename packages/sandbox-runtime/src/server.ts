@@ -11,7 +11,7 @@ import { type AppEnv, createApp } from '@roj-ai/sdk/transport/http/app'
 import { createAgentTransport, type IAgentTransport, ServerAdapter } from '@roj-ai/sdk/transport/adapter'
 import { bunWebSocketFactory, createBunWebSocketHandlers } from '@roj-ai/transport/bun'
 import type { Hono } from 'hono'
-import { createBunPlatform } from '@roj-ai/sdk/bun-platform'
+import { createBunPlatform, createServerLifecycle, runServerStartup, shutdownFromSignal } from '@roj-ai/sdk/bun-platform'
 import { SANDBOX_RUNTIME_NAME, SANDBOX_RUNTIME_VERSION } from './info.js'
 
 // ============================================================================
@@ -31,20 +31,6 @@ export interface ServerHandle {
 	config: Config
 	logger: Logger
 	shutdown(): Promise<void>
-}
-
-export async function shutdownFromSignal(
-	shutdown: () => Promise<void>,
-	reportError: (message: string, error: unknown) => void = (message, error) => console.error(message, error),
-	exit: (code: number) => void = (code) => process.exit(code),
-): Promise<void> {
-	try {
-		await shutdown()
-	} catch (error) {
-		reportError('Shutdown failed', error)
-	} finally {
-		exit(0)
-	}
 }
 
 // ============================================================================
@@ -97,19 +83,37 @@ export async function startServer(options: StartServerOptions): Promise<ServerHa
 	})
 
 	const server = startBunServer(config, app, transport)
-
-	// Load persisted sessions after HTTP server is up (health checks pass during loading)
-	try {
-		await sessionManager.loadAllSessions()
-	} catch (error) {
-		logger.error('Failed to load persisted sessions', error instanceof Error ? error : new Error(String(error)))
+	let transportStopPromise: Promise<void> | undefined
+	let transportStopErrorReported = false
+	const stopTransportOnce = async () => {
+		transportStopPromise ??= Promise.resolve().then(() => transport.stop())
+		try {
+			await transportStopPromise
+		} catch (error) {
+			if (transportStopErrorReported) return
+			transportStopErrorReported = true
+			throw error
+		}
 	}
 
-	try {
-		await transport.start()
-	} catch (error) {
-		logger.error('Transport connection failed (will retry via reconnect)', error instanceof Error ? error : new Error(String(error)))
-	}
+	const lifecycle = createServerLifecycle({
+		stopIngress: () => server.stop(true),
+		cleanupSteps: [
+			...options.onShutdown ? [options.onShutdown] : [],
+			() => sessionManager.shutdown(),
+			stopTransportOnce,
+		],
+		runSignalShutdown: shutdown => {
+			void shutdownFromSignal(shutdown)
+		},
+	})
+
+	// Load persisted sessions after HTTP server is up (health checks pass during loading).
+	await runServerStartup(lifecycle, [
+		{ run: () => sessionManager.loadAllSessions() },
+		// A pending connection is canceled before the remaining ordered cleanup.
+		{ run: () => transport.start(), cancel: stopTransportOnce },
+	])
 
 	logger.info('Agent server started', {
 		host: config.host,
@@ -118,24 +122,7 @@ export async function startServer(options: StartServerOptions): Promise<ServerHa
 		mode: isWorkerMode ? 'worker' : 'standalone',
 	})
 
-	const shutdown = async () => {
-		logger.info('Shutting down...')
-		if (options.onShutdown) {
-			await options.onShutdown()
-		}
-		await sessionManager.shutdown()
-		await transport.stop()
-		server.stop()
-	}
-
-	process.on('SIGINT', () => {
-		void shutdownFromSignal(shutdown)
-	})
-	process.on('SIGTERM', () => {
-		void shutdownFromSignal(shutdown)
-	})
-
-	return { config, logger, shutdown }
+	return { config, logger, shutdown: lifecycle.shutdown }
 }
 
 // ============================================================================
