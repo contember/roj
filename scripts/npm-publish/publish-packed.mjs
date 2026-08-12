@@ -1,5 +1,3 @@
-import { spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -8,6 +6,9 @@ import {
 	publishedDependencyFields,
 	topologicallySortWorkspacePackages,
 } from './workspace-plan.mjs'
+import { fileHashes } from './artifact-validation.mjs'
+import { assertReleaseAncestry } from './check-release-ancestry.mjs'
+import { decidePublish, runNpm } from './release-policy.mjs'
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(scriptDir, '../..')
@@ -16,7 +17,7 @@ if (!manifestInput) throw new Error('PACKAGE_TARBALL_MANIFEST is required')
 const manifestPath = path.resolve(manifestInput)
 
 const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
-if (manifest.schemaVersion !== 1 || !manifest.validatedAt || !Array.isArray(manifest.packages)) {
+if (manifest.schemaVersion !== 2 || !manifest.validatedAt || !Array.isArray(manifest.packages)) {
 	throw new Error(`Invalid validated tarball manifest: ${manifestPath}`)
 }
 
@@ -39,17 +40,29 @@ for (let index = 0; index < publishOrder.length; index++) {
 		throw new Error(`Tarball manifest entry does not match ${workspace.pkg.name}`)
 	}
 	await stat(packed.tarball)
-	const actualHash = createHash('sha256').update(await readFile(packed.tarball)).digest('hex')
-	if (actualHash !== packed.sha256) throw new Error(`Validated tarball changed after validation: ${packed.tarball}`)
+	const actualHashes = await fileHashes(packed.tarball)
+	if (actualHashes.sha256 !== packed.sha256 || actualHashes.integrity !== packed.integrity) {
+		throw new Error(`Validated tarball changed after validation: ${packed.tarball}`)
+	}
 }
 
 console.log(`Verified ${manifest.packages.length} validated tarballs before publishing`)
 if (process.argv.includes('--check')) process.exit(0)
 
+assertReleaseAncestry({
+	commit: process.env.ROJ_RELEASE_COMMIT ?? process.env.GITHUB_SHA ?? 'HEAD',
+	releaseRef: process.env.ROJ_RELEASE_REF ?? 'origin/main',
+})
+
 const npmTag = process.env.NPM_TAG ?? 'latest'
 for (const entry of manifest.packages) {
+	const decision = decidePublish(entry, npmTag)
+	if (decision.action === 'skip') {
+		console.log(`\n→ Skipping ${entry.name}@${entry.version}: ${decision.reason}`)
+		continue
+	}
 	console.log(`\n→ Publishing ${entry.name} (tag: ${npmTag})`)
-	const result = spawnSync('npm', ['publish', entry.tarball, '--tag', npmTag, '--access', 'public', '--provenance'], {
+	const result = runNpm(['publish', entry.tarball, '--tag', npmTag, '--access', 'public', '--provenance'], {
 		stdio: 'inherit',
 	})
 	if (result.error) throw result.error

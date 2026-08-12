@@ -26,6 +26,10 @@ fi
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+RELEASE_COMMIT="${ROJ_RELEASE_COMMIT:-HEAD}"
+RELEASE_REF="${ROJ_RELEASE_REF:-origin/main}"
+node ./scripts/npm-publish/check-release-ancestry.mjs "$RELEASE_COMMIT" "$RELEASE_REF"
+
 if ! command -v npm > /dev/null; then
   echo "npm not found in PATH" >&2
   exit 1
