@@ -358,7 +358,7 @@ describe('resources plugin', () => {
 				content: 'Mock response',
 				toolCalls: [],
 				finishReason: 'stop',
-				metrics: { inputTokens: 0, outputTokens: 0 },
+				metrics: { promptTokens: 0, completionTokens: 0, totalTokens: 0, latencyMs: 0, model: 'mock' },
 			}),
 		}, { presets: [createTestPreset()] }, platform)
 		const sessionRuntime = createSessionManager(services)
