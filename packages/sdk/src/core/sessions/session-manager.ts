@@ -661,11 +661,18 @@ export class SessionManager {
 			Array.from(this.sessions.values()).map((p) => p.catch(() => null)),
 		)
 
-		for (const session of sessions) {
-			if (session) {
-				session.shutdown()
+		await Promise.all(sessions.map(async (session) => {
+			if (!session) return
+			try {
+				await session.dispose()
+			} catch (error) {
+				this.logger.error(
+					'Failed to dispose session during shutdown',
+					error instanceof Error ? error : new Error(String(error)),
+					{ sessionId: session.id },
+				)
 			}
-		}
+		}))
 		this.sessions.clear()
 		for (const cleanup of this.sessionListenerCleanup.values()) {
 			cleanup()
@@ -818,11 +825,6 @@ export class SessionManager {
 		plugins: ConfiguredPlugin[],
 		opts: { skipReadyHooks?: boolean } = {},
 	): Promise<Session> {
-		// Only register cache eviction listener for active sessions (not closed)
-		if (store.getState().status !== 'closed') {
-			this.registerSessionEventListener(store.sessionId, store)
-		}
-
 		const sessionDir = this.getSessionDir(store.sessionId)
 		const sessionLogger = new TeeLogger([
 			this.logger.child({ sessionId: store.sessionId }),
@@ -844,6 +846,11 @@ export class SessionManager {
 			llmLogger: this.llmLogger,
 			platform: this.platform,
 		})
+
+		// Only register cache eviction listener for active sessions (not closed)
+		if (store.getState().status !== 'closed') {
+			this.registerSessionEventListener(store.sessionId, store, session)
+		}
 
 		// Ensure session and workspace directories exist before plugins run
 		await this.platform.fs.mkdir(sessionDir, { recursive: true })
@@ -896,14 +903,29 @@ export class SessionManager {
 	 * Cleans up any previous listener for this sessionId (from a prior load)
 	 * to prevent duplicate listeners firing on old stores.
 	 */
-	private registerSessionEventListener(sessionId: SessionId, store: SessionStore): void {
+	private registerSessionEventListener(sessionId: SessionId, store: SessionStore, session: Session): void {
 		const prevCleanup = this.sessionListenerCleanup.get(sessionId)
 		if (prevCleanup) prevCleanup()
 
+		const evict = () => {
+			if (this.sessionListenerCleanup.get(sessionId) !== unsubscribe) return
+			this.sessions.delete(sessionId)
+			unsubscribe()
+			this.sessionListenerCleanup.delete(sessionId)
+		}
+
 		const unsubscribe = store.onEvent((event) => {
-			if (event.type === 'session_closed' || event.type === 'session_reopened') {
-				this.sessions.delete(sessionId)
-				this.sessionListenerCleanup.delete(sessionId)
+			if (event.type === 'session_closed') {
+				session.dispose().then(evict, (error) => {
+					this.logger.error(
+						'Failed to dispose closed session',
+						error instanceof Error ? error : new Error(String(error)),
+						{ sessionId },
+					)
+					evict()
+				})
+			} else if (event.type === 'session_reopened') {
+				evict()
 			}
 		})
 		this.sessionListenerCleanup.set(sessionId, unsubscribe)

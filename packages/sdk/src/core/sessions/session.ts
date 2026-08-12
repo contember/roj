@@ -100,6 +100,7 @@ export class Session {
 	private readonly agents = new Map<AgentId, Agent>()
 	/** Cached plugin contexts created by plugin.createContext() */
 	private readonly pluginContexts = new Map<string, unknown>()
+	private disposalPromise?: Promise<void>
 
 	constructor(deps: SessionDependencies) {
 		this.id = deps.store.sessionId
@@ -189,7 +190,7 @@ export class Session {
 
 	/**
 	 * Close the session.
-	 * Emits session_closed event — hooks and agent shutdown are handled reactively by handleSessionClosed().
+	 * Emits session_closed, then awaits the shared runtime disposal path.
 	 */
 	async close(): Promise<Result<void, DomainError>> {
 		if (this.store.isClosed()) {
@@ -197,6 +198,7 @@ export class Session {
 		}
 
 		await this.store.emit(withSessionId(this.id, sessionEvents.create('session_closed', {})))
+		await this.dispose()
 
 		return Ok(undefined)
 	}
@@ -425,16 +427,11 @@ export class Session {
 	}
 
 	/**
-	 * Shutdown the session - stop all agent processing.
+	 * Dispose runtime resources without changing persisted session state.
 	 */
-	shutdown(): void {
-		for (const agent of this.agents.values()) {
-			try {
-				agent.shutdown()
-			} catch {
-				// Suppress errors during shutdown
-			}
-		}
+	dispose(): Promise<void> {
+		this.disposalPromise ??= Promise.resolve().then(() => this.performDisposal())
+		return this.disposalPromise
 	}
 
 	/**
@@ -634,8 +631,8 @@ export class Session {
 				break
 			}
 			case 'session_closed': {
-				this.handleSessionClosed().catch((err) => {
-					this.logger.error('Unhandled error in handleSessionClosed()', err instanceof Error ? err : undefined, { sessionId: this.id })
+				this.dispose().catch((err) => {
+					this.logger.error('Unhandled error in session disposal', err instanceof Error ? err : undefined, { sessionId: this.id })
 				})
 				break
 			}
@@ -643,13 +640,13 @@ export class Session {
 	}
 
 	/**
-	 * Handle session_closed event — call close hooks and shutdown agents.
+	 * Call close hooks and release all in-memory runtime state.
 	 *
 	 * Unlike onSessionReady (which re-throws), onSessionClose intentionally
 	 * swallows per-plugin errors so that all plugins get a chance to clean up
 	 * and agents are always shut down, even if one plugin's close hook fails.
 	 */
-	private async handleSessionClosed(): Promise<void> {
+	private async performDisposal(): Promise<void> {
 		// Call onSessionClose for all plugins in REVERSE order (per-plugin isolation)
 		const reversedPlugins = [...this.plugins].reverse()
 		for (const plugin of reversedPlugins) {
@@ -680,7 +677,7 @@ export class Session {
 		this.pluginContexts.clear()
 		this.store.clearListeners()
 
-		this.logger.info('Session closed', { sessionId: this.id })
+		this.logger.info('Session runtime disposed', { sessionId: this.id })
 	}
 
 	/**
