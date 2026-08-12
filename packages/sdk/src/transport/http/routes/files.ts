@@ -6,7 +6,7 @@
  */
 
 import { Hono } from 'hono'
-import { resolve } from 'node:path'
+import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { getMimeType, preventTraversal } from '~/plugins/filesystem/listing.js'
 import { SessionId } from '~/core/sessions/schema.js'
 import { type AppContext, type AppEnv, getServices } from '../context.js'
@@ -24,10 +24,42 @@ import { type AppContext, type AppEnv, getServices } from '../context.js'
 function extractWildcardPath(c: AppContext, marker: string): string {
 	const idx = c.req.path.indexOf(`/${marker}/`)
 	if (idx === -1) return ''
-	return c.req.path.slice(idx + marker.length + 2)
+	try {
+		return decodeURIComponent(c.req.path.slice(idx + marker.length + 2))
+	} catch {
+		return ''
+	}
 }
 
-async function serveFile(c: AppContext, filePath: string): Promise<Response> {
+type CanonicalPathResult =
+	| { status: 'ok'; path: string }
+	| { status: 'not_found' }
+	| { status: 'forbidden' }
+
+async function resolveCanonicalPath(c: AppContext, rootPath: string, targetPath: string): Promise<CanonicalPathResult> {
+	const { platform } = getServices(c)
+	let canonicalRoot: string
+	let canonicalTarget: string
+	try {
+		canonicalRoot = await platform.fs.realpath(rootPath)
+		canonicalTarget = await platform.fs.realpath(targetPath)
+	} catch {
+		return { status: 'not_found' }
+	}
+
+	const relativeTarget = relative(canonicalRoot, canonicalTarget)
+	const isContained = relativeTarget === '' || (
+		!isAbsolute(relativeTarget)
+		&& relativeTarget !== '..'
+		&& !relativeTarget.startsWith(`..${sep}`)
+	)
+
+	return isContained
+		? { status: 'ok', path: canonicalTarget }
+		: { status: 'forbidden' }
+}
+
+async function serveFile(c: AppContext, filePath: string, mimePath: string): Promise<Response> {
 	const { platform } = getServices(c)
 	let data: Buffer
 	try {
@@ -39,7 +71,7 @@ async function serveFile(c: AppContext, filePath: string): Promise<Response> {
 		)
 	}
 
-	const contentType = getMimeType(filePath)
+	const contentType = getMimeType(mimePath)
 
 	return new Response(data, {
 		headers: {
@@ -93,7 +125,21 @@ export function createFileRoutes(): Hono<AppEnv> {
 			)
 		}
 
-		return serveFile(c, resolvedPath)
+		const canonicalPath = await resolveCanonicalPath(c, sessionDir, resolvedPath)
+		if (canonicalPath.status === 'forbidden') {
+			return c.json(
+				{ error: { type: 'forbidden', message: 'Symlink traversal not allowed' } },
+				403,
+			)
+		}
+		if (canonicalPath.status === 'not_found') {
+			return c.json(
+				{ error: { type: 'not_found', message: 'File not found' } },
+				404,
+			)
+		}
+
+		return serveFile(c, canonicalPath.path, resolvedPath)
 	})
 
 	// --- Serve workspace file ---
@@ -124,7 +170,21 @@ export function createFileRoutes(): Hono<AppEnv> {
 			)
 		}
 
-		return serveFile(c, resolvedPath)
+		const canonicalPath = await resolveCanonicalPath(c, workspaceDir, resolvedPath)
+		if (canonicalPath.status === 'forbidden') {
+			return c.json(
+				{ error: { type: 'forbidden', message: 'Symlink traversal not allowed' } },
+				403,
+			)
+		}
+		if (canonicalPath.status === 'not_found') {
+			return c.json(
+				{ error: { type: 'not_found', message: 'File not found' } },
+				404,
+			)
+		}
+
+		return serveFile(c, canonicalPath.path, resolvedPath)
 	})
 
 	return app
