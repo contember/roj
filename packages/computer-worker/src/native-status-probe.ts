@@ -16,6 +16,8 @@
  */
 
 import type { Workspace } from '@cloudflare/computer'
+import { createNativeDiffSummary } from '@roj-ai/computer-platform'
+import type { NativeDiffSummary } from '@roj-ai/computer-platform'
 import type { Platform } from '@roj-ai/sdk/platform'
 import { runVfsCostProbe } from './vfs-cost-probe.js'
 import type { RawQuery, VfsCostResult } from './vfs-cost-probe.js'
@@ -66,8 +68,27 @@ export interface NativeStatusResult {
 	dirty: StatusComparison
 	/** Repo-relative path of the file written into an ignored directory. */
 	ignored: string | null
+	/** `diffSummary` from SQLite against the binding's, over the same dirty tree. */
+	diff?: DiffComparison
 	/** Where the per-node cost goes, layer by layer — see vfs-cost-probe.ts. */
 	cost?: VfsCostResult
+}
+
+/**
+ * `git diff --numstat`, asked of both implementations.
+ *
+ * Counts are compared per path, not just totals, so a diff that is fast because
+ * it is wrong shows up as a disagreement rather than as a good number.
+ */
+export interface DiffComparison {
+	nativeMs: number
+	nativeEntries: number | null
+	bindingMs: number
+	bindingEntries: number | null
+	/** Paths whose status or line counts differ, capped for readability. */
+	disagreements: string[]
+	agrees: boolean | null
+	error?: string
 }
 
 /** One question, asked of both implementations. */
@@ -158,6 +179,61 @@ function topLevelInode(db: SqlSource, name: string): number | null {
  * implementations that disagree by one addition and one omission would otherwise
  * look identical.
  */
+const MAX_DISAGREEMENTS = 10
+
+async function compareDiff(native: NativeDiffSummary, workspace: Workspace, dir: string): Promise<DiffComparison> {
+	try {
+		await scheduler.wait(0)
+		const nativeStart = Date.now()
+		const ours = await native(dir)
+		await scheduler.wait(0)
+		const nativeMs = Date.now() - nativeStart
+
+		const bindingStart = Date.now()
+		const theirs = await workspace.git.diffSummary({ dir })
+		await scheduler.wait(0)
+		const bindingMs = Date.now() - bindingStart
+
+		if (ours === undefined) {
+			return { nativeMs, nativeEntries: null, bindingMs, bindingEntries: theirs.length, disagreements: [], agrees: null }
+		}
+
+		const mine = new Map(ours.map((entry) => [entry.path, entry]))
+		const disagreements: string[] = []
+		for (const entry of theirs) {
+			const found = mine.get(entry.path)
+			if (found === undefined) {
+				disagreements.push(`${entry.path}: binding only`)
+			} else if (found.status !== entry.status || found.insertions !== entry.insertions || found.deletions !== entry.deletions) {
+				disagreements.push(
+					`${entry.path}: ${found.status}+${found.insertions}-${found.deletions} vs ${entry.status}+${entry.insertions}-${entry.deletions}`,
+				)
+			}
+			mine.delete(entry.path)
+		}
+		for (const path of mine.keys()) disagreements.push(`${path}: native only`)
+
+		return {
+			nativeMs,
+			nativeEntries: ours.length,
+			bindingMs,
+			bindingEntries: theirs.length,
+			disagreements: disagreements.slice(0, MAX_DISAGREEMENTS),
+			agrees: disagreements.length === 0,
+		}
+	} catch (error) {
+		return {
+			nativeMs: 0,
+			nativeEntries: null,
+			bindingMs: 0,
+			bindingEntries: null,
+			disagreements: [],
+			agrees: null,
+			error: error instanceof Error ? error.message : String(error),
+		}
+	}
+}
+
 async function compareStatus(platform: Platform, workspace: Workspace, dir: string): Promise<StatusComparison> {
 	try {
 		await scheduler.wait(0)
@@ -276,6 +352,14 @@ export async function runNativeStatusProbe(options: {
 	const ignored = await writeIgnored(platform, dir)
 	const dirty = await compareStatus(platform, workspace, dir)
 
+	// Same dirty tree, so the diff is measured over a real change set rather
+	// than over nothing.
+	const diff = await compareDiff(
+		createNativeDiffSummary({ db: workspace.db, git: workspace.git, fs: platform.fs }),
+		workspace,
+		dir,
+	)
+
 	return {
 		rootInode,
 		enumMs,
@@ -294,6 +378,7 @@ export async function runNativeStatusProbe(options: {
 		...head,
 		clean,
 		dirty,
+		diff,
 		ignored,
 		...(rootInode === null ? {} : {
 			cost: await runVfsCostProbe({
