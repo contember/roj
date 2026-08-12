@@ -14,6 +14,7 @@ import type { Workspace } from '@cloudflare/computer'
 import type { Platform } from '@roj-ai/sdk/platform'
 import { runNativeStatusProbe } from './native-status-probe.js'
 import type { NativeStatusResult, SqlSource } from './native-status-probe.js'
+import type { RawQuery } from './vfs-cost-probe.js'
 
 export interface CloneProbeResult {
 	url: string
@@ -86,8 +87,10 @@ export async function runCloneProbe(options: {
 	db?: SqlSource
 	/** Files the native probe rewrites before measuring the delta. */
 	touch?: number
+	/** One statement against the DO's own SQL API, for the layer breakdown. */
+	rawQuery?: RawQuery
 }): Promise<CloneProbeResult> {
-	const { platform, workspace, url, dir, ref, depth, token, dbSize, db, touch } = options
+	const { platform, workspace, url, dir, ref, depth, token, dbSize, db, touch, rawQuery } = options
 
 	const dbBytesBefore = dbSize?.()
 	// workerd freezes its clock between I/O, so yield before reading it.
@@ -163,7 +166,14 @@ export async function runCloneProbe(options: {
 	// Runs last: it dirties the tree on purpose, so every measurement above is
 	// taken against the tree the clone produced.
 	if (db !== undefined) {
-		result.native = await runNativeStatusProbe({ platform, workspace, db, dir, touch: touch ?? 200 })
+		result.native = await runNativeStatusProbe({
+			platform,
+			workspace,
+			db,
+			dir,
+			touch: touch ?? 200,
+			...(rawQuery === undefined ? {} : { rawQuery }),
+		})
 	}
 
 	return result

@@ -17,6 +17,8 @@
 
 import type { Workspace } from '@cloudflare/computer'
 import type { Platform } from '@roj-ai/sdk/platform'
+import { runVfsCostProbe } from './vfs-cost-probe.js'
+import type { RawQuery, VfsCostResult } from './vfs-cost-probe.js'
 
 /** The `all` slice of `Workspace['db']`, structurally — rows are the schema's business. */
 export interface SqlSource {
@@ -64,6 +66,8 @@ export interface NativeStatusResult {
 	dirty: StatusComparison
 	/** Repo-relative path of the file written into an ignored directory. */
 	ignored: string | null
+	/** Where the per-node cost goes, layer by layer — see vfs-cost-probe.ts. */
+	cost?: VfsCostResult
 }
 
 /** One question, asked of both implementations. */
@@ -113,6 +117,9 @@ const DIFF_SAMPLE = 10
 
 /** Directories a site repository almost certainly ignores; the first that takes a write wins. */
 const IGNORED_DIRS = ['node_modules', 'dist', '.astro', 'build'] as const
+
+/** Enough iterations for a sub-millisecond operation to register on a frozen clock. */
+const DEFAULT_COST_SAMPLES = 2000
 
 function stringField(row: unknown, key: string): string | undefined {
 	if (typeof row !== 'object' || row === null || !(key in row)) return undefined
@@ -199,8 +206,10 @@ export async function runNativeStatusProbe(options: {
 	db: SqlSource
 	dir: string
 	touch: number
+	rawQuery?: RawQuery
+	costSamples?: number
 }): Promise<NativeStatusResult> {
-	const { platform, workspace, db, dir, touch } = options
+	const { platform, workspace, db, dir, touch, rawQuery, costSamples } = options
 	const rootInode = topLevelInode(db, dir.replace(/^\//, ''))
 	const clean = await compareStatus(platform, workspace, dir)
 
@@ -286,6 +295,18 @@ export async function runNativeStatusProbe(options: {
 		clean,
 		dirty,
 		ignored,
+		...(rootInode === null ? {} : {
+			cost: await runVfsCostProbe({
+				platform,
+				workspace,
+				db,
+				rootInode,
+				dir,
+				paths,
+				samples: costSamples ?? DEFAULT_COST_SAMPLES,
+				...(rawQuery === undefined ? {} : { rawQuery }),
+			}),
+		}),
 	}
 }
 

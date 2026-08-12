@@ -407,6 +407,11 @@ export class RojAgentDO extends DurableObject<Env> {
 				dbSize: () => this.ctx.storage.sql.databaseSize,
 				db: this.#workspace.db,
 				touch,
+				// The same lookup the workspace's Database wrapper makes, but straight
+				// off the DO's SQL API — the wrapper's own cost is the difference.
+				rawQuery: (inode) =>
+					this.ctx.storage.sql.exec<{ size: number }>('SELECT size FROM vfs_nodes WHERE inode = ? LIMIT 1', inode)
+						.toArray().length,
 			})
 			return Response.json({ ok: true, ...result })
 		} catch (error) {
