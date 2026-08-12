@@ -7,11 +7,36 @@
  * organization resources into sessions, bypassing the uploads/attachment pipeline.
  */
 
-import { parseError, sessionNotFound } from '../responses.js'
 import { Hono } from 'hono'
+import z from 'zod/v4'
+import { SessionId } from '~/core/sessions/schema.js'
+import { ResourceBasenameSchema } from '~/plugins/resources/filename.js'
 import type { AppContext, AppEnv } from '../context.js'
 import { getServices } from '../context.js'
-import { SessionId } from '~/core/sessions/schema.js'
+import { parseError, sessionNotFound } from '../responses.js'
+
+const ResourceRequestSchema = z.object({
+	url: z.string().min(1),
+	filename: z.string().min(1),
+	mimeType: z.string().min(1),
+	metadata: z.object({
+		slug: z.string().optional(),
+		name: z.string().optional(),
+	}).optional(),
+}).superRefine((body, refinement) => {
+	if (body.mimeType !== 'application/zip' && !ResourceBasenameSchema.safeParse(body.filename).success) {
+		refinement.addIssue({
+			code: 'custom',
+			path: ['filename'],
+			message: 'Resource filename must be a basename',
+		})
+	}
+})
+
+const ResourceInjectResultSchema = z.object({
+	resourceId: z.string(),
+	paths: z.array(z.string()),
+})
 
 export function createResourceRoutes(): Hono<AppEnv> {
 	const app = new Hono<AppEnv>()
@@ -27,19 +52,21 @@ export function createResourceRoutes(): Hono<AppEnv> {
 		}
 
 		// 2. Parse JSON body
-		let body: { url: string; filename: string; mimeType: string; metadata?: { slug?: string; name?: string } }
+		let rawBody: unknown
 		try {
-			body = await c.req.json()
+			rawBody = await c.req.json()
 		} catch {
 			return parseError(c, 'Failed to parse JSON body')
 		}
 
-		if (!body.url || !body.filename || !body.mimeType) {
+		const parsedBody = ResourceRequestSchema.safeParse(rawBody)
+		if (!parsedBody.success) {
 			return c.json(
-				{ error: { type: 'validation_error', message: 'Missing required fields: url, filename, mimeType' } },
+				{ error: { type: 'validation_error', message: parsedBody.error.message } },
 				400,
 			)
 		}
+		const body = parsedBody.data
 
 		// 3. Fetch URL
 		const maxSize = 50 * 1024 * 1024 // 50MB
@@ -97,12 +124,19 @@ export function createResourceRoutes(): Hono<AppEnv> {
 			)
 		}
 
-		const injectResult = result.value as { resourceId: string; paths: string[] }
+		const injectResult = ResourceInjectResultSchema.safeParse(result.value)
+		if (!injectResult.success) {
+			logger.error('Resource injection returned an invalid result', undefined, { sessionId: String(sessionId) })
+			return c.json(
+				{ error: { type: 'internal_error', message: 'Resource injection returned an invalid result' } },
+				500,
+			)
+		}
 
 		return c.json({
 			ok: true,
-			resourceId: injectResult.resourceId,
-			paths: injectResult.paths,
+			resourceId: injectResult.data.resourceId,
+			paths: injectResult.data.paths,
 		}, 201)
 	})
 

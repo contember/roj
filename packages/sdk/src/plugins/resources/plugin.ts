@@ -1,9 +1,11 @@
-import { join, relative, resolve } from 'node:path'
+import { join, posix, resolve } from 'node:path'
 import z from 'zod/v4'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
+import { inspectZipArchive } from '~/lib/archive/index.js'
 import { Ok } from '~/lib/utils/result.js'
 import type { FileSystem } from '~/platform/fs.js'
 import type { ProcessRunner } from '~/platform/process.js'
+import { ResourceBasenameSchema } from './filename.js'
 import { RESOURCE_MANIFEST_FILENAME, type ResourceManifest, ResourceManifestSchema } from './manifest.js'
 import {
 	type PostInjectContext,
@@ -11,9 +13,10 @@ import {
 	type PostInjectHook,
 	postInjectRules,
 } from './post-inject.js'
-import { type InjectedResource, resourceEvents, type ResourcesState } from './state.js'
+import { type InjectedResource, type ResourcesState, resourceEvents } from './state.js'
 
-const MAX_LISTED_PATHS = 100
+const ARCHIVE_TIMEOUT_MS = 120_000
+const ARCHIVE_MAX_BUFFER = 50 * 1024 * 1024
 
 export interface ResourcesTargetDirArgs {
 	sessionId: string
@@ -40,33 +43,52 @@ function makeExec(processRunner: ProcessRunner) {
 		options?: PostInjectExecOptions,
 	): Promise<{ stdout: string; stderr: string }> {
 		return processRunner.execFile(cmd, args, {
-			timeout: options?.timeout ?? 120_000,
-			maxBuffer: 50 * 1024 * 1024,
+			timeout: options?.timeout ?? ARCHIVE_TIMEOUT_MS,
+			maxBuffer: ARCHIVE_MAX_BUFFER,
 			cwd: options?.cwd,
 			env: options?.env ? { ...process.env, ...options.env } : undefined,
 		})
 	}
 }
 
-async function listFiles(fs: FileSystem, dir: string, maxEntries: number): Promise<string[]> {
-	const results: string[] = []
+function normalizeArchiveEntryPath(path: string): string {
+	return posix.normalize(path)
+}
 
-	async function walk(current: string): Promise<void> {
-		if (results.length >= maxEntries) return
-		const entries = await fs.readdir(current, { withFileTypes: true })
-		for (const entry of entries) {
-			if (results.length >= maxEntries) break
-			const fullPath = join(current, entry.name)
-			if (entry.isDirectory()) {
-				await walk(fullPath)
-			} else {
-				results.push(relative(dir, fullPath))
-			}
+function isExcludedGitPath(path: string): boolean {
+	const normalized = normalizeArchiveEntryPath(path)
+	return normalized === '.git' || normalized.startsWith('.git/')
+}
+
+function getErrorCode(error: unknown): string | undefined {
+	return error instanceof Error && 'code' in error && typeof error.code === 'string'
+		? error.code
+		: undefined
+}
+
+async function unlinkIfPresent(fs: FileSystem, path: string): Promise<void> {
+	try {
+		await fs.unlink(path)
+	} catch (error) {
+		if (getErrorCode(error) !== 'ENOENT') throw error
+	}
+}
+
+async function verifiedExtractedPaths(
+	fs: FileSystem,
+	stagingDir: string,
+	entryPaths: readonly string[],
+): Promise<string[]> {
+	const paths = [...new Set(entryPaths
+		.map(normalizeArchiveEntryPath)
+		.filter(path => !isExcludedGitPath(path)))]
+	for (const path of paths) {
+		const stats = await fs.stat(join(stagingDir, path))
+		if (!stats.isFile()) {
+			throw new Error(`ZIP extraction did not produce a regular file: ${path}`)
 		}
 	}
-
-	await walk(dir)
-	return results
+	return paths
 }
 
 async function resolveTargetDir(targetDir: ResourcesTargetDir | undefined, args: ResourcesTargetDirArgs): Promise<string> {
@@ -113,6 +135,14 @@ export const resourcesPlugin = definePlugin('resources')
 				slug: z.string().optional(),
 				name: z.string().optional(),
 			}).optional(),
+		}).superRefine((input, refinement) => {
+			if (input.mimeType !== 'application/zip' && !ResourceBasenameSchema.safeParse(input.filename).success) {
+				refinement.addIssue({
+					code: 'custom',
+					path: ['filename'],
+					message: 'Resource filename must be a basename',
+				})
+			}
 		}),
 		output: z.object({
 			resourceId: z.string(),
@@ -126,59 +156,72 @@ export const resourcesPlugin = definePlugin('resources')
 				sessionDir: ctx.environment.sessionDir,
 				workspaceDir: ctx.environment.workspaceDir,
 			})
-			await fs.mkdir(targetDir, { recursive: true })
 			const resourceId = crypto.randomUUID()
 			let paths: string[]
+			let manifest: ResourceManifest | null = null
 
 			if (input.mimeType === 'application/zip') {
-				// Write to temp file, extract, clean up
-				const tempPath = join(ctx.environment.sessionDir, `_tmp_resource_${resourceId}.zip`)
-				await fs.writeFile(tempPath, input.fileBuffer)
+				const tempRoot = join(ctx.environment.sessionDir, `_tmp_resource_${resourceId}`)
+				const tempPath = join(tempRoot, 'resource.zip')
+				const stagingDir = join(tempRoot, 'staging')
 
 				try {
+					await fs.mkdir(stagingDir, { recursive: true })
+					await fs.writeFile(tempPath, input.fileBuffer)
+
+					const inspection = await inspectZipArchive(ctx.platform.process, tempPath, {
+						timeoutMs: ARCHIVE_TIMEOUT_MS,
+					})
+					if (!inspection.ok) {
+						throw new Error(`ZIP inspection failed: ${inspection.error.message}`, { cause: inspection.error })
+					}
+
 					// `-x .git .git/*` so a stray .git entry in the ZIP can't overwrite the
 					// worktree's gitdir pointer (which silently breaks every subsequent git
 					// command in the workspace).
-					await exec('unzip', ['-o', '-q', tempPath, '-d', targetDir, '-x', '.git', '.git/*'])
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error)
-					// unzip returns exit code 1 for warnings — still usable
-					if (!message.includes('exit code 1')) {
-						await fs.unlink(tempPath).catch(() => {})
-						throw new Error(`unzip failed: ${message}`)
-					}
-				}
+					await exec('unzip', ['-q', tempPath, '-d', stagingDir, '-x', '.git', '.git/*'])
 
-				await fs.unlink(tempPath).catch(() => {})
-				paths = await listFiles(fs, targetDir, MAX_LISTED_PATHS)
+					paths = await verifiedExtractedPaths(
+						fs,
+						stagingDir,
+						inspection.value.entries
+							.filter(entry => entry.type === 'file')
+							.map(entry => entry.name),
+					)
+
+					const manifestPath = join(stagingDir, RESOURCE_MANIFEST_FILENAME)
+					try {
+						const raw = await fs.readFile(manifestPath, 'utf-8')
+						manifest = ResourceManifestSchema.parse(JSON.parse(raw))
+						ctx.logger.info('resources.inject: loaded resource manifest', {
+							filename: RESOURCE_MANIFEST_FILENAME,
+							postInjectRules: manifest.postInject?.length ?? 0,
+						})
+					} catch (error) {
+						if (getErrorCode(error) !== 'ENOENT') {
+							ctx.logger.warn('resources.inject: invalid resource manifest, skipping', {
+								filename: RESOURCE_MANIFEST_FILENAME,
+								error: error instanceof Error ? error.message : String(error),
+							})
+						}
+					} finally {
+						await unlinkIfPresent(fs, manifestPath)
+					}
+
+					paths = paths.filter(path => normalizeArchiveEntryPath(path) !== RESOURCE_MANIFEST_FILENAME)
+					// Exclude every root .git spelling before promoting the complete staging tree.
+					await fs.rm(join(stagingDir, '.git'), { recursive: true, force: true })
+					await fs.cp(stagingDir, targetDir, { recursive: true, force: true })
+				} finally {
+					await fs.rm(tempRoot, { recursive: true, force: true })
+				}
 			} else {
-				// Copy file directly to target dir
+				// Keep this check adjacent to the filesystem write as defense in depth.
+				ResourceBasenameSchema.parse(input.filename)
+				await fs.mkdir(targetDir, { recursive: true })
 				const filePath = join(targetDir, input.filename)
 				await fs.writeFile(filePath, input.fileBuffer)
 				paths = [input.filename]
-			}
-
-			let manifest: ResourceManifest | null = null
-			if (input.mimeType === 'application/zip') {
-				const manifestPath = join(targetDir, RESOURCE_MANIFEST_FILENAME)
-				try {
-					const raw = await fs.readFile(manifestPath, 'utf-8')
-					manifest = ResourceManifestSchema.parse(JSON.parse(raw))
-					await fs.unlink(manifestPath).catch(() => {})
-					paths = paths.filter((p) => p !== RESOURCE_MANIFEST_FILENAME)
-					ctx.logger.info('resources.inject: loaded resource manifest', {
-						filename: RESOURCE_MANIFEST_FILENAME,
-						postInjectRules: manifest.postInject?.length ?? 0,
-					})
-				} catch (err) {
-					const code = (err as NodeJS.ErrnoException)?.code
-					if (code !== 'ENOENT') {
-						ctx.logger.warn('resources.inject: invalid resource manifest, skipping', {
-							filename: RESOURCE_MANIFEST_FILENAME,
-							error: err instanceof Error ? err.message : String(err),
-						})
-					}
-				}
 			}
 
 			const postInjectCtx: PostInjectContext = {
