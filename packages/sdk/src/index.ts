@@ -133,6 +133,7 @@ export type {
 export { RESOURCE_MANIFEST_FILENAME, ResourceManifestSchema } from '~/plugins/resources/manifest.js'
 export type { ResourceManifest } from '~/plugins/resources/manifest.js'
 export { uploadsPlugin } from '~/plugins/uploads/plugin.js'
+export type { ArchiveLimitOverrides, ArchiveLimits } from '~/lib/archive/index.js'
 export { userChatPlugin } from '~/plugins/user-chat/plugin.js'
 export type { UserChatAgentConfig, UserChatPresetConfig, UserCommunicationMode } from '~/plugins/user-chat/plugin.js'
 

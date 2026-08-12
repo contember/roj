@@ -8,7 +8,7 @@
  */
 
 import { extname } from 'node:path'
-import { inspectZipArchive } from '~/lib/archive/index.js'
+import { ArchiveBudget, inspectZipArchive } from '~/lib/archive/index.js'
 import { mapWithConcurrency } from '~/lib/utils/concurrency.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
@@ -25,6 +25,12 @@ import {
 
 const MAX_DEPTH = 3
 const ZIP_FILE_CONCURRENCY = 10
+
+interface ProcessedArchiveEntry {
+	manifestEntry: string
+	derivedPaths: string[]
+	nestedArchiveError?: Error
+}
 
 const MIME_MAP: Record<string, string> = {
 	'.pdf': 'application/pdf',
@@ -99,8 +105,10 @@ export class ZipPreprocessor implements Preprocessor {
 		if (this.depth >= MAX_DEPTH) {
 			return Err(new Error(`ZIP nesting depth limit reached (max ${MAX_DEPTH})`))
 		}
+		const archiveBudget = ctx.archiveBudget ?? new ArchiveBudget()
 		const inspection = await inspectZipArchive(this.processRunner, filePath, {
 			signal,
+			limits: archiveBudget.limits,
 		})
 		if (!inspection.ok) {
 			if (signal.aborted) return Err(preprocessingAbortError(signal))
@@ -111,6 +119,8 @@ export class ZipPreprocessor implements Preprocessor {
 			)
 		}
 		if (signal.aborted) return Err(preprocessingAbortError(signal))
+		const budgetResult = archiveBudget.consume(inspection.value)
+		if (!budgetResult.ok) return Err(budgetResult.error)
 
 		// Extract to disk via unzip
 		const extractStore = ctx.files.scoped('extracted')
@@ -146,7 +156,7 @@ export class ZipPreprocessor implements Preprocessor {
 		const fileCount = files.length
 
 		// Process files in parallel with bounded concurrency
-		const processed = await mapWithConcurrency(files, ZIP_FILE_CONCURRENCY, async (file) => {
+		const processed = await mapWithConcurrency(files, ZIP_FILE_CONCURRENCY, async (file): Promise<ProcessedArchiveEntry> => {
 			const collectedPaths: string[] = []
 			if (signal.aborted) {
 				return { manifestEntry: '', derivedPaths: collectedPaths }
@@ -182,6 +192,7 @@ export class ZipPreprocessor implements Preprocessor {
 					const subResult = await preprocessor.process(fileRealPath.value, mime, {
 						...ctx,
 						files: ctx.files.scoped(`extracted/${file.name}-content`),
+						archiveBudget,
 					})
 					if (subResult.ok) {
 						if (subResult.value.derivedPaths) {
@@ -197,6 +208,13 @@ export class ZipPreprocessor implements Preprocessor {
 						}
 					} else {
 						this.logger.warn('Sub-preprocessor failed', { file: file.name, error: subResult.error.message })
+						if (mime === 'application/zip') {
+							return {
+								manifestEntry: `- ${file.name} (nested ZIP rejected)`,
+								derivedPaths: collectedPaths,
+								nestedArchiveError: subResult.error,
+							}
+						}
 					}
 				}
 			}
@@ -207,6 +225,8 @@ export class ZipPreprocessor implements Preprocessor {
 			}
 		})
 		if (signal.aborted) return Err(preprocessingAbortError(signal))
+		const nestedArchiveError = processed.find(item => item.nestedArchiveError)?.nestedArchiveError
+		if (nestedArchiveError) return Err(nestedArchiveError)
 
 		const derivedPaths: string[] = []
 		const manifest: string[] = []

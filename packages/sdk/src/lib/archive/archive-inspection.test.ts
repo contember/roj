@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import type { ProcessRunner } from '~/platform/process.js'
 import {
+	ArchiveBudget,
 	DEFAULT_ARCHIVE_LIMITS,
 	inspectZipArchive,
 	parseZipInfoVerbose,
@@ -109,6 +110,32 @@ describe('validateArchiveEntries', () => {
 	})
 })
 
+describe('ArchiveBudget', () => {
+	test('enforces aggregate entry and expanded-size limits across inspections', () => {
+		const budget = new ArchiveBudget({ maxEntries: 3, maxTotalUncompressedSize: 10 })
+		const first = validateArchiveEntries([file('nested.zip', 4)], budget.limits)
+		const second = validateArchiveEntries([file('one.txt', 3), file('two.txt', 4)], budget.limits)
+		if (!first.ok || !second.ok) throw new Error('Expected fixtures to fit their per-archive limits')
+
+		expect(budget.consume(first.value).ok).toBe(true)
+		const result = budget.consume(second.value)
+
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.code).toBe('too_large')
+		expect(result.error.message).toContain('aggregate')
+	})
+
+	test('merges partial overrides with the default limits', () => {
+		const budget = new ArchiveBudget({ maxEntries: 7 })
+
+		expect(budget.limits).toEqual({
+			maxEntries: 7,
+			maxTotalUncompressedSize: DEFAULT_ARCHIVE_LIMITS.maxTotalUncompressedSize,
+		})
+	})
+})
+
 describe('parseZipInfoVerbose', () => {
 	test('parses captured regular, Unicode/space, and directory entries', () => {
 		expect(parseZipInfoVerbose(SAFE_INFO_ZIP_6_FIXTURE)).toEqual({
@@ -195,6 +222,23 @@ describe('inspectZipArchive', () => {
 
 		expect(result.ok).toBe(true)
 		expect(receivedSignal).toBe(controller.signal)
+	})
+
+	test('applies partial caller limits before extraction', async () => {
+		const process: ProcessRunner = {
+			async execFile() {
+				return { stdout: SAFE_INFO_ZIP_6_FIXTURE, stderr: '' }
+			},
+			spawn() {
+				throw new Error('not used')
+			},
+		}
+
+		const result = await inspectZipArchive(process, '/archive.zip', { limits: { maxEntries: 2 } })
+
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.code).toBe('too_many_entries')
 	})
 
 	test('fails closed when Info-ZIP reports a non-zero warning exit', async () => {

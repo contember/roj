@@ -1,7 +1,7 @@
 import { join, posix, resolve } from 'node:path'
 import z from 'zod/v4'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
-import { inspectZipArchive } from '~/lib/archive/index.js'
+import { type ArchiveLimitOverrides, inspectZipArchive } from '~/lib/archive/index.js'
 import { Ok } from '~/lib/utils/result.js'
 import type { FileSystem } from '~/platform/fs.js'
 import type { ProcessRunner } from '~/platform/process.js'
@@ -28,6 +28,8 @@ export type ResourcesTargetDir = string | ((args: ResourcesTargetDirArgs) => str
 
 export interface ResourcesPluginConfig {
 	targetDir?: ResourcesTargetDir
+	/** Entry and expanded-size limits for each injected ZIP resource. */
+	archiveLimits?: ArchiveLimitOverrides
 	/**
 	 * Called after a resource is written/extracted into `targetDir`, before the
 	 * `resource_injected` event is emitted. Use `postInjectRules` for a declarative
@@ -171,6 +173,7 @@ export const resourcesPlugin = definePlugin('resources')
 
 					const inspection = await inspectZipArchive(ctx.platform.process, tempPath, {
 						timeoutMs: ARCHIVE_TIMEOUT_MS,
+						limits: ctx.pluginConfig?.archiveLimits,
 					})
 					if (!inspection.ok) {
 						throw new Error(`ZIP inspection failed: ${inspection.error.message}`, { cause: inspection.error })

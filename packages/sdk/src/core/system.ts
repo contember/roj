@@ -9,6 +9,7 @@
 
 import type z4 from 'zod/v4'
 import type { Logger } from '~/lib/logger/logger.js'
+import type { ArchiveLimitOverrides } from '~/lib/archive/index.js'
 import type { Platform } from '~/platform/index.js'
 import type { ServicePidRegistry } from '~/plugins/services/pid-registry.js'
 import type { PortPool } from '~/plugins/services/port-pool.js'
@@ -119,6 +120,8 @@ export interface CreateSystemOptions<TPlugins extends readonly PluginDefinition<
 	dataFileStore: FileStore
 	onUserOutput?: UserOutputCallback
 	preprocessorRegistry?: PreprocessorRegistry
+	uploadArchiveLimits?: ArchiveLimitOverrides
+	resourceArchiveLimits?: ArchiveLimitOverrides
 	llmLogger?: LLMLogger
 	portPool?: PortPool
 	pidRegistry?: ServicePidRegistry
@@ -145,6 +148,8 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		dataFileStore,
 		onUserOutput,
 		preprocessorRegistry,
+		uploadArchiveLimits,
+		resourceArchiveLimits,
 		llmLogger,
 		portPool,
 		pidRegistry,
@@ -168,6 +173,8 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		dataFileStore,
 		onUserOutput,
 		preprocessorRegistry,
+		uploadArchiveLimits,
+		resourceArchiveLimits,
 		llmLogger,
 		portPool,
 		pidRegistry,

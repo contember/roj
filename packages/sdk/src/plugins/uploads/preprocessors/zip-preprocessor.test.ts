@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SessionFileStore } from '~/core/file-store/file-store.js'
+import { ArchiveBudget } from '~/lib/archive/index.js'
 import { SYMLINK_INFO_ZIP_6_FIXTURE } from '~/lib/archive/archive-inspection.fixtures.js'
 import type { ProcessRunner } from '~/platform/process.js'
 import { silentLogger } from '../../../lib/logger/logger.js'
@@ -257,6 +258,50 @@ describe('ZipPreprocessor archive inspection', () => {
 			'extract:/outer.zip',
 			`inspect:${join(workDir, 'extracted/nested.zip')}`,
 			`extract:${join(workDir, 'extracted/nested.zip')}`,
+		])
+	})
+
+	it('shares one configured budget across nested archives', async () => {
+		const calls: string[] = []
+		const process: ProcessRunner = {
+			async execFile(_command, args) {
+				if (args[0] === '-Z') {
+					const archivePath = args[args.length - 1]
+					calls.push(`inspect:${archivePath}`)
+					return archivePath.endsWith('nested.zip')
+						? { stdout: zipListing([{ name: 'one.txt', size: 3 }, { name: 'two.txt', size: 3 }]), stderr: '' }
+						: { stdout: zipListing([{ name: 'nested.zip', size: 4 }]), stderr: '' }
+				}
+
+				const archivePath = args[2]
+				const destination = args[args.indexOf('-d') + 1]
+				calls.push(`extract:${archivePath}`)
+				await mkdir(destination, { recursive: true })
+				await writeFile(join(destination, 'nested.zip'), 'nested')
+				return { stdout: '', stderr: '' }
+			},
+			spawn() {
+				throw new Error('not used')
+			},
+		}
+		const preprocessor = new ZipPreprocessor({
+			registry: new PreprocessorRegistry(),
+			logger: silentLogger,
+			process,
+		})
+
+		const result = await preprocessor.process('/outer.zip', 'application/zip', {
+			...createContext(),
+			archiveBudget: new ArchiveBudget({ maxEntries: 2, maxTotalUncompressedSize: 100 }),
+		})
+
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.message).toContain('aggregate 2 entry limit')
+		expect(calls).toEqual([
+			'inspect:/outer.zip',
+			'extract:/outer.zip',
+			`inspect:${join(workDir, 'extracted/nested.zip')}`,
 		])
 	})
 })

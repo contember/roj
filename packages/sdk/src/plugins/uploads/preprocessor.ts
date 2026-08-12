@@ -10,6 +10,7 @@
 
 import type { FileStore } from '~/core/file-store/types.js'
 import type { InferenceContext } from '~/core/llm/provider.js'
+import type { ArchiveBudget } from '~/lib/archive/index.js'
 import type { Result } from '~/lib/utils/result.js'
 
 // ============================================================================
@@ -29,6 +30,8 @@ export interface PreprocessorContext {
 	signal?: AbortSignal
 	/** Optional metadata required to pass cancellation through LLM providers. */
 	inferenceContext?: Omit<InferenceContext, 'signal'>
+	/** Shared extraction budget for all ZIPs nested within one upload. */
+	archiveBudget?: ArchiveBudget
 }
 
 const NEVER_ABORTED_SIGNAL = new AbortController().signal

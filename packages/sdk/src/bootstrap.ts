@@ -257,6 +257,8 @@ export function createSystemFromServices(
 		dataFileStore: services.dataFileStore,
 		onUserOutput: options?.onUserOutput,
 		preprocessorRegistry: services.preprocessorRegistry,
+		uploadArchiveLimits: services.config.uploadArchiveLimits,
+		resourceArchiveLimits: services.config.resourceArchiveLimits,
 		llmLogger: services.llmLogger,
 		portPool: services.portPool,
 		pidRegistry: services.pidRegistry,
