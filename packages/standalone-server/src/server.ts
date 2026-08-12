@@ -72,22 +72,28 @@ export async function shutdownFromSignal(
 
 export async function startStandaloneServer(options: StartStandaloneOptions): Promise<StandaloneHandle> {
 	const envConfig = loadConfig()
-	const config: Config = options.config ? { ...envConfig, ...options.config } : envConfig
+	const config: Config = {
+		...envConfig,
+		...options.config,
+		host: resolveStandaloneHost(options.config?.host, process.env.HOST),
+	}
 
 	const errors = validateConfig(config)
 	if (errors.length > 0) {
 		throw new Error(`Configuration errors:\n${errors.map(e => `  - ${e}`).join('\n')}`)
 	}
 
-	const presets = options.llmMiddleware?.length
+	const llmMiddleware = options.llmMiddleware
+	const presets = llmMiddleware?.length
 		? options.presets.map(p => ({
 			...p,
-			llmMiddleware: [...options.llmMiddleware!, ...(p.llmMiddleware ?? [])],
+			llmMiddleware: [...llmMiddleware, ...(p.llmMiddleware ?? [])],
 		}))
 		: options.presets
 
 	const services = bootstrap(config, { presets }, createBunPlatform())
 	const { logger } = services
+	warnIfStandaloneExposed(config.host, logger)
 
 	// Reap service processes left behind by a previous agent, before any session can load
 	// and start its own. At boot this agent owns nothing, so every survivor is an orphan.
@@ -117,8 +123,8 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 	})
 
 	const tokenSecret = generateTokenSecret()
-	const publicHost = config.host === '0.0.0.0' ? 'localhost' : config.host
-	const publicBaseUrl = `http://${publicHost}:${config.port}`
+	let publicPort = config.port
+	const getPublicBaseUrl = () => `http://${formatPublicHost(config.host)}:${publicPort}`
 
 	const registry = new LocalRegistry(config.dataPath, logger)
 	await registry.init()
@@ -137,7 +143,7 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 		registry,
 		gitFs,
 		tokenSecret,
-		publicBaseUrl,
+		getPublicBaseUrl,
 	})
 
 	const outerApp = new Hono()
@@ -182,6 +188,7 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 	})
 
 	const server = startBunServer(config, outerApp, serverAdapter)
+	publicPort = server.port ?? config.port
 
 	try {
 		await sessionManager.loadAllSessions()
@@ -197,9 +204,9 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 
 	logger.info('Standalone server started', {
 		host: config.host,
-		port: config.port,
+		port: publicPort,
 		instanceId: instance.id,
-		url: `http://${config.host === '0.0.0.0' ? 'localhost' : config.host}:${config.port}`,
+		url: getPublicBaseUrl(),
 	})
 
 	const shutdown = async () => {
@@ -219,7 +226,35 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 		void shutdownFromSignal(shutdown)
 	})
 
-	return { config, logger, instance, port: server.port ?? config.port, sessionManager, shutdown }
+	return { config, logger, instance, port: publicPort, sessionManager, shutdown }
+}
+
+export function resolveStandaloneHost(configHost: string | undefined, envHost: string | undefined): string {
+	return configHost ?? envHost ?? '127.0.0.1'
+}
+
+export function isLoopbackHost(host: string): boolean {
+	const normalized = host.toLowerCase().replace(/^\[|\]$/g, '')
+	if (normalized === 'localhost' || normalized === '::1' || normalized === '0:0:0:0:0:0:0:1') return true
+	if (normalized.startsWith('::ffff:')) return isLoopbackHost(normalized.slice('::ffff:'.length))
+	const ipv4 = normalized.split('.')
+	return ipv4.length === 4
+		&& ipv4.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+		&& ipv4[0] === '127'
+}
+
+export function warnIfStandaloneExposed(host: string, logger: Pick<Logger, 'warn'>): void {
+	if (isLoopbackHost(host)) return
+	logger.warn('Standalone server is listening on a non-loopback host without authentication', {
+		host,
+		action: 'Bind to 127.0.0.1 unless network access is intentional and protected externally',
+	})
+}
+
+function formatPublicHost(host: string): string {
+	if (host === '0.0.0.0' || host === '::' || host === '[::]') return 'localhost'
+	const unwrapped = host.replace(/^\[|\]$/g, '')
+	return unwrapped.includes(':') ? `[${unwrapped}]` : unwrapped
 }
 
 interface WSData {
