@@ -19,3 +19,15 @@ export function createBunPlatform(): Platform {
 }
 
 export { createBunFileSystem, createBunProcessRunner }
+export {
+	createServerLifecycle,
+	runServerStartup,
+	ServerCleanupError,
+	shutdownFromSignal,
+	StartupInterruptedError,
+	type ServerLifecycle,
+	type ServerLifecycleOptions,
+	type ServerSignal,
+	type SignalListenerRegistry,
+	type StartupStage,
+} from './server-lifecycle.js'
