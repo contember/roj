@@ -19,7 +19,7 @@ import { PortPool } from './port-pool.js'
 import { buildServiceStatusMessage } from './prompt.js'
 import type { ServiceCommandArgs, ServiceConfig, ServiceCwdArgs, ServiceEntry, ServiceStatus } from './schema.js'
 import type { ServiceStatusChangeDetails } from './service.js'
-import { ServiceExecutor } from './service.js'
+import { ServiceExecutor, setServiceExecutorObserverForTesting } from './service.js'
 
 // ============================================================================
 // Test Service Configs
@@ -148,6 +148,15 @@ async function waitFor(
 	while (Date.now() < deadline) {
 		if (condition()) return
 		await new Promise((r) => setTimeout(r, 20))
+	}
+	throw new Error(`Timed out after ${timeoutMs}ms; saw ${describeState()}`)
+}
+
+async function waitForAsync(condition: () => Promise<boolean>, describeState: () => string, timeoutMs = 5000): Promise<void> {
+	const deadline = Date.now() + timeoutMs
+	while (Date.now() < deadline) {
+		if (await condition()) return
+		await new Promise((resolve) => setTimeout(resolve, 20))
 	}
 	throw new Error(`Timed out after ${timeoutMs}ms; saw ${describeState()}`)
 }
@@ -549,10 +558,11 @@ describe('services plugin', () => {
 
 		it('a service that closes during spawn setup skips ready and schedules restart', async () => {
 			const child = new ChildProcess()
+			const stdout = new EventEmitter()
 			Object.defineProperties(child, {
 				pid: { value: 424_242 },
 				stdin: { value: null },
-				stdout: { value: null },
+				stdout: { value: stdout },
 				stderr: { value: null },
 			})
 			const processRunner: ProcessRunner = {
@@ -560,7 +570,10 @@ describe('services plugin', () => {
 					// The death lands in the window between spawn and the handlers —
 					// the case a runtime never replays. exitCode is deliberately left
 					// unset so only the event can reveal it.
-					queueMicrotask(() => child.emit('close', 1))
+					queueMicrotask(() => {
+						stdout.emit('data', Buffer.from('READY\n'))
+						child.emit('close', 1)
+					})
 					return child
 				},
 				execFile: async (): Promise<ExecFileResult> => {
@@ -582,6 +595,7 @@ describe('services plugin', () => {
 					type: 'missed-close',
 					description: 'Process is already gone when spawn returns',
 					command: 'unused',
+					readyPattern: 'READY',
 					restartPolicy: { maxRetries: 1, initialDelayMs: 60_000 },
 				}, SessionId('s-missed-close'))
 
@@ -597,7 +611,7 @@ describe('services plugin', () => {
 			}
 		})
 
-		it('keeps the output a service produced during spawn setup', async () => {
+		it('bounds output produced during spawn setup while preserving its diagnostic tail', async () => {
 			const child = new ChildProcess()
 			// Bare emitters, not streams: a real child's pipe drops what it emitted
 			// before anything listened, and a buffering stream would hide exactly the
@@ -612,7 +626,8 @@ describe('services plugin', () => {
 			const processRunner: ProcessRunner = {
 				spawn: () => {
 					queueMicrotask(() => {
-						stderr.emit('data', Buffer.from('config file not found\n'))
+						stderr.emit('data', Buffer.from('line-0\nline-1\nline-2\nline-3\nline-4\n'))
+						stderr.emit('data', Buffer.concat([Buffer.alloc(100_000, 'x'), Buffer.from('\n')]))
 						child.emit('close', 7)
 					})
 					return child
@@ -635,6 +650,8 @@ describe('services plugin', () => {
 				await executor.start({
 					type: 'loud-crash',
 					description: 'Explains itself on stderr, then exits',
+					command: 'unused',
+					logBufferSize: 3,
 				}, SessionId('s-loud-crash'))
 
 				await waitFor(() => observed.includes('failed'), () => `[${observed.join(', ')}]`)
@@ -642,8 +659,187 @@ describe('services plugin', () => {
 				const logs = executor.getLogs('loud-crash')
 				expect(logs.ok).toBe(true)
 				if (logs.ok) {
-					expect(logs.value.join('\n')).toContain('config file not found')
+					expect(logs.value).toHaveLength(3)
+					expect(logs.value[0]).toBe('[stderr] line-3')
+					expect(logs.value[1]).toBe('[stderr] line-4')
+					expect(logs.value[2]?.startsWith('[stderr] xxx')).toBe(true)
+					expect(logs.value[2]?.length).toBe(16_384)
 				}
+			} finally {
+				await executor.shutdown()
+			}
+		})
+
+		it('does not mark an already-reaped child ready before close drains its output', async () => {
+			const child = new ChildProcess()
+			Object.defineProperties(child, {
+				pid: { value: 424_244 },
+				exitCode: { value: 9 },
+				stdin: { value: null },
+				stdout: { value: new EventEmitter() },
+				stderr: { value: new EventEmitter() },
+			})
+			const processRunner: ProcessRunner = {
+				spawn: () => child,
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: processRunner,
+			})
+			const observed: ServiceStatus[] = []
+			executor.onStatusChanged = (_sessionId, _serviceType, status) => observed.push(status)
+
+			try {
+				const result = await executor.start({
+					type: 'already-reaped',
+					description: 'Exit is recorded before stdio closes',
+					command: 'unused',
+				}, SessionId('s-already-reaped'))
+
+				expect(result.ok).toBe(true)
+				expect(observed).toEqual(['starting'])
+				child.emit('close', 9)
+				await waitFor(() => observed.includes('failed'), () => `[${observed.join(', ')}]`)
+				expect(observed).toEqual(['starting', 'failed'])
+			} finally {
+				await executor.shutdown()
+			}
+		})
+
+		it('detects a setup ready marker before truncating an oversized partial line', async () => {
+			const child = new ChildProcess()
+			const stdout = new EventEmitter()
+			Object.defineProperties(child, {
+				pid: { value: 424_245 },
+				stdin: { value: null },
+				stdout: { value: stdout },
+				stderr: { value: new EventEmitter() },
+			})
+			const processRunner: ProcessRunner = {
+				spawn: () => child,
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			const recordStarted = Promise.withResolvers<void>()
+			const releaseRecord = Promise.withResolvers<void>()
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: processRunner,
+				pidRegistry: {
+					record: async () => {
+						recordStarted.resolve()
+						await releaseRecord.promise
+					},
+					forget: async () => {},
+				},
+			})
+
+			try {
+				const started = executor.start({
+					type: 'ready-before-truncation',
+					description: 'Ready marker precedes an oversized diagnostic tail',
+					command: 'unused',
+					readyPattern: 'READY',
+					logBufferSize: 1,
+				}, SessionId('s-ready-before-truncation'))
+				await recordStarted.promise
+				stdout.emit('data', Buffer.concat([Buffer.from('READY'), Buffer.alloc(100_000, 'x')]))
+				releaseRecord.resolve()
+				expect((await started).ok).toBe(true)
+				expect(executor.getStatus('ready-before-truncation')).toBe('ready')
+
+				child.emit('close', 1)
+				await waitFor(() => executor.getStatus('ready-before-truncation') === 'failed', () => String(executor.getStatus('ready-before-truncation')))
+			} finally {
+				releaseRecord.resolve()
+				await executor.shutdown()
+			}
+		})
+
+		it('keeps completed stdout and stderr diagnostics in emission order', async () => {
+			const child = new ChildProcess()
+			const stdout = new EventEmitter()
+			const stderr = new EventEmitter()
+			Object.defineProperties(child, {
+				pid: { value: 424_246 },
+				stdin: { value: null },
+				stdout: { value: stdout },
+				stderr: { value: stderr },
+			})
+			const processRunner: ProcessRunner = {
+				spawn: () => {
+					queueMicrotask(() => {
+						stdout.emit('data', Buffer.from('out-'))
+						stderr.emit('data', Buffer.from('err\n'))
+						stdout.emit('data', Buffer.from('done\n'))
+						child.emit('close', 1)
+					})
+					return child
+				},
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: processRunner })
+
+			try {
+				await executor.start({
+					type: 'interleaved-output',
+					description: 'Interleaved stream output',
+					command: 'unused',
+				}, SessionId('s-interleaved-output'))
+				await waitFor(() => executor.getStatus('interleaved-output') === 'failed', () => String(executor.getStatus('interleaved-output')))
+				const logs = executor.getLogs('interleaved-output')
+				expect(logs.ok).toBe(true)
+				if (logs.ok) expect(logs.value).toEqual(['[stderr] err', 'out-done'])
+			} finally {
+				await executor.shutdown()
+			}
+		})
+
+		it('flushes unterminated stdout and stderr diagnostics in callback order', async () => {
+			const child = new ChildProcess()
+			const stdout = new EventEmitter()
+			const stderr = new EventEmitter()
+			Object.defineProperties(child, {
+				pid: { value: 424_247 },
+				stdin: { value: null },
+				stdout: { value: stdout },
+				stderr: { value: stderr },
+			})
+			const processRunner: ProcessRunner = {
+				spawn: () => {
+					queueMicrotask(() => {
+						stderr.emit('data', Buffer.from('stderr-partial'))
+						stdout.emit('data', Buffer.from('stdout-partial'))
+						child.emit('close', 1)
+					})
+					return child
+				},
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: processRunner })
+
+			try {
+				await executor.start({
+					type: 'partial-output-order',
+					description: 'Unterminated interleaved stream output',
+					command: 'unused',
+				}, SessionId('s-partial-output-order'))
+				await waitFor(() => executor.getStatus('partial-output-order') === 'failed', () => String(executor.getStatus('partial-output-order')))
+				const logs = executor.getLogs('partial-output-order')
+				expect(logs.ok).toBe(true)
+				if (logs.ok) expect(logs.value).toEqual(['[stderr] stderr-partial', 'stdout-partial'])
 			} finally {
 				await executor.shutdown()
 			}
@@ -752,9 +948,10 @@ describe('services plugin', () => {
 
 		it('kills orphaned process group from previous server instance', async () => {
 			const eventStore = new MemoryEventStore()
+			const platform = createNodePlatform()
 
-			// Harness 1: start service, capture pid + port, then "crash" (shutdown
-			// without running onSessionClose — matches session.shutdown() behavior).
+			// Create the durable session first, then inject the process record that a
+			// crashed runtime would leave behind without calling lifecycle hooks.
 			const harness1 = new TestHarness({
 				presets: [createServicesPreset([quickService], ['quick'], new PortPool())],
 				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
@@ -763,33 +960,27 @@ describe('services plugin', () => {
 			})
 
 			const session1 = await harness1.createSession('test')
-			await session1.sendAndWaitForIdle('Hi')
-
-			const entryAgentId = session1.getEntryAgentId()!
-			await session1.callPluginMethod('services.start', {
-				sessionId: String(session1.sessionId),
-				agentId: String(entryAgentId),
-				serviceType: 'quick',
-			})
-			await waitForServiceStateStatus(session1, 'quick', 'ready')
-
-			const stateBefore = selectPluginState<Map<string, ServiceEntry>>(session1.state, 'services')?.get('quick')
-			const orphanPid = stateBefore?.pid
-			const orphanPort = stateBefore?.port
-			expect(orphanPid).toBeDefined()
-			expect(orphanPort).toBeDefined()
-
-			// Process should be alive before restart
-			expect(() => process.kill(orphanPid!, 0)).not.toThrow()
-
 			const sessionId = session1.sessionId
+			await harness1.shutdown()
 
-			// Simulate server crash: sessionManager.shutdown() clears in-memory state
-			// but does NOT run onSessionClose, so the detached service process survives.
-			await harness1.sessionManager.shutdown()
-
-			// Orphan must still be alive after "crash"
-			expect(() => process.kill(orphanPid!, 0)).not.toThrow()
+			const orphan = platform.process.spawn('/bin/sh', ['-c', 'sleep 60'], {
+				detached: true,
+				stdio: 'ignore',
+			})
+			const orphanPid = orphan.pid
+			const orphanPort = 41_234
+			expect(orphanPid).toBeDefined()
+			if (orphanPid === undefined) throw new Error('Detached orphan did not receive a pid')
+			await eventStore.append(sessionId, {
+				...serviceEvents.create('service_status_changed', {
+					serviceType: 'quick',
+					toStatus: 'starting',
+					port: orphanPort,
+					pid: orphanPid,
+				}),
+				sessionId,
+			})
+			expect(() => process.kill(orphanPid, 0)).not.toThrow()
 
 			// Harness 2: fresh SessionManager over the same event store
 			const harness2 = new TestHarness({
@@ -808,7 +999,7 @@ describe('services plugin', () => {
 			// Give the OS a beat to reap the killed process
 			for (let i = 0; i < 20; i++) {
 				try {
-					process.kill(orphanPid!, 0)
+					process.kill(orphanPid, 0)
 				} catch {
 					break
 				}
@@ -817,14 +1008,14 @@ describe('services plugin', () => {
 
 			let isAlive = true
 			try {
-				process.kill(orphanPid!, 0)
+				process.kill(orphanPid, 0)
 			} catch {
 				isAlive = false
 			}
 			// Safety net in case reconcile didn't kill it — don't leave zombies behind
 			if (isAlive) {
 				try {
-					process.kill(-orphanPid!, 'SIGKILL')
+					process.kill(-orphanPid, 'SIGKILL')
 				} catch {
 					// already gone
 				}
@@ -834,7 +1025,7 @@ describe('services plugin', () => {
 			// Port preserved in state — next start() would receive it via preferredPort
 			const stateAfter = selectPluginState<Map<string, ServiceEntry>>(session2.state, 'services')?.get('quick')
 			expect(stateAfter?.status).toBe('stopped')
-			expect(stateAfter?.port).toBe(orphanPort!)
+			expect(stateAfter?.port).toBe(orphanPort)
 			expect(stateAfter?.pid).toBeUndefined()
 		})
 	})
@@ -867,6 +1058,104 @@ describe('services plugin', () => {
 			const events = await session.getEventsByType(serviceEvents, 'service_status_changed')
 			const stoppedEvent = events.find((e) => e.serviceType === 'quick' && e.toStatus === 'stopped')
 			expect(stoppedEvent).toBeDefined()
+		})
+
+		it('closing a session stops a paused service through its lifecycle hook', async () => {
+			const config: ServiceConfig = {
+				type: 'paused-close',
+				description: 'Paused process closed with its session',
+				command: 'sleep 60',
+				gracefulStopMs: 50,
+			}
+			const executorCreated = Promise.withResolvers<ServiceExecutor>()
+			const stopObserving = setServiceExecutorObserverForTesting((executor) => executorCreated.resolve(executor))
+			try {
+				const harness = createServicesHarness({
+					presets: [createServicesPreset([config], ['paused-close'], new PortPool())],
+					llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				})
+				const session = await harness.createSession('test')
+				const executor = await executorCreated.promise
+
+				await session.callPluginMethod('services.start', { serviceType: 'paused-close' })
+				await waitForServiceStateStatus(session, 'paused-close', 'ready')
+				const paused = await executor.pause('paused-close', session.sessionId)
+				expect(paused.ok).toBe(true)
+				await waitForServiceStateStatus(session, 'paused-close', 'paused')
+				const pid = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('paused-close')?.pid
+				if (pid === undefined) throw new Error('Service did not report its pid')
+
+				await session.close()
+				await waitForServiceStateStatus(session, 'paused-close', 'stopped')
+				expect(() => process.kill(pid, 0)).toThrow()
+			} finally {
+				stopObserving()
+			}
+		})
+
+		it('restarting a paused service replaces its process', async () => {
+			const config: ServiceConfig = {
+				type: 'paused-restart',
+				description: 'Paused process restarted through the plugin method',
+				command: 'sleep 60',
+				gracefulStopMs: 50,
+			}
+			const executorCreated = Promise.withResolvers<ServiceExecutor>()
+			const stopObserving = setServiceExecutorObserverForTesting((executor) => executorCreated.resolve(executor))
+			try {
+				const harness = createServicesHarness({
+					presets: [createServicesPreset([config], ['paused-restart'], new PortPool())],
+					llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				})
+				const session = await harness.createSession('test')
+				const executor = await executorCreated.promise
+
+				await session.callPluginMethod('services.start', { serviceType: 'paused-restart' })
+				await waitForServiceStateStatus(session, 'paused-restart', 'ready')
+				const originalPid = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('paused-restart')?.pid
+				if (originalPid === undefined) throw new Error('Service did not report its pid')
+				const paused = await executor.pause('paused-restart', session.sessionId)
+				expect(paused.ok).toBe(true)
+				await waitForServiceStateStatus(session, 'paused-restart', 'paused')
+
+				const restarted = await session.callPluginMethod('services.restart', { serviceType: 'paused-restart' })
+				expect(restarted.ok).toBe(true)
+				await waitForServiceStateStatus(session, 'paused-restart', 'ready')
+				const replacementPid = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('paused-restart')?.pid
+				expect(replacementPid).toBeDefined()
+				expect(replacementPid).not.toBe(originalPid)
+				expect(() => process.kill(originalPid, 0)).toThrow()
+			} finally {
+				stopObserving()
+			}
+		})
+
+		it('an externally killed paused service transitions to failed', async () => {
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: platform.process })
+			const config: ServiceConfig = {
+				type: 'paused-crash',
+				description: 'Paused process killed externally',
+				command: 'sleep 60',
+			}
+			let pid: number | undefined
+			executor.onStatusChanged = (_sessionId, _serviceType, status, details) => {
+				if (status === 'starting') pid = details.pid
+			}
+
+			try {
+				await executor.start(config, SessionId('s-paused-crash'))
+				const paused = await executor.pause('paused-crash', SessionId('s-paused-crash'))
+				expect(paused.ok).toBe(true)
+				if (pid === undefined) throw new Error('Service did not report its pid')
+				process.kill(-pid, 'SIGKILL')
+				await waitFor(
+					() => executor.getStatus('paused-crash') === 'failed',
+					() => String(executor.getStatus('paused-crash')),
+				)
+			} finally {
+				await executor.shutdown()
+			}
 		})
 	})
 
@@ -933,8 +1222,12 @@ describe('services plugin', () => {
 			}
 
 			try {
-				const result = await executor.start(config, SessionId('s-flaky'))
-				expect(result.ok).toBe(true)
+				const [firstResult, concurrentResult] = await Promise.all([
+					executor.start(config, SessionId('s-flaky')),
+					executor.start(config, SessionId('s-flaky')),
+				])
+				expect(firstResult.ok).toBe(true)
+				expect(concurrentResult.ok).toBe(true)
 
 				await waitUntil(() => executor.getStatus('flaky-port') === 'ready')
 				expect(executor.getStatus('flaky-port')).toBe('ready')
@@ -950,6 +1243,412 @@ describe('services plugin', () => {
 				await executor.shutdown()
 				await rm(marker, { force: true })
 			}
+		})
+
+		it('retries a setup-window conflict inside the shared start and waits for registry deletion', async () => {
+			const children = [new ChildProcess(), new ChildProcess()]
+			const streams = children.map(() => ({ stdout: new EventEmitter(), stderr: new EventEmitter() }))
+			for (const [index, child] of children.entries()) {
+				Object.defineProperties(child, {
+					pid: { value: 425_000 + index },
+					stdin: { value: null },
+					stdout: { value: streams[index]?.stdout },
+					stderr: { value: streams[index]?.stderr },
+				})
+			}
+			let spawnCount = 0
+			const processRunner: ProcessRunner = {
+				spawn: () => {
+					const child = children[spawnCount]
+					if (!child) throw new Error(`Unexpected spawn ${spawnCount + 1}`)
+					spawnCount += 1
+					return child
+				},
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			const firstRecordStarted = Promise.withResolvers<void>()
+			const releaseFirstRecord = Promise.withResolvers<void>()
+			const forgetStarted = Promise.withResolvers<void>()
+			const releaseForget = Promise.withResolvers<void>()
+			const operations: string[] = []
+			let currentRecordedPid: number | undefined
+			let recordCount = 0
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: processRunner,
+				pidRegistry: {
+					record: async (record) => {
+						recordCount += 1
+						operations.push(`record:${record.pid}`)
+						currentRecordedPid = record.pid
+						if (recordCount === 1) {
+							firstRecordStarted.resolve()
+							await releaseFirstRecord.promise
+						}
+					},
+					forget: async () => {
+						operations.push('forget:start')
+						forgetStarted.resolve()
+						await releaseForget.promise
+						currentRecordedPid = undefined
+						operations.push('forget:end')
+					},
+				},
+			})
+			const observed: ServiceStatus[] = []
+			executor.onStatusChanged = (_sessionId, _serviceType, status) => observed.push(status)
+			const config: ServiceConfig = {
+				type: 'controlled-conflict',
+				description: 'Conflict during blocked setup',
+				command: 'unused',
+				readyPattern: 'READY',
+			}
+
+			try {
+				const firstStart = executor.start(config, SessionId('s-controlled-conflict'))
+				const concurrentStart = executor.start(config, SessionId('s-controlled-conflict'))
+				await firstRecordStarted.promise
+				streams[0]?.stderr.emit('data', Buffer.from('listen EADDRINUSE\n'))
+				children[0]?.emit('close', 1)
+				releaseFirstRecord.resolve()
+				await forgetStarted.promise
+				expect(spawnCount).toBe(1)
+				expect(recordCount).toBe(1)
+
+				releaseForget.resolve()
+				await waitFor(() => spawnCount === 2, () => `spawnCount=${spawnCount}`)
+				streams[1]?.stdout.emit('data', Buffer.from('READY\n'))
+				const [firstResult, concurrentResult] = await Promise.all([firstStart, concurrentStart])
+				expect(firstResult).toBe(concurrentResult)
+				expect(firstResult.ok).toBe(true)
+				expect(spawnCount).toBe(2)
+				expect(recordCount).toBe(2)
+				expect(currentRecordedPid).toBe(425_001)
+				expect(operations).toEqual(['record:425000', 'forget:start', 'forget:end', 'record:425001'])
+				expect(observed).toEqual(['starting', 'starting', 'ready'])
+				expect(executor.getStatus('controlled-conflict')).toBe('ready')
+
+				children[1]?.emit('close', 1)
+				await waitFor(() => executor.getStatus('controlled-conflict') === 'failed', () => String(executor.getStatus('controlled-conflict')))
+			} finally {
+				releaseFirstRecord.resolve()
+				releaseForget.resolve()
+				await executor.shutdown()
+			}
+		})
+
+		const exercisePidForgetBarrier = async (mode: 'explicit' | 'automatic'): Promise<void> => {
+			const children = [new ChildProcess(), new ChildProcess()]
+			for (const [index, child] of children.entries()) {
+				Object.defineProperties(child, {
+					pid: { value: 425_100 + index },
+					stdin: { value: null },
+					stdout: { value: new EventEmitter() },
+					stderr: { value: new EventEmitter() },
+				})
+			}
+			let spawnCount = 0
+			const processRunner: ProcessRunner = {
+				spawn: () => {
+					const child = children[spawnCount]
+					if (!child) throw new Error(`Unexpected spawn ${spawnCount + 1}`)
+					spawnCount += 1
+					return child
+				},
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			const forgetStarted = Promise.withResolvers<void>()
+			const releaseForget = Promise.withResolvers<void>()
+			const operations: string[] = []
+			let currentRecordedPid: number | undefined
+			const terminated = new Set<number>()
+			const processGone = (): Error => {
+				const error = new Error('ESRCH')
+				Object.defineProperty(error, 'code', { value: 'ESRCH' })
+				return error
+			}
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: processRunner,
+				pidRegistry: {
+					record: async (record) => {
+						operations.push(`record:${record.pid}`)
+						currentRecordedPid = record.pid
+					},
+					forget: async () => {
+						operations.push('forget:start')
+						forgetStarted.resolve()
+						await releaseForget.promise
+						currentRecordedPid = undefined
+						operations.push('forget:end')
+					},
+				},
+				kill: (pid, signal) => {
+					const processId = Math.abs(pid)
+					if (signal === 0) {
+						if (terminated.has(processId)) throw processGone()
+						return true
+					}
+					terminated.add(processId)
+					children[processId - 425_100]?.emit('close', 0)
+					return true
+				},
+			})
+			const config: ServiceConfig = {
+				type: `pid-forget-${mode}`,
+				description: 'Replacement waits for durable PID deletion',
+				command: 'unused',
+				restartPolicy: mode === 'automatic' ? { maxRetries: 1, initialDelayMs: 0 } : undefined,
+			}
+
+			try {
+				await executor.start(config, SessionId(`s-pid-forget-${mode}`))
+				let explicitRestart: ReturnType<ServiceExecutor['restart']> | undefined
+				if (mode === 'explicit') {
+					explicitRestart = executor.restart(config, SessionId('s-pid-forget-explicit'))
+				} else {
+					children[0]?.emit('close', 1)
+				}
+
+				await forgetStarted.promise
+				await new Promise((resolve) => setTimeout(resolve, 25))
+				expect(spawnCount).toBe(1)
+				expect(currentRecordedPid).toBe(425_100)
+
+				releaseForget.resolve()
+				if (explicitRestart) expect((await explicitRestart).ok).toBe(true)
+				await waitFor(() => spawnCount === 2 && executor.getStatus(config.type) === 'ready', () => `spawnCount=${spawnCount}, status=${executor.getStatus(config.type)}`)
+				expect(currentRecordedPid).toBe(425_101)
+				expect(operations.slice(0, 4)).toEqual(['record:425100', 'forget:start', 'forget:end', 'record:425101'])
+			} finally {
+				releaseForget.resolve()
+				await executor.shutdown()
+			}
+		}
+
+		it('blocks explicit replacement until the old PID record is deleted', async () => {
+			await exercisePidForgetBarrier('explicit')
+		})
+
+		it('blocks zero-delay automatic replacement until the old PID record is deleted', async () => {
+			await exercisePidForgetBarrier('automatic')
+		})
+	})
+
+	describe('process group termination', () => {
+		const systemError = (code: string): Error => {
+			const error = new Error(code)
+			Object.defineProperty(error, 'code', { value: code })
+			return error
+		}
+
+		const isPidTerminated = async (pid: number): Promise<boolean> => {
+			try {
+				const stat = await readFile(`/proc/${pid}/stat`, 'utf-8')
+				const rparen = stat.lastIndexOf(')')
+				return rparen !== -1 && stat.slice(rparen + 2).startsWith('Z ')
+			} catch {
+				return true
+			}
+		}
+
+		it('keeps stop retryable across permission and probe errors, then accepts ESRCH', async () => {
+			const child = new ChildProcess()
+			Object.defineProperties(child, {
+				pid: { value: 426_000 },
+				stdin: { value: null },
+				stdout: { value: new EventEmitter() },
+				stderr: { value: new EventEmitter() },
+			})
+			const processRunner: ProcessRunner = {
+				spawn: () => child,
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			let mode: 'permission' | 'probe-error' | 'signal-error' | 'gone' = 'permission'
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: processRunner,
+				kill: (_pid, signal) => {
+					if (mode === 'permission') throw systemError('EPERM')
+					if (mode === 'probe-error') throw systemError('EIO')
+					if (mode === 'signal-error') throw systemError(signal === 0 ? 'EPERM' : 'EIO')
+					if (signal === 0) throw systemError('ESRCH')
+					return true
+				},
+			})
+			await executor.start({
+				type: 'retryable-stop',
+				description: 'Controlled process-group errors',
+				command: 'unused',
+			}, SessionId('s-retryable-stop'))
+
+			const permission = await executor.stop('retryable-stop', SessionId('s-retryable-stop'))
+			expect(permission.ok).toBe(false)
+			expect(executor.getStatus('retryable-stop')).toBe('ready')
+			mode = 'probe-error'
+			const unexpected = await executor.stop('retryable-stop', SessionId('s-retryable-stop'))
+			expect(unexpected.ok).toBe(false)
+			expect(executor.getStatus('retryable-stop')).toBe('ready')
+			mode = 'signal-error'
+			const signalFailure = await executor.stop('retryable-stop', SessionId('s-retryable-stop'))
+			expect(signalFailure.ok).toBe(false)
+			expect(executor.getStatus('retryable-stop')).toBe('ready')
+			mode = 'gone'
+			const gone = await executor.stop('retryable-stop', SessionId('s-retryable-stop'))
+			expect(gone.ok).toBe(true)
+			expect(executor.getStatus('retryable-stop')).toBe('stopped')
+			await executor.shutdown()
+		})
+
+		it('does not restore a live status when close wins a later probe error', async () => {
+			const child = new ChildProcess()
+			Object.defineProperties(child, {
+				pid: { value: 426_002 },
+				stdin: { value: null },
+				stdout: { value: new EventEmitter() },
+				stderr: { value: new EventEmitter() },
+			})
+			const processRunner: ProcessRunner = {
+				spawn: () => child,
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			let probeCount = 0
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: processRunner,
+				kill: (_pid, signal) => {
+					if (signal !== 0) return true
+					probeCount += 1
+					if (probeCount === 3) {
+						child.emit('close', 0)
+						throw systemError('EIO')
+					}
+					return true
+				},
+			})
+			const observed: ServiceStatus[] = []
+			executor.onStatusChanged = (_sessionId, _serviceType, status) => observed.push(status)
+			await executor.start({
+				type: 'close-before-probe-error',
+				description: 'Close races with a process-group probe error',
+				command: 'unused',
+			}, SessionId('s-close-before-probe-error'))
+
+			const stopped = await executor.stop('close-before-probe-error', SessionId('s-close-before-probe-error'))
+			expect(stopped.ok).toBe(false)
+			expect(executor.getStatus('close-before-probe-error')).toBe('stopped')
+			expect(observed).toEqual(['starting', 'ready', 'stopping', 'stopped'])
+			await executor.shutdown()
+		})
+
+		it('a failed shutdown retries entries already marked stopping', async () => {
+			const child = new ChildProcess()
+			Object.defineProperties(child, {
+				pid: { value: 426_001 },
+				stdin: { value: null },
+				stdout: { value: new EventEmitter() },
+				stderr: { value: new EventEmitter() },
+			})
+			const processRunner: ProcessRunner = {
+				spawn: () => child,
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			let permissionDenied = true
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: processRunner,
+				kill: () => {
+					throw systemError(permissionDenied ? 'EPERM' : 'ESRCH')
+				},
+			})
+			await executor.start({
+				type: 'retryable-shutdown',
+				description: 'Shutdown retries stopping entries',
+				command: 'unused',
+			}, SessionId('s-retryable-shutdown'))
+
+			await expect(executor.shutdown()).rejects.toThrow('SIGTERM')
+			expect(executor.getStatus('retryable-shutdown')).toBe('stopping')
+			permissionDenied = false
+			await executor.shutdown()
+			expect(executor.getStatus('retryable-shutdown')).toBeNull()
+		})
+
+		const exerciseTermination = async (mode: 'stop' | 'shutdown'): Promise<void> => {
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: platform.process })
+			const fixtureDir = await mkdtemp(join(tmpdir(), `roj-svc-group-${mode}-`))
+			const childFile = join(fixtureDir, 'child.pid')
+			const grandchildFile = join(fixtureDir, 'grandchild.pid')
+			const serviceType = `group-${mode}`
+			let leaderPid: number | undefined
+			executor.onStatusChanged = (_sessionId, _serviceType, status, details) => {
+				if (status === 'starting') leaderPid = details.pid
+			}
+			const config: ServiceConfig = {
+				type: serviceType,
+				description: 'Leader exits on TERM while descendants ignore it',
+				command:
+					`sh -c 'trap "" TERM; sleep 60 & echo $! > "${grandchildFile}"; wait' & echo $! > "${childFile}"; trap 'exit 0' TERM; echo READY; wait`,
+				readyPattern: 'READY',
+				gracefulStopMs: 50,
+			}
+
+			try {
+				await executor.start(config, SessionId(`s-${serviceType}`))
+				await waitFor(() => executor.getStatus(serviceType) === 'ready', () => String(executor.getStatus(serviceType)))
+				await waitForAsync(
+					async () => platform.fs.exists(childFile).then(async (childExists) => childExists && await platform.fs.exists(grandchildFile)),
+					() => 'waiting for child and grandchild pid files',
+				)
+				const childPid = Number.parseInt(await readFile(childFile, 'utf-8'), 10)
+				const grandchildPid = Number.parseInt(await readFile(grandchildFile, 'utf-8'), 10)
+				expect(await isPidTerminated(childPid)).toBe(false)
+				expect(await isPidTerminated(grandchildPid)).toBe(false)
+
+				if (mode === 'stop') {
+					const result = await executor.stop(serviceType, SessionId(`s-${serviceType}`))
+					expect(result.ok).toBe(true)
+				} else {
+					await executor.shutdown()
+				}
+
+				expect(await isPidTerminated(childPid)).toBe(true)
+				expect(await isPidTerminated(grandchildPid)).toBe(true)
+			} finally {
+				await executor.shutdown()
+				if (leaderPid !== undefined) {
+					try {
+						process.kill(-leaderPid, 'SIGKILL')
+					} catch {
+						// Already gone.
+					}
+				}
+				await rm(fixtureDir, { recursive: true, force: true })
+			}
+		}
+
+		it('stop waits for child and grandchild processes after the leader exits', async () => {
+			await exerciseTermination('stop')
+		})
+
+		it('shutdown waits for child and grandchild processes after the leader exits', async () => {
+			await exerciseTermination('shutdown')
 		})
 	})
 

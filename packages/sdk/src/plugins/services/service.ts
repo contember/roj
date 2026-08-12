@@ -61,6 +61,7 @@ interface RunningService {
 	cwd?: string
 	command: string
 	logs: RingBuffer
+	forgetPid: () => Promise<void>
 }
 
 export interface ServiceStatusChangeDetails {
@@ -108,7 +109,22 @@ export interface ServiceExecutorDeps {
 	fs: FileSystem
 	process: ProcessRunner
 	/** Durable pid record, swept at agent boot. Optional so embedders without a data dir still work. */
-	pidRegistry?: ServicePidRegistry
+	pidRegistry?: Pick<ServicePidRegistry, 'record' | 'forget'>
+	/** Test seam for process-group failure handling. */
+	kill?: typeof process.kill
+}
+
+type ProcessGroupProbe = { state: 'alive' | 'gone' } | { state: 'error'; error: Error }
+
+let serviceExecutorObserverForTesting: ((executor: ServiceExecutor) => void) | undefined
+
+/** Observe executor creation in integration tests without exposing lifecycle methods as plugin API. */
+export function setServiceExecutorObserverForTesting(observer: (executor: ServiceExecutor) => void): () => void {
+	const previous = serviceExecutorObserverForTesting
+	serviceExecutorObserverForTesting = observer
+	return () => {
+		if (serviceExecutorObserverForTesting === observer) serviceExecutorObserverForTesting = previous
+	}
 }
 
 export class ServiceExecutor {
@@ -117,6 +133,8 @@ export class ServiceExecutor {
 	private readonly waiters = new Map<string, Array<{ resolve: (result: Result<void, ToolError>) => void; timer: ReturnType<typeof setTimeout> }>>()
 	/** Per-type lock collapsing concurrent start() calls onto a single in-flight start. */
 	private readonly startInFlight = new Map<string, Promise<Result<void, ToolError>>>()
+	/** Registry deletions that must settle before a replacement can record its PID. */
+	private readonly pidForgets = new Map<string, Promise<void>>()
 	/** Per-type counter bounding automatic EADDRINUSE port re-allocation retries. */
 	private readonly portConflictRetries = new Map<string, number>()
 	/** Per-type counter bounding `restartPolicy` revivals after an unexpected exit. */
@@ -127,7 +145,8 @@ export class ServiceExecutor {
 	private readonly portPool: PortPool
 	private readonly fs: FileSystem
 	private readonly processRunner: ProcessRunner
-	private readonly pidRegistry?: ServicePidRegistry
+	private readonly pidRegistry?: Pick<ServicePidRegistry, 'record' | 'forget'>
+	private readonly killProcess: typeof process.kill
 
 	/** Optional callback invoked on every service status change */
 	onStatusChanged?: (
@@ -143,6 +162,8 @@ export class ServiceExecutor {
 		this.fs = deps.fs
 		this.processRunner = deps.process
 		this.pidRegistry = deps.pidRegistry
+		this.killProcess = deps.kill ?? process.kill
+		serviceExecutorObserverForTesting?.(this)
 	}
 
 	private notifyStatusChanged(
@@ -279,9 +300,14 @@ export class ServiceExecutor {
 		this.cancelPendingRestart(config.type)
 
 		const existing = this.services.get(config.type)
-		if (existing && (existing.status === 'starting' || existing.status === 'ready')) {
+		if (existing && (existing.status === 'starting' || existing.status === 'ready' || existing.status === 'paused')) {
 			return Ok(undefined)
 		}
+		if (existing?.status === 'stopping') {
+			return Err({ message: `Service '${config.type}' is stopping, cannot start`, recoverable: true })
+		}
+		if (existing) await existing.forgetPid()
+		await this.pidForgets.get(config.type)
 
 		const availability = await this.isAvailable(config, sessionId, workspaceDir)
 		if (!availability.ok) return availability
@@ -313,10 +339,23 @@ export class ServiceExecutor {
 		}
 
 		const cwd = cwdResult.value
-		const logBufferSize = config.logBufferSize ?? 200
+		const logBufferSize = Math.max(1, config.logBufferSize ?? 200)
 		const startupTimeoutMs = config.startupTimeoutMs ?? 30_000
 
 		const readyRegex = config.readyPattern ? new RegExp(config.readyPattern) : undefined
+		const logs = new RingBuffer(logBufferSize)
+		const maxDiagnosticLength = 16_384
+		const startTime = Date.now()
+		let portConflictDetected = false
+		let setupComplete = false
+		let retryPortConflictDuringSetup = false
+		let readyDetectedDuringSetup = false
+		let readyLineDuringSetup: string | undefined
+		let stdoutPartial = ''
+		let stderrPartial = ''
+		let outputSequence = 0
+		let stdoutPartialSequence = 0
+		let stderrPartialSequence = 0
 
 		const startArgs = {
 			port,
@@ -379,22 +418,80 @@ export class ServiceExecutor {
 			return Err({ message: 'Failed to spawn service process', recoverable: true })
 		}
 
-		// Listen before the first await. Neither Node nor Bun replays buffered stdio
-		// or a 'close' to a listener attached after the child exited, and the two
-		// awaits below — the /proc start-time read and the pid-registry write — are
-		// long enough for a fast crash (bad command, missing binary, occupied port)
-		// to slip through the gap. These collectors hold both until the real
-		// handlers exist further down, which then take over and replay them.
-		const bufferedStdout: Buffer[] = []
-		const bufferedStderr: Buffer[] = []
+		const matches = (regex: RegExp, content: string): boolean => {
+			regex.lastIndex = 0
+			const matched = regex.test(content)
+			regex.lastIndex = 0
+			return matched
+		}
+
+		const recordDiagnostic = (line: string, prefix: string) => {
+			const maxContentLength = Math.max(0, maxDiagnosticLength - prefix.length)
+			const bounded = line.length > maxContentLength ? line.slice(-maxContentLength) : line
+			logs.push(`${prefix}${bounded}`)
+		}
+
+		// Detection sees the full incoming content before diagnostics are truncated.
+		const appendOutput = (partial: string, data: Buffer, prefix: string): string => {
+			const combined = partial + data.toString()
+			if (matches(PORT_CONFLICT_PATTERN, combined)) portConflictDetected = true
+			const lines = combined.split('\n')
+			const nextPartial = lines.pop() ?? ''
+			const readyMatched = readyRegex ? matches(readyRegex, combined) || lines.some((line) => matches(readyRegex, line)) : false
+			if (readyMatched && !setupComplete) {
+				readyDetectedDuringSetup = true
+				readyLineDuringSetup = combined.slice(-maxDiagnosticLength)
+			}
+
+			for (const line of lines) recordDiagnostic(line, prefix)
+
+			if (setupComplete) {
+				const current = this.services.get(config.type)
+				if (current?.process === child && current.status === 'starting') {
+					this.logger.debug('Service output', { serviceType: config.type })
+					if (readyMatched) markReady(combined.slice(-maxDiagnosticLength))
+				}
+				void checkReadyWhen()
+			}
+
+			// Retain enough suffix for markers split across chunks, never an entire line.
+			return nextPartial.length > maxDiagnosticLength ? nextPartial.slice(-maxDiagnosticLength) : nextPartial
+		}
+
+		const onStdout = (data: Buffer) => {
+			stdoutPartial = appendOutput(stdoutPartial, data, '')
+			stdoutPartialSequence = stdoutPartial ? ++outputSequence : 0
+		}
+		const onStderr = (data: Buffer) => {
+			stderrPartial = appendOutput(stderrPartial, data, '[stderr] ')
+			stderrPartialSequence = stderrPartial ? ++outputSequence : 0
+		}
+
 		let exitDuringSetup: { code: number | null } | undefined
-		const bufferStdout = (data: Buffer) => void bufferedStdout.push(data)
-		const bufferStderr = (data: Buffer) => void bufferedStderr.push(data)
+		let forgetPromise: Promise<void> | undefined
+		const forgetPid = (): Promise<void> => {
+			if (forgetPromise) return forgetPromise
+			const previous = this.pidForgets.get(config.type)
+			const runForget = () => this.pidRegistry?.forget(String(sessionId), config.type) ?? Promise.resolve()
+			const operation = previous ? previous.then(runForget, runForget) : runForget()
+			forgetPromise = operation
+			this.pidForgets.set(config.type, operation)
+			void operation.then(
+				() => {
+					if (this.pidForgets.get(config.type) === operation) this.pidForgets.delete(config.type)
+				},
+				() => {
+					if (this.pidForgets.get(config.type) === operation) this.pidForgets.delete(config.type)
+					if (forgetPromise === operation) forgetPromise = undefined
+				},
+			)
+			return operation
+		}
 		const bufferClose = (code: number | null) => {
 			exitDuringSetup = { code }
 		}
-		child.stdout?.on('data', bufferStdout)
-		child.stderr?.on('data', bufferStderr)
+		child.stdout?.on('data', onStdout)
+		child.stderr?.on('data', onStderr)
 		child.on('close', bufferClose)
 
 		// Capture start time immediately so a later PID-reuse check can distinguish
@@ -409,12 +506,6 @@ export class ServiceExecutor {
 		// Emit starting event with PID, port, resolved cwd/command, and start time.
 		this.notifyStatusChanged(sessionId, config.type, 'starting', { port, pid: child.pid, pidStartTime, cwd, command })
 
-		const logs = new RingBuffer(logBufferSize)
-		const startTime = Date.now()
-		// Set when the child reports a port bind-conflict; read by the close handler
-		// to decide between a fresh-port retry and a terminal failure.
-		let portConflictDetected = false
-
 		const entry: RunningService = {
 			config,
 			process: child,
@@ -424,6 +515,7 @@ export class ServiceExecutor {
 			cwd,
 			command,
 			logs,
+			forgetPid,
 		}
 		this.services.set(config.type, entry)
 
@@ -485,27 +577,6 @@ export class ServiceExecutor {
 			}
 		}
 
-		const processLine = (line: string) => {
-			logs.push(line)
-			if (PORT_CONFLICT_PATTERN.test(line)) {
-				portConflictDetected = true
-			}
-			const current = this.services.get(config.type)
-			if (!current || current.process !== child) return
-
-			if (current.status === 'starting') {
-				this.logger.debug('Service output', { serviceType: config.type, line })
-			}
-
-			if (readyRegex && current.status === 'starting') {
-				if (readyRegex.test(line)) {
-					markReady(line)
-				}
-			}
-
-			void checkReadyWhen()
-		}
-
 		// Startup timeout — mark as failed if not ready in time
 		if (readyRegex || config.readyWhen) {
 			startupTimer = setTimeout(() => {
@@ -537,40 +608,7 @@ export class ServiceExecutor {
 			readyCheckTimer = setInterval(() => {
 				void checkReadyWhen()
 			}, intervalMs)
-			void checkReadyWhen()
 		}
-
-		// Pipe stdout/stderr line by line
-		let stdoutPartial = ''
-		const onStdout = (data: Buffer) => {
-			stdoutPartial += data.toString()
-			const lines = stdoutPartial.split('\n')
-			stdoutPartial = lines.pop()!
-			for (const line of lines) {
-				processLine(line)
-			}
-		}
-
-		let stderrPartial = ''
-		const onStderr = (data: Buffer) => {
-			stderrPartial += data.toString()
-			const lines = stderrPartial.split('\n')
-			stderrPartial = lines.pop()!
-			for (const line of lines) {
-				processLine(`[stderr] ${line}`)
-			}
-		}
-
-		// Take over from the setup collectors and replay what they caught, so a
-		// service that already spoke (or already died) is judged on its real output:
-		// the ready pattern, the port-conflict pattern and the failure log all read
-		// from it. Swap and replay synchronously — no 'data' can land in between.
-		child.stdout?.off('data', bufferStdout)
-		child.stderr?.off('data', bufferStderr)
-		child.stdout?.on('data', onStdout)
-		child.stderr?.on('data', onStderr)
-		for (const chunk of bufferedStdout) onStdout(chunk)
-		for (const chunk of bufferedStderr) onStderr(chunk)
 
 		// Handle unexpected exit. Named and guarded because it also has to be
 		// replayable — see the exit-during-setup check after markReady() below.
@@ -579,17 +617,17 @@ export class ServiceExecutor {
 			if (closeHandled) return
 			closeHandled = true
 			clearReadinessTimers()
-			// The process is gone, so its durable record has nothing left to reap.
-			void this.pidRegistry?.forget(String(sessionId), config.type)
-			// Flush remaining partial lines
-			if (stdoutPartial) {
-				processLine(stdoutPartial)
-				stdoutPartial = ''
+			// A replacement must not be recorded until this deletion finishes.
+			void forgetPid()
+			const partials = [
+				{ content: stdoutPartial, prefix: '', sequence: stdoutPartialSequence },
+				{ content: stderrPartial, prefix: '[stderr] ', sequence: stderrPartialSequence },
+			]
+			for (const partial of partials.filter(({ content }) => content).sort((left, right) => left.sequence - right.sequence)) {
+				recordDiagnostic(partial.content, partial.prefix)
 			}
-			if (stderrPartial) {
-				processLine(`[stderr] ${stderrPartial}`)
-				stderrPartial = ''
-			}
+			stdoutPartial = ''
+			stderrPartial = ''
 
 			const current = this.services.get(config.type)
 			if (!current || current.process !== child) return
@@ -598,9 +636,9 @@ export class ServiceExecutor {
 				// Expected stop
 				current.status = 'stopped'
 				this.notifyStatusChanged(sessionId, config.type, 'stopped')
-			} else if (current.status === 'starting' || current.status === 'ready') {
+			} else if (current.status === 'starting' || current.status === 'ready' || current.status === 'paused') {
 				const retries = this.portConflictRetries.get(config.type) ?? 0
-				if (portConflictDetected && retries < MAX_PORT_CONFLICT_RETRIES) {
+				if (current.status === 'starting' && portConflictDetected && retries < MAX_PORT_CONFLICT_RETRIES) {
 					// The chosen port is held by a foreign process (e.g. a service
 					// leaked from another session, or a survivor of a previous boot).
 					// Re-allocate a fresh port and retry so the service recovers on a
@@ -617,7 +655,11 @@ export class ServiceExecutor {
 					})
 					this.allocatedPorts.delete(config.type)
 					this.services.delete(config.type)
-					void this.start(config, sessionId, workspaceDir)
+					if (!setupComplete) {
+						retryPortConflictDuringSetup = true
+					} else {
+						setTimeout(() => void this.start(config, sessionId, workspaceDir), 0)
+					}
 					return
 				}
 
@@ -655,8 +697,7 @@ export class ServiceExecutor {
 		})
 
 		// A service that died inside the bookkeeping above closed while only the
-		// setup collector was listening, so replay that close now — its output has
-		// just been replayed, so the handler sees the same log a live exit would.
+		// setup close collector was listening, so replay that close now.
 		// `alreadyReaped` covers the in-between state: the exit is recorded but
 		// 'close' has not fired yet because it waits for the stdio EOF. The listener
 		// above is guaranteed to receive it, so calling handleClose here would only
@@ -665,9 +706,23 @@ export class ServiceExecutor {
 		const alreadyReaped = child.exitCode != null || child.signalCode != null
 		if (exitDuringSetup) {
 			handleClose(exitDuringSetup.code)
-		} else if (!alreadyReaped && !readyRegex && !config.readyWhen) {
+		}
+
+		setupComplete = true
+		if (retryPortConflictDuringSetup) {
+			await forgetPid()
+			return this.startInternal(config, sessionId, workspaceDir)
+		}
+		if (exitDuringSetup || alreadyReaped) {
+			return Ok(undefined)
+		}
+		if (readyDetectedDuringSetup) {
+			markReady(readyLineDuringSetup)
+		} else if (!readyRegex && !config.readyWhen) {
 			// If no ready condition is configured, a live child is ready immediately.
 			markReady()
+		} else if (config.readyWhen) {
+			void checkReadyWhen()
 		}
 
 		return Ok(undefined)
@@ -744,6 +799,111 @@ export class ServiceExecutor {
 		return this.restartTimers.has(serviceType)
 	}
 
+	private errorWithContext(error: unknown, context: string): Error {
+		const cause = error instanceof Error ? error.message : String(error)
+		return new Error(`${context}: ${cause}`)
+	}
+
+	private hasErrorCode(error: unknown, code: string): boolean {
+		return error instanceof Error && 'code' in error && error.code === code
+	}
+
+	private async hasNonZombieProcessGroupMember(pid: number): Promise<boolean> {
+		if (process.platform !== 'linux') return true
+
+		let entries: string[]
+		try {
+			entries = await this.fs.readdir('/proc')
+		} catch {
+			return true
+		}
+
+		let foundGroupMember = false
+		for (const entry of entries) {
+			if (!/^\d+$/.test(entry)) continue
+			try {
+				const stat = await this.fs.readFile(`/proc/${entry}/stat`, 'utf-8')
+				const rparen = stat.lastIndexOf(')')
+				if (rparen === -1) continue
+				const fields = stat.slice(rparen + 2).split(' ')
+				if (Number(fields[2]) !== pid) continue
+				foundGroupMember = true
+				if (fields[0] !== 'Z') return true
+			} catch {
+				// Processes can disappear while /proc is scanned.
+			}
+		}
+		// A successful group probe with no readable member is still evidence of life.
+		return !foundGroupMember
+	}
+
+	private async probeProcessGroup(pid: number): Promise<ProcessGroupProbe> {
+		try {
+			this.killProcess(-pid, 0)
+		} catch (error) {
+			if (this.hasErrorCode(error, 'ESRCH')) return { state: 'gone' }
+			if (this.hasErrorCode(error, 'EPERM')) return { state: 'alive' }
+			return { state: 'error', error: this.errorWithContext(error, `Failed to probe process group ${pid}`) }
+		}
+
+		return await this.hasNonZombieProcessGroupMember(pid) ? { state: 'alive' } : { state: 'gone' }
+	}
+
+	private async signalProcessGroup(pid: number, signal: NodeJS.Signals): Promise<ProcessGroupProbe> {
+		try {
+			this.killProcess(-pid, signal)
+			return { state: 'alive' }
+		} catch (error) {
+			if (this.hasErrorCode(error, 'ESRCH')) return { state: 'gone' }
+			return { state: 'error', error: this.errorWithContext(error, `Failed to send ${signal} to process group ${pid}`) }
+		}
+	}
+
+	private async waitForProcessGroupExit(pid: number, timeoutMs: number): Promise<ProcessGroupProbe> {
+		const initial = await this.probeProcessGroup(pid)
+		if (initial.state !== 'alive') return initial
+
+		return new Promise((resolve) => {
+			let settled = false
+			const finish = (result: ProcessGroupProbe) => {
+				if (settled) return
+				settled = true
+				clearInterval(checkInterval)
+				clearTimeout(timeout)
+				resolve(result)
+			}
+			const checkInterval = setInterval(() => {
+				void this.probeProcessGroup(pid).then((result) => {
+					if (result.state !== 'alive') finish(result)
+				})
+			}, 50)
+			const timeout = setTimeout(() => {
+				void this.probeProcessGroup(pid).then(finish)
+			}, timeoutMs)
+		})
+	}
+
+	private async terminateProcessGroup(pid: number, gracefulStopMs: number): Promise<Result<void, Error>> {
+		const initial = await this.probeProcessGroup(pid)
+		if (initial.state === 'gone') return Ok(undefined)
+		if (initial.state === 'error') return Err(initial.error)
+
+		const term = await this.signalProcessGroup(pid, 'SIGTERM')
+		if (term.state === 'gone') return Ok(undefined)
+		if (term.state === 'error') return Err(term.error)
+		const graceful = await this.waitForProcessGroupExit(pid, gracefulStopMs)
+		if (graceful.state === 'gone') return Ok(undefined)
+		if (graceful.state === 'error') return Err(graceful.error)
+
+		const kill = await this.signalProcessGroup(pid, 'SIGKILL')
+		if (kill.state === 'gone') return Ok(undefined)
+		if (kill.state === 'error') return Err(kill.error)
+		const forced = await this.waitForProcessGroupExit(pid, 5000)
+		if (forced.state === 'gone') return Ok(undefined)
+		if (forced.state === 'error') return Err(forced.error)
+		return Err(new Error(`Process group ${pid} survived SIGKILL`))
+	}
+
 	/**
 	 * Stop a running service gracefully.
 	 * Port is NOT released — kept for session-level stability across restarts.
@@ -759,6 +919,11 @@ export class ServiceExecutor {
 			// A failed service with a revival queued is really "about to restart",
 			// and calling that off is a legitimate stop rather than an error.
 			if (hadPendingRestart) {
+				try {
+					await entry.forgetPid()
+				} catch (error) {
+					return Err({ message: this.errorWithContext(error, `Failed to forget PID for service '${serviceType}'`).message, recoverable: true })
+				}
 				entry.status = 'stopped'
 				this.notifyStatusChanged(sessionId, serviceType, 'stopped')
 				return Ok(undefined)
@@ -766,45 +931,34 @@ export class ServiceExecutor {
 			return Err({ message: `Service '${serviceType}' is ${entry.status}, cannot stop`, recoverable: false })
 		}
 
+		const previousStatus = entry.status
 		entry.status = 'stopping'
 		this.notifyStatusChanged(sessionId, serviceType, 'stopping')
 
 		const gracefulStopMs = entry.config.gracefulStopMs ?? 5000
 
-		// Send SIGTERM
+		const stopped = await this.terminateProcessGroup(entry.pid, gracefulStopMs)
+		if (!stopped.ok) {
+			if (entry.status === 'stopping') {
+				entry.status = previousStatus
+				this.notifyStatusChanged(sessionId, serviceType, previousStatus, {
+					port: entry.port,
+					cwd: entry.cwd,
+					command: entry.command,
+					error: stopped.error.message,
+				})
+			}
+			return Err({ message: stopped.error.message, recoverable: true })
+		}
 		try {
-			process.kill(-entry.pid, 'SIGTERM')
-		} catch {
-			// Process already gone
+			await entry.forgetPid()
+		} catch (error) {
+			return Err({ message: this.errorWithContext(error, `Failed to forget PID for service '${serviceType}'`).message, recoverable: true })
+		}
+		if (entry.status === 'stopping') {
 			entry.status = 'stopped'
 			this.notifyStatusChanged(sessionId, serviceType, 'stopped')
-			return Ok(undefined)
 		}
-
-		// Wait for graceful shutdown, then SIGKILL
-		await new Promise<void>((resolve) => {
-			const checkInterval = setInterval(() => {
-				try {
-					// Check if process is still alive (signal 0 doesn't kill, just checks)
-					process.kill(entry.pid, 0)
-				} catch {
-					// Process gone
-					clearInterval(checkInterval)
-					clearTimeout(killTimeout)
-					resolve()
-				}
-			}, 200)
-
-			const killTimeout = setTimeout(() => {
-				clearInterval(checkInterval)
-				try {
-					process.kill(-entry.pid, 'SIGKILL')
-				} catch {
-					// Already gone
-				}
-				resolve()
-			}, gracefulStopMs)
-		})
 
 		this.logger.info('Service stopped', { serviceType })
 		return Ok(undefined)
@@ -909,7 +1063,7 @@ export class ServiceExecutor {
 	 */
 	isRunning(serviceType: string): boolean {
 		const status = this.getStatus(serviceType)
-		return status === 'starting' || status === 'ready'
+		return status === 'starting' || status === 'ready' || status === 'paused'
 	}
 
 	/**
@@ -924,35 +1078,12 @@ export class ServiceExecutor {
 		const promises: Promise<void>[] = []
 
 		for (const [serviceType, entry] of this.services) {
-			if (entry.status === 'starting' || entry.status === 'ready' || entry.status === 'paused') {
+			if (entry.status === 'starting' || entry.status === 'ready' || entry.status === 'paused' || entry.status === 'stopping') {
 				const gracefulStopMs = entry.config.gracefulStopMs ?? 5000
 
-				const killPromise = new Promise<void>((resolve) => {
-					try {
-						process.kill(-entry.pid, 'SIGTERM')
-					} catch {
-						resolve()
-						return
-					}
-
-					const killTimeout = setTimeout(() => {
-						try {
-							process.kill(-entry.pid, 'SIGKILL')
-						} catch {
-							// Already gone
-						}
-						resolve()
-					}, gracefulStopMs)
-
-					const checkInterval = setInterval(() => {
-						try {
-							process.kill(entry.pid, 0)
-						} catch {
-							clearInterval(checkInterval)
-							clearTimeout(killTimeout)
-							resolve()
-						}
-					}, 200)
+				const killPromise = this.terminateProcessGroup(entry.pid, gracefulStopMs).then(async (stopped) => {
+					if (!stopped.ok) throw stopped.error
+					await entry.forgetPid()
 				})
 
 				promises.push(killPromise)
@@ -962,6 +1093,7 @@ export class ServiceExecutor {
 		}
 
 		await Promise.all(promises)
+		await Promise.all(this.pidForgets.values())
 		this.services.clear()
 
 		// Drain all waiters with error
