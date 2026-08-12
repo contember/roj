@@ -9,7 +9,7 @@ import type { PortPool } from './port-pool.js'
 import { buildServiceStatusMessage } from './prompt.js'
 import type { ServiceConfig, ServiceEntry } from './schema.js'
 import type { ServicePidRegistry } from './pid-registry.js'
-import { getProcessStartTime, ServiceExecutor } from './service.js'
+import { reapServiceProcessGroup, ServiceExecutor } from './service.js'
 
 export const serviceEvents = createEventsFactory({
 	events: {
@@ -107,10 +107,16 @@ export const servicePlugin = definePlugin('services')
 								updated.command = event.command
 							}
 						}
-						if (event.toStatus === 'failed' && event.error) {
-							updated.error = event.error
-							updated.pid = undefined
-							updated.pidStartTime = undefined
+						if (event.toStatus === 'failed') {
+							if (event.error) {
+								updated.error = event.error
+							}
+							// A failed start does not imply a dead process — the wait ended, the
+							// process may not have. The executor reports the pid it could not
+							// confirm gone, and nothing once the process is known to have exited,
+							// so an entry carries a pid exactly while something may still be running.
+							updated.pid = event.pid
+							updated.pidStartTime = event.pidStartTime
 						}
 						if (event.toStatus === 'stopped') {
 							updated.stoppedAt = event.timestamp
@@ -140,9 +146,11 @@ export const servicePlugin = definePlugin('services')
 						if (running) {
 							updated.status = 'stopped'
 							updated.port = undefined
-							updated.pid = undefined
-							updated.pidStartTime = undefined
 							updated.stoppedAt = event.timestamp
+							// The pid deliberately survives: this event only says the runtime
+							// restarted, and nobody has looked at the process yet. Dropping it here
+							// blinded the onSessionReady reconcile — which fires straight after —
+							// to exactly the orphans it exists to reclaim.
 						}
 						newServices.set(serviceType, updated)
 						changed = true
@@ -347,51 +355,46 @@ export const servicePlugin = definePlugin('services')
 		},
 	})
 	.sessionHook('onSessionReady', async (ctx) => {
-		// Reconcile: kill orphaned process groups from previous server instance
-		// and mark corresponding services as stopped. Port is preserved in state
-		// so the next start() reuses it via preferredPort.
-		// Also re-notify running services so DO re-registers their URLs.
+		// Reconcile: kill orphaned process groups from previous server instances and settle
+		// their entries. Port is preserved in state so the next start() reuses it via
+		// preferredPort. Also re-notify running services so DO re-registers their URLs.
+		//
+		// Driven off the recorded pid, not off a list of "running" statuses. A process we
+		// spawned and never saw exit is an orphan whatever the entry says it is, and the
+		// statuses that can still carry one are not only the running ones: a startup failure
+		// leaves `failed`, and session_restarted — which fires just before this hook — leaves
+		// `stopped`. Both were skipped, so their dev servers survived every later boot.
 		for (const [serviceType, entry] of ctx.pluginState) {
-			if (entry.status === 'starting' || entry.status === 'ready' || entry.status === 'paused') {
-				const executorStatus = ctx.pluginContext.executor.getStatus(serviceType)
-				if (!executorStatus) {
-					if (entry.pid !== undefined) {
-						// PID-reuse guard: only kill if we can confirm this PID still
-						// belongs to the process we spawned. If we stored a pidStartTime,
-						// the current start time must match — a mismatch means the kernel
-						// recycled the PID for an unrelated process and SIGKILL would be
-						// disastrous. On non-Linux (no /proc), start times are always
-						// undefined and we fall back to the pre-existing kill-and-hope path.
-						const currentStartTime = await getProcessStartTime(ctx.platform.fs, entry.pid)
-						const pidReused = entry.pidStartTime !== undefined
-							&& currentStartTime !== undefined
-							&& currentStartTime !== entry.pidStartTime
+			const looksRunning = entry.status === 'starting' || entry.status === 'ready' || entry.status === 'paused'
+			if (!looksRunning && entry.pid === undefined) continue
 
-						if (pidReused) {
-							ctx.logger.warn('PID reuse detected during orphan reconcile — refusing to kill', {
-								serviceType,
-								pid: entry.pid,
-								storedStartTime: entry.pidStartTime,
-								currentStartTime,
-							})
-						} else {
-							try {
-								process.kill(-entry.pid, 'SIGKILL')
-								ctx.logger.info('Killed orphaned service process group', { serviceType, pid: entry.pid })
-							} catch (err) {
-								ctx.logger.debug('Orphaned service process already gone', { serviceType, pid: entry.pid, err })
-							}
-						}
-					}
-					await ctx.emitEvent(serviceEvents.create('service_status_changed', {
-						serviceType,
-						toStatus: 'stopped',
-					}))
-				} else if (executorStatus === 'ready' && entry.port) {
+			const executorStatus = ctx.pluginContext.executor.getStatus(serviceType)
+			if (executorStatus) {
+				// This runtime owns the service — nothing to reclaim.
+				if (executorStatus === 'ready' && entry.port) {
 					// Re-notify so DO can re-register service URL after reconnect
 					ctx.notify('serviceStatus', { sessionId: String(ctx.sessionId), serviceType, status: 'ready', port: entry.port })
 				}
+				continue
 			}
+
+			if (entry.pid !== undefined) {
+				await reapServiceProcessGroup(
+					ctx.platform.fs,
+					ctx.logger,
+					{ pid: entry.pid, pidStartTime: entry.pidStartTime },
+					{ serviceType, reason: 'orphan reconcile' },
+				)
+			}
+
+			// A failure keeps its status and its error — reconciling only takes away its
+			// claim on a process. Anything else settles as stopped, as it always did.
+			const toStatus = entry.status === 'failed' ? 'failed' : 'stopped'
+			await ctx.emitEvent(serviceEvents.create('service_status_changed', {
+				serviceType,
+				toStatus,
+				error: toStatus === 'failed' ? entry.error : undefined,
+			}))
 		}
 
 		// Auto-start services configured with autoStart

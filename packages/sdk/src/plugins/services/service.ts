@@ -16,7 +16,7 @@ import type { PortPool } from '~/plugins/services/port-pool.js'
 import type { ServicePidRegistry } from '~/plugins/services/pid-registry.js'
 import type { ServiceConfig, ServiceStartArgs, ServiceStatus } from '~/plugins/services/schema.js'
 import type { ToolError } from '../../core/tools/executor.js'
-import type { Logger } from '../../lib/logger/logger.js'
+import type { LogContext, Logger } from '../../lib/logger/logger.js'
 import { RingBuffer } from '../../lib/logger/ring-buffer.js'
 
 // ============================================================================
@@ -48,6 +48,57 @@ export async function getProcessStartTime(fs: FileSystem, pid: number): Promise<
 	}
 }
 
+/** A spawned service process we may still have to reclaim. */
+export interface ReapTarget {
+	pid: number
+	/** Start time captured at spawn; undefined on non-Linux, or when /proc was unreadable. */
+	pidStartTime?: number
+}
+
+/**
+ * SIGKILL the whole process group of a service we spawned, unless the pid has been recycled.
+ *
+ * Every path that gives up on a service has to come through here, because ending the *wait*
+ * is not ending the *process*: a dev server that missed its readiness window on a memory-
+ * starved box keeps its several hundred MB of RSS until somebody kills it, which then makes
+ * the next startup miss its window too.
+ *
+ * The guard is the same one the orphan sweep uses: `pidStartTime` was captured at spawn, so a
+ * different current start time means the kernel handed this pid to an unrelated process and
+ * killing it would be disastrous. An unknown start time (no /proc, i.e. non-Linux) leaves only
+ * the kill-and-hope path.
+ *
+ * Returns whether the signal was delivered.
+ */
+export async function reapServiceProcessGroup(
+	fs: FileSystem,
+	logger: Logger,
+	target: ReapTarget,
+	context: LogContext = {},
+): Promise<boolean> {
+	const currentStartTime = await getProcessStartTime(fs, target.pid)
+	if (target.pidStartTime !== undefined && currentStartTime !== undefined && currentStartTime !== target.pidStartTime) {
+		logger.warn('PID reuse detected — refusing to kill service process group', {
+			...context,
+			pid: target.pid,
+			storedStartTime: target.pidStartTime,
+			currentStartTime,
+		})
+		return false
+	}
+
+	try {
+		// Negative pid: services are spawned detached, so this takes the whole group —
+		// the `/bin/sh -c` wrapper and the runtime it exec'd underneath it.
+		process.kill(-target.pid, 'SIGKILL')
+		logger.info('Killed service process group', { ...context, pid: target.pid })
+		return true
+	} catch (error) {
+		logger.debug('Service process group already gone', { ...context, pid: target.pid, error })
+		return false
+	}
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -56,11 +107,15 @@ interface RunningService {
 	config: ServiceConfig
 	process: ChildProcess
 	pid: number
+	/** Captured at spawn so a later reap can tell our process from a recycled pid. */
+	pidStartTime?: number
 	status: ServiceStatus
 	port: number
 	cwd?: string
 	command: string
 	logs: RingBuffer
+	/** Set once the child's `close` fired — there is nothing left to reclaim. */
+	exited: boolean
 }
 
 export interface ServiceStatusChangeDetails {
@@ -155,6 +210,24 @@ export class ServiceExecutor {
 		if (status === 'ready' || status === 'failed' || status === 'stopped') {
 			this.resolveWaiters(serviceType, status, details.error)
 		}
+	}
+
+	/**
+	 * Reclaim the process group of an entry we are giving up on or replacing.
+	 *
+	 * Idempotent and safe to call on an entry that already exited — that is the
+	 * common case, and skipping it also keeps the non-Linux kill-and-hope path away
+	 * from a pid the kernel may since have recycled.
+	 */
+	private async reapEntry(entry: RunningService, reason: string): Promise<void> {
+		if (entry.exited) return
+		entry.exited = true
+		await reapServiceProcessGroup(
+			this.fs,
+			this.logger,
+			{ pid: entry.pid, pidStartTime: entry.pidStartTime },
+			{ serviceType: entry.config.type, reason },
+		)
 	}
 
 	private async isAvailable(config: ServiceConfig, sessionId: SessionId, workspaceDir?: string): Promise<Result<boolean, ToolError>> {
@@ -345,6 +418,18 @@ export class ServiceExecutor {
 			return Err({ message: errorMessage, recoverable: true })
 		}
 
+		// Whatever still sits under this type is about to be overwritten — in this map and in
+		// the pid registry, both keyed by (session, type) — and to lose its port to the
+		// process spawned below, since a restart deliberately reuses the same one. A `failed`
+		// or `paused` entry can still own a live process group, so reclaim it here or nothing
+		// will ever be able to find it again. Dropping it from the map first also stops the
+		// old child's `close` from mistaking itself for the current one.
+		const superseded = this.services.get(config.type)
+		if (superseded) {
+			this.services.delete(config.type)
+			await this.reapEntry(superseded, 'superseded by a new start')
+		}
+
 		const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh'
 		const shellFlag = process.platform === 'win32' ? '/c' : '-c'
 
@@ -366,7 +451,10 @@ export class ServiceExecutor {
 					error: error.message,
 					cwd,
 					command,
+					pid: current.pid,
+					pidStartTime: current.pidStartTime,
 				})
+				void this.reapEntry(current, 'process error')
 			}
 		})
 
@@ -401,11 +489,13 @@ export class ServiceExecutor {
 			config,
 			process: child,
 			pid: child.pid,
+			pidStartTime,
 			status: 'starting',
 			port,
 			cwd,
 			command,
 			logs,
+			exited: false,
 		}
 		this.services.set(config.type, entry)
 
@@ -498,19 +588,18 @@ export class ServiceExecutor {
 				const errorMsg = `Service startup timed out after ${startupTimeoutMs}ms`
 				this.logger.error(errorMsg, undefined, { serviceType: config.type })
 				clearReadinessTimers()
+				// The pid rides along on purpose: should this agent die before the reap below
+				// completes, the recorded pid is all a later boot has to find the survivor.
 				this.notifyStatusChanged(sessionId, config.type, 'failed', {
 					port: current.port,
 					cwd: current.cwd,
 					command: current.command,
 					error: errorMsg,
+					pid: current.pid,
+					pidStartTime: current.pidStartTime,
 				})
 
-				// Kill the timed-out process
-				try {
-					process.kill(-current.pid, 'SIGKILL')
-				} catch {
-					// Already gone
-				}
+				void this.reapEntry(current, 'startup timeout')
 			}, startupTimeoutMs)
 		}
 
@@ -546,8 +635,14 @@ export class ServiceExecutor {
 		// Handle unexpected exit
 		child.on('close', (code) => {
 			clearReadinessTimers()
-			// The process is gone, so its durable record has nothing left to reap.
-			void this.pidRegistry?.forget(String(sessionId), config.type)
+			entry.exited = true
+			const current = this.services.get(config.type)
+			// Only the child that still owns the type may drop the durable record, or a
+			// superseded generation's exit deletes the record of the one that replaced it.
+			if (current?.process === child) {
+				// The process is gone, so its durable record has nothing left to reap.
+				void this.pidRegistry?.forget(String(sessionId), config.type)
+			}
 			// Flush remaining partial lines
 			if (stdoutPartial) {
 				processLine(stdoutPartial)
@@ -558,7 +653,6 @@ export class ServiceExecutor {
 				stderrPartial = ''
 			}
 
-			const current = this.services.get(config.type)
 			if (!current || current.process !== child) return
 
 			if (current.status === 'stopping') {
@@ -713,6 +807,15 @@ export class ServiceExecutor {
 			// A failed service with a revival queued is really "about to restart",
 			// and calling that off is a legitimate stop rather than an error.
 			if (hadPendingRestart) {
+				entry.status = 'stopped'
+				this.notifyStatusChanged(sessionId, serviceType, 'stopped')
+				return Ok(undefined)
+			}
+			// `failed` says the start gave up, not that the process did. Refusing to stop it
+			// left the one caller who could reclaim its memory — the platform's reaper —
+			// with no way to do so, so a stop reclaims the group and settles on `stopped`.
+			if (entry.status === 'failed') {
+				await this.reapEntry(entry, 'stopped while failed')
 				entry.status = 'stopped'
 				this.notifyStatusChanged(sessionId, serviceType, 'stopped')
 				return Ok(undefined)

@@ -18,7 +18,7 @@
 import { join } from 'node:path'
 import type { FileSystem } from '~/platform/fs.js'
 import type { Logger } from '../../lib/logger/logger.js'
-import { getProcessStartTime } from './service.js'
+import { getProcessStartTime, reapServiceProcessGroup } from './service.js'
 
 /**
  * What we need in order to decide, later and from another process, whether a recorded
@@ -161,31 +161,11 @@ export class ServicePidRegistry {
 	}
 
 	private async killIfStillOurs(record: ServicePidRecord): Promise<void> {
-		const currentStartTime = await getProcessStartTime(this.fs, record.pid)
-		if (currentStartTime === undefined) return // Process is gone.
-		if (record.pidStartTime !== undefined && currentStartTime !== record.pidStartTime) {
-			this.logger.warn('PID reuse detected during orphan sweep — refusing to kill', {
-				sessionId: record.sessionId,
-				serviceType: record.serviceType,
-				pid: record.pid,
-				storedStartTime: record.pidStartTime,
-				currentStartTime,
-			})
-			return
-		}
-
-		try {
-			// Negative pid: services are spawned detached, so this takes the whole group —
-			// the `/bin/sh -c` wrapper and the runtime it exec'd underneath it.
-			process.kill(-record.pid, 'SIGKILL')
-			this.logger.info('Killed orphaned service process group', {
-				sessionId: record.sessionId,
-				serviceType: record.serviceType,
-				pid: record.pid,
-				command: record.command,
-			})
-		} catch (error) {
-			this.logger.debug('Orphaned service process already gone', { pid: record.pid, error })
-		}
+		await reapServiceProcessGroup(
+			this.fs,
+			this.logger,
+			{ pid: record.pid, pidStartTime: record.pidStartTime },
+			{ sessionId: record.sessionId, serviceType: record.serviceType, command: record.command, reason: 'orphan sweep' },
+		)
 	}
 }
