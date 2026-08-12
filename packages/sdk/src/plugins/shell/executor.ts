@@ -337,6 +337,13 @@ export class ShellExecutor {
 			let stdout = ''
 			let stderr = ''
 			let timedOut = false
+			let processClosed = false
+			let processError: Error | undefined
+			let exitCode: number | null = null
+			let exitSignal: NodeJS.Signals | null = null
+			let stdinSettled = input.stdin === undefined
+			let stdinError: Error | undefined
+			let settled = false
 
 			let child: ChildProcess
 			if (sandboxEnabled) {
@@ -365,19 +372,6 @@ export class ShellExecutor {
 					env: { ...getSafeEnv(), ...this.config.env },
 					detached: true,
 				})
-			}
-
-			// A command that ignores stdin (or exits first) makes the write EPIPE.
-			// An unhandled 'error' on a writable is an uncaught exception, which
-			// would take down the agent instead of failing the tool call.
-			child.stdin?.on('error', () => {})
-
-			// Handle stdin
-			if (input.stdin) {
-				child.stdin?.write(input.stdin)
-				child.stdin?.end()
-			} else {
-				child.stdin?.end()
 			}
 
 			// Collect stdout with size cap
@@ -416,6 +410,55 @@ export class ShellExecutor {
 
 			// Timeout handler — SIGTERM first, then SIGKILL after grace period
 			let killTimeoutId: ReturnType<typeof setTimeout> | undefined
+			const clearTimers = () => {
+				clearTimeout(timeoutId)
+				if (killTimeoutId) clearTimeout(killTimeoutId)
+			}
+			const finishExecution = () => {
+				if (settled) return
+				if (!processClosed) return
+
+				const durationMs = Date.now() - startTime
+				if (processError) {
+					settled = true
+					clearTimers()
+					resolve(Err({
+						message: `Failed to execute command: ${processError.message}`,
+						recoverable: false,
+						details: { durationMs },
+					}))
+					return
+				}
+
+				if (!stdinSettled) return
+
+				settled = true
+				clearTimers()
+				if (stdinError) {
+					resolve(Err({
+						message: `Failed to deliver command stdin: ${stdinError.message}`,
+						recoverable: false,
+						details: {
+							stdout: stdout.trim(),
+							stderr: stderr.trim(),
+							durationMs,
+							exitCode: exitCode ?? -1,
+							signal: exitSignal ?? undefined,
+							timedOut,
+						},
+					}))
+					return
+				}
+
+				resolve(Ok({
+					stdout: stdout.trim(),
+					stderr: stderr.trim(),
+					exitCode: exitCode ?? -1,
+					signal: exitSignal ?? undefined,
+					timedOut,
+					durationMs,
+				}))
+			}
 			const timeoutId = setTimeout(() => {
 				timedOut = true
 				try {
@@ -436,32 +479,57 @@ export class ShellExecutor {
 
 			// Process exit
 			child.on('close', (code, signal) => {
-				clearTimeout(timeoutId)
-				if (killTimeoutId) clearTimeout(killTimeoutId)
-				const durationMs = Date.now() - startTime
-
-				resolve(Ok({
-					stdout: stdout.trim(),
-					stderr: stderr.trim(),
-					exitCode: code ?? -1,
-					signal: signal ?? undefined,
-					timedOut,
-					durationMs,
-				}))
+				processClosed = true
+				exitCode = code
+				exitSignal = signal
+				if (input.stdin !== undefined && !stdinSettled) {
+					if (child.stdin?.writableFinished) {
+						stdinSettled = true
+					} else {
+						stdinError = new Error('child process closed before accepting all stdin input')
+						stdinSettled = true
+					}
+				}
+				finishExecution()
 			})
 
 			// Process error
 			child.on('error', (error) => {
-				clearTimeout(timeoutId)
-				if (killTimeoutId) clearTimeout(killTimeoutId)
-				const durationMs = Date.now() - startTime
-
-				resolve(Err({
-					message: `Failed to execute command: ${error.message}`,
-					recoverable: false,
-					details: { durationMs },
-				}))
+				processError = error
+				finishExecution()
 			})
+
+			// A failed stdin write must not be hidden by a successful process exit.
+			if (input.stdin !== undefined) {
+				if (!child.stdin) {
+					stdinError = new Error('child process stdin is unavailable')
+					stdinSettled = true
+				} else {
+					child.stdin.once('finish', () => {
+						if (stdinSettled) return
+						stdinSettled = true
+						finishExecution()
+					})
+					child.stdin.on('error', (error) => {
+						if (stdinSettled) return
+						stdinError = error
+						stdinSettled = true
+						finishExecution()
+					})
+					child.stdin.once('close', () => {
+						if (stdinSettled) return
+						stdinError = new Error('child process stdin closed before accepting all input')
+						stdinSettled = true
+						finishExecution()
+					})
+					child.stdin.end(input.stdin)
+				}
+			} else {
+				// Keep late pipe errors contained when no input delivery was requested.
+				child.stdin?.on('error', () => {})
+				child.stdin?.end()
+			}
+			finishExecution()
 		})
 	}
 }
