@@ -14,6 +14,10 @@ import type { Workspace } from '@cloudflare/computer'
 import type { Platform } from '@roj-ai/sdk/platform'
 import { runNativeStatusProbe } from './native-status-probe.js'
 import type { NativeStatusResult, SqlSource } from './native-status-probe.js'
+import { runOpsProfile } from './ops-profile.js'
+import type { OpProfile } from './ops-profile.js'
+import { profileSql } from './sql-profile.js'
+import type { SqlProfile } from './sql-profile.js'
 import type { RawQuery } from './vfs-cost-probe.js'
 
 export interface CloneProbeResult {
@@ -48,6 +52,10 @@ export interface CloneProbeResult {
 	statusAfterEditEntries?: number
 	/** The same questions asked of SQLite instead of of git — see native-status-probe.ts. */
 	native?: NativeStatusResult
+	/** Every statement the clone itself ran — the write side of the driver. */
+	cloneSql?: SqlProfile
+	/** The rest of the working set, one statement count each — see ops-profile.ts. */
+	ops?: OpProfile[]
 }
 
 interface WalkTotals {
@@ -125,17 +133,23 @@ export async function runCloneProbe(options: {
 	// workerd freezes its clock between I/O, so yield before reading it.
 	await scheduler.wait(0)
 	const cloneStart = Date.now()
-	await workspace.git.clone({
-		url,
-		dir,
-		depth,
-		singleBranch: true,
-		noTags: true,
-		...(ref === undefined ? {} : { ref }),
-		// Git-over-HTTPS wants Basic, not the Bearer the package README shows —
-		// a Bearer header 401s even against a public repo.
-		...(token === undefined ? {} : { headers: { Authorization: `Basic ${btoa(`x-access-token:${token}`)}` } }),
-	})
+	const runClone = async (): Promise<void> => {
+		await workspace.git.clone({
+			url,
+			dir,
+			depth,
+			singleBranch: true,
+			noTags: true,
+			...(ref === undefined ? {} : { ref }),
+			// Git-over-HTTPS wants Basic, not the Bearer the package README shows —
+			// a Bearer header 401s even against a public repo.
+			...(token === undefined ? {} : { headers: { Authorization: `Basic ${btoa(`x-access-token:${token}`)}` } }),
+		})
+	}
+	// The clone is the one operation that is mostly writes, so it is the one the
+	// read scope cannot help — profile it to see what the write path costs.
+	const cloneSql = db === undefined ? undefined : (await profileSql(workspace.db, runClone)).profile
+	if (db === undefined) await runClone()
 	await scheduler.wait(0)
 	const cloneMs = Date.now() - cloneStart
 	const dbBytesAfter = dbSize?.()
@@ -163,6 +177,7 @@ export async function runCloneProbe(options: {
 		dbBytesBefore,
 		dbBytesAfter,
 		statusRunsMs: [],
+		...(cloneSql === undefined ? {} : { cloneSql }),
 	}
 
 	// A clone that blew the invocation budget never gets here; one that didn't
@@ -211,6 +226,9 @@ export async function runCloneProbe(options: {
 			touch: touch ?? 200,
 			...(rawQuery === undefined ? {} : { rawQuery }),
 		})
+		// After the native probe, so `diff` and `commit` have a dirty tree to
+		// work on rather than the pristine one the clone left.
+		result.ops = await runOpsProfile({ platform, workspace, db: workspace.db, dir })
 	}
 
 	return result
