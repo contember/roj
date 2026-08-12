@@ -28,6 +28,7 @@ import type { SessionCreatedEvent, SessionOverridesPatch } from '~/core/sessions
 import { checkRecoveryNeeded, isSessionCreatedEvent, reconstructSessionState, sessionEvents } from '~/core/sessions/state.js'
 import type { ToolExecutor } from '~/core/tools'
 import { FileLogger } from '~/lib/logger/file.js'
+import type { ArchiveLimitOverrides } from '~/lib/archive/index.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import { TeeLogger } from '~/lib/logger/tee.js'
 import type { Platform } from '~/platform/index.js'
@@ -77,6 +78,8 @@ export interface SessionManagerOptions {
 	dataFileStore: FileStore
 	onUserOutput?: UserOutputCallback
 	preprocessorRegistry?: PreprocessorRegistry
+	uploadArchiveLimits?: ArchiveLimitOverrides
+	resourceArchiveLimits?: ArchiveLimitOverrides
 	llmLogger?: LLMLogger
 	portPool?: PortPool
 	pidRegistry?: ServicePidRegistry
@@ -109,6 +112,8 @@ export class SessionManager {
 	private readonly dataFileStore: FileStore
 	private readonly onUserOutput?: UserOutputCallback
 	private readonly preprocessorRegistry?: PreprocessorRegistry
+	private readonly uploadArchiveLimits?: ArchiveLimitOverrides
+	private readonly resourceArchiveLimits?: ArchiveLimitOverrides
 	private readonly llmLogger?: LLMLogger
 	private readonly portPool?: PortPool
 	private readonly pidRegistry?: ServicePidRegistry
@@ -126,6 +131,8 @@ export class SessionManager {
 		this.dataFileStore = options.dataFileStore
 		this.onUserOutput = options.onUserOutput
 		this.preprocessorRegistry = options.preprocessorRegistry
+		this.uploadArchiveLimits = options.uploadArchiveLimits
+		this.resourceArchiveLimits = options.resourceArchiveLimits
 		this.llmLogger = options.llmLogger
 		this.portPool = options.portPool
 		this.pidRegistry = options.pidRegistry
@@ -793,7 +800,12 @@ export class SessionManager {
 		configs.set('uploads', {
 			dataFileStore: this.dataFileStore,
 			preprocessorRegistry: this.preprocessorRegistry,
+			archiveLimits: this.uploadArchiveLimits,
 		})
+
+		if (this.resourceArchiveLimits) {
+			configs.set('resources', { archiveLimits: this.resourceArchiveLimits })
+		}
 
 		// services plugin — collect services from all agent definitions
 		const allAgentConfigs = [preset.orchestrator, ...(preset.communicator ? [preset.communicator] : []), ...preset.agents]

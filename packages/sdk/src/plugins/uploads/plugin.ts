@@ -5,6 +5,7 @@ import type { InferenceContext } from '~/core/llm/provider.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { SessionId } from '~/core/sessions/schema.js'
 import { getEntryAgentId } from '~/core/sessions/state.js'
+import { ArchiveBudget, type ArchiveLimitOverrides } from '~/lib/archive/index.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import type { PreprocessorRegistry, PreprocessorResult } from './preprocessor.js'
 import { generateUploadId, type MessageAttachment, UploadId, type UploadMetadata } from './schema.js'
@@ -57,6 +58,7 @@ export interface UploadsPluginConfig {
 	preprocessorRegistry?: PreprocessorRegistry
 	processingTimeoutMs?: number
 	processingAbortGraceMs?: number
+	archiveLimits?: ArchiveLimitOverrides
 }
 
 interface UploadInput {
@@ -192,6 +194,7 @@ async function runPreprocessor(args: {
 	preprocessorRegistry?: PreprocessorRegistry
 	processingTimeoutMs?: number
 	processingAbortGraceMs?: number
+	archiveLimits?: ArchiveLimitOverrides
 	controller: AbortController
 	inferenceContext?: Omit<InferenceContext, 'signal'>
 }): Promise<UploadResult> {
@@ -207,6 +210,7 @@ async function runPreprocessor(args: {
 					files: args.uploadStore,
 					signal: args.controller.signal,
 					inferenceContext: args.inferenceContext,
+					archiveBudget: new ArchiveBudget(args.archiveLimits),
 				}),
 			}
 		} catch (error) {
@@ -336,6 +340,7 @@ async function processUpload(args: {
 		preprocessorRegistry: args.config.preprocessorRegistry,
 		processingTimeoutMs: args.config.processingTimeoutMs,
 		processingAbortGraceMs: args.config.processingAbortGraceMs,
+		archiveLimits: args.config.archiveLimits,
 		controller: args.prepared.lifecycle.controller,
 		inferenceContext: args.inferenceContext,
 	})

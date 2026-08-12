@@ -4,6 +4,7 @@
 
 import { resolve } from 'node:path'
 import type { MockInferenceHandler } from './core/llm/mock.js'
+import type { ArchiveLimitOverrides } from './lib/archive/index.js'
 import type { LogLevel } from './lib/logger/logger.js'
 
 /**
@@ -32,6 +33,11 @@ export interface Config {
 
 	/** Max concurrent vision LLM calls when classifying uploaded images. Default 10. */
 	imageClassifierConcurrency?: number
+
+	/** Aggregate limits across every ZIP nested in one attachment upload. */
+	uploadArchiveLimits?: ArchiveLimitOverrides
+	/** Per-archive limits for resource ZIP injection. */
+	resourceArchiveLimits?: ArchiveLimitOverrides
 
 	/**
 	 * Identity of the application embedding this SDK. Reported via `/status`
@@ -78,6 +84,8 @@ export const loadConfig = (): Config => {
 		imageClassifierConcurrency: process.env.IMAGE_CLASSIFIER_CONCURRENCY
 			? parseInt(process.env.IMAGE_CLASSIFIER_CONCURRENCY, 10)
 			: undefined,
+		uploadArchiveLimits: archiveLimitsFromEnv('UPLOAD_ARCHIVE'),
+		resourceArchiveLimits: archiveLimitsFromEnv('RESOURCE_ARCHIVE'),
 		logLevel: (process.env.LOG_LEVEL ?? 'info') as LogLevel,
 		logFormat: (process.env.LOG_FORMAT ?? 'console') as 'console' | 'json',
 		workerUrl: process.env.WORKER_URL,
@@ -118,5 +126,33 @@ export const validateConfig = (config: Config): string[] => {
 		errors.push(`Invalid persistence type: ${config.persistence}`)
 	}
 
+	validateArchiveLimitOverrides('uploadArchiveLimits', config.uploadArchiveLimits, errors)
+	validateArchiveLimitOverrides('resourceArchiveLimits', config.resourceArchiveLimits, errors)
+
 	return errors
+}
+
+function archiveLimitsFromEnv(prefix: 'UPLOAD_ARCHIVE' | 'RESOURCE_ARCHIVE'): ArchiveLimitOverrides | undefined {
+	const maxEntries = process.env[`${prefix}_MAX_ENTRIES`]
+	const maxTotalUncompressedSize = process.env[`${prefix}_MAX_UNCOMPRESSED_BYTES`]
+	if (maxEntries === undefined && maxTotalUncompressedSize === undefined) return undefined
+	return {
+		maxEntries: maxEntries === undefined ? undefined : parseInt(maxEntries, 10),
+		maxTotalUncompressedSize: maxTotalUncompressedSize === undefined
+			? undefined
+			: parseInt(maxTotalUncompressedSize, 10),
+	}
+}
+
+function validateArchiveLimitOverrides(
+	name: 'uploadArchiveLimits' | 'resourceArchiveLimits',
+	limits: ArchiveLimitOverrides | undefined,
+	errors: string[],
+): void {
+	if (!limits) return
+	for (const [field, value] of Object.entries(limits)) {
+		if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+			errors.push(`Invalid ${name}.${field}: ${value}`)
+		}
+	}
 }

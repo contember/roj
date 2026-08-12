@@ -23,6 +23,10 @@ describe('config', () => {
 			delete process.env.LOG_FORMAT
 			delete process.env.WORKER_URL
 			delete process.env.AGENT_TOKEN
+			delete process.env.UPLOAD_ARCHIVE_MAX_ENTRIES
+			delete process.env.UPLOAD_ARCHIVE_MAX_UNCOMPRESSED_BYTES
+			delete process.env.RESOURCE_ARCHIVE_MAX_ENTRIES
+			delete process.env.RESOURCE_ARCHIVE_MAX_UNCOMPRESSED_BYTES
 
 			const config = loadConfig()
 
@@ -36,6 +40,8 @@ describe('config', () => {
 			expect(config.logFormat).toBe('console')
 			expect(config.workerUrl).toBeUndefined()
 			expect(config.agentToken).toBeUndefined()
+			expect(config.uploadArchiveLimits).toBeUndefined()
+			expect(config.resourceArchiveLimits).toBeUndefined()
 		})
 
 		test('loads values from environment', () => {
@@ -49,6 +55,10 @@ describe('config', () => {
 			process.env.LOG_FORMAT = 'json'
 			process.env.WORKER_URL = 'https://worker.example.com'
 			process.env.AGENT_TOKEN = 'secret-token'
+			process.env.UPLOAD_ARCHIVE_MAX_ENTRIES = '750'
+			process.env.UPLOAD_ARCHIVE_MAX_UNCOMPRESSED_BYTES = '209715200'
+			process.env.RESOURCE_ARCHIVE_MAX_ENTRIES = '2500'
+			process.env.RESOURCE_ARCHIVE_MAX_UNCOMPRESSED_BYTES = '1073741824'
 
 			const config = loadConfig()
 
@@ -62,6 +72,14 @@ describe('config', () => {
 			expect(config.logFormat).toBe('json')
 			expect(config.workerUrl).toBe('https://worker.example.com')
 			expect(config.agentToken).toBe('secret-token')
+			expect(config.uploadArchiveLimits).toEqual({
+				maxEntries: 750,
+				maxTotalUncompressedSize: 209715200,
+			})
+			expect(config.resourceArchiveLimits).toEqual({
+				maxEntries: 2500,
+				maxTotalUncompressedSize: 1073741824,
+			})
 		})
 	})
 
@@ -169,6 +187,19 @@ describe('config', () => {
 			}
 			const errors = validateConfig(config)
 			expect(errors.length).toBeGreaterThanOrEqual(3)
+		})
+
+		test('rejects invalid archive limits', () => {
+			const config: Config = {
+				...validConfig,
+				uploadArchiveLimits: { maxEntries: -1 },
+				resourceArchiveLimits: { maxTotalUncompressedSize: Number.NaN },
+			}
+
+			expect(validateConfig(config)).toEqual([
+				'Invalid uploadArchiveLimits.maxEntries: -1',
+				'Invalid resourceArchiveLimits.maxTotalUncompressedSize: NaN',
+			])
 		})
 	})
 })

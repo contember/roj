@@ -205,6 +205,88 @@ describe('resources plugin', () => {
 		}
 	})
 
+	it('applies resource-specific archive limits before extraction', async () => {
+		const workspaceDir = await mkdtemp(join(tmpdir(), 'roj-resources-custom-limit-'))
+		const listing = zipInfoFixture([
+			{ name: 'one.txt', size: 1, type: 'file' },
+			{ name: 'two.txt', size: 1, type: 'file' },
+		])
+
+		try {
+			const { harness, session } = await createResourceHarness(workspaceDir, {
+				archiveLimits: { maxEntries: 1 },
+			})
+			let extractionCalled = false
+			const process = harness.sessionManager.getPlatform().process
+			const originalExec = process.execFile.bind(process)
+			process.execFile = async (file, args, options) => {
+				if (file === 'unzip' && args[0] === '-Z') return { stdout: listing, stderr: '' }
+				if (file === 'unzip' && args[0] === '-q') extractionCalled = true
+				return originalExec(file, args, options)
+			}
+
+			await expect(session.callPluginMethod('resources.inject', resourceInput({
+				filename: 'resource.zip',
+				mimeType: 'application/zip',
+			}))).rejects.toThrow('ZIP inspection failed')
+
+			expect(extractionCalled).toBe(false)
+			expect(await readdir(workspaceDir)).toEqual([])
+		} finally {
+			await rm(workspaceDir, { recursive: true, force: true })
+		}
+	})
+
+	it('applies server-configured resource archive limits', async () => {
+		const baseDir = await mkdtemp(join(tmpdir(), 'roj-resource-server-limit-'))
+		const workspaceDir = join(baseDir, 'workspace')
+		await mkdir(workspaceDir)
+		const platform = createNodePlatform()
+		let extractionCalled = false
+		const listing = zipInfoFixture([
+			{ name: 'one.txt', size: 1, type: 'file' },
+			{ name: 'two.txt', size: 1, type: 'file' },
+		])
+		const originalExec = platform.process.execFile.bind(platform.process)
+		platform.process.execFile = async (file, args, options) => {
+			if (file === 'unzip' && args[0] === '-Z') return { stdout: listing, stderr: '' }
+			if (file === 'unzip' && args[0] === '-q') extractionCalled = true
+			return originalExec(file, args, options)
+		}
+		const services = bootstrap({
+			port: 0,
+			host: 'localhost',
+			dataPath: baseDir,
+			persistence: 'memory',
+			logLevel: 'error',
+			logFormat: 'console',
+			resourceArchiveLimits: { maxEntries: 1 },
+			llmMock: () => ({
+				content: 'Mock response',
+				toolCalls: [],
+				finishReason: 'stop',
+				metrics: { promptTokens: 0, completionTokens: 0, totalTokens: 0, latencyMs: 0, model: 'mock' },
+			}),
+		}, { presets: [createTestPreset({ workspaceDir })] }, platform)
+		const sessionManager = createSessionManager(services)
+
+		try {
+			const sessionResult = await sessionManager.createSession('test', { workspaceDir })
+			if (!sessionResult.ok) throw new Error(sessionResult.error.message)
+
+			await expect(sessionResult.value.callPluginMethod('resources.inject', resourceInput({
+				filename: 'resource.zip',
+				mimeType: 'application/zip',
+			}))).rejects.toThrow('ZIP inspection failed')
+
+			expect(extractionCalled).toBe(false)
+			expect(await readdir(workspaceDir)).toEqual([])
+		} finally {
+			await sessionManager.shutdown()
+			await rm(baseDir, { recursive: true, force: true })
+		}
+	})
+
 	it('cleans staging and leaves the target unchanged when extraction fails', async () => {
 		const workspaceDir = await mkdtemp(join(tmpdir(), 'roj-resources-extract-'))
 		await writeFile(join(workspaceDir, 'existing.txt'), 'unchanged')

@@ -11,6 +11,8 @@ export interface ArchiveLimits {
 	maxTotalUncompressedSize: number
 }
 
+export type ArchiveLimitOverrides = Partial<ArchiveLimits>
+
 export const DEFAULT_ARCHIVE_LIMITS: Readonly<ArchiveLimits> = {
 	maxEntries: 500,
 	maxTotalUncompressedSize: 100 * MEBIBYTE,
@@ -54,6 +56,48 @@ export class ArchiveInspectionError extends Error {
 export interface InspectZipArchiveOptions {
 	signal?: AbortSignal
 	timeoutMs?: number
+	limits?: ArchiveLimitOverrides
+}
+
+export function resolveArchiveLimits(overrides: ArchiveLimitOverrides = {}): Readonly<ArchiveLimits> {
+	return { ...DEFAULT_ARCHIVE_LIMITS, ...overrides }
+}
+
+/** Tracks one aggregate extraction budget across a top-level archive and every nested archive. */
+export class ArchiveBudget {
+	readonly limits: Readonly<ArchiveLimits>
+	private consumedEntries = 0
+	private consumedUncompressedSize = 0
+
+	constructor(limits: ArchiveLimitOverrides = {}) {
+		this.limits = resolveArchiveLimits(limits)
+	}
+
+	consume(inspection: ArchiveInspection): Result<void, ArchiveInspectionError> {
+		if (!isValidLimit(this.limits.maxEntries) || !isValidLimit(this.limits.maxTotalUncompressedSize)) {
+			return invalidListing('Archive limits must be non-negative safe integers')
+		}
+
+		const nextEntries = this.consumedEntries + inspection.entries.length
+		if (!Number.isSafeInteger(nextEntries) || nextEntries > this.limits.maxEntries) {
+			return Err(new ArchiveInspectionError(
+				'too_many_entries',
+				`Nested ZIP archives exceed the aggregate ${this.limits.maxEntries} entry limit`,
+			))
+		}
+
+		const nextSize = this.consumedUncompressedSize + inspection.totalUncompressedSize
+		if (!Number.isSafeInteger(nextSize) || nextSize > this.limits.maxTotalUncompressedSize) {
+			return Err(new ArchiveInspectionError(
+				'too_large',
+				`Nested ZIP archives exceed the aggregate ${this.limits.maxTotalUncompressedSize} byte uncompressed size limit`,
+			))
+		}
+
+		this.consumedEntries = nextEntries
+		this.consumedUncompressedSize = nextSize
+		return Ok(undefined)
+	}
 }
 
 /** Inspect the central directory before a caller performs extraction. */
@@ -84,7 +128,7 @@ export async function inspectZipArchive(
 
 	const parsed = parseZipInfoVerbose(stdout)
 	if (!parsed.ok) return parsed
-	return validateArchiveEntries(parsed.value)
+	return validateArchiveEntries(parsed.value, resolveArchiveLimits(options.limits))
 }
 
 /** Parse the stable fields emitted by Info-ZIP's verbose central-directory listing. */
