@@ -19,6 +19,8 @@ import type { Workspace } from '@cloudflare/computer'
 import { createNativeDiffSummary } from '@roj-ai/computer-platform'
 import type { NativeDiffSummary } from '@roj-ai/computer-platform'
 import type { Platform } from '@roj-ai/sdk/platform'
+import { profileSql } from './sql-profile.js'
+import type { SqlProfile } from './sql-profile.js'
 import { runVfsCostProbe } from './vfs-cost-probe.js'
 import type { RawQuery, VfsCostResult } from './vfs-cost-probe.js'
 
@@ -70,6 +72,8 @@ export interface NativeStatusResult {
 	ignored: string | null
 	/** `diffSummary` from SQLite against the binding's, over the same dirty tree. */
 	diff?: DiffComparison
+	/** Every statement the binding's own `git status` runs — see sql-profile.ts. */
+	statusSql?: SqlProfile
 	/** Where the per-node cost goes, layer by layer — see vfs-cost-probe.ts. */
 	cost?: VfsCostResult
 }
@@ -360,6 +364,10 @@ export async function runNativeStatusProbe(options: {
 		dir,
 	)
 
+	// What the binding asks the filesystem for, statement by statement. This is
+	// the number the driver has to bring down; everything native sidesteps it.
+	const { profile: statusSql } = await profileSql(workspace.db, () => workspace.git.status({ dir }))
+
 	return {
 		rootInode,
 		enumMs,
@@ -379,6 +387,7 @@ export async function runNativeStatusProbe(options: {
 		clean,
 		dirty,
 		diff,
+		statusSql,
 		ignored,
 		...(rootInode === null ? {} : {
 			cost: await runVfsCostProbe({
