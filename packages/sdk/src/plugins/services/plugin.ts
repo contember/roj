@@ -414,7 +414,7 @@ export const servicePlugin = definePlugin('services')
 			// A queued revival outlives the session otherwise: its timer holds the
 			// executor alive and spawns a process into a session that is already gone.
 			const revivalQueued = ctx.pluginContext.executor.hasScheduledRestart(svcConfig.type)
-			if (status === 'ready' || status === 'starting' || revivalQueued) {
+			if (status === 'ready' || status === 'starting' || status === 'paused' || revivalQueued) {
 				await ctx.pluginContext.executor.stop(svcConfig.type, ctx.sessionId)
 			}
 		}
