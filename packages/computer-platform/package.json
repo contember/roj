@@ -32,7 +32,7 @@
 		"type-check": "tsc --noEmit"
 	},
 	"dependencies": {
-		"@cloudflare/computer": "0.1.1",
+		"@cloudflare/computer": "0.2.0",
 		"@platformatic/vfs": "*",
 		"@roj-ai/sdk": "workspace:*"
 	},

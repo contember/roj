@@ -8,7 +8,7 @@
 		"type-check": "tsc --noEmit"
 	},
 	"dependencies": {
-		"@cloudflare/computer": "0.1.1",
+		"@cloudflare/computer": "0.2.0",
 		"@roj-ai/computer-platform": "workspace:*",
 		"@roj-ai/sdk": "workspace:*",
 		"@roj-ai/transport": "workspace:*"

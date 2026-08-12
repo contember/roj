@@ -24,6 +24,10 @@ export interface CloneProbeResult {
 	cloneMs: number
 	/** Wall clock for the walk that produced `files` / `bytes`. */
 	walkMs: number
+	/** The same walk over readdir's own metadata, with no stat per file (0.2.0+). */
+	walkMetaMs?: number
+	walkMetaFiles?: number
+	walkMetaBytes?: number
 	files: number
 	dirs: number
 	bytes: number
@@ -50,6 +54,31 @@ interface WalkTotals {
 	files: number
 	dirs: number
 	bytes: number
+}
+
+/**
+ * The same traversal, but reading size off the directory listing instead of
+ * asking for each file. 0.2.0's readdir returns size and mtime from the join it
+ * already runs, so this is one statement per directory against the other walk's
+ * one-plus-per-file.
+ */
+async function walkOverListing(workspace: Workspace, path: string): Promise<WalkTotals> {
+	const totals: WalkTotals = { files: 0, dirs: 0, bytes: 0 }
+	const stack = [path]
+	while (stack.length > 0) {
+		const dir = stack.pop()
+		if (dir === undefined) break
+		for (const entry of await workspace.fs.readdir(dir)) {
+			if (entry.isDirectory) {
+				totals.dirs++
+				stack.push(`${dir}/${entry.name}`)
+			} else {
+				totals.files++
+				totals.bytes += entry.size
+			}
+		}
+	}
+	return totals
 }
 
 async function walk(platform: Platform, path: string): Promise<WalkTotals> {
@@ -116,12 +145,20 @@ export async function runCloneProbe(options: {
 	await scheduler.wait(0)
 	const walkMs = Date.now() - walkStart
 
+	const metaStart = Date.now()
+	const metaTotals = await walkOverListing(workspace, dir)
+	await scheduler.wait(0)
+	const walkMetaMs = Date.now() - metaStart
+
 	const result: CloneProbeResult = {
 		url,
 		ref,
 		depth,
 		cloneMs,
 		walkMs,
+		walkMetaMs,
+		walkMetaFiles: metaTotals.files,
+		walkMetaBytes: metaTotals.bytes,
 		...totals,
 		dbBytesBefore,
 		dbBytesAfter,
