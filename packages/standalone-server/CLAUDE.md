@@ -14,7 +14,7 @@ What this does:
 What this does NOT do:
 - Multi-tenancy (one `instanceId` per process, generated on startup)
 - Sandbox isolation (agent runs directly on the host)
-- Authentication (no tokens, no cookies — bind to localhost)
+- Authentication (no tokens, no cookies — binds to `127.0.0.1` by default)
 - Bundle management (`bundles.*` RPC returns `method_not_found`)
 - Publishing (`sessions.publish` returns `method_not_found`)
 
@@ -62,8 +62,8 @@ Implemented:
   process-singleton)
 - `sessions.create/list` — delegates to SDK `callManagerMethod`. `initialPrompt`
   is delivered as a `user-chat.sendMessage` after creation, mirroring
-  roj-platform `activatePendingSession`. `resourceIds` are matched against the
-  local registry (see below).
+  roj-platform `activatePendingSession`. This method does not accept resource or
+  file IDs; those belong only to `instances.create.autoCreateSession`.
 - `tokens.create` — returns `{ token: '' }`
 - `sessionFiles.createDownloadUrl` — HMAC-signed URL pointing at
   `GET /api/v1/instances/:id/sessions/:sid/files/{workspace|session}/{path}?token=...`,
@@ -113,14 +113,19 @@ left alone (so previously uploaded revisions survive restarts).
 At session start, resources to inject are resolved in this order
 (mirroring roj-platform's project-init):
 
-1. `input.resourceIds` (from `instances.create.autoCreateSession` or
-   `sessions.create`) — each value is matched against the registry first
-   by `id`, then by `slug`. Unmatched values are warned-and-skipped.
-2. If nothing matched, fall back to `preset.defaultResourceSlugs`
-   (looked up by slug).
+1. `instances.create.autoCreateSession.resourceIds` — each value is matched
+   against the registry first by `id`, then by `slug`.
+2. `instances.create.autoCreateSession.fileIds` — each value is matched directly
+   against a registry file.
+3. If neither explicit list contains an ID, fall back to
+   `preset.defaultResourceSlugs` (looked up by slug).
 
-For each resolved resource, the server reads the latest revision's file
-bytes from the registry and calls `resources.inject` directly on the
+Unmatched IDs are warned-and-skipped. Files are injected in the listed order,
+with resources before direct files. A registry file selected more than once is
+injected once.
+
+For each selected file, the server reads its bytes from the registry and calls
+`resources.inject` directly on the
 session — same plugin method the SDK's `POST /sessions/:sid/inject-resource`
 HTTP route uses, just bypassing the URL fetch.
 
@@ -155,10 +160,15 @@ Lifecycle:
   if `repo.git` already exists). The bare gets an empty `Initial commit` on
   `main` via plumbing (`mktree`, `commit-tree`, `update-ref`) so subsequent
   `worktree add -b session/{sid}` calls have something to branch from.
-- `sessions.create` mints the session id locally, `git worktree add`s its
+- Session creation mints the session id locally, `git worktree add`s its
   worktree, and passes the worktree path to the SDK as `workspaceDir`. If
   `sessionManager.callManagerMethod('sessions.create', ...)` fails, the
   worktree is rolled back so retries aren't blocked by an orphaned dir.
+- If resource injection fails after SDK creation, standalone closes the domain
+  session (which awaits runtime disposal) and removes the worktree before
+  returning the original injection error. The closed session events remain in
+  the event store and can appear in history; standalone does not delete domain
+  history as part of rollback.
 - Worktrees persist across `roj-standalone` restarts. There is currently no
   automatic cleanup — to nuke instance state, stop the server and
   `rm -rf {dataPath}/instances/`.
@@ -166,3 +176,10 @@ Lifecycle:
 No auto-commit. Resources extracted via `resources.inject` land in the
 worktree as untracked files; whether to commit them is the agent's call,
 matching platform behavior.
+
+## Network binding
+
+Without an explicit host, standalone binds to `127.0.0.1`. `config.host` takes
+precedence over the `HOST` environment variable. Explicit non-loopback hosts
+are allowed for intentional network access, but startup logs a warning because
+standalone does not authenticate requests. Protect such a listener externally.

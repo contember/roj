@@ -14,54 +14,249 @@
  * - instances.archive  — no-op; shutdown the server instead
  */
 
-import { platformMethods } from '@roj-ai/client/platform'
 import type { MethodInput, MethodOutput, PlatformMethodName, PlatformMethods } from '@roj-ai/client/platform'
-import type { Logger, Preset, SessionManager } from '@roj-ai/sdk'
+import type { Logger, Preset, Result, Session } from '@roj-ai/sdk'
 import { SessionId, sessionMetadataSchema } from '@roj-ai/sdk'
 import z from 'zod/v4'
 import { randomUUID } from 'node:crypto'
 import { Hono } from 'hono'
-import type { GitInstanceFs } from './git-instance-fs.js'
 import type { InstanceState } from './instance.js'
 import type { LocalRegistry } from './local-registry.js'
 import { signFileToken } from './signed-token.js'
 
+interface RpcError {
+	type: string
+	message: string
+	httpStatus: number
+}
+
+interface PlatformSessionManager {
+	callManagerMethod(method: string, input: unknown): Promise<Result<unknown, RpcError>>
+	callPluginMethod(sessionId: SessionId, method: string, input: unknown): Promise<Result<unknown, RpcError>>
+	getSession(sessionId: SessionId): Promise<Result<Pick<Session, 'close'>, RpcError>>
+	getStats(): Promise<{
+		sessions: Array<{ id: SessionId; presetId: string; status: string }>
+	}>
+}
+
+interface SessionGitFs {
+	addSessionWorktree(instanceId: string, sessionId: string): Promise<string>
+	removeSessionWorktree(instanceId: string, sessionId: string): Promise<void>
+}
+
 interface Deps {
 	instance: InstanceState
-	sessionManager: SessionManager
+	sessionManager: PlatformSessionManager
 	logger: Logger
 	presets: Preset[]
 	registry: LocalRegistry
 	/** Per-instance bare repo + per-session worktree manager. */
-	gitFs: GitInstanceFs
+	gitFs: SessionGitFs
 	/** HMAC secret for signing download tokens (`sessionFiles.createDownloadUrl`). */
 	tokenSecret: string
 	/** Externally-reachable base URL (e.g. `http://localhost:8765`) used when minting download URLs. */
-	publicBaseUrl: string
+	getPublicBaseUrl(): string
 }
 
-interface RpcEnvelope {
-	method?: string
-	input?: unknown
-	batch?: Array<{ method: string; input?: unknown }>
-}
+const RpcCallSchema = z.strictObject({
+	method: z.string(),
+	input: z.unknown().optional(),
+})
+
+const RpcEnvelopeSchema = z.union([
+	RpcCallSchema,
+	z.strictObject({ batch: z.array(RpcCallSchema) }),
+])
+
+const AutoCreateSessionSchema = z.strictObject({
+	presetId: z.string().min(1),
+	blocking: z.boolean().optional(),
+	initialPrompt: z.string().optional(),
+	resourceIds: z.array(z.string()).optional(),
+	fileIds: z.array(z.string()).optional(),
+})
+
+const inputSchemas = {
+	'instances.create': z.strictObject({
+		templateSlug: z.string(),
+		bundleSlug: z.string().optional(),
+		bundleRevisionId: z.string().optional(),
+		name: z.string(),
+		vcsType: z.enum(['github', 'gitLocal', 'none']).optional(),
+		metadata: z.record(z.string(), z.unknown()).optional(),
+		autoCreateSession: AutoCreateSessionSchema.optional(),
+	}),
+	'instances.get': z.strictObject({ instanceId: z.string() }),
+	'instances.list': z.strictObject({
+		limit: z.number().optional(),
+		offset: z.number().optional(),
+	}),
+	'instances.status': z.strictObject({ instanceId: z.string() }),
+	'instances.archive': z.strictObject({ instanceId: z.string() }),
+	'sessions.create': z.strictObject({
+		instanceId: z.string(),
+		presetId: z.string().min(1),
+		blocking: z.boolean().optional(),
+		origin: z.string().optional(),
+		expiresIn: z.number().optional(),
+		initialPrompt: z.string().optional(),
+	}),
+	'sessions.list': z.strictObject({ instanceId: z.string() }),
+	'tokens.create': z.strictObject({
+		instanceId: z.string(),
+		origin: z.string().optional(),
+		expiresIn: z.number().optional(),
+		meta: z.record(z.string(), z.unknown()).optional(),
+	}),
+	'resources.create': z.strictObject({
+		slug: z.string(),
+		name: z.string().optional(),
+		description: z.string().optional(),
+		fileId: z.string(),
+		label: z.string().optional(),
+	}),
+	'resources.addRevision': z.strictObject({
+		resourceId: z.string().optional(),
+		resourceSlug: z.string().optional(),
+		fileId: z.string(),
+		label: z.string().optional(),
+	}),
+	'resources.get': z.strictObject({
+		resourceId: z.string().optional(),
+		resourceSlug: z.string().optional(),
+	}),
+	'resources.list': z.strictObject({
+		limit: z.number().optional(),
+		offset: z.number().optional(),
+	}),
+	'resources.delete': z.strictObject({ resourceId: z.string() }),
+	'sessionFiles.createDownloadUrl': z.strictObject({
+		instanceId: z.string(),
+		sessionId: z.string(),
+		scope: z.enum(['workspace', 'session']),
+		path: z.string(),
+		ttlSeconds: z.number().optional(),
+	}),
+} satisfies Partial<Record<PlatformMethodName, z.ZodType>>
+
+type ImplementedMethod = keyof typeof inputSchemas
+
+const InstanceSummaryOutputSchema = z.strictObject({
+	instanceId: z.string(),
+	name: z.string(),
+	status: z.string(),
+	templateSlug: z.string(),
+	bundleSlug: z.string(),
+	bundleRevisionId: z.string(),
+	vcsType: z.string(),
+	metadata: z.record(z.string(), z.unknown()).nullable(),
+	createdAt: z.string(),
+})
+
+const SessionSummaryOutputSchema = z.strictObject({
+	id: z.string(),
+	presetId: z.string().nullable(),
+	status: z.string(),
+	createdAt: z.string(),
+})
+
+const ResourceOutputSchema = z.strictObject({
+	id: z.string(),
+	slug: z.string(),
+	name: z.string().nullable(),
+	description: z.string().nullable(),
+	latestRevision: z.strictObject({
+		id: z.string(),
+		label: z.string().nullable(),
+		file: z.strictObject({
+			id: z.string(),
+			filename: z.string(),
+			mimeType: z.string(),
+			size: z.number(),
+		}),
+		createdAt: z.string(),
+	}).nullable(),
+	createdAt: z.string(),
+})
+
+const outputSchemas = {
+	'instances.create': z.strictObject({
+		instanceId: z.string(),
+		status: z.enum(['created', 'initializing', 'ready']),
+		sessionId: z.string().optional(),
+		wsToken: z.string().optional(),
+	}),
+	'instances.get': InstanceSummaryOutputSchema,
+	'instances.list': z.strictObject({
+		instances: z.array(InstanceSummaryOutputSchema),
+		total: z.number(),
+	}),
+	'instances.status': z.strictObject({
+		instanceId: z.string(),
+		status: z.string(),
+		sandbox: z.strictObject({
+			state: z.enum(['stopped', 'starting', 'running', 'pausing', 'paused', 'failed']),
+			e2bId: z.string().optional(),
+			lastActivityAt: z.string().optional(),
+			versions: z.strictObject({
+				sdk: z.string(),
+				runtime: z.strictObject({ name: z.string(), version: z.string() }).nullable(),
+			}).optional(),
+		}).nullable(),
+		sessions: z.array(SessionSummaryOutputSchema),
+		lifecycleEvents: z.array(z.strictObject({
+			event: z.string(),
+			detail: z.string().optional(),
+			createdAt: z.string(),
+		})),
+		serviceUrls: z.array(z.strictObject({
+			code: z.string(),
+			sessionId: z.string().nullable(),
+			serviceType: z.string().nullable(),
+			port: z.number(),
+		})),
+	}),
+	'instances.archive': z.strictObject({ ok: z.boolean() }),
+	'sessions.create': z.strictObject({
+		sessionId: z.string(),
+		status: z.enum(['creating', 'active']),
+		wsToken: z.string().optional(),
+	}),
+	'sessions.list': z.strictObject({ sessions: z.array(SessionSummaryOutputSchema) }),
+	'tokens.create': z.strictObject({ token: z.string(), expiresAt: z.string() }),
+	'resources.create': z.strictObject({ resourceId: z.string(), revisionId: z.string() }),
+	'resources.addRevision': z.strictObject({
+		revisionId: z.string(),
+		noop: z.boolean().optional(),
+	}),
+	'resources.get': ResourceOutputSchema,
+	'resources.list': z.strictObject({ resources: z.array(ResourceOutputSchema) }),
+	'resources.delete': z.strictObject({ ok: z.boolean() }),
+	'sessionFiles.createDownloadUrl': z.strictObject({ url: z.string(), expiresAt: z.string() }),
+} satisfies { [M in ImplementedMethod]: z.ZodType<MethodOutput<PlatformMethods, M>> }
 
 export function createPlatformApi(deps: Deps): Hono {
 	const app = new Hono()
 
 	app.post('/rpc', async (c) => {
-		const body = await c.req.json<RpcEnvelope>().catch(() => ({} as RpcEnvelope))
+		let rawBody: unknown
+		try {
+			rawBody = await c.req.json()
+		} catch {
+			return c.json({ ok: false, error: { type: 'invalid_request', message: 'Invalid JSON body' } }, 400)
+		}
+		const parsedBody = RpcEnvelopeSchema.safeParse(rawBody)
+		if (!parsedBody.success) {
+			return c.json({ ok: false, error: { type: 'invalid_request', message: parsedBody.error.message } }, 400)
+		}
+		const body = parsedBody.data
 
-		if (Array.isArray(body.batch)) {
+		if ('batch' in body) {
 			const results = []
 			for (const call of body.batch) {
 				results.push(await dispatch(deps, call.method, call.input))
 			}
 			return c.json({ results })
-		}
-
-		if (typeof body.method !== 'string') {
-			return c.json({ ok: false, error: { type: 'invalid_request', message: 'Missing method' } }, 400)
 		}
 
 		const result = await dispatch(deps, body.method, body.input)
@@ -71,29 +266,93 @@ export function createPlatformApi(deps: Deps): Hono {
 	return app
 }
 
-const isPlatformMethod = (method: string): method is PlatformMethodName =>
-	Object.hasOwn(platformMethods, method)
-
 async function dispatch(
 	deps: Deps,
 	method: string,
 	input: unknown,
 ): Promise<{ ok: true; value: unknown } | { ok: false; error: { type: string; message: string } }> {
-	const handler = isPlatformMethod(method) ? handlers[method] : undefined
-	if (!handler) {
-		return { ok: false, error: { type: 'method_not_found', message: `Method not supported in standalone: ${method}` } }
-	}
-
 	try {
-		// The map is keyed by method, so each handler's input type is its own; the
-		// envelope carries an unvalidated body, which is exactly what the contract
-		// types describe.
-		const value = await (handler as (deps: Deps, input: unknown) => Promise<unknown>)(deps, input ?? {})
+		const value = await callHandler(deps, method, input ?? {})
 		return { ok: true, value }
 	} catch (err) {
+		if (err instanceof UnsupportedMethodError) {
+			return { ok: false, error: { type: 'method_not_found', message: err.message } }
+		}
 		const message = err instanceof Error ? err.message : String(err)
 		deps.logger.error(`Platform RPC handler failed: ${method}`, err instanceof Error ? err : new Error(message))
 		return { ok: false, error: { type: 'handler_error', message } }
+	}
+}
+
+async function callHandler(deps: Deps, method: string, input: unknown): Promise<unknown> {
+	switch (method) {
+		case 'instances.create':
+			return outputSchemas['instances.create'].parse(
+				await handlers['instances.create'](deps, inputSchemas['instances.create'].parse(input)),
+			)
+		case 'instances.get':
+			return outputSchemas['instances.get'].parse(
+				await handlers['instances.get'](deps, inputSchemas['instances.get'].parse(input)),
+			)
+		case 'instances.list':
+			return outputSchemas['instances.list'].parse(
+				await handlers['instances.list'](deps, inputSchemas['instances.list'].parse(input)),
+			)
+		case 'instances.status':
+			return outputSchemas['instances.status'].parse(
+				await handlers['instances.status'](deps, inputSchemas['instances.status'].parse(input)),
+			)
+		case 'instances.archive':
+			return outputSchemas['instances.archive'].parse(
+				await handlers['instances.archive'](deps, inputSchemas['instances.archive'].parse(input)),
+			)
+		case 'sessions.create':
+			return outputSchemas['sessions.create'].parse(
+				await handlers['sessions.create'](deps, inputSchemas['sessions.create'].parse(input)),
+			)
+		case 'sessions.list':
+			return outputSchemas['sessions.list'].parse(
+				await handlers['sessions.list'](deps, inputSchemas['sessions.list'].parse(input)),
+			)
+		case 'tokens.create':
+			return outputSchemas['tokens.create'].parse(
+				await handlers['tokens.create'](deps, inputSchemas['tokens.create'].parse(input)),
+			)
+		case 'resources.create':
+			return outputSchemas['resources.create'].parse(
+				await handlers['resources.create'](deps, inputSchemas['resources.create'].parse(input)),
+			)
+		case 'resources.addRevision':
+			return outputSchemas['resources.addRevision'].parse(
+				await handlers['resources.addRevision'](deps, inputSchemas['resources.addRevision'].parse(input)),
+			)
+		case 'resources.get':
+			return outputSchemas['resources.get'].parse(
+				await handlers['resources.get'](deps, inputSchemas['resources.get'].parse(input)),
+			)
+		case 'resources.list':
+			return outputSchemas['resources.list'].parse(
+				await handlers['resources.list'](deps, inputSchemas['resources.list'].parse(input)),
+			)
+		case 'resources.delete':
+			return outputSchemas['resources.delete'].parse(
+				await handlers['resources.delete'](deps, inputSchemas['resources.delete'].parse(input)),
+			)
+		case 'sessionFiles.createDownloadUrl':
+			return outputSchemas['sessionFiles.createDownloadUrl'].parse(
+				await handlers['sessionFiles.createDownloadUrl'](
+					deps,
+					inputSchemas['sessionFiles.createDownloadUrl'].parse(input),
+				),
+			)
+		default:
+			throw new UnsupportedMethodError(method)
+	}
+}
+
+class UnsupportedMethodError extends Error {
+	constructor(readonly method: string) {
+		super(`Method not supported in standalone: ${method}`)
 	}
 }
 
@@ -110,24 +369,9 @@ type Handler<M extends PlatformMethodName> = (
 	input: MethodInput<PlatformMethods, M>,
 ) => Promise<MethodOutput<PlatformMethods, M>>
 
-/**
- * Partial on purpose: bundles.*, sessions.publish, sessions.usage,
- * instances.archive and services.getUrl are deliberately unimplemented here and
- * fall through to `method_not_found`. Partial makes that an explicit gap rather
- * than a silent one, while still checking every method that IS implemented.
- */
-type PlatformHandlers = Partial<{ [M in PlatformMethodName]: Handler<M> }>
+type PlatformHandlers = { [M in ImplementedMethod]: Handler<M> }
 
-interface AutoCreateSessionInput {
-	presetId: string
-	initialPrompt?: string
-	resourceIds?: string[]
-	fileIds?: string[]
-	blocking?: boolean
-}
-
-// Shared by `instances.create.autoCreateSession` and `sessions.create`. Creates
-// a session via the SDK session manager, injects any matching local resources,
+// Creates a session via the SDK session manager, injects selected local files,
 // then (if set) pushes `initialPrompt` as a user-chat message — order matters:
 // resources must land in the workspace before the agent's first inference so
 // the agent sees a non-empty workspace. Mirrors roj-platform's project-init
@@ -138,7 +382,7 @@ interface AutoCreateSessionInput {
 // — the worktree path is then passed through as `workspaceDir`.
 async function startSession(
 	deps: Deps,
-	input: { presetId: string; initialPrompt?: string; resourceIds?: string[] },
+	input: { presetId: string; initialPrompt?: string; resourceIds?: string[]; fileIds?: string[] },
 ): Promise<{ sessionId: string; status: 'active' }> {
 	const sessionId = randomUUID()
 	const workspaceDir = await deps.gitFs.addSessionWorktree(deps.instance.id, sessionId)
@@ -149,15 +393,18 @@ async function startSession(
 		workspaceDir,
 	})
 	if (!created.ok) {
-		// Roll back the worktree we just created so a retry isn't blocked by an
-		// orphaned dir. Best-effort — failure here is logged inside removeSessionWorktree.
-		await deps.gitFs.removeSessionWorktree(deps.instance.id, sessionId)
+		await removeWorktreeAfterFailure(deps, sessionId)
 		throw new Error(created.error.message)
 	}
 
-	const resources = resolveSessionResources(deps, input.presetId, input.resourceIds)
-	for (const resource of resources) {
-		await injectRegistryResource(deps, sessionId, resource)
+	try {
+		const selections = resolveSessionFiles(deps, input.presetId, input.resourceIds, input.fileIds)
+		for (const selection of selections) {
+			await injectRegistryFile(deps, sessionId, selection)
+		}
+	} catch (error) {
+		await rollbackCreatedSession(deps, sessionId)
+		throw error
 	}
 
 	if (input.initialPrompt) {
@@ -178,33 +425,38 @@ async function startSession(
 	return { sessionId, status: 'active' }
 }
 
-interface ResolvedResource {
-	resourceId: string
-	slug: string
-	name: string | null
+interface ResolvedFile {
 	fileId: string
-	filename: string
-	mimeType: string
+	metadata?: { slug?: string; name?: string }
 }
 
 // Resolution mirrors roj-platform's project-init.ts:206:
-//   1. explicit input.resourceIds — matched against the local registry by ID
-//      first, then by slug (since local-dev callers often pass slugs as ids).
-//   2. fallback to preset.defaultResourceSlugs (looked up by slug).
-function resolveSessionResources(
+//   1. explicit resourceIds, followed by explicit fileIds.
+//   2. preset.defaultResourceSlugs only when no explicit IDs were supplied.
+// Repeated selections of the same registry file are injected once.
+function resolveSessionFiles(
 	deps: Deps,
 	presetId: string,
 	inputResourceIds: string[] | undefined,
-): ResolvedResource[] {
-	if (inputResourceIds && inputResourceIds.length > 0) {
-		const matched: ResolvedResource[] = []
+	inputFileIds: string[] | undefined,
+): ResolvedFile[] {
+	const hasExplicitFiles = (inputResourceIds?.length ?? 0) > 0 || (inputFileIds?.length ?? 0) > 0
+	const resolved: ResolvedFile[] = []
+	const seenFileIds = new Set<string>()
+
+	if (hasExplicitFiles) {
 		const unmatched: string[] = []
-		for (const id of inputResourceIds) {
+		for (const id of inputResourceIds ?? []) {
 			const resource =
 				deps.registry.getResource({ resourceId: id }) ?? deps.registry.getResource({ resourceSlug: id })
-			const resolved = toResolvedResource(resource)
-			if (resolved) matched.push(resolved)
-			else unmatched.push(id)
+			const selection = toResolvedFile(resource)
+			if (!selection) {
+				unmatched.push(id)
+				continue
+			}
+			if (seenFileIds.has(selection.fileId)) continue
+			seenFileIds.add(selection.fileId)
+			resolved.push(selection)
 		}
 		if (unmatched.length > 0) {
 			deps.logger.warn('Some input resourceIds did not match the local registry; ignoring', {
@@ -212,17 +464,26 @@ function resolveSessionResources(
 				availableSlugs: deps.registry.listResources().map(r => r.slug),
 			})
 		}
-		if (matched.length > 0) return matched
+		for (const fileId of inputFileIds ?? []) {
+			if (seenFileIds.has(fileId)) continue
+			seenFileIds.add(fileId)
+			resolved.push({ fileId })
+		}
+		return resolved
 	}
 
 	const preset = deps.presets.find(p => p.id === presetId)
 	const slugs = preset?.defaultResourceSlugs ?? []
-	const resolved: ResolvedResource[] = []
 	const missing: string[] = []
 	for (const slug of slugs) {
-		const r = toResolvedResource(deps.registry.getResource({ resourceSlug: slug }))
-		if (r) resolved.push(r)
-		else missing.push(slug)
+		const selection = toResolvedFile(deps.registry.getResource({ resourceSlug: slug }))
+		if (!selection) {
+			missing.push(slug)
+			continue
+		}
+		if (seenFileIds.has(selection.fileId)) continue
+		seenFileIds.add(selection.fileId)
+		resolved.push(selection)
 	}
 	if (missing.length > 0) {
 		deps.logger.warn(
@@ -233,48 +494,96 @@ function resolveSessionResources(
 	return resolved
 }
 
-function toResolvedResource(resource: ReturnType<LocalRegistry['getResource']>): ResolvedResource | null {
+function toResolvedFile(resource: ReturnType<LocalRegistry['getResource']>): ResolvedFile | null {
 	if (!resource || !resource.latestRevision) return null
 	const file = resource.latestRevision.file
 	return {
-		resourceId: resource.id,
-		slug: resource.slug,
-		name: resource.name,
 		fileId: file.id,
-		filename: file.filename,
-		mimeType: file.mimeType,
+		metadata: { slug: resource.slug, name: resource.name ?? resource.slug },
 	}
 }
 
-async function injectRegistryResource(deps: Deps, sessionId: string, resource: ResolvedResource): Promise<void> {
-	const file = await deps.registry.readFileById(resource.fileId)
+async function injectRegistryFile(deps: Deps, sessionId: string, selection: ResolvedFile): Promise<void> {
+	const file = await deps.registry.readFileById(selection.fileId)
 	if (!file) {
-		throw new Error(`Registry file not found for resource ${resource.slug} (fileId=${resource.fileId})`)
+		if (selection.metadata?.slug) {
+			throw new Error(
+				`Registry file not found for resource ${selection.metadata.slug} (fileId=${selection.fileId})`,
+			)
+		}
+		deps.logger.warn('Selected fileId did not match the local registry; ignoring', {
+			fileId: selection.fileId,
+		})
+		return
 	}
 
 	const result = await deps.sessionManager.callPluginMethod(SessionId(sessionId), 'resources.inject', {
 		sessionId,
-		filename: resource.filename,
-		mimeType: resource.mimeType,
+		filename: file.meta.filename,
+		mimeType: file.meta.mimeType,
 		size: file.buffer.length,
 		fileBuffer: file.buffer,
-		metadata: { slug: resource.slug, name: resource.name ?? resource.slug },
+		metadata: selection.metadata,
 	})
 	if (!result.ok) {
 		deps.logger.error('Registry resource injection failed', undefined, {
 			sessionId,
-			slug: resource.slug,
+			fileId: selection.fileId,
 			error: result.error,
 		})
-		throw new Error(`Failed to inject resource '${resource.slug}': ${result.error.message ?? result.error.type}`)
+		throw new Error(`Failed to inject registry file '${selection.fileId}': ${result.error.message}`)
+	}
+}
+
+async function rollbackCreatedSession(deps: Deps, sessionId: string): Promise<void> {
+	let sessionResult: Awaited<ReturnType<PlatformSessionManager['getSession']>> | null = null
+	try {
+		sessionResult = await deps.sessionManager.getSession(SessionId(sessionId))
+	} catch (error) {
+		deps.logger.error(
+			'Failed to load session for rollback',
+			error instanceof Error ? error : new Error(String(error)),
+			{ sessionId },
+		)
+	}
+
+	if (sessionResult && !sessionResult.ok) {
+		deps.logger.error('Failed to load session for rollback', undefined, {
+			sessionId,
+			error: sessionResult.error,
+		})
+	} else if (sessionResult) {
+		try {
+			const closed = await sessionResult.value.close()
+			if (!closed.ok) {
+				deps.logger.error('Failed to close session during rollback', undefined, { sessionId, error: closed.error })
+			}
+		} catch (error) {
+			deps.logger.error(
+				'Failed to close session during rollback',
+				error instanceof Error ? error : new Error(String(error)),
+				{ sessionId },
+			)
+		}
+	}
+
+	await removeWorktreeAfterFailure(deps, sessionId)
+}
+
+async function removeWorktreeAfterFailure(deps: Deps, sessionId: string): Promise<void> {
+	try {
+		await deps.gitFs.removeSessionWorktree(deps.instance.id, sessionId)
+	} catch (error) {
+		deps.logger.error(
+			'Failed to remove session worktree during rollback',
+			error instanceof Error ? error : new Error(String(error)),
+			{ sessionId },
+		)
 	}
 }
 
 const handlers: PlatformHandlers = {
-	'instances.create': async (
-		deps,
-		input: { metadata?: Record<string, unknown>; autoCreateSession?: AutoCreateSessionInput },
-	) => {
+	'instances.create': async (deps, input) => {
 		if (input.metadata !== undefined) {
 			deps.instance.metadata = input.metadata
 		}
@@ -285,6 +594,7 @@ const handlers: PlatformHandlers = {
 				presetId: input.autoCreateSession.presetId,
 				initialPrompt: input.autoCreateSession.initialPrompt,
 				resourceIds: input.autoCreateSession.resourceIds,
+				fileIds: input.autoCreateSession.fileIds,
 			})
 			sessionId = result.sessionId
 		}
@@ -322,10 +632,7 @@ const handlers: PlatformHandlers = {
 
 	'instances.archive': async () => ({ ok: true }),
 
-	'sessions.create': async (
-		deps,
-		input: { presetId: string; initialPrompt?: string; resourceIds?: string[] },
-	) => startSession(deps, input),
+	'sessions.create': async (deps, input) => startSession(deps, input),
 
 	'sessions.list': async ({ sessionManager }) => {
 		const result = await sessionManager.callManagerMethod('sessions.list', {})
@@ -348,38 +655,23 @@ const handlers: PlatformHandlers = {
 	// omitting the field and hoping no caller reads it.
 	'tokens.create': async () => ({ token: '', expiresAt: new Date(Date.now() + 3600_000).toISOString() }),
 
-	'resources.create': async (
-		deps,
-		input: { slug: string; name?: string; description?: string; fileId: string; label?: string },
-	) => deps.registry.createResource(input),
+	'resources.create': async (deps, input) => deps.registry.createResource(input),
 
-	'resources.addRevision': async (
-		deps,
-		input: { resourceId?: string; resourceSlug?: string; fileId: string; label?: string },
-	) => deps.registry.addRevision(input),
+	'resources.addRevision': async (deps, input) => deps.registry.addRevision(input),
 
-	'resources.get': async (deps, input: { resourceId?: string; resourceSlug?: string }) => {
+	'resources.get': async (deps, input) => {
 		const resource = deps.registry.getResource(input)
 		if (!resource) throw new Error('Resource not found')
 		return resource
 	},
 
-	'resources.list': async (deps, _input: { limit?: number; offset?: number }) => ({
+	'resources.list': async (deps, _input) => ({
 		resources: deps.registry.listResources(),
 	}),
 
-	'resources.delete': async (deps, input: { resourceId: string }) => deps.registry.deleteResource(input.resourceId),
+	'resources.delete': async (deps, input) => deps.registry.deleteResource(input.resourceId),
 
-	'sessionFiles.createDownloadUrl': async (
-		deps,
-		input: {
-			instanceId: string
-			sessionId: string
-			scope: 'workspace' | 'session'
-			path: string
-			ttlSeconds?: number
-		},
-	) => {
+	'sessionFiles.createDownloadUrl': async (deps, input) => {
 		if (input.scope !== 'workspace' && input.scope !== 'session') {
 			throw new Error(`Invalid scope: ${input.scope}`)
 		}
@@ -402,7 +694,7 @@ const handlers: PlatformHandlers = {
 			.split('/')
 			.map(seg => encodeURIComponent(seg))
 			.join('/')
-		const url = `${deps.publicBaseUrl}/api/v1/instances/${input.instanceId}/sessions/${input.sessionId}/files/${input.scope}/${encodedPath}?token=${encodeURIComponent(token)}`
+		const url = `${deps.getPublicBaseUrl()}/api/v1/instances/${input.instanceId}/sessions/${input.sessionId}/files/${input.scope}/${encodedPath}?token=${encodeURIComponent(token)}`
 
 		return { url, expiresAt: new Date(expiresAt).toISOString() }
 	},
