@@ -31,6 +31,8 @@ export type SessionContext<TSessionInput = unknown> = {
 	readonly logger: Logger
 
 	emitEvent: (event: Omit<BaseEvent<string>, 'sessionId'>) => Promise<void>
+	/** Atomically persist and apply related domain events. */
+	emitEvents: (events: Array<Omit<BaseEvent<string>, 'sessionId'>>) => Promise<void>
 	/** Send a notification to connected clients via transport (ephemeral, not persisted) */
 	notify: (type: string, payload: unknown) => void
 }

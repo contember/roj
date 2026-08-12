@@ -55,47 +55,50 @@ const PROCESSING_ABORT_GRACE_MS = 1_000
 export interface UploadsPluginConfig {
 	dataFileStore: FileStore
 	preprocessorRegistry?: PreprocessorRegistry
-	/** Override for tests or deployments with a stricter preprocessing budget. */
 	processingTimeoutMs?: number
-	/** Maximum time to wait for cooperative cancellation before finalizing. */
 	processingAbortGraceMs?: number
 }
 
-interface PreprocessingResult {
+interface UploadInput {
+	sessionId: string
+	filename: string
+	mimeType: string
+	size: number
+	fileBuffer: Buffer
+}
+
+interface UploadResult {
 	status: 'ready' | 'failed'
 	extractedContent?: string
 	derivedPaths?: string[]
 	error?: string
 }
 
-interface ActiveUploadLifecycle {
+interface ActiveUpload {
 	controller: AbortController
 	completion: Promise<void>
 }
 
 interface UploadsPluginContext {
-	activeUploads: Map<string, ActiveUploadLifecycle>
+	activeUploads: Map<string, ActiveUpload>
+	deletedUploads: Set<string>
+	operationQueues: Map<string, Promise<void>>
 	closing: boolean
 }
 
-interface PreprocessorCompleted {
-	kind: 'completed'
-	result: Result<PreprocessorResult, Error>
+interface PreparedUpload {
+	uploadId: ReturnType<typeof generateUploadId>
+	uploadIdStr: string
+	uploadStore: FileStore
+	filePath: string
+	createdAt: number
+	lifecycle: UploadLifecycle
 }
 
-interface PreprocessorThrew {
-	kind: 'threw'
-	error: unknown
-}
-
-type PreprocessorOutcome = PreprocessorCompleted | PreprocessorThrew
-
-interface PreprocessorAborted {
-	kind: 'aborted'
-}
-
-interface AbortGraceExpired {
-	kind: 'abort_grace_expired'
+interface UploadLifecycle {
+	controller: AbortController
+	start<T>(run: (controller: AbortController) => Promise<T>): Promise<T>
+	abandon(): void
 }
 
 // ============================================================================
@@ -103,11 +106,7 @@ interface AbortGraceExpired {
 // ============================================================================
 
 function isAllowedMimeType(mimeType: string): boolean {
-	return ALLOWED_MIME_TYPES.some((allowed) =>
-		allowed.endsWith('/')
-			? mimeType.startsWith(allowed)
-			: mimeType === allowed
-	)
+	return ALLOWED_MIME_TYPES.some((allowed) => (allowed.endsWith('/') ? mimeType.startsWith(allowed) : mimeType === allowed))
 }
 
 function formatUploadsForLLM(uploads: PendingUpload[], sessionRoot: string): string {
@@ -119,140 +118,259 @@ function formatUploadsForLLM(uploads: PendingUpload[], sessionRoot: string): str
 	return blocks.join('\n')
 }
 
-/**
- * Run preprocessor (with timeout) and persist final upload metadata to disk.
- * Returns the resolved status + extracted/derived data for the caller to emit.
- */
-async function runPreprocessAndPersist(args: {
-	uploadId: string
-	sessionId: SessionId
+function validateUploadInput(input: Pick<UploadInput, 'size' | 'mimeType'>): string | undefined {
+	if (input.size > MAX_FILE_SIZE) return `File too large: max ${MAX_FILE_SIZE / (1024 * 1024)}MB`
+	if (!isAllowedMimeType(input.mimeType)) return `Unsupported file type: ${input.mimeType}`
+	return undefined
+}
+
+function reserveUploadLifecycle(pluginContext: UploadsPluginContext, uploadId: string): UploadLifecycle {
+	const controller = new AbortController()
+	if (pluginContext.closing) controller.abort(new Error('Session is closing'))
+	let resolveCompletion = () => {}
+	const completion = new Promise<void>((resolve) => {
+		resolveCompletion = resolve
+	})
+	const operation: ActiveUpload = { controller, completion }
+	pluginContext.activeUploads.set(uploadId, operation)
+	let settled = false
+	const settle = () => {
+		if (settled) return
+		settled = true
+		resolveCompletion()
+		if (pluginContext.activeUploads.get(uploadId) === operation) pluginContext.activeUploads.delete(uploadId)
+	}
+	return {
+		controller,
+		start<T>(run: (signalController: AbortController) => Promise<T>): Promise<T> {
+			const result = run(controller)
+			result.then(settle, settle)
+			return result
+		},
+		abandon: settle,
+	}
+}
+
+async function prepareUpload(args: { pluginContext: UploadsPluginContext; dataFileStore: FileStore; input: UploadInput }): Promise<Result<PreparedUpload, string>> {
+	const validationError = validateUploadInput(args.input)
+	if (validationError) return Err(validationError)
+
+	const uploadId = generateUploadId()
+	const uploadIdStr = String(uploadId)
+	const lifecycle = reserveUploadLifecycle(args.pluginContext, uploadIdStr)
+	if (lifecycle.controller.signal.aborted) {
+		lifecycle.abandon()
+		return Err('Session is closing')
+	}
+	const uploadStore = args.dataFileStore.scoped(`sessions/${args.input.sessionId}/uploads/${uploadId}`)
+	const writeResult = await uploadStore.write(args.input.filename, args.input.fileBuffer)
+	if (!writeResult.ok) {
+		lifecycle.abandon()
+		return Err('Failed to write file')
+	}
+	if (args.pluginContext.closing) {
+		await uploadStore.remove(args.input.filename)
+		lifecycle.abandon()
+		return Err('Session is closing')
+	}
+	return Ok({
+		uploadId,
+		uploadIdStr,
+		uploadStore,
+		filePath: writeResult.value.path,
+		createdAt: Date.now(),
+		lifecycle,
+	})
+}
+
+type PreprocessorOutcome = { kind: 'completed'; result: Result<PreprocessorResult, Error> } | { kind: 'threw'; error: unknown }
+
+async function runPreprocessor(args: {
 	uploadStore: FileStore
 	filePath: string
-	filename: string
 	mimeType: string
-	size: number
-	createdAt: number
 	preprocessorRegistry?: PreprocessorRegistry
 	processingTimeoutMs?: number
 	processingAbortGraceMs?: number
 	controller: AbortController
 	inferenceContext?: Omit<InferenceContext, 'signal'>
-}): Promise<PreprocessingResult> {
+}): Promise<UploadResult> {
 	const preprocessor = args.preprocessorRegistry?.getForMimeType(args.mimeType)
+	if (!preprocessor) return { status: 'ready' }
 
-	let status: 'ready' | 'failed' = 'ready'
-	let extractedContent: string | undefined
-	let derivedPaths: string[] | undefined
-	let errorMessage: string | undefined
-
-	if (preprocessor) {
-		let timedOut = false
-		const processPromise: Promise<PreprocessorOutcome> = (async () => {
-			try {
-				return {
-					kind: 'completed',
-					result: await preprocessor.process(args.filePath, args.mimeType, {
-						files: args.uploadStore,
-						signal: args.controller.signal,
-						inferenceContext: args.inferenceContext,
-					}),
-				}
-			} catch (error) {
-				return { kind: 'threw', error }
-			}
-		})()
-		const abortPromise = new Promise<PreprocessorAborted>((resolve) => {
-			const aborted: PreprocessorAborted = { kind: 'aborted' }
-			if (args.controller.signal.aborted) {
-				resolve(aborted)
-				return
-			}
-			args.controller.signal.addEventListener('abort', () => resolve(aborted), { once: true })
-		})
-		const timeoutId = setTimeout(() => {
-			timedOut = true
-			args.controller.abort(new Error('Processing timeout'))
-		}, args.processingTimeoutMs ?? PROCESSING_TIMEOUT_MS)
-
-		let processOutcome: PreprocessorOutcome | undefined
+	let timedOut = false
+	const processPromise: Promise<PreprocessorOutcome> = (async () => {
 		try {
-			const firstOutcome = await Promise.race([processPromise, abortPromise])
-			if (firstOutcome.kind === 'aborted') {
-				let graceTimer: ReturnType<typeof setTimeout> | undefined
-				const graceExpired = new Promise<AbortGraceExpired>((resolve) => {
-					graceTimer = setTimeout(
-						() => resolve({ kind: 'abort_grace_expired' }),
-						args.processingAbortGraceMs ?? PROCESSING_ABORT_GRACE_MS,
-					)
-				})
-				const graceOutcome = await Promise.race([processPromise, graceExpired])
-				if (graceTimer !== undefined) clearTimeout(graceTimer)
-				if (graceOutcome.kind !== 'abort_grace_expired') processOutcome = graceOutcome
-			} else {
-				processOutcome = firstOutcome
+			return {
+				kind: 'completed',
+				result: await preprocessor.process(args.filePath, args.mimeType, {
+					files: args.uploadStore,
+					signal: args.controller.signal,
+					inferenceContext: args.inferenceContext,
+				}),
 			}
-		} finally {
-			clearTimeout(timeoutId)
+		} catch (error) {
+			return { kind: 'threw', error }
 		}
-
+	})()
+	let resolveAbort: (() => void) | undefined
+	const aborted = new Promise<{ kind: 'aborted' }>((resolve) => {
 		if (args.controller.signal.aborted) {
-			status = 'failed'
-			errorMessage = timedOut ? 'Processing timeout' : 'Processing cancelled'
-		} else if (processOutcome?.kind === 'completed') {
-			if (processOutcome.result.ok) {
-				extractedContent = processOutcome.result.value.extractedContent
-				derivedPaths = processOutcome.result.value.derivedPaths
-			} else {
-				status = 'failed'
-				errorMessage = processOutcome.result.error.message
-			}
-		} else if (processOutcome?.kind === 'threw') {
-			status = 'failed'
-			errorMessage = processOutcome.error instanceof Error
-				? processOutcome.error.message
-				: String(processOutcome.error)
+			resolve({ kind: 'aborted' })
+			return
+		}
+		resolveAbort = () => resolve({ kind: 'aborted' })
+		args.controller.signal.addEventListener('abort', resolveAbort, {
+			once: true,
+		})
+	})
+	const timeoutId = setTimeout(() => {
+		timedOut = true
+		args.controller.abort(new Error('Processing timeout'))
+	}, args.processingTimeoutMs ?? PROCESSING_TIMEOUT_MS)
+
+	let outcome: PreprocessorOutcome | undefined
+	let graceTimeoutId: ReturnType<typeof setTimeout> | undefined
+	try {
+		const first = await Promise.race([processPromise, aborted])
+		if (first.kind === 'aborted') {
+			const grace = new Promise<{ kind: 'grace-expired' }>((resolve) => {
+				graceTimeoutId = setTimeout(() => resolve({ kind: 'grace-expired' }), args.processingAbortGraceMs ?? PROCESSING_ABORT_GRACE_MS)
+			})
+			const afterAbort = await Promise.race([processPromise, grace])
+			if (afterAbort.kind !== 'grace-expired') outcome = afterAbort
+		} else {
+			outcome = first
+		}
+	} finally {
+		clearTimeout(timeoutId)
+		if (graceTimeoutId) clearTimeout(graceTimeoutId)
+		if (resolveAbort) args.controller.signal.removeEventListener('abort', resolveAbort)
+	}
+
+	if (args.controller.signal.aborted) {
+		return {
+			status: 'failed',
+			error: timedOut ? 'Processing timeout' : 'Processing cancelled',
 		}
 	}
-
-	const metadata: UploadMetadata = {
-		uploadId: UploadId(args.uploadId),
-		sessionId: args.sessionId,
-		filename: args.filename,
-		mimeType: args.mimeType,
-		size: args.size,
-		path: args.filePath,
-		status,
-		extractedContent,
-		derivedPaths,
-		error: errorMessage,
-		createdAt: args.createdAt,
-		completedAt: Date.now(),
+	if (outcome?.kind === 'threw') {
+		return {
+			status: 'failed',
+			error: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
+		}
 	}
-	await args.uploadStore.write('meta.json', JSON.stringify(metadata, null, 2))
-
-	return { status, extractedContent, derivedPaths, error: errorMessage }
+	if (!outcome) return { status: 'failed', error: 'Processing failed' }
+	if (!outcome.result.ok) return { status: 'failed', error: outcome.result.error.message }
+	return {
+		status: 'ready',
+		extractedContent: outcome.result.value.extractedContent,
+		derivedPaths: outcome.result.value.derivedPaths,
+	}
 }
 
-function beginUploadLifecycle<T>(
-	pluginContext: UploadsPluginContext,
-	uploadId: string,
-	run: (controller: AbortController) => Promise<T>,
-): { controller: AbortController; result: Promise<T>; completion: Promise<void> } {
-	const controller = new AbortController()
-	if (pluginContext.closing) controller.abort(new Error('Session closed'))
-	const result = run(controller)
-	let operation: ActiveUploadLifecycle | undefined
-	const completion = result.then(
-		() => undefined,
-		() => undefined,
-	).then(() => {
-		if (operation && pluginContext.activeUploads.get(uploadId) === operation) {
-			pluginContext.activeUploads.delete(uploadId)
-		}
+async function writeMetadata(uploadStore: FileStore, metadata: UploadMetadata): Promise<void> {
+	const result = await uploadStore.write('meta.json', JSON.stringify(metadata, null, 2))
+	if (!result.ok) throw new Error(result.error)
+}
+
+function createFinalMetadata(args: { prepared: PreparedUpload; sessionId: SessionId; input: UploadInput; result: UploadResult }): UploadMetadata {
+	return {
+		uploadId: args.prepared.uploadId,
+		sessionId: args.sessionId,
+		filename: args.input.filename,
+		mimeType: args.input.mimeType,
+		size: args.input.size,
+		path: args.prepared.filePath,
+		status: args.result.status,
+		extractedContent: args.result.extractedContent,
+		derivedPaths: args.result.derivedPaths,
+		error: args.result.error,
+		createdAt: args.prepared.createdAt,
+		completedAt: Date.now(),
+	}
+}
+
+function createUploadResultEvent(input: UploadInput, prepared: PreparedUpload, result: UploadResult) {
+	return uploadEvents.create('attachment_uploaded', {
+		uploadId: prepared.uploadId,
+		filename: input.filename,
+		mimeType: input.mimeType,
+		size: input.size,
+		status: result.status,
+		extractedContent: result.extractedContent,
+		derivedPaths: result.derivedPaths,
+		error: result.error,
 	})
-	operation = { controller, completion }
-	pluginContext.activeUploads.set(uploadId, operation)
-	return { controller, result, completion }
+}
+
+async function withUploadLock<T>(pluginContext: UploadsPluginContext, uploadId: string, run: () => Promise<T>): Promise<T> {
+	const previous = pluginContext.operationQueues.get(uploadId) ?? Promise.resolve()
+	let release = () => {}
+	const current = new Promise<void>((resolve) => {
+		release = resolve
+	})
+	pluginContext.operationQueues.set(uploadId, current)
+	await previous
+	try {
+		return await run()
+	} finally {
+		release()
+		if (pluginContext.operationQueues.get(uploadId) === current) pluginContext.operationQueues.delete(uploadId)
+	}
+}
+
+async function processUpload(args: {
+	pluginContext: UploadsPluginContext
+	prepared: PreparedUpload
+	sessionId: SessionId
+	input: UploadInput
+	config: UploadsPluginConfig
+	inferenceContext?: Omit<InferenceContext, 'signal'>
+	onFinal: (result: UploadResult) => Promise<void>
+}): Promise<UploadResult> {
+	const result = await runPreprocessor({
+		uploadStore: args.prepared.uploadStore,
+		filePath: args.prepared.filePath,
+		mimeType: args.input.mimeType,
+		preprocessorRegistry: args.config.preprocessorRegistry,
+		processingTimeoutMs: args.config.processingTimeoutMs,
+		processingAbortGraceMs: args.config.processingAbortGraceMs,
+		controller: args.prepared.lifecycle.controller,
+		inferenceContext: args.inferenceContext,
+	})
+	await withUploadLock(args.pluginContext, args.prepared.uploadIdStr, async () => {
+		if (args.pluginContext.deletedUploads.has(args.prepared.uploadIdStr)) return
+		await writeMetadata(
+			args.prepared.uploadStore,
+			createFinalMetadata({
+				prepared: args.prepared,
+				sessionId: args.sessionId,
+				input: args.input,
+				result,
+			}),
+		)
+		if (!args.pluginContext.closing) await args.onFinal(result)
+	})
+	return result
+}
+
+async function removeUploadFiles(uploadStore: FileStore, path = ''): Promise<Result<void, string>> {
+	const listResult = await uploadStore.list(path, { maxDepth: 1 })
+	if (!listResult.ok) return listResult
+	for (const entry of listResult.value) {
+		const entryPath = path ? `${path}/${entry.name}` : entry.name
+		if (entry.type === 'directory') {
+			const nested = await removeUploadFiles(uploadStore, entryPath)
+			if (!nested.ok) return nested
+			continue
+		}
+		if (entryPath === 'meta.json') continue
+		if (entry.type !== 'file' && entry.type !== 'symlink') return Err(`Unsupported upload entry: ${entryPath}`)
+		const removed = await uploadStore.remove(entryPath)
+		if (!removed.ok) return removed
+	}
+	return Ok(undefined)
 }
 
 // ============================================================================
@@ -269,7 +387,8 @@ export const uploadsPlugin = definePlugin('uploads')
 		reduce: (state, event) => {
 			switch (event.type) {
 				case 'attachment_uploaded': {
-					if (event.status !== 'ready') return state
+					const pending = state.pending.filter((upload) => String(upload.uploadId) !== String(event.uploadId))
+					if (event.status !== 'ready') return { ...state, pending }
 					const upload: PendingUpload = {
 						uploadId: event.uploadId,
 						filename: event.filename,
@@ -279,7 +398,7 @@ export const uploadsPlugin = definePlugin('uploads')
 						extractedContent: event.extractedContent,
 						derivedPaths: event.derivedPaths,
 					}
-					return { ...state, pending: [...state.pending, upload] }
+					return { ...state, pending: [...pending, upload] }
 				}
 				case 'attachments_consumed': {
 					const consumedIds = new Set(event.uploadIds.map(String))
@@ -288,15 +407,25 @@ export const uploadsPlugin = definePlugin('uploads')
 						pending: state.pending.filter((u) => !consumedIds.has(String(u.uploadId))),
 					}
 				}
+				case 'attachment_deletion_completed': {
+					return {
+						...state,
+						pending: state.pending.filter((upload) => String(upload.uploadId) !== String(event.uploadId)),
+					}
+				}
 				default:
 					return state
 			}
 		},
 	})
-	.context(async (): Promise<UploadsPluginContext> => ({
-		activeUploads: new Map(),
-		closing: false,
-	}))
+	.context(
+		async (): Promise<UploadsPluginContext> => ({
+			activeUploads: new Map(),
+			deletedUploads: new Set(),
+			operationQueues: new Map(),
+			closing: false,
+		}),
+	)
 	.dequeue({
 		hasPendingMessages: (ctx) => {
 			const uploads = ctx.pluginState
@@ -307,29 +436,35 @@ export const uploadsPlugin = definePlugin('uploads')
 			if (uploads.pending.length === 0) return null
 			const sessionRoot = ctx.files.getRoots().session
 			return {
-				messages: [{
-					role: 'user',
-					content: formatUploadsForLLM(uploads.pending, sessionRoot),
-				}],
+				messages: [
+					{
+						role: 'user',
+						content: formatUploadsForLLM(uploads.pending, sessionRoot),
+					},
+				],
 				token: uploads.pending.map((u) => u.uploadId),
 			}
 		},
 		markConsumed: async (ctx, token) => {
-			await ctx.emitEvent(uploadEvents.create('attachments_consumed', {
-				agentId: ctx.agentId,
-				uploadIds: token.map(UploadId),
-			}))
+			await ctx.emitEvent(
+				uploadEvents.create('attachments_consumed', {
+					agentId: ctx.agentId,
+					uploadIds: token.map(UploadId),
+				}),
+			)
 
 			// Also mark as used on disk
 			const { dataFileStore } = ctx.pluginConfig
 			for (const uploadIdStr of token) {
-				const uploadStore = dataFileStore.scoped(`sessions/${ctx.sessionId}/uploads/${uploadIdStr}`)
-				const metaResult = await uploadStore.read('meta.json')
-				if (metaResult.ok) {
+				await withUploadLock(ctx.pluginContext, uploadIdStr, async () => {
+					const uploadStore = dataFileStore.scoped(`sessions/${ctx.sessionId}/uploads/${uploadIdStr}`)
+					const metaResult = await uploadStore.read('meta.json')
+					if (!metaResult.ok) return
 					const meta: UploadMetadata = JSON.parse(metaResult.value)
+					if (meta.status === 'deleted') return
 					meta.usedInMessageId = 'auto-dequeued'
-					await uploadStore.write('meta.json', JSON.stringify(meta, null, 2))
-				}
+					await writeMetadata(uploadStore, meta)
+				})
 			}
 		},
 	})
@@ -338,14 +473,16 @@ export const uploadsPlugin = definePlugin('uploads')
 			sessionId: z.string(),
 		}),
 		output: z.object({
-			uploads: z.array(z.object({
-				uploadId: z.string(),
-				filename: z.string(),
-				mimeType: z.string(),
-				size: z.number(),
-				status: z.enum(['processing', 'ready', 'failed']),
-				createdAt: z.number(),
-			})),
+			uploads: z.array(
+				z.object({
+					uploadId: z.string(),
+					filename: z.string(),
+					mimeType: z.string(),
+					size: z.number(),
+					status: z.enum(['processing', 'ready', 'failed']),
+					createdAt: z.number(),
+				}),
+			),
 		}),
 		handler: async (ctx, input) => {
 			const { dataFileStore } = ctx.pluginConfig
@@ -404,27 +541,39 @@ export const uploadsPlugin = definePlugin('uploads')
 		handler: async (ctx, input) => {
 			const { dataFileStore } = ctx.pluginConfig
 			const uploadStore = dataFileStore.scoped(`sessions/${input.sessionId}/uploads/${input.uploadId}`)
-			const metaResult = await uploadStore.read('meta.json')
+			const reservation = await withUploadLock(ctx.pluginContext, input.uploadId, async () => {
+				const metaResult = await uploadStore.read('meta.json')
+				if (!metaResult.ok) return Err(ValidationErrors.invalid(`Upload not found: ${input.uploadId}`))
+				const meta: UploadMetadata = JSON.parse(metaResult.value)
+				if (meta.sessionId !== input.sessionId) {
+					return Err(ValidationErrors.invalid('Upload does not belong to this session'))
+				}
+				if (meta.usedInMessageId) {
+					return Err(ValidationErrors.invalid('Cannot delete an upload that has been sent in a message'))
+				}
+				ctx.pluginContext.deletedUploads.add(input.uploadId)
+				const active = ctx.pluginContext.activeUploads.get(input.uploadId)
+				active?.controller.abort(new Error('Upload deleted'))
+				return Ok(active?.completion)
+			})
+			if (!reservation.ok) return reservation
+			await reservation.value
 
-			if (!metaResult.ok) {
-				return Err(ValidationErrors.invalid(`Upload not found: ${input.uploadId}`))
-			}
-
-			const meta: UploadMetadata = JSON.parse(metaResult.value)
-
-			if (meta.sessionId !== input.sessionId) {
-				return Err(ValidationErrors.invalid('Upload does not belong to this session'))
-			}
-
-			if (meta.usedInMessageId) {
-				return Err(ValidationErrors.invalid('Cannot delete an upload that has been sent in a message'))
-			}
-
-			// Mark as deleted
-			meta.status = 'deleted'
-			await uploadStore.write('meta.json', JSON.stringify(meta, null, 2))
-
-			return Ok({})
+			return withUploadLock(ctx.pluginContext, input.uploadId, async () => {
+				const metaResult = await uploadStore.read('meta.json')
+				if (!metaResult.ok) return Err(ValidationErrors.invalid(`Upload not found: ${input.uploadId}`))
+				const meta: UploadMetadata = JSON.parse(metaResult.value)
+				meta.status = 'deleted'
+				await writeMetadata(uploadStore, meta)
+				const cleanup = await removeUploadFiles(uploadStore)
+				if (!cleanup.ok) return Err(ValidationErrors.invalid(`Could not remove upload: ${input.uploadId}`))
+				await ctx.emitEvent(
+					uploadEvents.create('attachment_deletion_completed', {
+						uploadId: UploadId(input.uploadId),
+					}),
+				)
+				return Ok({})
+			})
 		},
 	})
 	.method('loadAttachments', {
@@ -481,13 +630,19 @@ export const uploadsPlugin = definePlugin('uploads')
 			const { dataFileStore } = ctx.pluginConfig
 
 			for (const uploadIdStr of input.uploadIds) {
-				const uploadStore = dataFileStore.scoped(`sessions/${input.sessionId}/uploads/${uploadIdStr}`)
-				const metaResult = await uploadStore.read('meta.json')
-				if (metaResult.ok) {
+				const result = await withUploadLock(ctx.pluginContext, uploadIdStr, async () => {
+					const uploadStore = dataFileStore.scoped(`sessions/${input.sessionId}/uploads/${uploadIdStr}`)
+					const metaResult = await uploadStore.read('meta.json')
+					if (!metaResult.ok || ctx.pluginContext.deletedUploads.has(uploadIdStr)) {
+						return Err(ValidationErrors.invalid(`Upload not found: ${uploadIdStr}`))
+					}
 					const meta: UploadMetadata = JSON.parse(metaResult.value)
+					if (meta.status === 'deleted') return Err(ValidationErrors.invalid(`Upload not found: ${uploadIdStr}`))
 					meta.usedInMessageId = input.messageId
-					await uploadStore.write('meta.json', JSON.stringify(meta, null, 2))
-				}
+					await writeMetadata(uploadStore, meta)
+					return Ok({})
+				})
+				if (!result.ok) return result
 			}
 
 			return Ok({})
@@ -507,69 +662,43 @@ export const uploadsPlugin = definePlugin('uploads')
 			extractedContent: z.string().optional(),
 		}),
 		handler: async (ctx, input) => {
-			const { dataFileStore, preprocessorRegistry, processingTimeoutMs, processingAbortGraceMs } = ctx.pluginConfig
-
-			if (input.size > MAX_FILE_SIZE) {
-				return Err(ValidationErrors.invalid(`File too large: max ${MAX_FILE_SIZE / (1024 * 1024)}MB`))
-			}
-			if (!isAllowedMimeType(input.mimeType)) {
-				return Err(ValidationErrors.invalid(`Unsupported file type: ${input.mimeType}`))
-			}
-
-			const uploadId = generateUploadId()
-			const uploadStore = dataFileStore.scoped(`sessions/${input.sessionId}/uploads/${uploadId}`)
-
-			const writeResult = await uploadStore.write(input.filename, input.fileBuffer)
-			if (!writeResult.ok) {
-				return Err(ValidationErrors.invalid('Failed to write file'))
-			}
-
+			const preparedResult = await prepareUpload({
+				pluginContext: ctx.pluginContext,
+				dataFileStore: ctx.pluginConfig.dataFileStore,
+				input,
+			})
+			if (!preparedResult.ok) return Err(ValidationErrors.invalid(preparedResult.error))
+			const prepared = preparedResult.value
 			const entryAgentId = getEntryAgentId(ctx.sessionState)
-			const lifecycle = beginUploadLifecycle(ctx.pluginContext, String(uploadId), async (controller) => {
-				const result = await runPreprocessAndPersist({
-					uploadId: String(uploadId),
-					sessionId: ctx.sessionId,
-					uploadStore,
-					filePath: writeResult.value.path,
-					filename: input.filename,
-					mimeType: input.mimeType,
-					size: input.size,
-					createdAt: Date.now(),
-					preprocessorRegistry,
-					processingTimeoutMs,
-					processingAbortGraceMs,
-					controller,
-					inferenceContext: entryAgentId ? {
-						sessionId: String(ctx.sessionId),
-						agentId: String(entryAgentId),
-						fileStore: ctx.files,
-					} : undefined,
-				})
-				if (ctx.pluginContext.closing) return result
-
-				await ctx.emitEvent(uploadEvents.create('attachment_uploaded', {
-					uploadId,
-					filename: input.filename,
-					mimeType: input.mimeType,
-					size: input.size,
+			try {
+				const result = await prepared.lifecycle.start(() =>
+					processUpload({
+						pluginContext: ctx.pluginContext,
+						prepared,
+						sessionId: ctx.sessionId,
+						input,
+						config: ctx.pluginConfig,
+						inferenceContext: entryAgentId
+							? {
+									sessionId: String(ctx.sessionId),
+									agentId: String(entryAgentId),
+									fileStore: ctx.files,
+								}
+							: undefined,
+						onFinal: async (finalResult) => {
+							await ctx.emitEvent(createUploadResultEvent(input, prepared, finalResult))
+							if (finalResult.status === 'ready' && entryAgentId) ctx.scheduleAgent(entryAgentId)
+						},
+					}),
+				)
+				return Ok({
+					uploadId: prepared.uploadIdStr,
 					status: result.status,
 					extractedContent: result.extractedContent,
-					derivedPaths: result.derivedPaths,
-					error: result.error,
-				}))
-
-				if (!ctx.pluginContext.closing && result.status === 'ready' && entryAgentId) {
-					ctx.scheduleAgent(entryAgentId)
-				}
-				return result
-			})
-			const result = await lifecycle.result
-
-			return Ok({
-				uploadId: String(uploadId),
-				status: result.status,
-				extractedContent: result.extractedContent,
-			})
+				})
+			} catch (error) {
+				return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Upload processing failed'))
+			}
 		},
 	})
 	.method('uploadAsync', {
@@ -585,146 +714,146 @@ export const uploadsPlugin = definePlugin('uploads')
 			status: z.enum(['processing']),
 		}),
 		handler: async (ctx, input) => {
-			const { dataFileStore, preprocessorRegistry, processingTimeoutMs, processingAbortGraceMs } = ctx.pluginConfig
-
-			if (input.size > MAX_FILE_SIZE) {
-				return Err(ValidationErrors.invalid(`File too large: max ${MAX_FILE_SIZE / (1024 * 1024)}MB`))
-			}
-			if (!isAllowedMimeType(input.mimeType)) {
-				return Err(ValidationErrors.invalid(`Unsupported file type: ${input.mimeType}`))
-			}
-
-			const uploadId = generateUploadId()
-			const uploadIdStr = String(uploadId)
-			const uploadStore = dataFileStore.scoped(`sessions/${input.sessionId}/uploads/${uploadId}`)
-
-			const writeResult = await uploadStore.write(input.filename, input.fileBuffer)
-			if (!writeResult.ok) {
-				return Err(ValidationErrors.invalid('Failed to write file'))
-			}
-
-			const filePath = writeResult.value.path
-			const createdAt = Date.now()
-
-			// Persist initial 'processing' metadata so listPending sees it before preprocessor finishes.
+			const preparedResult = await prepareUpload({
+				pluginContext: ctx.pluginContext,
+				dataFileStore: ctx.pluginConfig.dataFileStore,
+				input,
+			})
+			if (!preparedResult.ok) return Err(ValidationErrors.invalid(preparedResult.error))
+			const prepared = preparedResult.value
 			const processingMeta: UploadMetadata = {
-				uploadId,
+				uploadId: prepared.uploadId,
 				sessionId: ctx.sessionId,
 				filename: input.filename,
 				mimeType: input.mimeType,
 				size: input.size,
-				path: filePath,
+				path: prepared.filePath,
 				status: 'processing',
-				createdAt,
-				completedAt: createdAt,
+				createdAt: prepared.createdAt,
 			}
-			await uploadStore.write('meta.json', JSON.stringify(processingMeta, null, 2))
-
-			await ctx.emitEvent(uploadEvents.create('attachment_uploaded', {
-				uploadId,
-				filename: input.filename,
-				mimeType: input.mimeType,
-				size: input.size,
-				status: 'processing',
-			}))
+			try {
+				await writeMetadata(prepared.uploadStore, processingMeta)
+				await ctx.emitEvent(
+					uploadEvents.create('attachment_uploaded', {
+						uploadId: prepared.uploadId,
+						filename: input.filename,
+						mimeType: input.mimeType,
+						size: input.size,
+						status: 'processing',
+					}),
+				)
+			} catch (error) {
+				prepared.lifecycle.abandon()
+				return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
+			}
 			ctx.notify('uploadStatusChanged', {
 				sessionId: input.sessionId,
-				uploadId: uploadIdStr,
+				uploadId: prepared.uploadIdStr,
 				status: 'processing',
 			})
 
-			// Capture refs from ctx before the handler returns — `notify`/`emitEvent`
-			// closures stay valid for the lifetime of the session, which in roj
-			// outlives any single handler call.
 			const { emitEvent, notify, logger, scheduleAgent } = ctx
 			const sessionId = ctx.sessionId
 			const entryAgentId = getEntryAgentId(ctx.sessionState)
-			beginUploadLifecycle(ctx.pluginContext, uploadIdStr, async (controller) => {
-				try {
-					const result = await runPreprocessAndPersist({
-						uploadId: uploadIdStr,
+			void prepared.lifecycle
+				.start(() =>
+					processUpload({
+						pluginContext: ctx.pluginContext,
+						prepared,
 						sessionId,
-						uploadStore,
-						filePath,
-						filename: input.filename,
-						mimeType: input.mimeType,
-						size: input.size,
-						createdAt,
-						preprocessorRegistry,
-						processingTimeoutMs,
-						processingAbortGraceMs,
-						controller,
-						inferenceContext: entryAgentId ? {
-							sessionId: String(sessionId),
-							agentId: String(entryAgentId),
-							fileStore: ctx.files,
-						} : undefined,
-					})
-					if (ctx.pluginContext.closing) return
-
-					await emitEvent(uploadEvents.create('attachment_uploaded', {
-						uploadId,
-						filename: input.filename,
-						mimeType: input.mimeType,
-						size: input.size,
-						status: result.status,
-						extractedContent: result.extractedContent,
-						derivedPaths: result.derivedPaths,
-						error: result.error,
-					}))
-					if (!ctx.pluginContext.closing && result.status === 'ready' && entryAgentId) {
-						scheduleAgent(entryAgentId)
-					}
-					if (ctx.pluginContext.closing) return
-					notify('uploadStatusChanged', {
-						sessionId: input.sessionId,
-						uploadId: uploadIdStr,
-						status: result.status,
-						extractedContent: result.extractedContent,
-						error: result.error,
-					})
-				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err)
-					logger.error('Async upload processing crashed', err instanceof Error ? err : undefined, {
-						uploadId: uploadIdStr,
+						input,
+						config: ctx.pluginConfig,
+						inferenceContext: entryAgentId
+							? {
+									sessionId: String(sessionId),
+									agentId: String(entryAgentId),
+									fileStore: ctx.files,
+								}
+							: undefined,
+						onFinal: async (result) => {
+							try {
+								await emitEvent(createUploadResultEvent(input, prepared, result))
+							} catch (error) {
+								logger.error('Could not persist upload result event', error instanceof Error ? error : undefined, {
+									uploadId: prepared.uploadIdStr,
+								})
+							}
+							if (result.status === 'ready' && entryAgentId) scheduleAgent(entryAgentId)
+							notify('uploadStatusChanged', {
+								sessionId: input.sessionId,
+								uploadId: prepared.uploadIdStr,
+								status: result.status,
+								extractedContent: result.extractedContent,
+								error: result.error,
+							})
+						},
+					}),
+				)
+				.catch((error) => {
+					logger.error('Async upload processing crashed', error instanceof Error ? error : undefined, {
+						uploadId: prepared.uploadIdStr,
 						filename: input.filename,
 					})
-					if (ctx.pluginContext.closing) return
-					try {
-						await emitEvent(uploadEvents.create('attachment_uploaded', {
-							uploadId,
-							filename: input.filename,
-							mimeType: input.mimeType,
-							size: input.size,
-							status: 'failed',
-							error: message,
-						}))
-					} catch {
-						// Even event emission failed — best-effort; nothing useful left to do.
-					}
-					if (ctx.pluginContext.closing) return
-					notify('uploadStatusChanged', {
-						sessionId: input.sessionId,
-						uploadId: uploadIdStr,
-						status: 'failed',
-						error: message,
-					})
-				}
-			})
+				})
 
 			return Ok({
-				uploadId: uploadIdStr,
-				status: 'processing' as const,
+				uploadId: prepared.uploadIdStr,
+				status: 'processing',
 			})
 		},
 	})
+	.sessionHook('onSessionReady', async (ctx) => {
+		const uploadsPath = `sessions/${ctx.sessionId}/uploads`
+		const listResult = await ctx.pluginConfig.dataFileStore.list(uploadsPath)
+		if (!listResult.ok) return
+
+		for (const entry of listResult.value) {
+			if (entry.type !== 'directory') continue
+			const uploadStore = ctx.pluginConfig.dataFileStore.scoped(`${uploadsPath}/${entry.name}`)
+			try {
+				const metaResult = await uploadStore.read('meta.json')
+				if (!metaResult.ok) continue
+				const metadata: UploadMetadata = JSON.parse(metaResult.value)
+				if (String(metadata.sessionId) !== String(ctx.sessionId)) continue
+				if (metadata.status === 'deleted') {
+					ctx.pluginContext.deletedUploads.add(String(metadata.uploadId))
+					continue
+				}
+				if (metadata.status !== 'processing') continue
+
+				metadata.status = 'failed'
+				metadata.error = 'Processing interrupted by restart'
+				metadata.completedAt = Date.now()
+				await writeMetadata(uploadStore, metadata)
+				await ctx.emitEvent(
+					uploadEvents.create('attachment_uploaded', {
+						uploadId: metadata.uploadId,
+						filename: metadata.filename,
+						mimeType: metadata.mimeType,
+						size: metadata.size,
+						status: 'failed',
+						error: metadata.error,
+					}),
+				)
+				ctx.notify('uploadStatusChanged', {
+					sessionId: String(ctx.sessionId),
+					uploadId: String(metadata.uploadId),
+					status: 'failed',
+					error: metadata.error,
+				})
+			} catch (error) {
+				ctx.logger.warn('Could not recover interrupted upload', {
+					uploadId: entry.name,
+					error: error instanceof Error ? error.message : String(error),
+				})
+			}
+		}
+	})
 	.sessionHook('onSessionClose', async (ctx) => {
 		ctx.pluginContext.closing = true
-		const operations = [...ctx.pluginContext.activeUploads.values()]
-		for (const operation of operations) {
-			operation.controller.abort(new Error('Session closed'))
-		}
-		await Promise.all(operations.map(operation => operation.completion))
+		const active = [...ctx.pluginContext.activeUploads.values()]
+		for (const upload of active) upload.controller.abort(new Error('Session is closing'))
+		await Promise.all(active.map((upload) => upload.completion))
 		ctx.pluginContext.activeUploads.clear()
 	})
 	.build()

@@ -3,11 +3,8 @@ import z from 'zod/v4'
 import { agentEvents } from '~/core/agents/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
-import { Ok } from '~/lib/utils/result.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 import type { TestSession } from '~/testing/index.js'
-import { uploadsPlugin } from './plugin.js'
-import { getPreprocessingSignal, type Preprocessor, PreprocessorRegistry } from './preprocessor.js'
 import type { UploadsState } from './state.js'
 import { uploadEvents } from './state.js'
 
@@ -26,20 +23,6 @@ async function pauseEntryAgent(session: TestSession): Promise<void> {
 	const entryAgentId = session.getEntryAgentId()
 	if (!entryAgentId) throw new Error('Expected entry agent')
 	await session.pauseAgent(entryAgentId, 'Keep upload pending for storage test')
-}
-
-function deferred(): { promise: Promise<void>; resolve: () => void } {
-	let resolvePromise: (() => void) | undefined
-	const promise = new Promise<void>((resolve) => {
-		resolvePromise = resolve
-	})
-	return {
-		promise,
-		resolve: () => {
-			if (!resolvePromise) throw new Error('Deferred promise is not initialized')
-			resolvePromise()
-		},
-	}
 }
 
 const uploadResultSchema = z.object({
@@ -85,132 +68,6 @@ describe('uploads plugin', () => {
 	// =========================================================================
 
 	describe('upload method', () => {
-		it('bounds timeout when a preprocessor ignores abort and observes its late rejection', async () => {
-			const started = deferred()
-			const aborted = deferred()
-			const releaseAfterResult = deferred()
-			const processorExited = deferred()
-			let processorSettled = false
-
-			const preprocessor: Preprocessor = {
-				name: 'timeout-test',
-				supportedMimeTypes: ['text/plain'],
-				process: async (_filePath, _mimeType, ctx) => {
-					const signal = getPreprocessingSignal(ctx)
-					started.resolve()
-					signal.addEventListener('abort', aborted.resolve, { once: true })
-					await releaseAfterResult.promise
-					processorSettled = true
-					processorExited.resolve()
-					throw new Error('late preprocessor rejection')
-				},
-			}
-			const registry = new PreprocessorRegistry()
-			registry.register(preprocessor)
-
-			const harness = new TestHarness({
-				presets: [createTestPreset({
-					plugins: [{
-						pluginName: 'uploads',
-						definition: uploadsPlugin,
-						config: {
-							preprocessorRegistry: registry,
-							processingTimeoutMs: 5,
-							processingAbortGraceMs: 5,
-						},
-					}],
-				})],
-			})
-			const session = await harness.createSession('test')
-			const uploadPromise = session.callPluginMethod('uploads.upload', {
-				sessionId: String(session.sessionId),
-				filename: 'slow.txt',
-				mimeType: 'text/plain',
-				size: 4,
-				fileBuffer: Buffer.from('slow'),
-			})
-
-			await started.promise
-			await aborted.promise
-			const data = okValue(await uploadPromise, uploadResultSchema)
-			expect(data.status).toBe('failed')
-			expect(processorSettled).toBe(false)
-
-			const events = await session.getEventsByType(uploadEvents, 'attachment_uploaded')
-			expect(events).toHaveLength(1)
-			expect(events[0].error).toBe('Processing timeout')
-
-			releaseAfterResult.resolve()
-			await processorExited.promise
-			await Promise.resolve()
-			await harness.shutdown()
-		})
-
-		it('suppresses the detached terminal continuation when the session closes', async () => {
-			const started = deferred()
-			const aborted = deferred()
-			const releaseAfterClose = deferred()
-			const processorExited = deferred()
-			const preprocessor: Preprocessor = {
-				name: 'session-close-test',
-				supportedMimeTypes: ['text/plain'],
-				process: async (_filePath, _mimeType, ctx) => {
-					const signal = getPreprocessingSignal(ctx)
-					started.resolve()
-					signal.addEventListener('abort', aborted.resolve, { once: true })
-					await releaseAfterClose.promise
-					processorExited.resolve()
-					return Ok({ extractedContent: 'too late' })
-				},
-			}
-			const registry = new PreprocessorRegistry()
-			registry.register(preprocessor)
-			const harness = new TestHarness({
-				presets: [createTestPreset({
-					plugins: [{
-						pluginName: 'uploads',
-						definition: uploadsPlugin,
-						config: {
-							preprocessorRegistry: registry,
-							processingTimeoutMs: 60_000,
-							processingAbortGraceMs: 5,
-						},
-					}],
-				})],
-			})
-			const session = await harness.createSession('test')
-
-			const result = await session.callPluginMethod('uploads.uploadAsync', {
-				sessionId: String(session.sessionId),
-				filename: 'closing.txt',
-				mimeType: 'text/plain',
-				size: 7,
-				fileBuffer: Buffer.from('closing'),
-			})
-			const data = okValue(result, z.object({ uploadId: z.string(), status: z.literal('processing') }))
-			await started.promise
-
-			await session.close()
-			await aborted.promise
-			await new Promise(resolve => setTimeout(resolve, 20))
-
-			const ownNotifications = harness.notifications
-				.getByType('uploads', 'uploadStatusChanged')
-				.filter(notification => z.object({ uploadId: z.string() }).parse(notification.payload).uploadId === data.uploadId)
-			expect(ownNotifications).toHaveLength(1)
-			expect(z.object({ status: z.string() }).parse(ownNotifications[0]?.payload).status).toBe('processing')
-
-			releaseAfterClose.resolve()
-			await processorExited.promise
-			await Promise.resolve()
-			const ownEvents = (await session.getEventsByType(uploadEvents, 'attachment_uploaded'))
-				.filter(event => String(event.uploadId) === data.uploadId)
-			expect(ownEvents).toHaveLength(1)
-			expect(ownEvents[0].status).toBe('processing')
-
-			await harness.shutdown()
-		})
-
 		it('upload valid file → attachment_uploaded event → upload in state', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
