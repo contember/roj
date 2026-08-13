@@ -137,9 +137,19 @@ export async function runOpsProfile(options: OpsProfileOptions): Promise<OpProfi
 		return `${commits.length} commits`
 	})
 
-	await measure('fs.walk (platform port)', async () => `${await walkPlatform(platform, dir)} files`)
+	// Both walks are controls, not something roj does: they open no scope, which
+	// is what the pair below is here to price. WorkspaceFilesystem.readdir opens
+	// none either, deliberately — a single listing has nothing to share, so the
+	// caller doing the walking is the one that has to say so.
+	await measure(
+		'fs.walk (platform port, no scope)',
+		async () => `${await walkPlatform(platform, dir)} files`,
+	)
 
-	await measure('fs.walk (workspace readdir)', async () => `${await walkWorkspace(workspace, dir)} files`)
+	await measure(
+		'fs.walk (workspace readdir, no scope)',
+		async () => `${await walkWorkspace(workspace, dir)} files`,
+	)
 
 	await measure('fs.listRecursive (unscoped)', async () => `${await walkWithSizes(platform, dir)} bytes`)
 
