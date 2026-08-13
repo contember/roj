@@ -111,7 +111,10 @@ export class SessionFileStore implements FileStore {
 
 		try {
 			const entries: FileEntry[] = []
-			await this.walkInto(resolved.value, '', maxDepth, entries)
+			// A listing plus a stat per file: one operation as far as the platform
+			// is concerned, so let it share the reads.
+			const walk = (): Promise<void> => this.walkInto(resolved.value, '', maxDepth, entries)
+			await (this.fs.scopeReads ? this.fs.scopeReads(walk) : walk())
 			return Ok(entries)
 		} catch {
 			return Err(`Directory not found: ${path}`)

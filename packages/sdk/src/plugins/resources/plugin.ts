@@ -84,12 +84,16 @@ async function verifiedExtractedPaths(
 	const paths = [...new Set(entryPaths
 		.map(normalizeArchiveEntryPath)
 		.filter(path => !isExcludedGitPath(path)))]
-	for (const path of paths) {
-		const stats = await fs.stat(join(stagingDir, path))
-		if (!stats.isFile()) {
-			throw new Error(`ZIP extraction did not produce a regular file: ${path}`)
+	const verify = async () => {
+		for (const path of paths) {
+			const stats = await fs.stat(join(stagingDir, path))
+			if (!stats.isFile()) {
+				throw new Error(`ZIP extraction did not produce a regular file: ${path}`)
+			}
 		}
 	}
+
+	await (fs.scopeReads ? fs.scopeReads(verify) : verify())
 	return paths
 }
 

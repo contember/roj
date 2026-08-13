@@ -186,6 +186,20 @@ export async function runOpsProfile(options: OpsProfileOptions): Promise<OpProfi
 		return `${sample} files`
 	})
 
+	// Outside `dir`, so the copy is not something the git ops below have to see.
+	// Both halves read the whole subtree back before they touch it, which is the
+	// shape a scope is for — and the only pair here that reads and writes.
+	const copyOf = `${dir}-copy`
+	await measure('fs.cp -r (subtree)', async () => {
+		await platform.fs.cp(dir, copyOf, { recursive: true })
+		return `${await walkPlatform(platform, copyOf)} files`
+	})
+
+	await measure('fs.rm -r (subtree)', async () => {
+		await platform.fs.rm(copyOf, { recursive: true, force: true })
+		return (await platform.fs.exists(copyOf)) ? 'still there' : 'gone'
+	})
+
 	await measure('git.add (all)', async () => {
 		await workspace.git.add({ dir, paths: ['.'] })
 		return 'staged'

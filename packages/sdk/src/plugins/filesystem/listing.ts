@@ -164,6 +164,13 @@ export async function listDirectory(fs: FileSystem, baseDir: string, subPath: st
 		throw new ListingError('forbidden', 'Path traversal not allowed')
 	}
 
+	// The listing and a stat per entry are one question asked in pieces, so let
+	// a platform that can share those reads see them as one.
+	const read = (): Promise<DirectoryEntry[]> => readLevel(fs, targetDir)
+	return fs.scopeReads ? await fs.scopeReads(read) : await read()
+}
+
+async function readLevel(fs: FileSystem, targetDir: string): Promise<DirectoryEntry[]> {
 	let dirents: import('node:fs').Dirent[]
 	try {
 		dirents = await fs.readdir(targetDir, { withFileTypes: true })
