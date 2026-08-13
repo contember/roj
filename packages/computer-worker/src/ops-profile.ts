@@ -60,6 +60,24 @@ async function walkPlatform(platform: Platform, dir: string): Promise<number> {
 	return files
 }
 
+/**
+ * The shape `listDirectoryRecursive` walks: a listing per directory and a stat
+ * per file, because a Dirent carries no size. Measured with and without a read
+ * scope, which is the only difference between the two entries below.
+ */
+async function walkWithSizes(platform: Platform, dir: string): Promise<number> {
+	let bytes = 0
+	const walk = async (current: string): Promise<void> => {
+		for (const entry of await platform.fs.readdir(current, { withFileTypes: true })) {
+			const path = `${current}/${entry.name}`
+			if (entry.isDirectory()) await walk(path)
+			else bytes += (await platform.fs.stat(path)).size
+		}
+	}
+	await walk(dir)
+	return bytes
+}
+
 /** The same walk over the workspace filesystem, whose readdir carries metadata. */
 async function walkWorkspace(workspace: Workspace, dir: string): Promise<number> {
 	let files = 0
@@ -101,6 +119,14 @@ export async function runOpsProfile(options: OpsProfileOptions): Promise<OpProfi
 
 	// --- Reads ---------------------------------------------------------
 
+	// First and last, because the two are not the same question: here HEAD is
+	// the packfile the clone brought, at the end it is a commit this profile
+	// wrote and whose tree objects are loose.
+	await measure('git.status (packed HEAD)', async () => {
+		const entries = await workspace.git.status({ dir })
+		return `${entries.length} entries`
+	})
+
 	await measure('git.diffSummary', async () => {
 		const entries = await workspace.git.diffSummary({ dir })
 		return `${entries.length} entries`
@@ -114,6 +140,14 @@ export async function runOpsProfile(options: OpsProfileOptions): Promise<OpProfi
 	await measure('fs.walk (platform port)', async () => `${await walkPlatform(platform, dir)} files`)
 
 	await measure('fs.walk (workspace readdir)', async () => `${await walkWorkspace(workspace, dir)} files`)
+
+	await measure('fs.listRecursive (unscoped)', async () => `${await walkWithSizes(platform, dir)} bytes`)
+
+	await measure('fs.listRecursive (scoped)', async () => {
+		const run = (): Promise<number> => walkWithSizes(platform, dir)
+		const bytes = await (platform.fs.scopeReads ? platform.fs.scopeReads(run) : run())
+		return `${bytes} bytes`
+	})
 
 	await measure('fs.find **/*.ts', async () => {
 		const found = await workspace.fs.find(dir, '**/*.ts')
@@ -171,6 +205,13 @@ export async function runOpsProfile(options: OpsProfileOptions): Promise<OpProfi
 			await platform.fs.rm(`${dir}/roj-ops-${index}.txt`)
 		}
 		return `${sample} files`
+	})
+
+	// Last, because a status refreshes the index stat cache and every op above
+	// should see the tree the one before it left.
+	await measure('git.status (loose HEAD)', async () => {
+		const entries = await workspace.git.status({ dir })
+		return `${entries.length} entries`
 	})
 
 	return profiles

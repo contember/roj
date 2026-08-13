@@ -47,4 +47,15 @@ export interface FileSystem {
 
 	/** Resolves symlinks and returns the canonical pathname. */
 	realpath(path: string): Promise<string>
+
+	/**
+	 * Optional. Run `fn` with reads served from a per-operation cache, where the
+	 * platform has one.
+	 *
+	 * A hint and nothing more: the same calls return the same answers with or
+	 * without it, so a caller may always skip it and a platform may leave it out.
+	 * Wrap a routine that reads many paths at once — a recursive listing, a
+	 * scan — not a single read, which has nothing to share.
+	 */
+	scopeReads?<T>(fn: () => Promise<T>): Promise<T>
 }

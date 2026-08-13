@@ -6,7 +6,7 @@
  * upstream, and `rm -r` / `cp -r` have no provider equivalent at all.
  */
 
-import type { SQLiteWorkspaceProvider } from '@cloudflare/computer'
+import { type SQLiteWorkspaceProvider, withReadScope } from '@cloudflare/computer'
 import type { FileSystem, ReadableFileHandle, Stats } from '@roj-ai/sdk/platform'
 
 /** node:fs errors carry `.code`; the provider follows the same convention. */
@@ -145,5 +145,11 @@ export function createComputerFileSystem(provider: SQLiteWorkspaceProvider): Fil
 
 		exists: (path) => provider.exists(path),
 		realpath: (path) => provider.realpath(path),
+
+		// The workspace keeps whole directory listings for the duration of a read
+		// scope, so a walk answers both presence and size out of the rows it has
+		// already read instead of asking per entry. Scopes count rather than nest,
+		// so an overlapping walk shares this one and neither closes it early.
+		scopeReads: (fn) => withReadScope(provider.db, fn),
 	}
 }

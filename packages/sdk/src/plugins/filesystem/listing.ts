@@ -215,7 +215,7 @@ export async function listDirectory(fs: FileSystem, baseDir: string, subPath: st
 export async function listDirectoryRecursive(fs: FileSystem, baseDir: string): Promise<DirectoryEntry[]> {
 	const entries: DirectoryEntry[] = []
 
-	async function walk(dir: string, prefix: string) {
+	async function walk(dir: string, prefix: string): Promise<void> {
 		let dirents: import('node:fs').Dirent[]
 		try {
 			dirents = await fs.readdir(dir, { withFileTypes: true })
@@ -258,8 +258,14 @@ export async function listDirectoryRecursive(fs: FileSystem, baseDir: string): P
 		}
 	}
 
-	await walk(baseDir, '')
-	return entries
+	// One walk asks about every path under baseDir, and each answer is a row the
+	// one before it already read past. On a platform that can share those reads
+	// this is the difference between a statement per entry and a handful.
+	const run = async (): Promise<DirectoryEntry[]> => {
+		await walk(baseDir, '')
+		return entries
+	}
+	return fs.scopeReads ? await fs.scopeReads(run) : await run()
 }
 
 // ============================================================================
