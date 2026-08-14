@@ -24,9 +24,10 @@ import type { SqlProfile } from './sql-profile.js'
 import { runVfsCostProbe } from './vfs-cost-probe.js'
 import type { RawQuery, VfsCostResult } from './vfs-cost-probe.js'
 
-/** The `all` slice of `Workspace['db']`, structurally — rows are the schema's business. */
+/** The read slice of `Workspace['db']`, structurally — rows are the schema's business. */
 export interface SqlSource {
 	all(query: string, ...bindings: unknown[]): unknown[]
+	one(query: string, ...bindings: unknown[]): unknown
 }
 
 export interface NativeStatusResult {
