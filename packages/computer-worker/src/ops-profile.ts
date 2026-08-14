@@ -175,6 +175,16 @@ export async function runOpsProfile(options: OpsProfileOptions): Promise<OpProfi
 
 		await measure(`fs.listRecursive (scoped)${suffix}`, async () => `${await scopedWalk()} bytes`)
 
+		// The same answer asked for as one question. Nothing to scope and nothing
+		// to remember: the platform walks it or it does not.
+		await measure(`fs.walk (platform verb)${suffix}`, async () => {
+			if (platform.fs.walk === undefined) return 'unavailable'
+			const entries = await platform.fs.walk(dir)
+			let bytes = 0
+			for (const entry of entries) bytes += entry.size
+			return `${entries.length} entries, ${bytes} bytes`
+		})
+
 		await measure(`fs.find **/*.ts${suffix}`, async () => {
 			const found = await workspace.fs.find(dir, '**/*.ts')
 			return `${found.length} entries`
