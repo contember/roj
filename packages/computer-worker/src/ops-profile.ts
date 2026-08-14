@@ -243,13 +243,17 @@ export async function runOpsProfile(options: OpsProfileOptions): Promise<OpProfi
 	})
 
 	// Outside `dir`, so the copy is not something the git ops below have to see.
-	// Both halves read the whole subtree back before they touch it, which is the
-	// shape a scope is for — and the only pair here that reads and writes.
+	// The walk that proves the copy landed runs after the measurement, not inside
+	// it: counting a whole tree is dearer than the copy and would drown it.
 	const copyOf = `${dir}-copy`
+	let copied = 0
 	await measure('fs.cp -r (subtree)', async () => {
 		await platform.fs.cp(dir, copyOf, { recursive: true })
-		return `${await walkPlatform(platform, copyOf)} files`
+		return 'copied'
 	})
+	copied = await walkPlatform(platform, copyOf)
+	const copy = profiles.find((profile) => profile.name === 'fs.cp -r (subtree)')
+	if (copy !== undefined) copy.result = `${copied} files`
 
 	await measure('fs.rm -r (subtree)', async () => {
 		await platform.fs.rm(copyOf, { recursive: true, force: true })
