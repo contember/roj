@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import type { Dirent, FileSystem, Stats } from '~/platform/fs.js'
+import type { Dirent, FileSystem, Stats, WalkEntry, WalkOptions } from '~/platform/fs.js'
 import { listDirectoryRecursive } from './listing.js'
 
 const TREE: Record<string, string[]> = { '/w': ['a.txt', 'sub'], '/w/sub': ['b.txt'] }
@@ -67,6 +67,42 @@ describe('listDirectoryRecursive', () => {
 		expect(maxOpen).toBe(1)
 		expect(readsOutsideScope).toBe(0)
 		// The hint changes nothing about the answer.
+		expect(entries).toEqual(await listDirectoryRecursive(fakeFs(), '/w'))
+	})
+
+	test('asks a platform that walks whole for the subtree, and reads nothing else', async () => {
+		let listings = 0
+		let walks = 0
+		const fs = fakeFs(() => listings++)
+		fs.walk = async (dir: string, options?: WalkOptions): Promise<WalkEntry[]> => {
+			walks++
+			// The caller's skips travel with the question rather than being applied
+			// to what comes back.
+			expect(options?.excludeHidden).toBe(true)
+			expect(options?.exclude).toContain('node_modules')
+			const out: WalkEntry[] = []
+			const descend = (path: string): void => {
+				for (const name of TREE[path] ?? []) {
+					const child = `${path}/${name}`
+					const isDir = TREE[child] !== undefined
+					out.push({
+						path: child,
+						type: isDir ? 'directory' : 'file',
+						size: SIZES[child] ?? 0,
+						mtime: 0,
+					})
+					if (isDir) descend(child)
+				}
+			}
+			descend(dir)
+			return out
+		}
+
+		const entries = await listDirectoryRecursive(fs, '/w')
+
+		expect(walks).toBe(1)
+		expect(listings).toBe(0)
+		// And it is the same answer the walk built one readdir at a time.
 		expect(entries).toEqual(await listDirectoryRecursive(fakeFs(), '/w'))
 	})
 })

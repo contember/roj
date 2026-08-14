@@ -5,7 +5,7 @@
  */
 
 import { extname, join, resolve } from 'node:path'
-import type { FileSystem } from '~/platform/fs.js'
+import type { FileSystem, WalkEntry } from '~/platform/fs.js'
 
 // ============================================================================
 // Constants
@@ -215,11 +215,33 @@ async function readLevel(fs: FileSystem, targetDir: string): Promise<DirectoryEn
 	return entries
 }
 
+/** A walked entry as this plugin reports it: path relative to the walk's root. */
+function toDirectoryEntry(entry: WalkEntry, baseDir: string): DirectoryEntry {
+	const name = entry.path.slice(entry.path.lastIndexOf('/') + 1)
+	const relativePath = entry.path.slice(baseDir.endsWith('/') ? baseDir.length : baseDir.length + 1)
+	const isDir = entry.type === 'directory'
+	const out: DirectoryEntry = {
+		name,
+		path: relativePath,
+		type: isDir ? 'directory' : 'file',
+		size: isDir ? 0 : entry.size,
+	}
+	if (!isDir) out.mimeType = getMimeType(name)
+	return out
+}
+
 /**
  * Recursively list all entries under a directory.
  * Skips hidden files and IGNORED_DIRS.
  */
 export async function listDirectoryRecursive(fs: FileSystem, baseDir: string): Promise<DirectoryEntry[]> {
+	// One question where the platform can answer it. The skips go with it, so a
+	// subtree nobody asked about is never read rather than read and discarded.
+	if (fs.walk) {
+		const found = await fs.walk(baseDir, { exclude: [...IGNORED_DIRS], excludeHidden: true })
+		return found.map((entry) => toDirectoryEntry(entry, baseDir))
+	}
+
 	const entries: DirectoryEntry[] = []
 
 	async function walk(dir: string, prefix: string): Promise<void> {
@@ -265,9 +287,8 @@ export async function listDirectoryRecursive(fs: FileSystem, baseDir: string): P
 		}
 	}
 
-	// One walk asks about every path under baseDir, and each answer is a row the
-	// one before it already read past. On a platform that can share those reads
-	// this is the difference between a statement per entry and a handful.
+	// Every answer here is a row the one before it already read past, so a
+	// platform that can share those reads should be given the chance to.
 	const run = async (): Promise<DirectoryEntry[]> => {
 		await walk(baseDir, '')
 		return entries

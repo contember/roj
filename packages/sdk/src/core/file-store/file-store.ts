@@ -110,9 +110,21 @@ export class SessionFileStore implements FileStore {
 		if (maxDepth < 1) return Ok([])
 
 		try {
+			// A listing plus a stat per file is one question asked in pieces. Where
+			// the platform takes it whole, ask it whole.
+			if (this.fs.walk) {
+				const base = resolved.value
+				const found = await this.fs.walk(base, { depth: maxDepth })
+				return Ok(
+					found.map((entry) => ({
+						name: entry.path.slice(base.endsWith('/') ? base.length : base.length + 1),
+						type: entry.type === 'symlink' ? 'symlink' : entry.type,
+						size: entry.type === 'file' ? entry.size : undefined,
+					})),
+				)
+			}
+
 			const entries: FileEntry[] = []
-			// A listing plus a stat per file: one operation as far as the platform
-			// is concerned, so let it share the reads.
 			const walk = (): Promise<void> => this.walkInto(resolved.value, '', maxDepth, entries)
 			await (this.fs.scopeReads ? this.fs.scopeReads(walk) : walk())
 			return Ok(entries)

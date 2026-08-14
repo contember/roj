@@ -49,13 +49,51 @@ export interface FileSystem {
 	realpath(path: string): Promise<string>
 
 	/**
+	 * Optional. Every entry under `dir`, with the metadata a stat would return.
+	 *
+	 * The verb a recursive listing wants. Walking with readdir and stat asks the
+	 * platform one question per entry and gives it no way to see that they belong
+	 * together; asking for the subtree does. A platform that can answer it whole
+	 * does — one backed by a database reads the tree in a handful of statements
+	 * instead of one per directory.
+	 *
+	 * Absent on a plain node:fs platform, where the walk below is what it would
+	 * do anyway. Callers keep their own policy: `exclude` and `excludeHidden` are
+	 * passed in so the walk can skip a subtree rather than return it for the
+	 * caller to discard.
+	 */
+	walk?(dir: string, options?: WalkOptions): Promise<WalkEntry[]>
+
+	/**
 	 * Optional. Run `fn` with reads served from a per-operation cache, where the
 	 * platform has one.
 	 *
 	 * A hint and nothing more: the same calls return the same answers with or
 	 * without it, so a caller may always skip it and a platform may leave it out.
-	 * Wrap a routine that reads many paths at once — a recursive listing, a
-	 * scan — not a single read, which has nothing to share.
+	 * Prefer `walk` where it fits — a verb cannot be forgotten the way a wrapper
+	 * can. This is for what no verb covers: reading, then writing, then reading
+	 * again within one operation.
 	 */
 	scopeReads?<T>(fn: () => Promise<T>): Promise<T>
+}
+
+/** One entry under a walked directory. */
+export interface WalkEntry {
+	/** Absolute path. */
+	path: string
+	type: 'file' | 'directory' | 'symlink'
+	/** Bytes for a file, 0 for a directory. */
+	size: number
+	mtime: number
+}
+
+export interface WalkOptions {
+	/** Levels to descend. 1 is the directory's own children; unlimited when absent. */
+	depth?: number
+	/** Entries to return at most, in traversal order. */
+	limit?: number
+	/** Names never returned and, for a directory, never descended into. */
+	exclude?: readonly string[]
+	/** The same, for every name beginning with a dot. */
+	excludeHidden?: boolean
 }
