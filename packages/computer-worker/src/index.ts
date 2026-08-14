@@ -27,6 +27,7 @@ import type { WakeLogEntry } from './limits/context.js'
 import { LIMIT_PROBES, LIMIT_PROBE_NAMES } from './limits/index.js'
 import { NOTE_PATH, scriptedHandler } from './mock-llm.js'
 import { isolatePreset } from './preset.js'
+import { runScopeMemoryProbe } from './scope-memory-probe.js'
 import { runShellProbes } from './shell-probe.js'
 
 /** The SDK's System narrowed to the plugin set the isolate profile registers. */
@@ -394,7 +395,7 @@ export class RojAgentDO extends DurableObject<Env> {
 	}
 
 	/** Measure what a real repo costs to land in this filesystem. See clone-probe.ts. */
-	async clone(url: string, ref: string | null, depth: number, touch: number): Promise<Response> {
+	async clone(url: string, ref: string | null, depth: number, touch: number, warm: boolean, overlap: number): Promise<Response> {
 		try {
 			const result = await runCloneProbe({
 				platform: this.#platform,
@@ -403,6 +404,8 @@ export class RojAgentDO extends DurableObject<Env> {
 				dir: '/site',
 				...(ref === null ? {} : { ref }),
 				depth,
+				warm,
+				overlap,
 				...(this.env.GITHUB_TOKEN === undefined ? {} : { token: this.env.GITHUB_TOKEN }),
 				dbSize: () => this.ctx.storage.sql.databaseSize,
 				db: this.#workspace.db,
@@ -413,6 +416,26 @@ export class RojAgentDO extends DurableObject<Env> {
 					this.ctx.storage.sql.exec<{ size: number }>('SELECT size FROM vfs_nodes WHERE inode = ? LIMIT 1', inode)
 						.toArray().length,
 			})
+			return Response.json({ ok: true, ...result })
+		} catch (error) {
+			return Response.json({ ok: false, ...describeError(error) }, { status: 500 })
+		}
+	}
+
+	/** Clone a tree, then stand still with a scope over it. See scope-memory-probe.ts. */
+	async scopeMemory(url: string, depth: number, holdMs: number): Promise<Response> {
+		try {
+			await this.#workspace.git.clone({
+				url,
+				dir: '/site',
+				depth,
+				singleBranch: true,
+				noTags: true,
+				...(this.env.GITHUB_TOKEN === undefined
+					? {}
+					: { headers: { Authorization: `Basic ${btoa(`x-access-token:${this.env.GITHUB_TOKEN}`)}` } }),
+			})
+			const result = await runScopeMemoryProbe({ platform: this.#platform, dir: '/site', holdMs })
 			return Response.json({ ok: true, ...result })
 		} catch (error) {
 			return Response.json({ ok: false, ...describeError(error) }, { status: 500 })
@@ -648,9 +671,27 @@ export default {
 			if (!Number.isSafeInteger(touch) || touch < 0) {
 				return new Response('touch must be a non-negative integer\n', { status: 400 })
 			}
+			const overlap = Number(url.searchParams.get('overlap') ?? 3)
+			if (!Number.isSafeInteger(overlap) || overlap < 0) {
+				return new Response('overlap must be a non-negative integer\n', { status: 400 })
+			}
+			const warm = (url.searchParams.get('warm') ?? '1') !== '0'
 			// A clone is not repeatable in a workspace that already holds one.
 			return env.AGENT.get(env.AGENT.idFromName(`clone:${crypto.randomUUID()}`))
-				.clone(repo, url.searchParams.get('ref'), depth, touch)
+				.clone(repo, url.searchParams.get('ref'), depth, touch, warm, overlap)
+		}
+		if (url.pathname === '/scope-memory') {
+			const repo = url.searchParams.get('url')
+			if (repo === null) {
+				return new Response('url is required\n', { status: 400 })
+			}
+			const depth = Number(url.searchParams.get('depth') ?? 1)
+			const hold = Number(url.searchParams.get('hold') ?? 4000)
+			if (!Number.isSafeInteger(depth) || depth < 0 || !Number.isSafeInteger(hold) || hold < 0) {
+				return new Response('depth and hold must be non-negative integers\n', { status: 400 })
+			}
+			// Its own DO, so the tree it measures is the only one in the isolate.
+			return env.AGENT.get(env.AGENT.idFromName(`scope-memory:${crypto.randomUUID()}`)).scopeMemory(repo, depth, hold)
 		}
 		if (url.pathname === '/reap') {
 			return stub.reap(url.search)

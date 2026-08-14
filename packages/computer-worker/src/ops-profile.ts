@@ -9,7 +9,8 @@
  *
  * Order matters: reads run before the writes that would invalidate them, and
  * the mutating operations run last because they leave the tree different from
- * how they found it.
+ * how they found it. The read half runs twice, because a first run pays for
+ * caches a second one inherits and only the pair says which is which.
  */
 
 import type { Workspace } from '@cloudflare/computer'
@@ -36,10 +37,17 @@ export interface OpsProfileOptions {
 	dir: string
 	/** Files the write/read benchmarks touch. */
 	sample?: number
+	/** Repeat the read half, so what a second run inherits is visible. */
+	warm?: boolean
+	/** Copies of one walk in the overlap pair. Zero skips it. */
+	overlap?: number
 }
 
 /** Enough files for a per-file cost to show, few enough to stay off the critical path. */
 const DEFAULT_SAMPLE = 50
+
+/** Enough concurrent walks for sharing to show, few enough to stay inside one request. */
+const DEFAULT_OVERLAP = 3
 
 /**
  * Every path under `dir`, walked one readdir at a time through the platform
@@ -94,11 +102,14 @@ async function walkWorkspace(workspace: Workspace, dir: string): Promise<number>
 	return files
 }
 
+/** One measured operation, named and appended to the run's profile list. */
+type Measure = (name: string, work: () => Promise<string>) => Promise<void>
+
 export async function runOpsProfile(options: OpsProfileOptions): Promise<OpProfile[]> {
-	const { platform, workspace, db, dir, sample = DEFAULT_SAMPLE } = options
+	const { platform, workspace, db, dir, sample = DEFAULT_SAMPLE, warm = true, overlap = DEFAULT_OVERLAP } = options
 	const profiles: OpProfile[] = []
 
-	const measure = async (name: string, work: () => Promise<string>): Promise<void> => {
+	const measure: Measure = async (name, work) => {
 		await scheduler.wait(0)
 		const start = Date.now()
 		try {
@@ -117,68 +128,103 @@ export async function runOpsProfile(options: OpsProfileOptions): Promise<OpProfi
 		}
 	}
 
-	// --- Reads ---------------------------------------------------------
-
-	// First and last, because the two are not the same question: here HEAD is
-	// the packfile the clone brought, at the end it is a commit this profile
-	// wrote and whose tree objects are loose.
-	await measure('git.status (packed HEAD)', async () => {
-		const entries = await workspace.git.status({ dir })
-		return `${entries.length} entries`
-	})
-
-	await measure('git.diffSummary', async () => {
-		const entries = await workspace.git.diffSummary({ dir })
-		return `${entries.length} entries`
-	})
-
-	await measure('git.log(20)', async () => {
-		const commits = await workspace.git.log({ dir, depth: 20 })
-		return `${commits.length} commits`
-	})
-
-	// Both walks are controls, not something roj does: they open no scope, which
-	// is what the pair below is here to price. WorkspaceFilesystem.readdir opens
-	// none either, deliberately — a single listing has nothing to share, so the
-	// caller doing the walking is the one that has to say so.
-	await measure(
-		'fs.walk (platform port, no scope)',
-		async () => `${await walkPlatform(platform, dir)} files`,
-	)
-
-	await measure(
-		'fs.walk (workspace readdir, no scope)',
-		async () => `${await walkWorkspace(workspace, dir)} files`,
-	)
-
-	await measure('fs.listRecursive (unscoped)', async () => `${await walkWithSizes(platform, dir)} bytes`)
-
-	await measure('fs.listRecursive (scoped)', async () => {
+	/** The same walk every overlap entry runs, scoped where the platform offers one. */
+	const scopedWalk = (): Promise<number> => {
 		const run = (): Promise<number> => walkWithSizes(platform, dir)
-		const bytes = await (platform.fs.scopeReads ? platform.fs.scopeReads(run) : run())
-		return `${bytes} bytes`
-	})
+		return platform.fs.scopeReads ? platform.fs.scopeReads(run) : run()
+	}
 
-	await measure('fs.find **/*.ts', async () => {
-		const found = await workspace.fs.find(dir, '**/*.ts')
-		return `${found.length} entries`
-	})
+	// --- Reads ---------------------------------------------------------
+	//
+	// Run whole rather than op by op, so the warm pass repeats exactly what the
+	// cold one did. `suffix` is the only difference between the two calls.
+	const reads = async (suffix: string): Promise<void> => {
+		// First and last, because the two are not the same question: here HEAD is
+		// the packfile the clone brought, at the end it is a commit this profile
+		// wrote and whose tree objects are loose.
+		await measure(`git.status (packed HEAD)${suffix}`, async () => {
+			const entries = await workspace.git.status({ dir })
+			return `${entries.length} entries`
+		})
 
-	await measure('fs.grep', async () => {
-		const matches = await workspace.fs.grep('export', dir, { limit: 200, include: '*.ts' })
-		return `${matches.length} matches`
-	})
+		await measure(`git.diffSummary${suffix}`, async () => {
+			const entries = await workspace.git.diffSummary({ dir })
+			return `${entries.length} entries`
+		})
 
-	const paths: string[] = []
-	await measure(`fs.readFile x${sample}`, async () => {
-		const found = await workspace.fs.find(dir, '**/*.ts', { limit: sample })
-		let bytes = 0
-		for (const entry of found) {
-			paths.push(entry.path)
-			bytes += (await platform.fs.readFile(entry.path)).length
-		}
-		return `${paths.length} files, ${bytes} bytes`
-	})
+		await measure(`git.log(20)${suffix}`, async () => {
+			const commits = await workspace.git.log({ dir, depth: 20 })
+			return `${commits.length} commits`
+		})
+
+		// Both walks are controls, not something roj does: they open no scope, which
+		// is what the pair below is here to price. WorkspaceFilesystem.readdir opens
+		// none either, deliberately — a single listing has nothing to share, so the
+		// caller doing the walking is the one that has to say so.
+		await measure(
+			`fs.walk (platform port, no scope)${suffix}`,
+			async () => `${await walkPlatform(platform, dir)} files`,
+		)
+
+		await measure(
+			`fs.walk (workspace readdir, no scope)${suffix}`,
+			async () => `${await walkWorkspace(workspace, dir)} files`,
+		)
+
+		await measure(`fs.listRecursive (unscoped)${suffix}`, async () => `${await walkWithSizes(platform, dir)} bytes`)
+
+		await measure(`fs.listRecursive (scoped)${suffix}`, async () => `${await scopedWalk()} bytes`)
+
+		await measure(`fs.find **/*.ts${suffix}`, async () => {
+			const found = await workspace.fs.find(dir, '**/*.ts')
+			return `${found.length} entries`
+		})
+
+		await measure(`fs.grep${suffix}`, async () => {
+			const matches = await workspace.fs.grep('export', dir, { limit: 200, include: '*.ts' })
+			return `${matches.length} matches`
+		})
+
+		await measure(`fs.readFile x${sample}${suffix}`, async () => {
+			const found = await workspace.fs.find(dir, '**/*.ts', { limit: sample })
+			let bytes = 0
+			for (const entry of found) bytes += (await platform.fs.readFile(entry.path)).length
+			return `${found.length} files, ${bytes} bytes`
+		})
+	}
+
+	await reads('')
+	if (warm) await reads(' (warm)')
+
+	// --- Overlap -------------------------------------------------------
+	//
+	// Read scopes count rather than nest, so requests that overlap in one DO
+	// share whichever scope is already open instead of each building its own.
+	// The pair below is what that is worth: the same walks, started together and
+	// started one after another, differing in nothing else.
+	if (overlap > 0) {
+		await measure(`fs.listRecursive x${overlap} (sequential)`, async () => {
+			const results: number[] = []
+			for (let index = 0; index < overlap; index++) results.push(await scopedWalk())
+			return `${results.length} walks, ${new Set(results).size} distinct results`
+		})
+
+		await measure(`fs.listRecursive x${overlap} (concurrent)`, async () => {
+			const results = await Promise.all(Array.from({ length: overlap }, () => scopedWalk()))
+			return `${results.length} walks, ${new Set(results).size} distinct results`
+		})
+
+		// Different operations rather than copies of one, because they open their
+		// scopes at different depths of the tree and finish out of order.
+		await measure('fs.walk+find+grep (concurrent)', async () => {
+			const [bytes, found, matches] = await Promise.all([
+				scopedWalk(),
+				workspace.fs.find(dir, '**/*.ts'),
+				workspace.fs.grep('export', dir, { limit: 200, include: '*.ts' }),
+			])
+			return `${bytes} bytes, ${found.length} entries, ${matches.length} matches`
+		})
+	}
 
 	// --- Writes --------------------------------------------------------
 

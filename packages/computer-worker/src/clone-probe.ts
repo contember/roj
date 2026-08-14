@@ -126,8 +126,11 @@ export async function runCloneProbe(options: {
 	touch?: number
 	/** One statement against the DO's own SQL API, for the layer breakdown. */
 	rawQuery?: RawQuery
+	/** Passed to the ops profile — repeat its read half, and how far to overlap. */
+	warm?: boolean
+	overlap?: number
 }): Promise<CloneProbeResult> {
-	const { platform, workspace, url, dir, ref, depth, token, dbSize, db, touch, rawQuery } = options
+	const { platform, workspace, url, dir, ref, depth, token, dbSize, db, touch, rawQuery, warm, overlap } = options
 
 	const dbBytesBefore = dbSize?.()
 	// workerd freezes its clock between I/O, so yield before reading it.
@@ -228,7 +231,14 @@ export async function runCloneProbe(options: {
 		})
 		// After the native probe, so `diff` and `commit` have a dirty tree to
 		// work on rather than the pristine one the clone left.
-		result.ops = await runOpsProfile({ platform, workspace, db: workspace.db, dir })
+		result.ops = await runOpsProfile({
+			platform,
+			workspace,
+			db: workspace.db,
+			dir,
+			...(warm === undefined ? {} : { warm }),
+			...(overlap === undefined ? {} : { overlap }),
+		})
 	}
 
 	return result
