@@ -80,6 +80,10 @@ type FsOp =
 	| 'open'
 	| 'exists'
 	| 'realpath'
+	| 'walk'
+	| 'readFiles'
+	| 'writeFiles'
+	| 'rmFiles'
 
 /** Path classes, in the order they are tested. */
 const CLASSES: readonly { name: string; match: RegExp }[] = [
@@ -201,7 +205,60 @@ function describeLogLine(line: string): string {
  * overloaded: only a declared overload pair satisfies the port without a cast.
  */
 class CountingFileSystem implements FileSystem {
-	constructor(private readonly inner: FileSystem, private readonly census: FsCensus) {}
+	/**
+	 * The port's optional verbs, forwarded only where the platform has them.
+	 *
+	 * Properties rather than methods, because a method would exist here whether
+	 * or not the platform behind it does — and a caller's `if (fs.walk)` would
+	 * then take a path the platform cannot serve. Each records what the loop it
+	 * replaces would have recorded, one entry per path, so the census still
+	 * reads as traffic per path class rather than as calls.
+	 */
+	readonly walk?: FileSystem['walk']
+	readonly readFiles?: FileSystem['readFiles']
+	readonly writeFiles?: FileSystem['writeFiles']
+	readonly rmFiles?: FileSystem['rmFiles']
+	readonly scopeReads?: FileSystem['scopeReads']
+
+	constructor(private readonly inner: FileSystem, private readonly census: FsCensus) {
+		const walk = inner.walk?.bind(inner)
+		if (walk !== undefined) {
+			this.walk = async (dir, options) => {
+				const entries = await walk(dir, options)
+				this.census.record('walk', dir, 0)
+				for (const entry of entries) this.census.record('walk', entry.path, 0)
+				return entries
+			}
+		}
+
+		const readFiles = inner.readFiles?.bind(inner)
+		if (readFiles !== undefined) {
+			this.readFiles = async (paths) => {
+				const read = await readFiles(paths)
+				for (const entry of read) this.census.record('readFiles', entry.path, entry.content?.byteLength ?? 0)
+				return read
+			}
+		}
+
+		const writeFiles = inner.writeFiles?.bind(inner)
+		if (writeFiles !== undefined) {
+			this.writeFiles = async (entries, options) => {
+				const kept = entries.filter((entry) => !this.census.drops(entry.path))
+				if (kept.length > 0) await writeFiles(kept, options)
+				for (const entry of kept) this.census.record('writeFiles', entry.path, byteLength(entry.content))
+			}
+		}
+
+		const rmFiles = inner.rmFiles?.bind(inner)
+		if (rmFiles !== undefined) {
+			this.rmFiles = async (paths, options) => {
+				await rmFiles(paths, options)
+				for (const path of paths) this.census.record('rmFiles', path, 0)
+			}
+		}
+
+		this.scopeReads = inner.scopeReads?.bind(inner)
+	}
 
 	readFile(path: string): Promise<FsBytes>
 	readFile(path: string, encoding: 'utf-8' | 'utf8'): Promise<string>

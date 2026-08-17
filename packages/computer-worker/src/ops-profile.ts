@@ -273,11 +273,17 @@ export async function runOpsProfile(options: OpsProfileOptions): Promise<OpProfi
 		)
 		return `${sample} files`
 	})
-	// Cleared outside the measurement, so the git ops below see the same tree
-	// they saw before this op existed.
-	for (let index = 0; index < sample; index++) {
-		await platform.fs.rm(`${dir}/roj-ops-set-${index}.txt`, { force: true })
-	}
+	// The same removals as one operation, which also clears what the write above
+	// left — so the git ops below see the same tree they saw before it existed.
+	await measure(`fs.rmFiles x${sample} (platform verb)`, async () => {
+		const paths = Array.from({ length: sample }, (_, index) => `${dir}/roj-ops-set-${index}.txt`)
+		if (platform.fs.rmFiles === undefined) {
+			for (const path of paths) await platform.fs.rm(path, { force: true })
+			return 'unavailable'
+		}
+		await platform.fs.rmFiles(paths, { force: true })
+		return `${sample} files`
+	})
 
 	// Outside `dir`, so the copy is not something the git ops below have to see.
 	// The walk that proves the copy landed runs after the measurement, not inside

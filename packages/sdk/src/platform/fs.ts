@@ -88,6 +88,18 @@ export interface FileSystem {
 	writeFiles?(entries: readonly WriteFilesEntry[], options?: WriteFilesOptions): Promise<void>
 
 	/**
+	 * Optional. Remove a set of paths as one operation.
+	 *
+	 * The same argument once more. Removing a path is several statements against
+	 * a database-backed store and almost none of them are per-path work, but a
+	 * caller that says `rm` fifty times pays for fifty operations.
+	 *
+	 * Raises what `rm` raises, for the same reasons. A failure partway through
+	 * leaves the paths before it removed.
+	 */
+	rmFiles?(paths: readonly string[], options?: { recursive?: boolean; force?: boolean }): Promise<void>
+
+	/**
 	 * Optional. Run `fn` with reads served from a per-operation cache, where the
 	 * platform has one.
 	 *

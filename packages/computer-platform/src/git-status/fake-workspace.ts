@@ -106,6 +106,21 @@ export interface FakeWorkspaceOptions {
 }
 
 /**
+ * Port members a platform may leave out.
+ *
+ * Answered as absent rather than thrown, because a caller asking whether one is
+ * there is asking a legitimate question — and the throw below is for calls the
+ * fake genuinely does not expect.
+ */
+const OPTIONAL_FS_MEMBERS: ReadonlySet<string> = new Set([
+	'walk',
+	'scopeReads',
+	'readFiles',
+	'writeFiles',
+	'rmFiles',
+])
+
+/**
  * Enough of the workspace to answer a status: the `vfs_*` rows the queries read,
  * a filesystem over the same content, and the git calls that are still made.
  */
