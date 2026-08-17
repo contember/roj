@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import { AgentId } from '~/core/agents/schema.js'
 import { generateLLMCallId, LLMCallId } from '~/core/llm/schema.js'
 import type { SessionId } from '~/core/sessions/schema.js'
+import { readTextFilesOrUndefined } from '~/lib/utils/fs-batch.js'
 import type { FileSystem } from '~/platform/fs.js'
 import type { LLMCallRow, LLMCallStore } from '~/platform/llm-call-log.js'
 import type { LLMCallError, LLMCallLogEntry, LLMCallMessage, LLMCallMetrics, LLMCallRequest, LLMCallResponse } from './llm-log-types.js'
@@ -84,6 +85,15 @@ function parseJson<T>(json: string): T {
 
 function parseOptionalJson<T>(json: string | undefined): T | undefined {
 	return json === undefined ? undefined : parseJson<T>(json)
+}
+
+/** One stored entry, or null when the file stopped being JSON. */
+function parseEntry(content: string): LLMCallLogEntry | null {
+	try {
+		return parseJson<LLMCallLogEntry>(content)
+	} catch {
+		return null
+	}
 }
 
 // ============================================================================
@@ -347,7 +357,7 @@ export class LLMLogger {
 	/** One stored entry, or null when the file has gone or stopped being JSON. */
 	private async readEntry(filePath: string): Promise<LLMCallLogEntry | null> {
 		try {
-			return parseJson<LLMCallLogEntry>(await this.fs.readFile(filePath, 'utf-8'))
+			return parseEntry(await this.fs.readFile(filePath, 'utf-8'))
 		} catch {
 			return null
 		}
@@ -390,10 +400,15 @@ export class LLMLogger {
 		const total = jsonFiles.length
 		const paginated = jsonFiles.slice(offset, offset + limit)
 
+		// The page is a known set of paths, so it is asked for as one where the
+		// platform takes one — the same read the store branch above replaces with
+		// a single query.
+		const contents = await readTextFilesOrUndefined(this.fs, paginated.map((file) => join(callsDir, file)))
+
 		const calls: LLMCallLogEntry[] = []
-		for (const file of paginated) {
-			const entry = await this.readEntry(join(callsDir, file))
+		for (const content of contents) {
 			// Skip invalid files
+			const entry = content === undefined ? null : parseEntry(content)
 			if (entry !== null) calls.push(entry)
 		}
 

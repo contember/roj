@@ -21,6 +21,7 @@
  */
 
 import * as path from 'node:path'
+import { readTextFilesOrUndefined } from '~/lib/utils/fs-batch.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { FileSystem } from '~/platform/fs.js'
@@ -200,16 +201,18 @@ export async function discoverSkills(
 		// Scan for subdirectories containing SKILL.md
 		const entries = await fs.readdir(sourcePath, { withFileTypes: true })
 
-		for (const entry of entries) {
-			if (!entry.isDirectory()) continue
+		// One read for every candidate, and no separate probe: a directory with
+		// no SKILL.md comes back with nothing rather than being asked about
+		// twice.
+		const candidates = entries
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => path.join(sourcePath, entry.name, 'SKILL.md'))
+		const contents = await readTextFilesOrUndefined(fs, candidates)
 
-			const skillDir = path.join(sourcePath, entry.name)
-			const skillFile = path.join(skillDir, 'SKILL.md')
+		for (const [index, skillFile] of candidates.entries()) {
+			const content = contents[index]
+			if (content === undefined) continue
 
-			if (!(await fs.exists(skillFile))) continue
-
-			// Read and parse the skill file
-			const content = await fs.readFile(skillFile, 'utf-8')
 			const parseResult = parseSkillFrontmatter(content)
 
 			if (!parseResult.ok) {
