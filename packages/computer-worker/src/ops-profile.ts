@@ -201,6 +201,16 @@ export async function runOpsProfile(options: OpsProfileOptions): Promise<OpProfi
 			for (const entry of found) bytes += (await platform.fs.readFile(entry.path)).length
 			return `${found.length} files, ${bytes} bytes`
 		})
+
+		// The same bytes asked for as one question.
+		await measure(`fs.readFiles x${sample} (platform verb)${suffix}`, async () => {
+			if (platform.fs.readFiles === undefined) return 'unavailable'
+			const found = await workspace.fs.find(dir, '**/*.ts', { limit: sample })
+			const entries = await platform.fs.readFiles(found.map((entry) => entry.path))
+			let bytes = 0
+			for (const entry of entries) bytes += entry.content?.length ?? 0
+			return `${entries.length} files, ${bytes} bytes`
+		})
 	}
 
 	await reads('')
@@ -251,6 +261,23 @@ export async function runOpsProfile(options: OpsProfileOptions): Promise<OpProfi
 		}
 		return `${sample} files`
 	})
+
+	// The same writes as one operation, so one batch settles rather than fifty.
+	await measure(`fs.writeFiles x${sample} (platform verb)`, async () => {
+		if (platform.fs.writeFiles === undefined) return 'unavailable'
+		await platform.fs.writeFiles(
+			Array.from({ length: sample }, (_, index) => ({
+				path: `${dir}/roj-ops-set-${index}.txt`,
+				content: `probe ${index}\n`,
+			})),
+		)
+		return `${sample} files`
+	})
+	// Cleared outside the measurement, so the git ops below see the same tree
+	// they saw before this op existed.
+	for (let index = 0; index < sample; index++) {
+		await platform.fs.rm(`${dir}/roj-ops-set-${index}.txt`, { force: true })
+	}
 
 	// Outside `dir`, so the copy is not something the git ops below have to see.
 	// The walk that proves the copy landed runs after the measurement, not inside

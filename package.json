@@ -32,5 +32,8 @@
 				"zod": "4.3.6"
 			}
 		}
+	},
+	"overrides": {
+		"@cloudflare/computer": "file:/tmp/claude-1000/-home-matej21-projects-contember-roj-wt-cf-computer/78e63e2d-0d29-4ff4-ab1a-04a90a47544b/scratchpad/computer-v22.tgz"
 	}
 }

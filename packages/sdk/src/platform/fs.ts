@@ -65,6 +65,29 @@ export interface FileSystem {
 	walk?(dir: string, options?: WalkOptions): Promise<WalkEntry[]>
 
 	/**
+	 * Optional. Every byte of every path, asked for once.
+	 *
+	 * Same argument as `walk`, for files rather than directories: a caller
+	 * reading a set of files one call at a time gives the platform no way to see
+	 * that they belong together, and a store backed by a database answers the
+	 * whole set in about as much work as it spends on one file.
+	 *
+	 * Reports per path instead of throwing, because a batch that threw on the
+	 * first missing file would send the caller back to asking one at a time.
+	 * Entries come back in the order they were asked for.
+	 */
+	readFiles?(paths: readonly string[]): Promise<ReadFilesEntry[]>
+
+	/**
+	 * Optional. Write a set of files as one operation.
+	 *
+	 * The other half of the same argument. A platform that batches its writes
+	 * can only do so within one operation, and one call per file is one
+	 * operation per file.
+	 */
+	writeFiles?(entries: readonly WriteFilesEntry[], options?: WriteFilesOptions): Promise<void>
+
+	/**
 	 * Optional. Run `fn` with reads served from a per-operation cache, where the
 	 * platform has one.
 	 *
@@ -85,6 +108,25 @@ export interface WalkEntry {
 	/** Bytes for a file, 0 for a directory. */
 	size: number
 	mtime: number
+}
+
+/** One path's answer from `readFiles`, in the order it was asked for. */
+export interface ReadFilesEntry {
+	path: string
+	/** The bytes, or absent when `error` says why there are none. */
+	content?: Buffer
+	/** The code `readFile` would have thrown for this path. */
+	error?: string
+}
+
+export interface WriteFilesEntry {
+	path: string
+	content: string | Uint8Array
+}
+
+export interface WriteFilesOptions {
+	/** Create the directories the entries need, as `mkdir -p` would. Off by default. */
+	createParents?: boolean
 }
 
 export interface WalkOptions {
