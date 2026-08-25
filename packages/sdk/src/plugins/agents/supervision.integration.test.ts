@@ -1,10 +1,21 @@
 import { describe, expect, it } from 'bun:test'
 import { AgentId } from '~/core/agents/schema.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import type { LLMError } from '~/core/llm/provider.js'
+import { definePlugin } from '~/core/plugins/index.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { agentsPlugin } from '~/plugins/agents/plugin.js'
-import { mailboxEvents } from '~/plugins/mailbox/index.js'
+import { generateTestMessageId, mailboxEvents } from '~/plugins/mailbox/index.js'
 import { createMultiAgentPreset, TestHarness, type TestSession } from '~/testing/index.js'
+
+/** Retryable, with a zero retry-after so the inner LLM retries burn no wall clock. */
+const RATE_LIMITED: LLMError = { type: 'rate_limit', message: 'slow down', retryAfterMs: 0 }
+
+/** Is this plugin-method call the supervision snapshot going out to a parent? */
+function isSupervisorSend(method: string, input: unknown): boolean {
+	if (method !== 'mailbox.send') return false
+	return typeof input === 'object' && input !== null && 'fromSupervisor' in input && input.fromSupervisor === true
+}
 
 /**
  * Helper — wait until at least one supervision message has landed in the parent's
@@ -27,6 +38,12 @@ async function waitForSupervisorMessage(
 		await new Promise((r) => setTimeout(r, 25))
 	}
 	return undefined
+}
+
+/** Count the supervision snapshots delivered so far. */
+async function countSupervisorMessages(session: TestSession): Promise<number> {
+	const events = await session.getEventsByType(mailboxEvents, 'mailbox_message')
+	return events.filter((e) => e.message.from === 'supervisor').length
 }
 
 describe('agents plugin supervision', () => {
@@ -245,5 +262,468 @@ describe('agents plugin supervision', () => {
 		expect(msg!.message.content).toContain('worker_1')
 
 		await harness2.shutdown()
+	})
+
+	it('the tick stops re-arming once every child is idle', async () => {
+		let orchestratorCalls = 0
+
+		const harness = new TestHarness({
+			presets: [{
+				...createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' }),
+				plugins: [{ pluginName: 'agents', definition: agentsPlugin, config: { superviseChildrenIntervalMs: 30 } }],
+			}],
+			mockHandler: (request) => {
+				if (request.systemPrompt.includes('Orchestrator')) {
+					orchestratorCalls++
+					if (orchestratorCalls === 1) {
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Quick task' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return { content: 'noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				}
+				return { content: 'finished', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			},
+		})
+
+		const session = await harness.createSession('test')
+		await session.sendMessage('Start')
+
+		const orchestratorId = session.getEntryAgentId()!
+		expect(await waitForSupervisorMessage(session, orchestratorId)).toBeDefined()
+
+		// Children are never removed from session state, so a tick that re-armed on
+		// "has children" would keep firing every 30ms for the life of the process.
+		await new Promise((r) => setTimeout(r, 100))
+		const settled = await countSupervisorMessages(session)
+		await new Promise((r) => setTimeout(r, 300))
+		expect(await countSupervisorMessages(session)).toBe(settled)
+
+		await harness.shutdown()
+	})
+
+	it('the tick keeps firing while a child is still working', async () => {
+		let orchestratorCalls = 0
+		let releaseWorker = () => {}
+		const workerGate = new Promise<void>((resolve) => {
+			releaseWorker = resolve
+		})
+
+		const harness = new TestHarness({
+			presets: [{
+				...createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' }),
+				plugins: [{ pluginName: 'agents', definition: agentsPlugin, config: { superviseChildrenIntervalMs: 30 } }],
+			}],
+			mockHandler: async (request) => {
+				if (request.systemPrompt.includes('Orchestrator')) {
+					orchestratorCalls++
+					if (orchestratorCalls === 1) {
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Slow task' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return { content: 'noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				}
+				// Worker stays in 'inferring' until the test releases it.
+				await workerGate
+				return { content: 'finally done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			},
+		})
+
+		const session = await harness.createSession('test')
+		await session.sendMessage('Start')
+
+		const orchestratorId = session.getEntryAgentId()!
+		expect(await waitForSupervisorMessage(session, orchestratorId)).toBeDefined()
+
+		await new Promise((r) => setTimeout(r, 200))
+		expect(await countSupervisorMessages(session)).toBeGreaterThan(2)
+
+		releaseWorker()
+		await session.waitForIdle()
+		await harness.shutdown()
+	})
+
+	it('supervision holds no lease while waiting, so an idle runtime is evictable', async () => {
+		let orchestratorCalls = 0
+
+		const harness = new TestHarness({
+			sessionIdleTimeoutMs: 20,
+			presets: [{
+				...createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' }),
+				// Far beyond the test window — the timer is armed the whole time.
+				plugins: [{ pluginName: 'agents', definition: agentsPlugin, config: { superviseChildrenIntervalMs: 5000 } }],
+			}],
+			mockHandler: (request) => {
+				if (request.systemPrompt.includes('Orchestrator')) {
+					orchestratorCalls++
+					if (orchestratorCalls === 1) {
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Task' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return { content: 'noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				}
+				return { content: 'done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			},
+		})
+
+		const session = await harness.createSession('test')
+		await session.sendAndWaitForIdle('Start')
+
+		const deadline = Date.now() + 2000
+		while (Date.now() < deadline && harness.sessionManager.getRuntimeCacheStats().loadedSessionCount > 0) {
+			await new Promise((r) => setTimeout(r, 10))
+		}
+		expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
+
+		await harness.shutdown()
+	})
+
+	it('a child that errored and is retrying itself still counts as working', async () => {
+		let orchestratorCalls = 0
+		let workerCalls = 0
+		let releaseWorker = () => {}
+		const workerGate = new Promise<void>((resolve) => {
+			releaseWorker = resolve
+		})
+
+		const harness = new TestHarness({
+			presets: [{
+				...createMultiAgentPreset([
+					{
+						name: 'worker',
+						system: 'Worker agent.',
+						tools: [],
+						agents: [],
+						// One short outer backoff, then the worker recovers on its own.
+						errorResumeBackoff: { baseDelayMs: 300, maxDelayMs: 300 },
+					},
+				], { orchestratorSystem: 'Orchestrator agent.' }),
+				plugins: [{ pluginName: 'agents', definition: agentsPlugin, config: { superviseChildrenIntervalMs: 60 } }],
+			}],
+			mockHandler: async (request) => {
+				if (request.systemPrompt.includes('Orchestrator')) {
+					orchestratorCalls++
+					if (orchestratorCalls === 1) {
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Task' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return { content: 'noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				}
+				workerCalls++
+				// Burn the inner withLLMRetry budget so the worker lands in 'errored' with
+				// its dequeue token preserved — decide() will call that resume_from_error.
+				if (workerCalls <= 5) throw RATE_LIMITED
+				await workerGate
+				return { content: 'finally done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			},
+		})
+
+		const session = await harness.createSession('test')
+		await session.sendMessage('Start')
+
+		const orchestratorId = session.getEntryAgentId()!
+		expect(await waitForSupervisorMessage(session, orchestratorId)).toBeDefined()
+
+		// 'errored' is not idle: the agent holds a live retry timer and comes back on its
+		// own. Treating it as idle stopped supervision permanently — nothing re-arms when
+		// a child transitions idle→busy by itself, and the parent has nothing to infer
+		// about because it is waiting on that child.
+		const workerStatus = () =>
+			[...session.state.agents.values()].find((a) => a.definitionName === 'worker')?.status
+		const recoveredBy = Date.now() + 3000
+		while (Date.now() < recoveredBy && workerStatus() !== 'inferring') {
+			await new Promise((r) => setTimeout(r, 10))
+		}
+		expect(workerStatus()).toBe('inferring')
+
+		// The child is now provably working; supervision must still be delivering.
+		const afterRecovery = await countSupervisorMessages(session)
+		await new Promise((r) => setTimeout(r, 400))
+		expect(await countSupervisorMessages(session)).toBeGreaterThan(afterRecovery)
+
+		releaseWorker()
+		await harness.shutdown()
+	})
+
+	it('the re-arm gate reads state as of after the snapshot send, not before it', async () => {
+		let orchestratorCalls = 0
+		let workerCalls = 0
+		let woken = false
+		let releaseWorker = () => {}
+		let releaseOrchestrator = () => {}
+		const workerGate = new Promise<void>((resolve) => {
+			releaseWorker = resolve
+		})
+		const orchestratorGate = new Promise<void>((resolve) => {
+			releaseOrchestrator = resolve
+		})
+
+		// Wakes the child from inside the tick's own await window: beforeMethod runs after
+		// _supervisionTick captured ctx.sessionState and before its re-arm gate.
+		const wakeChildPlugin = definePlugin('test-wake-child')
+			.sessionHook('beforeMethod', async (ctx) => {
+				if (woken || !isSupervisorSend(ctx.method, ctx.input)) return null
+				const worker = [...ctx.getSessionState().agents.values()].find((a) => a.definitionName === 'worker')
+				if (!worker) return null
+				woken = true
+				await ctx.emitEvent(mailboxEvents.create('mailbox_message', {
+					toAgentId: worker.id,
+					message: {
+						id: generateTestMessageId(),
+						from: 'user',
+						content: 'One more thing',
+						timestamp: Date.now(),
+						consumed: false,
+					},
+				}))
+				ctx.scheduleAgent(worker.id)
+				return null
+			})
+			.build()
+
+		const harness = new TestHarness({
+			presets: [{
+				...createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' }),
+				plugins: [
+					{ pluginName: 'agents', definition: agentsPlugin, config: { superviseChildrenIntervalMs: 200 } },
+					wakeChildPlugin.configure(),
+				],
+			}],
+			mockHandler: async (request) => {
+				if (request.systemPrompt.includes('Orchestrator')) {
+					orchestratorCalls++
+					if (orchestratorCalls === 1) {
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Task' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					// The parent never finishes another turn, so afterInference cannot be the
+					// thing that re-arms — only the tick's own gate can.
+					await orchestratorGate
+					return { content: 'noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				}
+				workerCalls++
+				if (workerCalls === 1) {
+					return { content: 'done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				}
+				await workerGate
+				return { content: 'done again', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			},
+		})
+
+		const session = await harness.createSession('test')
+		await session.sendMessage('Start')
+
+		// The parent stays inside its blocked second turn, so waitForIdle would never
+		// return; wait for the state the tick has to observe instead — the child idle
+		// again after its first turn.
+		const workerIdleBy = Date.now() + 3000
+		const workerStatus = () =>
+			[...session.state.agents.values()].find((a) => a.definitionName === 'worker')?.status
+		while (Date.now() < workerIdleBy && !(workerCalls >= 1 && workerStatus() === 'pending')) {
+			await new Promise((r) => setTimeout(r, 5))
+		}
+		expect(workerStatus()).toBe('pending')
+
+		const deadline = Date.now() + 3000
+		while (Date.now() < deadline && await countSupervisorMessages(session) < 3) {
+			await new Promise((r) => setTimeout(r, 25))
+		}
+		expect(woken).toBe(true)
+		expect(await countSupervisorMessages(session)).toBeGreaterThanOrEqual(3)
+
+		releaseWorker()
+		releaseOrchestrator()
+		await harness.shutdown()
+	})
+
+	it('a paused parent gets no snapshots it cannot consume', async () => {
+		let orchestratorCalls = 0
+		let releaseWorker = () => {}
+		const workerGate = new Promise<void>((resolve) => {
+			releaseWorker = resolve
+		})
+
+		const harness = new TestHarness({
+			presets: [{
+				...createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' }),
+				plugins: [{ pluginName: 'agents', definition: agentsPlugin, config: { superviseChildrenIntervalMs: 50 } }],
+			}],
+			mockHandler: async (request) => {
+				if (request.systemPrompt.includes('Orchestrator')) {
+					orchestratorCalls++
+					if (orchestratorCalls === 1) {
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Slow task' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return { content: 'noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				}
+				await workerGate
+				return { content: 'finally done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			},
+		})
+
+		const session = await harness.createSession('test')
+		await session.sendMessage('Start')
+
+		const orchestratorId = session.getEntryAgentId()!
+		expect(await waitForSupervisorMessage(session, orchestratorId)).toBeDefined()
+
+		// A paused parent cannot consume anything: every further snapshot just queues up
+		// and lands on it in one pile when it resumes.
+		await session.pauseAgent(orchestratorId)
+		await new Promise((r) => setTimeout(r, 60))
+		const whilePaused = await countSupervisorMessages(session)
+
+		await new Promise((r) => setTimeout(r, 400))
+		expect(await countSupervisorMessages(session)).toBe(whilePaused)
+
+		releaseWorker()
+		await harness.shutdown()
+	})
+
+	it('supervision resumes after an idle eviction rebuilds the runtime', async () => {
+		let orchestratorCalls = 0
+
+		const harness = new TestHarness({
+			sessionIdleTimeoutMs: 150,
+			presets: [{
+				...createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' }),
+				plugins: [{ pluginName: 'agents', definition: agentsPlugin, config: { superviseChildrenIntervalMs: 60 } }],
+			}],
+			mockHandler: (request) => {
+				if (request.systemPrompt.includes('Orchestrator')) {
+					orchestratorCalls++
+					if (orchestratorCalls === 1) {
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Task' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return { content: 'noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				}
+				return { content: 'done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			},
+		})
+
+		const session = await harness.createSession('test')
+		await session.sendAndWaitForIdle('Start')
+
+		const evictedBy = Date.now() + 5000
+		while (Date.now() < evictedBy && harness.sessionManager.getRuntimeCacheStats().loadedSessionCount > 0) {
+			await new Promise((r) => setTimeout(r, 10))
+		}
+		expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
+		const beforeReload = await countSupervisorMessages(session)
+
+		// The claim the lease-inside-the-tick comment makes: onSessionReady re-arms once
+		// the runtime is rebuilt, so an eviction only pauses supervision.
+		const reopened = await harness.openSession(session.sessionId)
+		const deadline = Date.now() + 3000
+		while (Date.now() < deadline && await countSupervisorMessages(reopened) <= beforeReload) {
+			await new Promise((r) => setTimeout(r, 10))
+		}
+		expect(await countSupervisorMessages(reopened)).toBeGreaterThan(beforeReload)
+
+		await harness.shutdown()
+	})
+
+	it('a tick that lands on an unloading runtime is skipped, not sent', async () => {
+		let orchestratorCalls = 0
+		let closeStarted = false
+
+		// Runs first in performDisposal's reversed plugin order, so the runtime sits in
+		// 'unloading' — timers not yet cleared — for as long as this blocks.
+		const slowClosePlugin = definePlugin('test-slow-close')
+			.sessionHook('onSessionClose', async () => {
+				closeStarted = true
+				await new Promise((r) => setTimeout(r, 400))
+			})
+			.build()
+
+		const harness = new TestHarness({
+			sessionIdleTimeoutMs: 40,
+			presets: [{
+				...createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' }),
+				plugins: [
+					{ pluginName: 'agents', definition: agentsPlugin, config: { superviseChildrenIntervalMs: 150 } },
+					slowClosePlugin.configure(),
+				],
+			}],
+			mockHandler: (request) => {
+				if (request.systemPrompt.includes('Orchestrator')) {
+					orchestratorCalls++
+					if (orchestratorCalls === 1) {
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Task' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return { content: 'noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				}
+				return { content: 'done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			},
+		})
+
+		const session = await harness.createSession('test')
+		await session.sendAndWaitForIdle('Start')
+
+		const closingBy = Date.now() + 5000
+		while (Date.now() < closingBy && !closeStarted) {
+			await new Promise((r) => setTimeout(r, 5))
+		}
+		expect(closeStarted).toBe(true)
+		const duringUnload = await countSupervisorMessages(session)
+
+		const evictedBy = Date.now() + 5000
+		while (Date.now() < evictedBy && harness.sessionManager.getRuntimeCacheStats().loadedSessionCount > 0) {
+			await new Promise((r) => setTimeout(r, 10))
+		}
+		expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
+		// The tick armed for the middle of that window found no lease and dropped itself
+		// instead of appending a snapshot to a runtime that was being torn down.
+		expect(await countSupervisorMessages(session)).toBe(duringUnload)
+
+		await harness.shutdown()
 	})
 })

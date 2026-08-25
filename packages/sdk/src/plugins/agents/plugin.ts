@@ -15,11 +15,13 @@ import { AgentId, agentIdSchema, generateAgentId } from '~/core/agents/schema.js
 import { type AgentState, agentEvents } from '~/core/agents/state.js'
 import { AgentErrors, ValidationErrors } from '~/core/errors.js'
 import { definePlugin } from '~/core/plugins/index.js'
-import { getNextAgentSeq } from '~/core/sessions/state.js'
+import type { SessionState } from '~/core/sessions/state.js'
+import { agentSequenceKey, getNextAgentSeq } from '~/core/sessions/state.js'
 import { createTool } from '~/core/tools/definition.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import { mailboxPlugin } from '~/plugins/mailbox/plugin.js'
+import { getAgentUnconsumedMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
 
 /**
  * Information about a spawnable agent, used to generate typed start_<name> tools.
@@ -58,6 +60,8 @@ export const SUPERVISION_INTERVAL_CACHE_FRIENDLY = 240_000
 /** Per-session runtime state held in plugin context — timers + trigger callback. */
 interface AgentsPluginContext {
 	timers: Map<AgentId, ReturnType<typeof setTimeout>>
+	/** Runtime lease, taken per tick — null while the runtime is unloading. */
+	acquireLease: ((reason: string) => (() => void) | null) | null
 	/** Set in onSessionReady — calls agents._supervisionTick via callPluginMethod (fresh ctx). */
 	triggerTick: ((agentId: AgentId) => Promise<unknown>) | null
 	/** null = supervision disabled for this session. */
@@ -74,6 +78,55 @@ function getDirectChildren(sessionAgents: Map<AgentId, AgentState>, parentId: Ag
 		if (agent.parentId === parentId) out.push(agent)
 	}
 	return out
+}
+
+/**
+ * Input waiting in the agent's queue that the loop will dequeue on its next turn.
+ *
+ * Incomplete on purpose, for want of a seam: `Agent.decide()` asks every plugin with
+ * a `dequeue` hook (mailbox, user-chat, uploads) and nothing exposes that predicate
+ * at session level, so a child fed only through user-chat or uploads reads as idle
+ * here. See PR #18.
+ */
+function hasQueuedInput(sessionState: SessionState, agentId: AgentId): boolean {
+	return getAgentUnconsumedMailbox(selectMailboxState(sessionState), agentId).length > 0
+}
+
+/**
+ * Is this agent running, or holding input it will run?
+ *
+ * `paused` is the only status that never resumes on its own — everything else is
+ * decided by the queue, exactly as `Agent.decide()` decides it. In particular an
+ * `errored` agent is NOT idle: with its input still queued (a retryable failure
+ * preserves the dequeue token) `decide()` returns `resume_from_error` and the
+ * agent retries itself at the capped backoff.
+ */
+function isAgentWorking(sessionState: SessionState, agent: AgentState): boolean {
+	if (agent.status === 'paused') return false
+	if (agent.status === 'inferring' || agent.status === 'tool_exec') return true
+	// decide() resumes an errored agent only for queued input — stale
+	// pendingToolResults were already there when the inference failed.
+	if (agent.status === 'errored') return hasQueuedInput(sessionState, agent.id)
+	if (agent.pendingToolCalls.length > 0 || agent.pendingToolResults.length > 0) return true
+	return hasQueuedInput(sessionState, agent.id)
+}
+
+/**
+ * Is anything below this agent still working? Agents are never removed from
+ * session state, so "has children" stays true forever and cannot gate the tick.
+ * Walks the whole subtree — a child idling on its own children is still work.
+ */
+function hasWorkingDescendant(sessionState: SessionState, parentId: AgentId): boolean {
+	const queue = getDirectChildren(sessionState.agents, parentId)
+	const seen = new Set<AgentId>()
+	for (let i = 0; i < queue.length; i++) {
+		const agent = queue[i]
+		if (seen.has(agent.id)) continue
+		seen.add(agent.id)
+		if (isAgentWorking(sessionState, agent)) return true
+		queue.push(...getDirectChildren(sessionState.agents, agent.id))
+	}
+	return false
 }
 
 /**
@@ -157,14 +210,25 @@ function scheduleSupervisionTick(
 	const timer = setTimeout(() => {
 		pluginContext.timers.delete(agentId)
 		const trigger = pluginContext.triggerTick
-		if (!trigger) return
-		trigger(agentId).catch((err) => {
-			pluginContext.logger?.error(
-				'Supervision tick failed',
-				err instanceof Error ? err : undefined,
-				{ agentId },
-			)
-		})
+		const acquireLease = pluginContext.acquireLease
+		if (!trigger || !acquireLease) return
+		// Lease the tick, not the wait before it — an idle session stays evictable
+		// between ticks, and onSessionReady re-arms after a reload.
+		const releaseLease = acquireLease(`supervision:${agentId}`)
+		if (!releaseLease) {
+			// Runtime is unloading — onSessionReady re-arms once it is rebuilt.
+			pluginContext.logger?.debug('Supervision tick skipped, runtime is unloading', { agentId })
+			return
+		}
+		trigger(agentId)
+			.catch((err) => {
+				pluginContext.logger?.error(
+					'Supervision tick failed',
+					err instanceof Error ? err : undefined,
+					{ agentId },
+				)
+			})
+			.finally(releaseLease)
 	}, delayMs)
 
 	pluginContext.timers.set(agentId, timer)
@@ -191,6 +255,7 @@ export const agentsPlugin = definePlugin('agents')
 	.dependencies([mailboxPlugin])
 	.context(async (): Promise<AgentsPluginContext> => ({
 		timers: new Map(),
+		acquireLease: null,
 		triggerTick: null,
 		intervalMs: null,
 		logger: null,
@@ -222,7 +287,11 @@ export const agentsPlugin = definePlugin('agents')
 			}
 
 			// Generate agent ID and emit spawn event
-			const agentId = generateAgentId(input.definitionName, getNextAgentSeq(ctx.sessionState, input.definitionName))
+			const seq = ctx.reserveSequence(
+				agentSequenceKey(input.definitionName),
+				() => getNextAgentSeq(ctx.getSessionState(), input.definitionName),
+			)
+			const agentId = generateAgentId(input.definitionName, seq)
 			await ctx.emitEvent(agentEvents.create('agent_spawned', {
 				agentId,
 				definitionName: input.definitionName,
@@ -346,7 +415,8 @@ export const agentsPlugin = definePlugin('agents')
 			const agentId = AgentId(input.agentId)
 
 			// Self may already be gone (terminated mid-tick); just stop.
-			if (!ctx.sessionState.agents.has(agentId)) return Ok({})
+			const agent = ctx.sessionState.agents.get(agentId)
+			if (!agent) return Ok({})
 
 			const children = getDirectChildren(ctx.sessionState.agents, agentId)
 			if (children.length === 0) {
@@ -354,21 +424,28 @@ export const agentsPlugin = definePlugin('agents')
 				return Ok({})
 			}
 
-			const snapshot = buildChildrenStatus(ctx.sessionState.agents, agentId)
-			const sendResult = await ctx.deps.mailbox.send({
-				toAgentId: agentId,
-				content: snapshot,
-				fromSupervisor: true,
-			})
-			if (!sendResult.ok) {
-				ctx.logger.warn('Supervision snapshot send failed', {
-					agentId,
-					error: sendResult.error.message,
+			// A paused parent cannot consume a snapshot — sending anyway piles one
+			// un-consumable message per interval into its mailbox until it resumes.
+			if (agent.status !== 'paused') {
+				const snapshot = buildChildrenStatus(ctx.sessionState.agents, agentId)
+				const sendResult = await ctx.deps.mailbox.send({
+					toAgentId: agentId,
+					content: snapshot,
+					fromSupervisor: true,
 				})
+				if (!sendResult.ok) {
+					ctx.logger.warn('Supervision snapshot send failed', {
+						agentId,
+						error: sendResult.error.message,
+					})
+				}
 			}
 
-			// Reschedule the next tick from now (rolling).
-			if (ctx.pluginContext.intervalMs !== null) {
+			// Reschedule the next tick from now (rolling), but only while something
+			// below is still working — otherwise the tick would re-arm forever.
+			// Read live state: the send above appended an event and dispatched
+			// listeners, so ctx.sessionState is already behind by the time we decide.
+			if (ctx.pluginContext.intervalMs !== null && hasWorkingDescendant(ctx.getSessionState(), agentId)) {
 				scheduleSupervisionTick(ctx.pluginContext, agentId, ctx.pluginContext.intervalMs)
 			}
 
@@ -385,14 +462,19 @@ export const agentsPlugin = definePlugin('agents')
 		}
 		ctx.pluginContext.intervalMs = intervalMs
 		ctx.pluginContext.logger = ctx.logger
+		const runtimeActivity = ctx.runtimeActivity
+		ctx.pluginContext.acquireLease = (reason) => runtimeActivity.tryAcquire(reason)
 
 		// Wire the trigger callback — calls back via self.* so each tick gets a
 		// fresh ctx (live sessionState/pluginState/deps).
-		ctx.pluginContext.triggerTick = (agentId) => ctx.self._supervisionTick({ agentId })
+		const triggerTick = ctx.self._supervisionTick
+		ctx.pluginContext.triggerTick = (agentId) => triggerTick({ agentId })
 
 		// (Re-)schedule timers for every agent that currently has direct children.
 		// Covers initial session creation AND server-restart reload (onSessionReady
 		// fires in both paths). Worst-case drift after restart = intervalMs.
+		// Not gated on live status: a reload resets 'inferring' back to 'pending',
+		// so the first tick — not this hook — decides whether to keep going.
 		for (const agent of ctx.sessionState.agents.values()) {
 			if (getDirectChildren(ctx.sessionState.agents, agent.id).length > 0) {
 				scheduleSupervisionTick(ctx.pluginContext, agent.id, intervalMs)
@@ -402,13 +484,14 @@ export const agentsPlugin = definePlugin('agents')
 	.sessionHook('onSessionClose', async (ctx) => {
 		for (const t of ctx.pluginContext.timers.values()) clearTimeout(t)
 		ctx.pluginContext.timers.clear()
+		ctx.pluginContext.acquireLease = null
 		ctx.pluginContext.triggerTick = null
 	})
 	.hook('afterInference', async (ctx) => {
 		// Natural inference warmed the cache — push the next tick out by intervalMs
 		// so we don't double-charge for parents who are already actively interacting.
 		if (ctx.pluginContext.intervalMs !== null) {
-			if (getDirectChildren(ctx.sessionState.agents, ctx.agentId).length > 0) {
+			if (hasWorkingDescendant(ctx.sessionState, ctx.agentId)) {
 				scheduleSupervisionTick(ctx.pluginContext, ctx.agentId, ctx.pluginContext.intervalMs)
 			}
 		}

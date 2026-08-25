@@ -1,10 +1,52 @@
 import { describe, expect, it } from 'bun:test'
 import z from 'zod/v4'
-import { AgentId } from '~/core/agents/schema.js'
+import { AgentId, agentIdSchema } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
+import { MemoryEventStore } from '~/core/events/memory.js'
+import type { DomainEvent } from '~/core/events/types.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import type { SessionId } from '~/core/sessions/schema.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { createMultiAgentPreset, createTestPreset, TestHarness } from '~/testing/index.js'
+
+/** Holds the first `agent_spawned` append open so a second spawn runs against the stale projection. */
+class GatedSpawnEventStore extends MemoryEventStore {
+	/** Armed only after session creation — that spawns the orchestrator through the same path. */
+	private armed = false
+	private spawnCount = 0
+	private releaseFirstSpawn = () => {}
+	private markFirstSpawnStarted = () => {}
+	readonly firstSpawnStarted = new Promise<void>((resolve) => {
+		this.markFirstSpawnStarted = resolve
+	})
+
+	arm(): void {
+		this.armed = true
+	}
+
+	release(): void {
+		this.releaseFirstSpawn()
+	}
+
+	private async gate(events: DomainEvent[]): Promise<void> {
+		if (!this.armed) return
+		if (!events.some((event) => event.type === 'agent_spawned') || ++this.spawnCount !== 1) return
+		this.markFirstSpawnStarted()
+		await new Promise<void>((resolve) => {
+			this.releaseFirstSpawn = resolve
+		})
+	}
+
+	override async append(sessionId: SessionId, event: DomainEvent): Promise<void> {
+		await this.gate([event])
+		await super.append(sessionId, event)
+	}
+
+	override async appendBatch(sessionId: SessionId, events: DomainEvent[]): Promise<void> {
+		await this.gate(events)
+		await super.appendBatch(sessionId, events)
+	}
+}
 
 describe('agents plugin', () => {
 	// =========================================================================
@@ -360,6 +402,47 @@ describe('agents plugin', () => {
 	// =========================================================================
 
 	describe('agents.spawn method', () => {
+		it('gives concurrent spawns of one definition distinct ids', async () => {
+			const eventStore = new GatedSpawnEventStore()
+			const harness = new TestHarness({
+				presets: [createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' })],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Done', toolCalls: [] }),
+				eventStore,
+			})
+
+			const session = await harness.createSession('test')
+			eventStore.arm()
+			const orchestratorId = session.getEntryAgentId()!
+			const spawn = () => session.callPluginMethod('agents.spawn', {
+				definitionName: 'worker',
+				parentId: String(orchestratorId),
+			})
+
+			// The second call derives its id while the first spawn is still unappended,
+			// so both see the same agent counter in the projection.
+			const first = spawn()
+			await eventStore.firstSpawnStarted
+			const second = spawn()
+			eventStore.release()
+			const results = await Promise.all([first, second])
+
+			const spawnOutput = z.object({ agentId: agentIdSchema })
+			const spawnedIds = results.map((result) => {
+				if (!result.ok) throw new Error(`Spawn failed: ${result.error.message}`)
+				return spawnOutput.parse(result.value).agentId
+			})
+			expect(new Set(spawnedIds).size).toBe(2)
+
+			await session.waitForIdle()
+			const workers = [...session.state.agents.values()].filter((agent) => agent.definitionName === 'worker')
+			expect(workers).toHaveLength(2)
+			expect(new Set(workers.map((agent) => agent.id))).toEqual(new Set(spawnedIds))
+
+			await harness.shutdown()
+		})
+
 		it('spawn with valid parent and definition → agent created', async () => {
 			const harness = new TestHarness({
 				presets: [createMultiAgentPreset([
