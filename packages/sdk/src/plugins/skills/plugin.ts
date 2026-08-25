@@ -18,7 +18,7 @@ import { createTool } from '~/core/tools/definition.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import { discoverSkills, loadSkillContent } from './discovery.js'
 import { buildLoadedSkillsMessage, formatLoadedSkills } from './prompts.js'
-import { type LoadedSkill, SkillId, skillIdSchema, type SkillMetadata } from './schema.js'
+import { type LoadedSkill, type LoadedSkillContent, SkillId, skillIdSchema, type SkillMetadata } from './schema.js'
 
 /**
  * A preset-contributed skill. Skills are matched by name; file-discovered
@@ -96,7 +96,7 @@ export const skillEvents = createEvents({
 			agentId: agentIdSchema,
 			skillId: skillIdSchema,
 			skillName: z.string(),
-			content: z.string(),
+			content: z.string().optional(),
 		}),
 	},
 })
@@ -116,7 +116,6 @@ export const skillsPlugin = definePlugin('skills')
 					const loadedSkill: LoadedSkill = {
 						id: event.skillId,
 						name: event.skillName,
-						content: event.content,
 						loadedAt: event.timestamp,
 					}
 					const agentSkills = skills.get(event.agentId) ?? []
@@ -218,25 +217,22 @@ export const skillsPlugin = definePlugin('skills')
 				return Err(ValidationErrors.invalid(`Failed to load skill: ${contentResult.error.message}`))
 			}
 
-			// Emit skill_loaded event
-			await ctx.emitEvent(skillEvents.create('skill_loaded', {
-				agentId: input.agentId,
-				skillId: skillMeta.id,
-				skillName: skillMeta.name,
-				content: contentResult.value,
-			}))
-
-			// Emit preamble with the newly loaded skill
-			const skillContent = formatLoadedSkills([{
+			const loadedSkill: LoadedSkillContent = {
 				id: skillMeta.id,
 				name: skillMeta.name,
 				content: contentResult.value,
 				loadedAt: Date.now(),
-			}])
-			await ctx.emitEvent(agentEvents.create('preamble_added', {
+			}
+			const skillContent = formatLoadedSkills([loadedSkill])
+
+			await ctx.emitEvents([skillEvents.create('skill_loaded', {
+				agentId: input.agentId,
+				skillId: skillMeta.id,
+				skillName: skillMeta.name,
+			}), agentEvents.create('preamble_added', {
 				agentId: input.agentId,
 				messages: [{ role: 'system', content: skillContent }],
-			}))
+			})])
 
 			return Ok({
 				skillId: skillMeta.id,
@@ -286,7 +282,7 @@ export const skillsPlugin = definePlugin('skills')
 		// Load preload skills
 		const availableSkills = ctx.pluginContext.availableSkills
 		const skillByName = new Map(availableSkills.map((s) => [s.name, s]))
-		const newlyLoaded: LoadedSkill[] = []
+		const newlyLoaded: LoadedSkillContent[] = []
 
 		for (const skillName of preloadSkills) {
 			const skillMeta = skillByName.get(skillName)
@@ -308,14 +304,6 @@ export const skillsPlugin = definePlugin('skills')
 				continue
 			}
 
-			// Emit skill_loaded event
-			await ctx.emitEvent(skillEvents.create('skill_loaded', {
-				agentId: ctx.agentId,
-				skillId: skillMeta.id,
-				skillName: skillMeta.name,
-				content: contentResult.value,
-			}))
-
 			newlyLoaded.push({
 				id: skillMeta.id,
 				name: skillMeta.name,
@@ -328,10 +316,14 @@ export const skillsPlugin = definePlugin('skills')
 		if (newlyLoaded.length > 0) {
 			const skillsMessage = buildLoadedSkillsMessage(newlyLoaded)
 			if (skillsMessage) {
-				await ctx.emitEvent(agentEvents.create('preamble_added', {
+				await ctx.emitEvents([...newlyLoaded.map((skill) => skillEvents.create('skill_loaded', {
+					agentId: ctx.agentId,
+					skillId: skill.id,
+					skillName: skill.name,
+				})), agentEvents.create('preamble_added', {
 					agentId: ctx.agentId,
 					messages: [{ role: 'system', content: skillsMessage }],
-				}))
+				})])
 			}
 		}
 

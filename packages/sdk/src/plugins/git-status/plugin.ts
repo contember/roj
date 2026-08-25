@@ -29,6 +29,7 @@ interface GitStatusPluginContext {
 	intervals: Map<string, NodeJS.Timeout>
 	lastSnapshots: Map<string, GitStatusSnapshot>
 	defaultBranches: Map<string, string>
+	active: boolean
 }
 
 export const gitStatusPlugin = definePlugin('git-status')
@@ -46,6 +47,7 @@ export const gitStatusPlugin = definePlugin('git-status')
 		intervals: new Map(),
 		lastSnapshots: new Map(),
 		defaultBranches: new Map(),
+		active: true,
 	}))
 	.sessionHook('onSessionReady', async (ctx) => {
 		const workdir = ctx.sessionState.workspaceDir
@@ -54,17 +56,23 @@ export const gitStatusPlugin = definePlugin('git-status')
 		const sessionId = ctx.sessionId
 		const pluginCtx = ctx.pluginContext
 		const processRunner = ctx.platform.process
+		const logger = ctx.logger
+		const notify = ctx.notify
+		pluginCtx.active = true
 
 		const tick = async () => {
+			if (!pluginCtx.active) return
 			let baseBranch = pluginCtx.defaultBranches.get(sessionId)
 			if (!baseBranch) {
 				baseBranch = await detectDefaultBranch(processRunner, workdir) ?? DEFAULT_BRANCH_FALLBACK
+				if (!pluginCtx.active) return
 				pluginCtx.defaultBranches.set(sessionId, baseBranch)
 			}
 
 			const snapshot = await computeGitStatus(processRunner, workdir, baseBranch)
+			if (!pluginCtx.active) return
 			if (!snapshot) {
-				ctx.logger.warn('git-status: snapshot failed', { sessionId, workdir, baseBranch })
+				logger.warn('git-status: snapshot failed', { sessionId, workdir, baseBranch })
 				return
 			}
 
@@ -72,7 +80,7 @@ export const gitStatusPlugin = definePlugin('git-status')
 			if (last && snapshotsEqual(last, snapshot)) return
 
 			pluginCtx.lastSnapshots.set(sessionId, snapshot)
-			ctx.notify('git_status_changed', {
+			notify('git_status_changed', {
 				sessionId,
 				committedAhead: snapshot.committedAhead,
 				uncommittedFiles: snapshot.uncommittedFiles,
@@ -84,7 +92,7 @@ export const gitStatusPlugin = definePlugin('git-status')
 
 		const runTick = () => {
 			tick().catch((err) => {
-				ctx.logger.warn('git-status tick failed', { sessionId, err: err instanceof Error ? err.message : String(err) })
+				logger.warn('git-status tick failed', { sessionId, err: err instanceof Error ? err.message : String(err) })
 			})
 		}
 
@@ -96,6 +104,7 @@ export const gitStatusPlugin = definePlugin('git-status')
 	.sessionHook('onSessionClose', async (ctx) => {
 		const sessionId = ctx.sessionId
 		const pluginCtx = ctx.pluginContext
+		pluginCtx.active = false
 		const interval = pluginCtx.intervals.get(sessionId)
 		if (interval) {
 			clearInterval(interval)

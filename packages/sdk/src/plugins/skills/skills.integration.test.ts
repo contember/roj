@@ -3,11 +3,15 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import z from 'zod/v4'
 import { agentEvents } from '~/core/agents/state.js'
+import { MemoryEventStore } from '~/core/events/memory.js'
+import { withSessionId } from '~/core/events/test-helpers.js'
+import type { DomainEvent } from '~/core/events/types.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import type { SessionId } from '~/core/sessions/schema.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
-import { skillEvents, skillsPlugin } from './index.js'
+import { SkillId, skillEvents, skillsPlugin } from './index.js'
 import type { LoadedSkill } from './schema.js'
 
 // ============================================================================
@@ -41,6 +45,15 @@ const skillLoadSchema = z.object({
 // ============================================================================
 
 let skillsDir: string
+
+class BatchTrackingEventStore extends MemoryEventStore {
+	readonly batches: string[][] = []
+
+	override async appendBatch(sessionId: SessionId, events: DomainEvent[]): Promise<void> {
+		this.batches.push(events.map((event) => event.type))
+		await super.appendBatch(sessionId, events)
+	}
+}
 
 beforeAll(() => {
 	skillsDir = `/tmp/roj-skills-test-${Math.random().toString(36).slice(2)}`
@@ -137,20 +150,23 @@ describe('skills plugin', () => {
 			const events = await session.getEventsByType(skillEvents, 'skill_loaded')
 			expect(events).toHaveLength(1)
 			expect(events[0].skillName).toBe('research')
-			expect(events[0].content).toContain('Research Skill')
+			expect(events[0]).not.toHaveProperty('content')
 
 			const entryAgentId = session.getEntryAgentId()!
 			const loadedSkills = selectPluginState<Map<string, LoadedSkill[]>>(session.state, 'skills')?.get(entryAgentId)
 			expect(loadedSkills).toBeDefined()
 			expect(loadedSkills).toHaveLength(1)
 			expect(loadedSkills![0].name).toBe('research')
+			expect(loadedSkills![0]).not.toHaveProperty('content')
 
 			await harness.shutdown()
 		})
 
 		it('loaded skill appears in agent preamble (preamble_added event)', async () => {
+			const eventStore = new BatchTrackingEventStore()
 			const harness = createSkillsHarness({
 				presets: [createSkillsPreset()],
+				eventStore,
 				llmProvider: MockLLMProvider.withSequence([
 					{
 						toolCalls: [{
@@ -172,6 +188,8 @@ describe('skills plugin', () => {
 			// At least one preamble event should contain the loaded skill content
 			const skillPreamble = preambleEvents.find((e) => e.messages.some((m) => m.role === 'system' && m.content.includes('loaded-skill')))
 			expect(skillPreamble).toBeDefined()
+			const skillBatch = eventStore.batches.find((types) => types.includes('skill_loaded'))
+			expect(skillBatch).toEqual(['skill_loaded', 'preamble_added'])
 
 			await harness.shutdown()
 		})
@@ -324,7 +342,7 @@ describe('skills plugin', () => {
 	// =========================================================================
 
 	describe('skills.load method', () => {
-		it('load by name → skill content loaded and event emitted', async () => {
+		it('load by name → metadata event and content preamble emitted', async () => {
 			const harness = createSkillsHarness({
 				presets: [createSkillsPreset()],
 				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
@@ -346,7 +364,11 @@ describe('skills plugin', () => {
 			const events = await session.getEventsByType(skillEvents, 'skill_loaded')
 			expect(events).toHaveLength(1)
 			expect(events[0].skillName).toBe('code-review')
-			expect(events[0].content).toContain('Code Review Skill')
+			expect(events[0]).not.toHaveProperty('content')
+			const preambles = await session.getEventsByType(agentEvents, 'preamble_added')
+			expect(preambles.some((event) => event.messages.some(
+				(message) => typeof message.content === 'string' && message.content.includes('Code Review Skill'),
+			))).toBe(true)
 
 			await harness.shutdown()
 		})
@@ -524,7 +546,11 @@ describe('skills plugin', () => {
 			const events = await session.getEventsByType(skillEvents, 'skill_loaded')
 			expect(events).toHaveLength(1)
 			expect(events[0].skillName).toBe('summarize')
-			expect(events[0].content).toContain('Condense a document')
+			expect(events[0]).not.toHaveProperty('content')
+			const preambles = await session.getEventsByType(agentEvents, 'preamble_added')
+			expect(preambles.some((event) => event.messages.some(
+				(message) => typeof message.content === 'string' && message.content.includes('Condense a document'),
+			))).toBe(true)
 
 			await harness.shutdown()
 		})
@@ -545,7 +571,7 @@ describe('skills plugin', () => {
 			const loadedSkills = selectPluginState<Map<string, LoadedSkill[]>>(session.state, 'skills')?.get(entryAgentId)
 			expect(loadedSkills).toHaveLength(1)
 			expect(loadedSkills![0].name).toBe('summarize')
-			expect(loadedSkills![0].content).toContain('Condense a document')
+			expect(loadedSkills![0]).not.toHaveProperty('content')
 
 			await harness.shutdown()
 		})
@@ -570,11 +596,52 @@ describe('skills plugin', () => {
 
 			const events = await session.getEventsByType(skillEvents, 'skill_loaded')
 			expect(events).toHaveLength(1)
-			// Content must come from the file, not the inline fallback
-			expect(events[0].content).toContain('Define the question')
-			expect(events[0].content).not.toContain('inline body')
+			const preambles = await session.getEventsByType(agentEvents, 'preamble_added')
+			const content = preambles.flatMap((event) => event.messages).map((message) => message.content).join('\n')
+			expect(content).toContain('Define the question')
+			expect(content).not.toContain('inline body')
 
 			await harness.shutdown()
+		})
+	})
+
+	describe('event replay compatibility', () => {
+		it('replays legacy content events as metadata and mixes with new events', async () => {
+			const eventStore = new MemoryEventStore()
+			const firstHarness = createSkillsHarness({
+				presets: [createSkillsPreset()],
+				eventStore,
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+			const firstSession = await firstHarness.createSession('test')
+			const sessionId = firstSession.sessionId
+			const agentId = firstSession.getEntryAgentId()
+			if (!agentId) throw new Error('Expected entry agent')
+			await firstHarness.shutdown()
+
+			await eventStore.append(sessionId, withSessionId(sessionId, skillEvents.create('skill_loaded', {
+				agentId,
+				skillId: SkillId('research'),
+				skillName: 'research',
+				content: 'legacy duplicated content',
+			})))
+
+			const secondHarness = createSkillsHarness({
+				presets: [createSkillsPreset()],
+				eventStore,
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+			const secondSession = await secondHarness.openSession(sessionId)
+			await secondSession.callPluginMethod('skills.load', {
+				sessionId: String(sessionId),
+				agentId: String(agentId),
+				skillName: 'code-review',
+			})
+
+			const loaded = selectPluginState<Map<string, LoadedSkill[]>>(secondSession.state, 'skills')?.get(agentId)
+			expect(loaded?.map((skill) => skill.name)).toEqual(['research', 'code-review'])
+			for (const skill of loaded ?? []) expect(skill).not.toHaveProperty('content')
+			await secondHarness.shutdown()
 		})
 	})
 })
