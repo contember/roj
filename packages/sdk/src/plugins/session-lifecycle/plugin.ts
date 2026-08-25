@@ -230,31 +230,30 @@ export const sessionLifecyclePlugin = definePlugin('sessions')
 			const sm = ctx.sessionManager
 			const sessionId = SessionId(input.sessionId)
 
-			const sessionResult = await sm.getSession(sessionId)
-			if (!sessionResult.ok) return sessionResult
-			const session = sessionResult.value
+			return sm.withSessionLease(sessionId, 'manager:sessions.setOverrides', async (session) => {
+				const preset = ctx.presets.get(session.state.presetId)
+				if (!preset) return Err(PresetErrors.notFound(session.state.presetId))
 
-			const preset = ctx.presets.get(session.state.presetId)
-			if (!preset) return Err(PresetErrors.notFound(session.state.presetId))
+				const unknown = unknownOverrideTargets(preset, input.overrides)
+				if (unknown.length > 0) {
+					return Err(ValidationErrors.invalid(
+						`Unknown agent definitions in overrides: ${unknown.join(', ')}. Preset '${preset.id}' defines: ${knownDefinitionNames(preset).join(', ')}`,
+					))
+				}
 
-			const unknown = unknownOverrideTargets(preset, input.overrides)
-			if (unknown.length > 0) {
-				return Err(ValidationErrors.invalid(
-					`Unknown agent definitions in overrides: ${unknown.join(', ')}. Preset '${preset.id}' defines: ${knownDefinitionNames(preset).join(', ')}`,
-				))
-			}
+				const setResult = await session.setOverrides(input.overrides)
+				if (!setResult.ok) return setResult
 
-			await session.setOverrides(input.overrides)
+				// Agents already mid-turn finish on the model they started with: the
+				// override is read when the next inference request is built, not applied
+				// retroactively to one in flight.
+				ctx.logger.info('Session overrides set', { sessionId, overrides: input.overrides })
 
-			// Agents already mid-turn finish on the model they started with: the
-			// override is read when the next inference request is built, not applied
-			// retroactively to one in flight.
-			ctx.logger.info('Session overrides set', { sessionId, overrides: input.overrides })
-
-			const state = session.state
-			return Ok({
-				agents: Object.fromEntries(state.overrides.agents),
-				defaults: state.overrides.defaults,
+				const state = session.state
+				return Ok({
+					agents: Object.fromEntries(state.overrides.agents),
+					defaults: state.overrides.defaults,
+				})
 			})
 		},
 	})

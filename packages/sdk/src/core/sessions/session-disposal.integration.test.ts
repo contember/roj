@@ -1,7 +1,10 @@
 import { describe, expect, it, spyOn } from 'bun:test'
+import z from 'zod/v4'
 import { Agent } from '~/core/agents/agent.js'
+import { createEventsFactory } from '~/core/events/types.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
+import { SessionRuntimeDetachedError } from '~/core/sessions/session-store.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 
 const createDeferred = () => {
@@ -167,4 +170,28 @@ describe('session disposal', () => {
 		await harness.shutdown()
 		expect(calls).toEqual(['failing', 'later'])
 	})
+
+	it('refuses an event emitted after the runtime was disposed', async () => {
+		const lateEvents = createEventsFactory({ events: { late_write: z.object({ note: z.string() }) } })
+		let lateEmit: (() => Promise<void>) | undefined
+		const plugin = definePlugin('late-writer')
+			.events([lateEvents])
+			.sessionHook('onSessionReady', async (ctx) => {
+				lateEmit = () => ctx.emitEvent(lateEvents.create('late_write', { note: 'after disposal' }))
+			})
+			.build()
+		const harness = createHarness([plugin])
+		const session = await harness.createSession('test')
+		if (!lateEmit) throw new Error('Expected the ready hook to capture an emit seam')
+
+		await session.close()
+
+		// The manager rebuilds this session from the log on the next access, so a
+		// write from the disposed runtime would be invisible to the live one.
+		await expect(lateEmit()).rejects.toBeInstanceOf(SessionRuntimeDetachedError)
+		expect(await session.getEventsByType('late_write')).toHaveLength(0)
+
+		await harness.shutdown()
+	})
+
 })

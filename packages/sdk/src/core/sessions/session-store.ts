@@ -19,6 +19,15 @@ import { getAgentState, reconstructSessionState } from '~/core/sessions/state.js
 // SessionStore
 // ============================================================================
 
+/** Thrown when a disposed runtime tries to append — see {@link SessionStore.detach}. */
+export class SessionRuntimeDetachedError extends Error {
+	constructor(readonly sessionId: SessionId, events: readonly DomainEvent[]) {
+		const types = [...new Set(events.map((event) => event.type))].join(', ')
+		super(`Session runtime for '${sessionId}' is disposed and cannot append events: ${types}`)
+		this.name = 'SessionRuntimeDetachedError'
+	}
+}
+
 /**
  * SessionStore wraps EventStore and provides:
  * - Event emission with automatic state updates
@@ -29,6 +38,7 @@ export class SessionStore {
 	private _state: SessionState
 	private readonly eventListeners: Array<(event: DomainEvent) => void> = []
 	private readonly applyEvent: SessionReducer
+	private detached = false
 
 	constructor(
 		readonly sessionId: SessionId,
@@ -60,6 +70,22 @@ export class SessionStore {
 	}
 
 	/**
+	 * Fence the store off from its disposed runtime — later emits fail instead of writing.
+	 *
+	 * The manager rebuilds an evicted session from the log, so a late write from the
+	 * old runtime (an abandoned worker, a timer, a settled effect) would land durably
+	 * while only the dead projection saw it, and the live one would never catch up.
+	 */
+	detach(): void {
+		this.detached = true
+	}
+
+	/** True once the owning runtime was disposed and the store stopped accepting writes. */
+	isDetached(): boolean {
+		return this.detached
+	}
+
+	/**
 	 * Create a new SessionStore by loading events from EventStore.
 	 * Also validates and reconciles metadata if out of sync (e.g., after crash).
 	 */
@@ -69,6 +95,16 @@ export class SessionStore {
 		applyEvent?: SessionReducer,
 	): Promise<SessionStore | null> {
 		const events = await eventStore.load(sessionId)
+		return SessionStore.fromEvents(sessionId, eventStore, events, applyEvent)
+	}
+
+	/** Build a store from an event log that the caller already loaded. */
+	static async fromEvents(
+		sessionId: SessionId,
+		eventStore: EventStore,
+		events: DomainEvent[],
+		applyEvent?: SessionReducer,
+	): Promise<SessionStore | null> {
 		if (events.length === 0) return null
 
 		const state = reconstructSessionState(events, applyEvent ?? coreApplyEvent)
@@ -84,6 +120,7 @@ export class SessionStore {
 	 * Emit a single event - writes to EventStore and applies to state.
 	 */
 	async emit(event: DomainEvent): Promise<void> {
+		if (this.detached) throw new SessionRuntimeDetachedError(this.sessionId, [event])
 		await this.eventStore.append(this.sessionId, event)
 		this._state = this.applyEvent(this._state, event)
 		this.notifyListeners(event)
@@ -96,6 +133,7 @@ export class SessionStore {
 	 */
 	async emitBatch(events: DomainEvent[]): Promise<void> {
 		if (events.length === 0) return
+		if (this.detached) throw new SessionRuntimeDetachedError(this.sessionId, events)
 
 		await this.eventStore.appendBatch(this.sessionId, events)
 		for (const event of events) {

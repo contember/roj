@@ -18,12 +18,12 @@ import type { DomainEvent } from '~/core/events/types.js'
 import type { LLMLogger } from '~/core/llm/logger.js'
 import { applyMiddleware, type LLMMiddleware } from '~/core/llm/middleware.js'
 import type { LLMProvider } from '~/core/llm/provider.js'
-import type { AgentPluginConfig, BaseSessionHookContext, CallerContext, ConfiguredPlugin } from '~/core/plugins/plugin-builder.js'
+import type { AgentPluginConfig, BaseSessionHookContext, CallerContext, ConfiguredPlugin, SessionCloseReason } from '~/core/plugins/plugin-builder.js'
 import { AGENT_CALLER, DEFAULT_CALLER, buildPluginDeps, type PluginNotification } from '~/core/plugins/plugin-builder.js'
 import type { Preset } from '~/core/preset/index.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import type { SessionOverridesPatch, SessionState } from '~/core/sessions/state.js'
-import { getEntryAgentId, getNextAgentSeq, sessionEvents } from '~/core/sessions/state.js'
+import { agentSequenceKey, getEntryAgentId, getNextAgentSeq, sessionEvents } from '~/core/sessions/state.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import type { Platform } from '~/platform/index.js'
 import type { Result } from '~/lib/utils/result.js'
@@ -40,16 +40,34 @@ import type { SessionContext } from '../sessions/context.js'
 import type { SessionEnvironment } from '../sessions/session-environment.js'
 import type { ToolExecutor } from '../tools/executor.js'
 import { SessionStore } from './session-store.js'
+import { type RuntimeLeaseRelease, SessionRuntimeActivityController } from './runtime-activity.js'
 
 // ============================================================================
 // Types
 // ============================================================================
+
+/** Sequence name behind reserveMailboxMessageSequence. */
+const MAILBOX_MESSAGE_SEQUENCE = 'mailbox.message'
+
+/** Disposal waits for aborted turns to unwind, but never pins on a wedged one. */
+const AGENT_DRAIN_TIMEOUT_MS = 5_000
 
 /**
  * Callback for user-facing output.
  * Receives plugin notifications that are broadcast to connected clients.
  */
 export type UserOutputCallback = (notification: PluginNotification) => void
+
+export interface SessionReopenRegistration {
+	complete(): Promise<void>
+	abort(error: unknown): void
+}
+
+class SessionReopenError extends Error {
+	constructor(readonly domainError: DomainError) {
+		super(domainError.message)
+	}
+}
 
 /**
  * Dependencies for creating a Session.
@@ -73,6 +91,9 @@ export interface SessionDependencies {
 	llmLogger?: LLMLogger
 	/** Host-environment adapters (filesystem, process). */
 	platform: Platform
+	/** Lifecycle guard shared by the manager, agents, and plugins. */
+	runtimeActivity: SessionRuntimeActivityController
+	registerReopenedSession?: (session: Session) => Result<SessionReopenRegistration | undefined, DomainError>
 }
 
 // ============================================================================
@@ -96,11 +117,16 @@ export class Session {
 	private readonly eventStore: EventStore
 	private readonly llmLogger?: LLMLogger
 	private readonly platform: Platform
+	private readonly runtimeActivity: SessionRuntimeActivityController
+	private readonly registerReopenedSession?: SessionDependencies['registerReopenedSession']
+	/** Named counters, seeded lazily from replayed state — see SessionContext.reserveSequence. */
+	private readonly sequences = new Map<string, number>()
 
 	private readonly agents = new Map<AgentId, Agent>()
 	/** Cached plugin contexts created by plugin.createContext() */
 	private readonly pluginContexts = new Map<string, unknown>()
 	private disposalPromise?: Promise<void>
+	private reopenPromise?: Promise<Result<void, DomainError>>
 
 	constructor(deps: SessionDependencies) {
 		this.id = deps.store.sessionId
@@ -116,6 +142,8 @@ export class Session {
 		this.eventStore = deps.eventStore
 		this.llmLogger = deps.llmLogger
 		this.platform = deps.platform
+		this.runtimeActivity = deps.runtimeActivity
+		this.registerReopenedSession = deps.registerReopenedSession
 		// Initialize agents from state
 		this.initializeAgents()
 
@@ -198,7 +226,7 @@ export class Session {
 		}
 
 		await this.store.emit(withSessionId(this.id, sessionEvents.create('session_closed', {})))
-		await this.dispose()
+		await this.dispose('closed')
 
 		return Ok(undefined)
 	}
@@ -210,10 +238,7 @@ export class Session {
 		if (!this.store.isClosed()) {
 			return Err(ValidationErrors.invalid('Session is not closed'))
 		}
-
-		await this.store.emit(withSessionId(this.id, sessionEvents.create('session_reopened', {})))
-
-		return Ok(undefined)
+		return this.reopenWithEvent(sessionEvents.create('session_reopened', {}))
 	}
 
 	/**
@@ -381,7 +406,7 @@ export class Session {
 			}
 		}
 
-		const seq = getNextAgentSeq(this.state, definitionName)
+		const seq = this.reserveSequence(agentSequenceKey(definitionName), () => getNextAgentSeq(this.state, definitionName))
 		const agentId = generateAgentId(definitionName, seq)
 		const now = Date.now()
 
@@ -398,11 +423,13 @@ export class Session {
 		]
 
 		if (message) {
-			const messageId = generateMessageId(getNextMessageSeq(selectMailboxState(this.state)) + 1)
+			const sequence = this.reserveMailboxMessageSequence()
+			const messageId = generateMessageId(sequence)
 			events.push(withSessionId(
 				this.id,
 				mailboxEvents.create('mailbox_message', {
 					toAgentId: agentId,
+					sequence,
 					message: {
 						id: messageId,
 						from: parentId,
@@ -428,10 +455,26 @@ export class Session {
 
 	/**
 	 * Dispose runtime resources without changing persisted session state.
+	 *
+	 * `reason` reaches every `onSessionClose` hook, and disposal is idempotent, so
+	 * the first caller's reason is the one the hooks see. It defaults to `evicted`
+	 * because a bare dispose only drops the runtime — the session survives and the
+	 * next access rebuilds it. The paths that really end a session pass `closed`.
 	 */
-	dispose(): Promise<void> {
-		this.disposalPromise ??= Promise.resolve().then(() => this.performDisposal())
+	dispose(reason: SessionCloseReason = 'evicted'): Promise<void> {
+		this.runtimeActivity.beginForcedUnload()
+		this.disposalPromise ??= Promise.resolve().then(() => this.performDisposal(reason))
 		return this.disposalPromise
+	}
+
+	/**
+	 * Take a runtime lease from outside the session; the caller must release it.
+	 *
+	 * Returns null once the runtime stopped being `ready`, so losing the race with
+	 * eviction reads as "this runtime is gone" instead of resurrecting it.
+	 */
+	tryAcquireRuntimeLease(reason: string): RuntimeLeaseRelease | null {
+		return this.runtimeActivity.tryAcquire(reason)
 	}
 
 	/**
@@ -467,6 +510,22 @@ export class Session {
 	 * pluginContext, and scheduleAgent.
 	 */
 	async callPluginMethod(
+		method: string,
+		input: unknown,
+		agentId?: AgentId,
+		caller?: CallerContext,
+	): Promise<Result<unknown, DomainError>> {
+		if (this.store.isClosed()) return this.executePluginMethod(method, input, agentId, caller)
+		const release = this.runtimeActivity.tryAcquire(`plugin:${method}`)
+		if (!release) return Err(SessionErrors.notFound(String(this.id)))
+		try {
+			return await this.executePluginMethod(method, input, agentId, caller)
+		} finally {
+			release()
+		}
+	}
+
+	private async executePluginMethod(
 		method: string,
 		input: unknown,
 		agentId?: AgentId,
@@ -536,9 +595,12 @@ export class Session {
 			deps,
 		}
 
-		const result = await methodDef.handler(ctx, parsed.data)
-
-		return result
+		try {
+			return await methodDef.handler(ctx, parsed.data)
+		} catch (error) {
+			if (error instanceof SessionReopenError) return Err(error.domainError)
+			throw error
+		}
 	}
 
 	// ============================================================================
@@ -584,27 +646,7 @@ export class Session {
 
 		return new Agent({
 			id: agentState.id,
-			sessionContext: {
-				sessionId: this.id,
-				sessionState: this.store.getState(),
-				sessionInput: undefined,
-				environment: env,
-				llm: this.llmProvider,
-				files: fileStore,
-				eventStore: this.eventStore,
-				llmLogger: this.llmLogger,
-				platform: this.platform,
-				logger: this.logger,
-				emitEvent: async (event) => {
-					await this.store.emit(withSessionId(this.id, event))
-				},
-				emitEvents: async (events) => {
-					await this.store.emitBatch(events.map((event) => withSessionId(this.id, event)))
-				},
-				notify: (type, payload) => {
-					this.onUserOutput?.({ pluginName: '_agent', type, payload })
-				},
-			},
+			getSessionContext: () => this.buildSessionContext('_agent'),
 			store: this.store,
 			llmProvider,
 			llmProviders: this.llmProviders,
@@ -634,7 +676,7 @@ export class Session {
 				break
 			}
 			case 'session_closed': {
-				this.dispose().catch((err) => {
+				this.dispose('closed').catch((err) => {
 					this.logger.error('Unhandled error in session disposal', err instanceof Error ? err : undefined, { sessionId: this.id })
 				})
 				break
@@ -649,14 +691,14 @@ export class Session {
 	 * swallows per-plugin errors so that all plugins get a chance to clean up
 	 * and agents are always shut down, even if one plugin's close hook fails.
 	 */
-	private async performDisposal(): Promise<void> {
+	private async performDisposal(reason: SessionCloseReason): Promise<void> {
 		// Call onSessionClose for all plugins in REVERSE order (per-plugin isolation)
 		const reversedPlugins = [...this.plugins].reverse()
 		for (const plugin of reversedPlugins) {
 			if (plugin.sessionHooks?.onSessionClose) {
 				try {
 					const ctx = this.buildSessionHookContext(plugin)
-					await plugin.sessionHooks.onSessionClose(ctx)
+					await plugin.sessionHooks.onSessionClose({ ...ctx, reason })
 				} catch (err) {
 					this.logger.error(`Session plugin '${plugin.name}' onSessionClose failed`, err instanceof Error ? err : new Error(String(err)), {
 						sessionId: this.id,
@@ -675,12 +717,43 @@ export class Session {
 			}
 		}
 
+		// The shutdown above only aborts; a turn still inside a tool call keeps
+		// running against the agents and plugin contexts cleared below.
+		await this.drainAgents()
+
 		// Clean up references to prevent memory leaks
 		this.agents.clear()
 		this.pluginContexts.clear()
 		this.store.clearListeners()
+		// Fence the log last: everything above may still emit legitimately, but
+		// whatever outlives disposal now fails instead of writing behind the
+		// replacement runtime the manager builds from the same log.
+		this.store.detach()
+		this.runtimeActivity.markDisposed()
 
-		this.logger.info('Session runtime disposed', { sessionId: this.id })
+		this.logger.info('Session runtime disposed', { sessionId: this.id, reason })
+	}
+
+	/** Await every in-flight turn, bounded — a wedged one must not hold disposal open. */
+	private async drainAgents(): Promise<void> {
+		const drains = [...this.agents.values()].map((agent) => agent.waitForIdle())
+		if (drains.length === 0) return
+
+		let timer: ReturnType<typeof setTimeout> | undefined
+		const expiry = new Promise<'expired'>((resolve) => {
+			timer = setTimeout(() => resolve('expired'), AGENT_DRAIN_TIMEOUT_MS)
+		})
+		try {
+			const outcome = await Promise.race([Promise.all(drains).then(() => 'drained' as const), expiry])
+			if (outcome === 'expired') {
+				this.logger.warn('Agent turns did not settle before disposal', {
+					sessionId: this.id,
+					timeoutMs: AGENT_DRAIN_TIMEOUT_MS,
+				})
+			}
+		} finally {
+			if (timer) clearTimeout(timer)
+		}
 	}
 
 	/**
@@ -736,12 +809,13 @@ export class Session {
 	/**
 	 * Build a SessionContext from current session state.
 	 */
-	private buildSessionContext(): SessionContext {
+	private buildSessionContext(notificationPluginName = '_session'): SessionContext {
 		const env = this.getSessionEnvironment()
 		const fileStore = new SessionFileStore(env.sessionDir, env.workspaceDir, env.sandboxed, this.platform.fs)
 		return {
 			sessionId: this.id,
 			sessionState: this.store.getState(),
+			getSessionState: () => this.store.getState(),
 			sessionInput: undefined,
 			environment: env,
 			llm: this.llmProvider,
@@ -750,15 +824,73 @@ export class Session {
 			llmLogger: this.llmLogger,
 			platform: this.platform,
 			logger: this.logger,
+			runtimeActivity: this.runtimeActivity,
+			reserveSequence: (name, seed) => this.reserveSequence(name, seed),
+			reserveMailboxMessageSequence: () => this.reserveMailboxMessageSequence(),
 			emitEvent: async (event) => {
+				if (event.type === 'session_reopened') {
+					const reopened = await this.reopenWithEvent(event)
+					if (!reopened.ok) throw new SessionReopenError(reopened.error)
+					return
+				}
 				await this.store.emit(withSessionId(this.id, event))
 			},
 			emitEvents: async (events) => {
 				await this.store.emitBatch(events.map((event) => withSessionId(this.id, event)))
 			},
 			notify: (type, payload) => {
-				this.onUserOutput?.({ pluginName: '_session', type, payload })
+				this.onUserOutput?.({ pluginName: notificationPluginName, type, payload })
 			},
+		}
+	}
+
+	private reserveSequence(name: string, seed: () => number): number {
+		const activity = this.runtimeActivity.getSnapshot()
+		if (this.store.isClosed() || activity.state !== 'ready') {
+			throw new Error(`Cannot reserve sequence "${name}" on a closed or disposed session runtime`)
+		}
+		const sequence = this.sequences.get(name) ?? seed()
+		this.sequences.set(name, sequence + 1)
+		return sequence
+	}
+
+	private reserveMailboxMessageSequence(): number {
+		return this.reserveSequence(MAILBOX_MESSAGE_SEQUENCE, () => getNextMessageSeq(selectMailboxState(this.store.getState())))
+	}
+
+	private reopenWithEvent(event: Omit<BaseEvent<string>, 'sessionId'>): Promise<Result<void, DomainError>> {
+		if (this.reopenPromise) return this.reopenPromise
+		const operation = this.performReopen(event)
+		this.reopenPromise = operation
+		void operation.then(
+			() => {
+				if (this.reopenPromise === operation) this.reopenPromise = undefined
+			},
+			() => {
+				if (this.reopenPromise === operation) this.reopenPromise = undefined
+			},
+		)
+		return operation
+	}
+
+	private async performReopen(event: Omit<BaseEvent<string>, 'sessionId'>): Promise<Result<void, DomainError>> {
+		if (!this.store.isClosed()) return Err(ValidationErrors.invalid('Session is not closed'))
+		// A disposed runtime cannot host the reopened session — the manager refuses to
+		// re-register it — so reopen through a freshly loaded one instead of writing
+		// the event from a handle that is already dead.
+		if (this.store.isDetached()) {
+			return Err(ValidationErrors.invalid('Session runtime is disposed; load the session again to reopen it'))
+		}
+		const registrationResult = this.registerReopenedSession?.(this) ?? Ok(undefined)
+		if (!registrationResult.ok) return registrationResult
+		const registration = registrationResult.value
+		try {
+			await this.store.emit(withSessionId(this.id, event))
+			await registration?.complete()
+			return Ok(undefined)
+		} catch (error) {
+			registration?.abort(error)
+			throw error
 		}
 	}
 

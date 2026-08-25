@@ -90,6 +90,10 @@ export class TestHarness {
 		llmLogger?: LLMLogger
 		/** Optional pre-existing event store — lets multiple harnesses share persisted state (simulates server restart) */
 		eventStore?: MemoryEventStore
+		/** Resident session idle timeout. Zero or absent disables eviction. */
+		sessionIdleTimeoutMs?: number
+		/** Extra notification sink, run after the recorder. Throwing here simulates a hostile embedder. */
+		onUserOutput?: (notification: PluginNotification) => void
 	}) {
 		this.eventStore = options.eventStore ?? new MemoryEventStore()
 
@@ -139,9 +143,13 @@ export class TestHarness {
 			logger: silentLogger,
 			basePath,
 			dataFileStore,
-			onUserOutput: (n: PluginNotification) => this.notifications.push(n),
+			onUserOutput: (n: PluginNotification) => {
+				this.notifications.push(n)
+				options.onUserOutput?.(n)
+			},
 			llmLogger: options.llmLogger,
 			platform,
+			sessionIdleTimeoutMs: options.sessionIdleTimeoutMs,
 			systemPlugins: mergeSystemPlugins([...defaultSystemPlugins, ...(options.systemPlugins ?? [])]),
 		})
 	}

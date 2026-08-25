@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it, spyOn } from 'bun:test'
 import { ORCHESTRATOR_ROLE } from '~/core/agents/agent-roles.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { ModelId } from '~/core/llm/schema.js'
@@ -9,6 +9,14 @@ const KIMI = ModelId('moonshotai/kimi-k3')
 
 /** Models the mock provider was actually asked for, in call order. */
 const modelsUsed = (llmProvider: MockLLMProvider): string[] => llmProvider.getCallHistory().map(request => String(request.model))
+
+const waitUntil = async (predicate: () => boolean, timeoutMs = 1_000): Promise<void> => {
+	const deadline = Date.now() + timeoutMs
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error('Timed out waiting for condition')
+		await Bun.sleep(5)
+	}
+}
 
 const newHarness = () =>
 	new TestHarness({
@@ -161,6 +169,54 @@ describe('session overrides', () => {
 			}
 
 			await harness.shutdown()
+		})
+
+		it('keeps the runtime leased while the override append is pending', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset({ agents: [{ name: 'worker', system: 'worker' }] })],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'ok', toolCalls: [] }),
+				sessionIdleTimeoutMs: 10,
+			})
+			let releaseAppend: (() => void) | undefined
+			let markAppendStarted: (() => void) | undefined
+			const appendStarted = new Promise<void>((resolve) => {
+				markAppendStarted = resolve
+			})
+			const appendGate = new Promise<void>((resolve) => {
+				releaseAppend = resolve
+			})
+			const originalAppend = harness.eventStore.append.bind(harness.eventStore)
+			const appendSpy = spyOn(harness.eventStore, 'append').mockImplementation(async (sessionId, event) => {
+				if (event.type === 'session_overrides_set') {
+					markAppendStarted?.()
+					await appendGate
+				}
+				await originalAppend(sessionId, event)
+			})
+
+			try {
+				const session = await harness.createSession('test')
+				const setting = harness.sessionManager.callManagerMethod('sessions.setOverrides', {
+					sessionId: String(session.sessionId),
+					overrides: { agents: { worker: { model: LUNA } } },
+				})
+
+				await appendStarted
+				await Bun.sleep(35)
+				const duringAppend = harness.sessionManager.getRuntimeCacheStats()
+				expect(duringAppend.loadedSessionCount).toBe(1)
+				expect(duringAppend.sessions[0]?.leaseReasons).toEqual({ 'manager:sessions.setOverrides': 1 })
+
+				if (!releaseAppend) throw new Error('Append release was not initialized')
+				releaseAppend()
+				const result = await setting
+				expect(result.ok).toBe(true)
+				await waitUntil(() => harness.sessionManager.getRuntimeCacheStats().loadedSessionCount === 0)
+			} finally {
+				releaseAppend?.()
+				appendSpy.mockRestore()
+				await harness.shutdown()
+			}
 		})
 
 		it('reports the effective overrides back through sessions.get', async () => {

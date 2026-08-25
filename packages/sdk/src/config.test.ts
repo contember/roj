@@ -27,6 +27,7 @@ describe('config', () => {
 			delete process.env.UPLOAD_ARCHIVE_MAX_UNCOMPRESSED_BYTES
 			delete process.env.RESOURCE_ARCHIVE_MAX_ENTRIES
 			delete process.env.RESOURCE_ARCHIVE_MAX_UNCOMPRESSED_BYTES
+			delete process.env.SESSION_IDLE_TIMEOUT_MS
 
 			const config = loadConfig()
 
@@ -42,6 +43,8 @@ describe('config', () => {
 			expect(config.agentToken).toBeUndefined()
 			expect(config.uploadArchiveLimits).toBeUndefined()
 			expect(config.resourceArchiveLimits).toBeUndefined()
+			// Unset means unset — the default belongs to whichever runtime wants eviction.
+			expect(config.sessionIdleTimeoutMs).toBeUndefined()
 		})
 
 		test('loads values from environment', () => {
@@ -59,6 +62,7 @@ describe('config', () => {
 			process.env.UPLOAD_ARCHIVE_MAX_UNCOMPRESSED_BYTES = '209715200'
 			process.env.RESOURCE_ARCHIVE_MAX_ENTRIES = '2500'
 			process.env.RESOURCE_ARCHIVE_MAX_UNCOMPRESSED_BYTES = '1073741824'
+			process.env.SESSION_IDLE_TIMEOUT_MS = '0'
 
 			const config = loadConfig()
 
@@ -80,6 +84,33 @@ describe('config', () => {
 				maxEntries: 2500,
 				maxTotalUncompressedSize: 1073741824,
 			})
+			expect(config.sessionIdleTimeoutMs).toBe(0)
+		})
+
+		test('preserves invalid idle timeout input for validation', () => {
+			process.env.SESSION_IDLE_TIMEOUT_MS = '1.5'
+			const config = loadConfig()
+			expect(config.sessionIdleTimeoutMs).toBe(1.5)
+			expect(validateConfig(config)).toContain('Invalid sessionIdleTimeoutMs: 1.5')
+
+			process.env.SESSION_IDLE_TIMEOUT_MS = ''
+			const emptyConfig = loadConfig()
+			expect(emptyConfig.sessionIdleTimeoutMs).toBeNaN()
+			expect(validateConfig(emptyConfig)).toContain('Invalid sessionIdleTimeoutMs: NaN')
+		})
+
+		test('parses REMOTE_FETCH_ALLOWED_HOSTS into trimmed entries', () => {
+			process.env.REMOTE_FETCH_ALLOWED_HOSTS = ' example.internal , 127.0.0.1 ,,'
+			expect(loadConfig().remoteFetchAllowedHosts).toEqual(['example.internal', '127.0.0.1'])
+		})
+
+		test('leaves the fetch allowlist undefined when unset or empty', () => {
+			delete process.env.REMOTE_FETCH_ALLOWED_HOSTS
+			expect(loadConfig().remoteFetchAllowedHosts).toBeUndefined()
+
+			// An empty or comma-only value must not read as "allow something".
+			process.env.REMOTE_FETCH_ALLOWED_HOSTS = ' , '
+			expect(loadConfig().remoteFetchAllowedHosts).toBeUndefined()
 		})
 	})
 
@@ -131,6 +162,42 @@ describe('config', () => {
 			expect(errors).toContain(
 				'At least one of OPENROUTER_API_KEY or ANTHROPIC_API_KEY must be set',
 			)
+		})
+
+		test('rejects a fetch allowlist entry that is not a bare host', () => {
+			const errors = validateConfig({
+				...validConfig,
+				remoteFetchAllowedHosts: ['https://example.internal/bucket', 'has space'],
+			})
+			expect(errors).toContain('Invalid remoteFetchAllowedHosts entry: https://example.internal/bucket')
+			expect(errors).toContain('Invalid remoteFetchAllowedHosts entry: has space')
+		})
+
+		test('accepts bare hosts and IPv6 literals in the fetch allowlist', () => {
+			const errors = validateConfig({
+				...validConfig,
+				remoteFetchAllowedHosts: ['example.internal', '127.0.0.1', '::1'],
+			})
+			expect(errors).toHaveLength(0)
+		})
+
+		test('accepts a fetch allowlist entry that pins a port', () => {
+			const errors = validateConfig({
+				...validConfig,
+				remoteFetchAllowedHosts: ['127.0.0.1:9000', '[::1]:9000', 'example.internal:8443'],
+			})
+			expect(errors).toHaveLength(0)
+		})
+
+		test('rejects a fetch allowlist entry whose port can never match', () => {
+			const errors = validateConfig({
+				...validConfig,
+				remoteFetchAllowedHosts: ['127.0.0.1:99999', '127.0.0.1:', 'example.internal:http', '[::1'],
+			})
+			expect(errors).toContain('Invalid remoteFetchAllowedHosts entry: 127.0.0.1:99999')
+			expect(errors).toContain('Invalid remoteFetchAllowedHosts entry: 127.0.0.1:')
+			expect(errors).toContain('Invalid remoteFetchAllowedHosts entry: example.internal:http')
+			expect(errors).toContain('Invalid remoteFetchAllowedHosts entry: [::1')
 		})
 
 		test('returns error for invalid port', () => {
@@ -200,6 +267,14 @@ describe('config', () => {
 				'Invalid uploadArchiveLimits.maxEntries: -1',
 				'Invalid resourceArchiveLimits.maxTotalUncompressedSize: NaN',
 			])
+		})
+
+		test('rejects invalid session idle timeouts', () => {
+			for (const sessionIdleTimeoutMs of [-1, Number.NaN, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+				expect(validateConfig({ ...validConfig, sessionIdleTimeoutMs })).toContain(
+					`Invalid sessionIdleTimeoutMs: ${sessionIdleTimeoutMs}`,
+				)
+			}
 		})
 	})
 })

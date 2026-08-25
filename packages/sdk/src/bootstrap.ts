@@ -111,7 +111,7 @@ export function bootstrap(config: Config, userConfig: RojConfig, platform: Platf
 
 	const eventStore = config.persistence === 'memory'
 		? new MemoryEventStore()
-		: new FileEventStore(config.dataPath, platform.fs)
+		: new FileEventStore(config.dataPath, platform.fs, logger)
 
 	const { llmProvider, llmProviders, llmLogger } = createLLMProvider(config, logger, platform)
 
@@ -263,6 +263,7 @@ export function createSystemFromServices(
 		portPool: services.portPool,
 		pidRegistry: services.pidRegistry,
 		platform: services.platform,
+		sessionIdleTimeoutMs: services.config.sessionIdleTimeoutMs,
 	})
 }
 
