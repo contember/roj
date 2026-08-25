@@ -7,6 +7,7 @@
  */
 
 import { resolve } from 'node:path'
+import type { SessionCloseReason } from '~/core/plugins/plugin-builder.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
@@ -14,7 +15,7 @@ import type { FileSystem } from '~/platform/fs.js'
 import type { ChildProcess, ProcessRunner } from '~/platform/process.js'
 import type { PortPool } from '~/plugins/services/port-pool.js'
 import type { ServicePidRegistry } from '~/plugins/services/pid-registry.js'
-import type { ServiceConfig, ServiceStartArgs, ServiceStatus } from '~/plugins/services/schema.js'
+import type { ServiceConfig, ServiceStartArgs, ServiceStatus, ServiceStopSource } from '~/plugins/services/schema.js'
 import type { ToolError } from '../../core/tools/executor.js'
 import type { Logger } from '../../lib/logger/logger.js'
 import { RingBuffer } from '../../lib/logger/ring-buffer.js'
@@ -62,6 +63,8 @@ interface RunningService {
 	command: string
 	logs: RingBuffer
 	forgetPid: () => Promise<void>
+	/** Who asked for the stop in progress — read back when the child's exit lands. */
+	stopSource?: ServiceStopSource
 }
 
 export interface ServiceStatusChangeDetails {
@@ -71,6 +74,8 @@ export interface ServiceStatusChangeDetails {
 	pidStartTime?: number
 	cwd?: string
 	command?: string
+	/** Set on a `stopped` change: who asked for it. See ServiceEntry.stoppedBy. */
+	stoppedBy?: ServiceStopSource
 	/** Set on a `failed` change that already has a revival queued — see ServiceEntry.restartAt. */
 	restartAt?: number
 	restartAttempt?: number
@@ -95,6 +100,16 @@ const PORT_CONFLICT_PATTERN = /EADDRINUSE|address already in use/i
  */
 const MAX_PORT_CONFLICT_RETRIES = 3
 
+/**
+ * Deadline for embedder callbacks and PID-registry writes inside a transition.
+ *
+ * A transition holds the runtime lease that idle eviction waits on, so a resolver
+ * or a registry write that never settles pins the session resident forever and
+ * defeats the bound the lease exists to enforce. None of them is meant to take
+ * 30 s — the deadline only turns "wedged" into "failed".
+ */
+const DEFAULT_SERVICE_HOOK_TIMEOUT_MS = 30_000
+
 /** `restartPolicy` defaults — see ServiceConfig.restartPolicy for the rationale. */
 const DEFAULT_MAX_RESTART_RETRIES = 3
 const DEFAULT_RESTART_DELAY_MS = 1000
@@ -112,6 +127,8 @@ export interface ServiceExecutorDeps {
 	pidRegistry?: Pick<ServicePidRegistry, 'record' | 'forget'>
 	/** Test seam for process-group failure handling. */
 	kill?: typeof process.kill
+	/** Deadline for embedder callbacks and PID-registry writes; test seam, defaults to 30 s. */
+	hookTimeoutMs?: number
 }
 
 type ProcessGroupProbe = { state: 'alive' | 'gone' } | { state: 'error'; error: Error }
@@ -133,10 +150,13 @@ export class ServiceExecutor {
 	private readonly waiters = new Map<string, Array<{ resolve: (result: Result<void, ToolError>) => void; timer: ReturnType<typeof setTimeout> }>>()
 	/** Per-type lock collapsing concurrent start() calls onto a single in-flight start. */
 	private readonly startInFlight = new Map<string, Promise<Result<void, ToolError>>>()
+	/** Per-type stop operation awaited by runtime disposal. */
+	private readonly stopInFlight = new Map<string, Promise<Result<void, ToolError>>>()
 	/** Registry deletions that must settle before a replacement can record its PID. */
 	private readonly pidForgets = new Map<string, Promise<void>>()
 	/** Per-type counter bounding automatic EADDRINUSE port re-allocation retries. */
 	private readonly portConflictRetries = new Map<string, number>()
+	private readonly portConflictTimers = new Map<string, ReturnType<typeof setTimeout>>()
 	/** Per-type counter bounding `restartPolicy` revivals after an unexpected exit. */
 	private readonly restartRetries = new Map<string, number>()
 	/** Pending `restartPolicy` timers, cancelled when someone stops or starts the service by hand. */
@@ -147,6 +167,9 @@ export class ServiceExecutor {
 	private readonly processRunner: ProcessRunner
 	private readonly pidRegistry?: Pick<ServicePidRegistry, 'record' | 'forget'>
 	private readonly killProcess: typeof process.kill
+	private readonly hookTimeoutMs: number
+	private closing = false
+	private closePromise?: Promise<void>
 
 	/** Optional callback invoked on every service status change */
 	onStatusChanged?: (
@@ -155,6 +178,8 @@ export class ServiceExecutor {
 		status: ServiceStatus,
 		details: ServiceStatusChangeDetails,
 	) => void
+	/** Invoked after every owned start attempt, including deferred retries. */
+	onStartSettled?: (serviceType: string) => void
 
 	constructor(logger: Logger, portPool: PortPool, deps: ServiceExecutorDeps) {
 		this.logger = logger
@@ -163,7 +188,31 @@ export class ServiceExecutor {
 		this.processRunner = deps.process
 		this.pidRegistry = deps.pidRegistry
 		this.killProcess = deps.kill ?? process.kill
+		this.hookTimeoutMs = deps.hookTimeoutMs ?? DEFAULT_SERVICE_HOOK_TIMEOUT_MS
 		serviceExecutorObserverForTesting?.(this)
+	}
+
+	/**
+	 * Reject when `operation` outlives {@link DEFAULT_SERVICE_HOOK_TIMEOUT_MS}.
+	 *
+	 * The operation itself cannot be cancelled — an embedder callback keeps running —
+	 * but the transition stops waiting on it, which is what releases the lease.
+	 */
+	private async withDeadline<T>(label: string, operation: () => Promise<T> | T): Promise<T> {
+		let timer: ReturnType<typeof setTimeout> | undefined
+		try {
+			return await Promise.race([
+				(async () => await operation())(),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() => reject(new Error(`${label} did not settle within ${this.hookTimeoutMs}ms`)),
+						this.hookTimeoutMs,
+					)
+				}),
+			])
+		} finally {
+			if (timer) clearTimeout(timer)
+		}
 	}
 
 	private notifyStatusChanged(
@@ -182,7 +231,10 @@ export class ServiceExecutor {
 		if (!config.availableWhen) return Ok(true)
 
 		try {
-			return Ok(await config.availableWhen({ sessionId: String(sessionId), workspaceDir }))
+			return Ok(await this.withDeadline(
+				`Service '${config.type}' availability check`,
+				() => config.availableWhen?.({ sessionId: String(sessionId), workspaceDir }) ?? true,
+			))
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error)
 			return Err({ message: `Service '${config.type}' availability check failed: ${message}`, recoverable: true })
@@ -198,7 +250,11 @@ export class ServiceExecutor {
 						recoverable: true,
 					})
 				}
-				const raw = await config.cwd({ sessionId: String(sessionId), workspaceDir })
+				const cwdResolver = config.cwd
+				const raw = await this.withDeadline(
+					`Service '${config.type}' cwd resolver`,
+					() => cwdResolver({ sessionId: String(sessionId), workspaceDir }),
+				)
 				return Ok(resolve(workspaceDir, raw))
 			}
 
@@ -278,6 +334,7 @@ export class ServiceExecutor {
 		workspaceDir?: string,
 		preferredPort?: number,
 	): Promise<Result<void, ToolError>> {
+		if (this.closing) return Err({ message: 'Service executor is closing', recoverable: false })
 		const inFlight = this.startInFlight.get(config.type)
 		if (inFlight) return inFlight
 
@@ -287,6 +344,7 @@ export class ServiceExecutor {
 			return await promise
 		} finally {
 			this.startInFlight.delete(config.type)
+			this.onStartSettled?.(config.type)
 		}
 	}
 
@@ -296,11 +354,12 @@ export class ServiceExecutor {
 		workspaceDir?: string,
 		preferredPort?: number,
 	): Promise<Result<void, ToolError>> {
+		if (this.closing) return Err({ message: 'Service executor is closing', recoverable: false })
 		// This start supersedes any revival the policy had queued.
 		this.cancelPendingRestart(config.type)
 
 		const existing = this.services.get(config.type)
-		if (existing && (existing.status === 'starting' || existing.status === 'ready' || existing.status === 'paused')) {
+		if (existing && (existing.status === 'starting' || existing.status === 'ready')) {
 			return Ok(undefined)
 		}
 		if (existing?.status === 'stopping') {
@@ -308,8 +367,10 @@ export class ServiceExecutor {
 		}
 		if (existing) await existing.forgetPid()
 		await this.pidForgets.get(config.type)
+		if (this.closing) return Err({ message: 'Service executor is closing', recoverable: false })
 
 		const availability = await this.isAvailable(config, sessionId, workspaceDir)
+		if (this.closing) return Err({ message: 'Service executor is closing', recoverable: false })
 		if (!availability.ok) return availability
 		if (!availability.value) {
 			return Err({ message: `Service '${config.type}' is not available in this workspace`, recoverable: true })
@@ -339,6 +400,13 @@ export class ServiceExecutor {
 		}
 
 		const cwd = cwdResult.value
+		if (this.closing) {
+			if (allocatedNow) {
+				this.allocatedPorts.delete(config.type)
+				this.portPool.release(port)
+			}
+			return Err({ message: 'Service executor is closing', recoverable: false })
+		}
 		const logBufferSize = Math.max(1, config.logBufferSize ?? 200)
 		const startupTimeoutMs = config.startupTimeoutMs ?? 30_000
 
@@ -367,12 +435,14 @@ export class ServiceExecutor {
 		let command: string
 		let serviceEnv: Record<string, string> | undefined
 		try {
-			command = typeof config.command === 'function'
-				? await config.command(startArgs)
-				: config.command
-			serviceEnv = typeof config.env === 'function'
-				? await config.env(startArgs)
-				: config.env
+			const commandResolver = config.command
+			command = typeof commandResolver === 'function'
+				? await this.withDeadline(`Service '${config.type}' command resolver`, () => commandResolver(startArgs))
+				: commandResolver
+			const envResolver = config.env
+			serviceEnv = typeof envResolver === 'function'
+				? await this.withDeadline(`Service '${config.type}' env resolver`, () => envResolver(startArgs))
+				: envResolver
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error)
 			const errorMessage = `Service '${config.type}' start resolver failed: ${message}`
@@ -382,6 +452,13 @@ export class ServiceExecutor {
 			}
 			this.notifyStatusChanged(sessionId, config.type, 'failed', { port, cwd, error: errorMessage })
 			return Err({ message: errorMessage, recoverable: true })
+		}
+		if (this.closing) {
+			if (allocatedNow) {
+				this.allocatedPorts.delete(config.type)
+				this.portPool.release(port)
+			}
+			return Err({ message: 'Service executor is closing', recoverable: false })
 		}
 
 		const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh'
@@ -417,6 +494,9 @@ export class ServiceExecutor {
 			this.notifyStatusChanged(sessionId, config.type, 'failed', { port, cwd, command, error: 'Failed to spawn process' })
 			return Err({ message: 'Failed to spawn service process', recoverable: true })
 		}
+		// Bind the narrowed pid: the deferred registry call below cannot carry the
+		// narrowing across the closure boundary.
+		const pid = child.pid
 
 		const matches = (regex: RegExp, content: string): boolean => {
 			regex.lastIndex = 0
@@ -472,7 +552,10 @@ export class ServiceExecutor {
 		const forgetPid = (): Promise<void> => {
 			if (forgetPromise) return forgetPromise
 			const previous = this.pidForgets.get(config.type)
-			const runForget = () => this.pidRegistry?.forget(String(sessionId), config.type) ?? Promise.resolve()
+			const runForget = () => this.withDeadline(
+				`Service '${config.type}' PID forget`,
+				() => this.pidRegistry?.forget(String(sessionId), config.type) ?? Promise.resolve(),
+			)
 			const operation = previous ? previous.then(runForget, runForget) : runForget()
 			forgetPromise = operation
 			this.pidForgets.set(config.type, operation)
@@ -501,7 +584,42 @@ export class ServiceExecutor {
 		// Durably record the process so a future agent can reap it if we die before the
 		// `close` handler gets to forget it. The session projection cannot serve that
 		// purpose — see ServicePidRegistry.
-		await this.pidRegistry?.record({ sessionId: String(sessionId), serviceType: config.type, pid: child.pid, pidStartTime, command })
+		try {
+			await this.withDeadline(
+				`Service '${config.type}' PID record`,
+				() => this.pidRegistry?.record({ sessionId: String(sessionId), serviceType: config.type, pid, pidStartTime, command })
+					?? Promise.resolve(),
+			)
+		} catch (error) {
+			// The child is already running but unrecorded, so nothing could reap it
+			// after a crash — tear it down here rather than leak it.
+			const message = error instanceof Error ? error.message : String(error)
+			const errorMessage = `Service '${config.type}' could not record its PID: ${message}`
+			try {
+				this.killProcess(-child.pid, 'SIGKILL')
+			} catch {
+				// The process may already be gone.
+			}
+			if (allocatedNow) {
+				this.allocatedPorts.delete(config.type)
+				this.portPool.release(port)
+			}
+			this.notifyStatusChanged(sessionId, config.type, 'failed', { port, cwd, command, error: errorMessage })
+			return Err({ message: errorMessage, recoverable: true })
+		}
+		if (this.closing) {
+			try {
+				this.killProcess(-child.pid, 'SIGKILL')
+			} catch {
+				// The process may already be gone.
+			}
+			await forgetPid()
+			if (allocatedNow) {
+				this.allocatedPorts.delete(config.type)
+				this.portPool.release(port)
+			}
+			return Err({ message: 'Service executor is closing', recoverable: false })
+		}
 
 		// Emit starting event with PID, port, resolved cwd/command, and start time.
 		this.notifyStatusChanged(sessionId, config.type, 'starting', { port, pid: child.pid, pidStartTime, cwd, command })
@@ -594,11 +712,9 @@ export class ServiceExecutor {
 					error: errorMsg,
 				})
 
-				// Kill the timed-out process
-				try {
-					process.kill(-current.pid, 'SIGKILL')
-				} catch {
-					// Already gone
+				const killed = this.killProcessGroup(current.pid)
+				if (!killed.ok) {
+					this.logger.error('Could not kill timed-out service process group', killed.error, { serviceType: config.type, pid: current.pid })
 				}
 			}, startupTimeoutMs)
 		}
@@ -633,12 +749,12 @@ export class ServiceExecutor {
 			if (!current || current.process !== child) return
 
 			if (current.status === 'stopping') {
-				// Expected stop
+				// Expected stop — the child's exit, not stopInternal, is what publishes it.
 				current.status = 'stopped'
-				this.notifyStatusChanged(sessionId, config.type, 'stopped')
-			} else if (current.status === 'starting' || current.status === 'ready' || current.status === 'paused') {
+				this.notifyStatusChanged(sessionId, config.type, 'stopped', { stoppedBy: current.stopSource ?? 'agent' })
+			} else if (current.status === 'starting' || current.status === 'ready') {
 				const retries = this.portConflictRetries.get(config.type) ?? 0
-				if (current.status === 'starting' && portConflictDetected && retries < MAX_PORT_CONFLICT_RETRIES) {
+				if (!this.closing && current.status === 'starting' && portConflictDetected && retries < MAX_PORT_CONFLICT_RETRIES) {
 					// The chosen port is held by a foreign process (e.g. a service
 					// leaked from another session, or a survivor of a previous boot).
 					// Re-allocate a fresh port and retry so the service recovers on a
@@ -658,7 +774,12 @@ export class ServiceExecutor {
 					if (!setupComplete) {
 						retryPortConflictDuringSetup = true
 					} else {
-						setTimeout(() => void this.start(config, sessionId, workspaceDir), 0)
+						const retryTimer = setTimeout(() => {
+							this.portConflictTimers.delete(config.type)
+							if (!this.closing) void this.start(config, sessionId, workspaceDir)
+						}, 0)
+						retryTimer.unref?.()
+						this.portConflictTimers.set(config.type, retryTimer)
 					}
 					return
 				}
@@ -711,6 +832,7 @@ export class ServiceExecutor {
 		setupComplete = true
 		if (retryPortConflictDuringSetup) {
 			await forgetPid()
+			if (this.closing) return Err({ message: 'Service executor is closing', recoverable: false })
 			return this.startInternal(config, sessionId, workspaceDir)
 		}
 		if (exitDuringSetup || alreadyReaped) {
@@ -742,6 +864,7 @@ export class ServiceExecutor {
 		uptimeMs: number,
 		exitCode: number | null,
 	): ScheduledRestart | undefined {
+		if (this.closing) return undefined
 		const policy = config.restartPolicy
 		if (!policy) return undefined
 
@@ -776,7 +899,7 @@ export class ServiceExecutor {
 
 		const timer = setTimeout(() => {
 			this.restartTimers.delete(config.type)
-			void this.start(config, sessionId, workspaceDir)
+			if (!this.closing) void this.start(config, sessionId, workspaceDir)
 		}, delayMs)
 		// A pending revival must not keep the process alive on its own.
 		timer.unref?.()
@@ -794,9 +917,121 @@ export class ServiceExecutor {
 		return true
 	}
 
-	/** Whether a `restartPolicy` revival is queued — the service is down but coming back. */
+	/**
+	 * Whether the service is down but coming back on its own — a `restartPolicy`
+	 * revival or a queued port-conflict retry. Both are timers this executor
+	 * owns, so both need the runtime to outlive the call that armed them.
+	 */
 	hasScheduledRestart(serviceType: string): boolean {
-		return this.restartTimers.has(serviceType)
+		return this.restartTimers.has(serviceType) || this.portConflictTimers.has(serviceType)
+	}
+
+	/**
+	 * Stop accepting work and drain all runtime-owned processes and timers.
+	 *
+	 * `reason: 'evicted'` only parks the session: every service keeps its full
+	 * graceful window and is recorded as stopped by the runtime, which is what
+	 * lets autoStart bring it back once the runtime is rebuilt. The other
+	 * reasons end the session, so a process group that ignores SIGTERM is taken
+	 * down without waiting.
+	 */
+	close(sessionId: SessionId, reason: SessionCloseReason = 'closed'): Promise<void> {
+		this.closing = true
+		this.closePromise ??= this.performClose(sessionId, reason).finally(() => {
+			this.onStatusChanged = undefined
+			this.onStartSettled = undefined
+		})
+		return this.closePromise
+	}
+
+	private async performClose(sessionId: SessionId, reason: SessionCloseReason): Promise<void> {
+		this.cancelPortConflictTimers()
+		await Promise.allSettled([...this.startInFlight.values()])
+		this.cancelPortConflictTimers()
+		const concurrentStopTypes = new Set(this.stopInFlight.keys())
+		await Promise.allSettled([...this.stopInFlight.values()])
+
+		// One service that cannot be signalled must not strand the others, and must not
+		// skip the tail — portPool is process-global, so a skipped release loses those
+		// ports for the life of the server.
+		const failures: unknown[] = []
+		const parking = reason === 'evicted'
+		try {
+			for (const [serviceType, entry] of [...this.services]) {
+				if (entry.status === 'stopped') continue
+				if (entry.status === 'starting' || entry.status === 'ready' || entry.status === 'stopping' || this.restartTimers.has(serviceType)) {
+					const forcedGraceMs = parking ? entry.config.gracefulStopMs ?? 5000 : 0
+					try {
+						if (concurrentStopTypes.has(serviceType)) {
+							await this.forceStopForClose(serviceType, entry, sessionId, forcedGraceMs)
+							continue
+						}
+						const stopped = await this.stop(serviceType, sessionId, 'eviction')
+						if (!stopped.ok) await this.forceStopForClose(serviceType, entry, sessionId, forcedGraceMs)
+					} catch (error) {
+						failures.push(error)
+					}
+				}
+			}
+		} finally {
+			this.cancelAllDeferredStarts()
+			await Promise.allSettled([...this.pidForgets.values()])
+			for (const port of this.allocatedPorts.values()) this.portPool.release(port)
+			this.allocatedPorts.clear()
+			this.services.clear()
+			for (const serviceType of this.waiters.keys()) this.resolveWaiters(serviceType, 'stopped')
+		}
+
+		// Still reject — a close that could not terminate a process is not a clean close.
+		if (failures.length === 1) throw failures[0]
+		if (failures.length > 1) {
+			throw new AggregateError(failures, `Failed to stop ${failures.length} services during close`)
+		}
+	}
+
+	private async forceStopForClose(serviceType: string, entry: RunningService, sessionId: SessionId, gracefulStopMs: number): Promise<void> {
+		const previousStatus = entry.status
+		this.recordStopSource(entry, 'eviction')
+		if (entry.status !== 'stopping') {
+			entry.status = 'stopping'
+			this.notifyStatusChanged(sessionId, serviceType, 'stopping')
+		}
+		const stopped = await this.terminateProcessGroup(entry.pid, gracefulStopMs)
+		if (!stopped.ok) {
+			// Mirror stopInternal: no recovery path matches a stranded `stopping`, so a
+			// force-stop that failed has to leave a status the next runtime can reap.
+			if (entry.status === 'stopping' && previousStatus !== 'stopping') {
+				entry.status = previousStatus
+				this.notifyStatusChanged(sessionId, serviceType, previousStatus, {
+					port: entry.port,
+					cwd: entry.cwd,
+					command: entry.command,
+					error: stopped.error.message,
+				})
+			}
+			throw stopped.error
+		}
+		await entry.forgetPid()
+		if (this.services.get(serviceType) === entry) {
+			entry.status = 'stopped'
+			this.notifyStatusChanged(sessionId, serviceType, 'stopped', { stoppedBy: entry.stopSource ?? 'eviction' })
+		}
+	}
+
+	/** An agent stop stays the agent's decision even when a lifecycle stop is what finishes it. */
+	private recordStopSource(entry: RunningService, stoppedBy: ServiceStopSource): void {
+		if (stoppedBy === 'agent' || entry.stopSource === undefined) entry.stopSource = stoppedBy
+	}
+
+	private cancelAllDeferredStarts(): void {
+		for (const timer of this.restartTimers.values()) clearTimeout(timer)
+		this.restartTimers.clear()
+		this.cancelPortConflictTimers()
+	}
+
+	private cancelPortConflictTimers(): void {
+		for (const timer of this.portConflictTimers.values()) clearTimeout(timer)
+		this.portConflictTimers.clear()
 	}
 
 	private errorWithContext(error: unknown, context: string): Error {
@@ -883,6 +1118,21 @@ export class ServiceExecutor {
 		})
 	}
 
+	/**
+	 * SIGKILL a process group through the injectable kill seam, without waiting
+	 * for it to go. For the places with no child handle left to await — a
+	 * startup timeout, or an orphan a previous runtime left behind.
+	 */
+	killProcessGroup(pid: number): Result<void, Error> {
+		try {
+			this.killProcess(-pid, 'SIGKILL')
+			return Ok(undefined)
+		} catch (error) {
+			if (this.hasErrorCode(error, 'ESRCH')) return Ok(undefined) // Already gone.
+			return Err(this.errorWithContext(error, `Failed to SIGKILL process group ${pid}`))
+		}
+	}
+
 	private async terminateProcessGroup(pid: number, gracefulStopMs: number): Promise<Result<void, Error>> {
 		const initial = await this.probeProcessGroup(pid)
 		if (initial.state === 'gone') return Ok(undefined)
@@ -908,14 +1158,26 @@ export class ServiceExecutor {
 	 * Stop a running service gracefully.
 	 * Port is NOT released — kept for session-level stability across restarts.
 	 */
-	async stop(serviceType: string, sessionId: SessionId): Promise<Result<void, ToolError>> {
+	async stop(serviceType: string, sessionId: SessionId, stoppedBy: ServiceStopSource = 'agent'): Promise<Result<void, ToolError>> {
+		const inFlight = this.stopInFlight.get(serviceType)
+		if (inFlight) return inFlight
+
+		let operation: Promise<Result<void, ToolError>>
+		operation = this.stopInternal(serviceType, sessionId, stoppedBy).finally(() => {
+			if (this.stopInFlight.get(serviceType) === operation) this.stopInFlight.delete(serviceType)
+		})
+		this.stopInFlight.set(serviceType, operation)
+		return operation
+	}
+
+	private async stopInternal(serviceType: string, sessionId: SessionId, stoppedBy: ServiceStopSource): Promise<Result<void, ToolError>> {
 		const hadPendingRestart = this.cancelPendingRestart(serviceType)
 		this.restartRetries.delete(serviceType)
 		const entry = this.services.get(serviceType)
 		if (!entry) {
 			return Err({ message: `Service '${serviceType}' not found`, recoverable: false })
 		}
-		if (entry.status !== 'starting' && entry.status !== 'ready' && entry.status !== 'paused') {
+		if (entry.status !== 'starting' && entry.status !== 'ready') {
 			// A failed service with a revival queued is really "about to restart",
 			// and calling that off is a legitimate stop rather than an error.
 			if (hadPendingRestart) {
@@ -925,13 +1187,14 @@ export class ServiceExecutor {
 					return Err({ message: this.errorWithContext(error, `Failed to forget PID for service '${serviceType}'`).message, recoverable: true })
 				}
 				entry.status = 'stopped'
-				this.notifyStatusChanged(sessionId, serviceType, 'stopped')
+				this.notifyStatusChanged(sessionId, serviceType, 'stopped', { stoppedBy })
 				return Ok(undefined)
 			}
 			return Err({ message: `Service '${serviceType}' is ${entry.status}, cannot stop`, recoverable: false })
 		}
 
 		const previousStatus = entry.status
+		this.recordStopSource(entry, stoppedBy)
 		entry.status = 'stopping'
 		this.notifyStatusChanged(sessionId, serviceType, 'stopping')
 
@@ -957,7 +1220,7 @@ export class ServiceExecutor {
 		}
 		if (entry.status === 'stopping') {
 			entry.status = 'stopped'
-			this.notifyStatusChanged(sessionId, serviceType, 'stopped')
+			this.notifyStatusChanged(sessionId, serviceType, 'stopped', { stoppedBy: entry.stopSource ?? stoppedBy })
 		}
 
 		this.logger.info('Service stopped', { serviceType })
@@ -974,70 +1237,12 @@ export class ServiceExecutor {
 		preferredPort?: number,
 	): Promise<Result<void, ToolError>> {
 		const entry = this.services.get(config.type)
-		if (entry && (entry.status === 'starting' || entry.status === 'ready' || entry.status === 'paused')) {
+		if (entry && (entry.status === 'starting' || entry.status === 'ready')) {
 			const stopResult = await this.stop(config.type, sessionId)
 			if (!stopResult.ok) return stopResult
 		}
 
 		return this.start(config, sessionId, workspaceDir, preferredPort)
-	}
-
-	/**
-	 * Pause a running service (SIGSTOP).
-	 */
-	async pause(serviceType: string, sessionId: SessionId): Promise<Result<void, ToolError>> {
-		const entry = this.services.get(serviceType)
-		if (!entry) {
-			return Err({ message: `Service '${serviceType}' not found`, recoverable: false })
-		}
-		if (entry.status !== 'ready') {
-			return Err({ message: `Service '${serviceType}' is ${entry.status}, cannot pause`, recoverable: false })
-		}
-
-		try {
-			process.kill(entry.pid, 'SIGSTOP')
-		} catch {
-			return Err({ message: `Failed to pause service '${serviceType}'`, recoverable: false })
-		}
-
-		entry.status = 'paused'
-		this.notifyStatusChanged(sessionId, serviceType, 'paused')
-
-		this.logger.info('Service paused', { serviceType })
-		return Ok(undefined)
-	}
-
-	/**
-	 * Resume a paused service (SIGCONT).
-	 */
-	async resume(
-		config: ServiceConfig,
-		sessionId: SessionId,
-		_workspaceDir?: string,
-	): Promise<Result<void, ToolError>> {
-		const entry = this.services.get(config.type)
-		if (!entry) {
-			return Err({ message: `Service '${config.type}' not found`, recoverable: false })
-		}
-		if (entry.status !== 'paused') {
-			return Err({ message: `Service '${config.type}' is ${entry.status}, cannot resume`, recoverable: false })
-		}
-
-		try {
-			process.kill(entry.pid, 'SIGCONT')
-		} catch {
-			return Err({ message: `Failed to resume service '${config.type}'`, recoverable: false })
-		}
-
-		entry.status = 'ready'
-		this.notifyStatusChanged(sessionId, config.type, 'ready', {
-			port: entry.port,
-			cwd: entry.cwd,
-			command: entry.command,
-		})
-
-		this.logger.info('Service resumed', { serviceType: config.type })
-		return Ok(undefined)
 	}
 
 	/**
@@ -1063,52 +1268,6 @@ export class ServiceExecutor {
 	 */
 	isRunning(serviceType: string): boolean {
 		const status = this.getStatus(serviceType)
-		return status === 'starting' || status === 'ready' || status === 'paused'
-	}
-
-	/**
-	 * Shutdown all services and release all ports back to pool.
-	 * Called on session close.
-	 */
-	async shutdown(): Promise<void> {
-		// Nothing queued may spawn after the executor is gone.
-		for (const serviceType of [...this.restartTimers.keys()]) this.cancelPendingRestart(serviceType)
-		this.restartRetries.clear()
-
-		const promises: Promise<void>[] = []
-
-		for (const [serviceType, entry] of this.services) {
-			if (entry.status === 'starting' || entry.status === 'ready' || entry.status === 'paused' || entry.status === 'stopping') {
-				const gracefulStopMs = entry.config.gracefulStopMs ?? 5000
-
-				const killPromise = this.terminateProcessGroup(entry.pid, gracefulStopMs).then(async (stopped) => {
-					if (!stopped.ok) throw stopped.error
-					await entry.forgetPid()
-				})
-
-				promises.push(killPromise)
-				entry.status = 'stopping'
-				this.logger.info('Shutting down service', { serviceType })
-			}
-		}
-
-		await Promise.all(promises)
-		await Promise.all(this.pidForgets.values())
-		this.services.clear()
-
-		// Drain all waiters with error
-		for (const [serviceType, pending] of this.waiters) {
-			for (const waiter of pending) {
-				clearTimeout(waiter.timer)
-				waiter.resolve(Err({ message: `Service '${serviceType}' shut down`, recoverable: false }))
-			}
-		}
-		this.waiters.clear()
-
-		// Release all allocated ports back to pool
-		for (const port of this.allocatedPorts.values()) {
-			this.portPool.release(port)
-		}
-		this.allocatedPorts.clear()
+		return status === 'starting' || status === 'ready'
 	}
 }

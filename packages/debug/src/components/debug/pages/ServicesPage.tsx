@@ -10,7 +10,6 @@ const statusColors: Record<ServiceStatus, string> = {
 	ready: 'bg-green-100 text-green-700',
 	stopping: 'bg-orange-100 text-orange-700',
 	failed: 'bg-red-100 text-red-700',
-	paused: 'bg-blue-100 text-blue-700',
 }
 
 function formatTimestamp(ts: number | undefined): string {
