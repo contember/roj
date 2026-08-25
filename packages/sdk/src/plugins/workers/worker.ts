@@ -60,10 +60,21 @@ export interface WorkerEntry {
 	workerType: string
 	/** Common status */
 	status: WorkerStatus
-	/** Worker-specific state (managed by worker's reducer) */
-	state: unknown
-	/** Configuration passed when starting the worker */
-	config: unknown
+	/** Worker-specific state, retained only while resumable. */
+	state?: unknown
+	/** Configuration passed when starting the worker, retained only while resumable. */
+	config?: unknown
+	/** Compact successful completion details. */
+	result?: {
+		status: string
+		resultsPath?: string
+		summary: string
+	}
+	/** Compact failure details. */
+	error?: {
+		message: string
+		resumable: boolean
+	}
 	/** Timestamps */
 	createdAt: number
 	updatedAt: number

@@ -12,7 +12,6 @@ import type { AgentId } from '~/core/agents/schema.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import type { SessionState } from '~/core/sessions/state.js'
-import { getNextMessageSeq, selectMailboxState } from '~/plugins/mailbox/query.js'
 import { generateMessageId } from '~/plugins/mailbox/schema.js'
 import { mailboxEvents } from '~/plugins/mailbox/state.js'
 import type { Logger } from '../../lib/logger/logger.js'
@@ -48,13 +47,24 @@ export interface WorkerContext<TState, TSubEvent extends WorkerSubEvent> {
 	readonly files: FileStore
 
 	/**
+	 * True when `execute()` is re-entered for a worker that already ran — after a
+	 * runtime rebuild or a `resume`. The state handed to this run is already
+	 * reconstructed from the event log, so a resumed worker must continue from
+	 * `getState()` rather than start over.
+	 */
+	readonly resumed: boolean
+
+	/**
 	 * Get current worker state (reconstructed from events).
 	 */
 	getState(): TState
 
 	/**
 	 * Emit a worker-specific event.
-	 * The event is persisted and applied to state.
+	 *
+	 * Applies the event to local state and persists it — but only while this run is
+	 * live: once the run has been stopped (pause, cancel, session close) the emit is
+	 * skipped and nothing is persisted.
 	 */
 	emit(event: TSubEvent): Promise<void>
 
@@ -65,8 +75,9 @@ export interface WorkerContext<TState, TSubEvent extends WorkerSubEvent> {
 	shouldContinue(): boolean
 
 	/**
-	 * Check if worker is paused.
-	 * Workers should pause their work when this returns true.
+	 * Check if a pause was requested for this worker.
+	 * A pause also stops execution — `shouldContinue()` goes false and `resume`
+	 * re-enters `execute()` — so this only tells a pause from a cancellation.
 	 */
 	isPaused(): boolean
 
@@ -102,11 +113,16 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 	readonly agentId: AgentId
 	readonly logger: Logger
 	readonly files: FileStore
+	readonly resumed: boolean
 
 	private readonly workerType: string
 	private readonly emitEvent: EmitEvent
 	private readonly getSessionStateCallback: () => SessionState
 	private readonly reducer: (state: TState, event: TSubEvent) => TState
+	private readonly reserveMailboxMessageSequence: () => number
+	private readonly acquireEffectLease: () => (() => void) | null
+	private readonly inFlightEffects = new Set<Promise<void>>()
+	private readonly effectLeases = new Set<() => void>()
 	private localState: TState
 
 	/**
@@ -115,10 +131,7 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 	 */
 	private _cancelled = false
 
-	/**
-	 * Local pause flag - provides immediate signal before event is persisted.
-	 * This is set by pause() and checked by isPaused() for fast response.
-	 */
+	/** Set by pause() so a winding-down run can tell a pause from a cancellation. */
 	private _paused = false
 
 	/**
@@ -126,6 +139,7 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 	 * Aborted when cancel() is called.
 	 */
 	private readonly abortController = new AbortController()
+	private active = true
 
 	private readonly scheduleCallback?: () => void
 
@@ -137,8 +151,11 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 		files: FileStore
 		emitEvent: EmitEvent
 		getSessionState: () => SessionState
+		reserveMailboxMessageSequence: () => number
+		acquireEffectLease: () => (() => void) | null
 		reducer: (state: TState, event: TSubEvent) => TState
 		initialState: TState
+		resumed: boolean
 		logger: Logger
 		schedule?: () => void
 	}) {
@@ -149,8 +166,11 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 		this.files = params.files
 		this.emitEvent = params.emitEvent
 		this.getSessionStateCallback = params.getSessionState
+		this.reserveMailboxMessageSequence = params.reserveMailboxMessageSequence
+		this.acquireEffectLease = params.acquireEffectLease
 		this.reducer = params.reducer
 		this.localState = params.initialState
+		this.resumed = params.resumed
 		this.logger = params.logger
 		this.scheduleCallback = params.schedule
 	}
@@ -167,12 +187,21 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 	 * Applies the event to local state before persisting.
 	 */
 	async emit(event: TSubEvent): Promise<void> {
-		this.localState = this.reducer(this.localState, event)
-		await this.emitEvent(workerEvents.create('worker_sub_event', {
-			workerId: this.workerId,
-			workerType: this.workerType,
-			subEvent: event,
-		}))
+		await this.runEffect(async () => {
+			this.localState = this.reducer(this.localState, event)
+			await this.emitEvent(workerEvents.create('worker_sub_event', {
+				workerId: this.workerId,
+				workerType: this.workerType,
+				subEvent: event,
+			}))
+		})
+	}
+
+	/** Persist a terminal worker event within the context effect lifecycle. */
+	async persistTerminal(event: Parameters<EmitEvent>[0]): Promise<boolean> {
+		return this.runEffect(async () => {
+			await this.emitEvent(event)
+		})
 	}
 
 	/**
@@ -180,7 +209,7 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 	 * Returns false if cancelled.
 	 */
 	shouldContinue(): boolean {
-		return !this._cancelled
+		return this.active && !this._cancelled
 	}
 
 	/**
@@ -197,20 +226,24 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 	 * as sender, but workers need to send as WorkerId. Migrate when mailbox.send supports WorkerId.
 	 */
 	async notifyAgent(message: string): Promise<void> {
-		const messageId = generateMessageId(getNextMessageSeq(selectMailboxState(this.getSessionStateCallback())))
+		await this.runEffect(async () => {
+			const sequence = this.reserveMailboxMessageSequence()
+			const messageId = generateMessageId(sequence)
 
-		await this.emitEvent(mailboxEvents.create('mailbox_message', {
-			toAgentId: this.agentId,
-			message: {
-				id: messageId,
-				from: this.workerId,
-				content: message,
-				timestamp: Date.now(),
-				consumed: false,
-			},
-		}))
+			await this.emitEvent(mailboxEvents.create('mailbox_message', {
+				toAgentId: this.agentId,
+				sequence,
+				message: {
+					id: messageId,
+					from: this.workerId,
+					content: message,
+					timestamp: Date.now(),
+					consumed: false,
+				},
+			}))
 
-		this.scheduleCallback?.()
+			if (this.active) this.scheduleCallback?.()
+		})
 	}
 
 	/**
@@ -235,17 +268,47 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 		this.abortController.abort()
 	}
 
-	/**
-	 * Mark worker as paused.
-	 */
-	pause(): void {
-		this._paused = true
+	/** Permanently disable callbacks — the worker is stopping and will never resume this run. */
+	invalidate(): void {
+		this.active = false
+		this.cancel()
+	}
+
+	/** Wait for effects that started before invalidation. */
+	async waitForEffects(): Promise<void> {
+		await Promise.allSettled([...this.inFlightEffects])
+	}
+
+	/** Give back the leases of effects that outlived their drain deadline, so a stalled write cannot pin the runtime forever. */
+	releaseEffectLeases(): void {
+		for (const release of this.effectLeases) release()
+		this.effectLeases.clear()
+	}
+
+	private async runEffect(effect: () => Promise<void>): Promise<boolean> {
+		if (!this.active) return false
+		// The runtime can start unloading between the check above and here — skip the
+		// effect rather than throw a lease error into worker code.
+		const releaseLease = this.acquireEffectLease()
+		if (!releaseLease) return false
+		this.effectLeases.add(releaseLease)
+		let promise: Promise<void> | undefined
+		try {
+			promise = effect()
+			this.inFlightEffects.add(promise)
+			await promise
+		} finally {
+			if (promise) this.inFlightEffects.delete(promise)
+			this.effectLeases.delete(releaseLease)
+			releaseLease()
+		}
+		return true
 	}
 
 	/**
-	 * Resume worker.
+	 * Record that this run is stopping because of a pause, not a cancellation.
 	 */
-	resume(): void {
-		this._paused = false
+	pause(): void {
+		this._paused = true
 	}
 }
