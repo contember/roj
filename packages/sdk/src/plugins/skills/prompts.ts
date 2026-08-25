@@ -2,7 +2,7 @@
  * Skills Prompt Sections - Build prompt sections for skill metadata and loaded skills.
  */
 
-import type { LoadedSkill, SkillMetadata } from './schema.js'
+import type { LoadedSkillContent, SkillMetadata } from './schema.js'
 
 // ============================================================================
 // Available Skills Section
@@ -46,7 +46,7 @@ export function buildSkillsSection(skills: SkillMetadata[]): string {
  * @param loadedSkills - Array of skills loaded into agent context
  * @returns Formatted string with all loaded skill content
  */
-export function formatLoadedSkills(loadedSkills: LoadedSkill[]): string {
+export function formatLoadedSkills(loadedSkills: LoadedSkillContent[]): string {
 	if (loadedSkills.length === 0) {
 		return ''
 	}
@@ -69,7 +69,7 @@ ${skill.content}
  * @param loadedSkills - Array of skills loaded into agent context
  * @returns System message content or null
  */
-export function buildLoadedSkillsMessage(loadedSkills: LoadedSkill[]): string | null {
+export function buildLoadedSkillsMessage(loadedSkills: LoadedSkillContent[]): string | null {
 	if (loadedSkills.length === 0) {
 		return null
 	}

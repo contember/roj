@@ -64,7 +64,12 @@ export const resultEvictionPlugin = definePlugin('result-eviction')
 		// Write full text to file via FileStore
 		const fileName = `${ctx.toolCall.id}.txt`
 		const filePath = `.results/${fileName}`
-		await ctx.files.session.write(filePath, text)
+		const writeResult = await ctx.files.session.write(filePath, text)
+		if (!writeResult.ok) {
+			// Keep the untruncated result rather than point the agent at a file that was never written.
+			ctx.logger.warn('Result eviction skipped: write failed', { filePath, error: writeResult.error })
+			return null
+		}
 
 		const preview = `${truncation.content}\n\n[Full output saved to: ${filePath}]`
 		const evicted: ToolResultContent = typeof content === 'string' ? preview : withTextReplaced(content, preview)

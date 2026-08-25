@@ -13,7 +13,7 @@ export type {
 
 // Schema
 export { SkillId, skillIdSchema } from './schema.js'
-export type { LoadedSkill, SkillMetadata } from './schema.js'
+export type { LoadedSkill, LoadedSkillContent, SkillMetadata } from './schema.js'
 
 // Events & state slice (now in plugin.ts)
 export { skillEvents } from './plugin.js'

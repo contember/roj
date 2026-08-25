@@ -69,10 +69,13 @@ export interface LoadedSkill {
 	id: SkillId
 	/** Skill name */
 	name: string
-	/** Full content of the SKILL.md file (without frontmatter) */
-	content: string
 	/** Timestamp when the skill was loaded */
 	loadedAt: number
+}
+
+/** Loaded skill content used only while creating the agent preamble. */
+export interface LoadedSkillContent extends LoadedSkill {
+	content: string
 }
 
 // ============================================================================
