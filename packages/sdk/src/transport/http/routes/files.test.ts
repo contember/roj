@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { Hono } from 'hono'
 import { bootstrap, createSessionManager } from '../../../bootstrap.js'
@@ -129,6 +129,40 @@ describe('file routes', () => {
 		const response = await app.request(`/sessions/${sessionId}/files/${traversal}`)
 
 		expect(response.status).toBe(403)
+	})
+
+	it('rejects a session id whose encoded slash escapes the sessions root', async () => {
+		const { app, baseDir } = currentFixture()
+		await writeFile(join(baseDir, 'outside-sessions.txt'), 'TOP-SECRET-OUTSIDE-DATA-ROOT')
+
+		// `%2F` survives Hono's route matching and only decodes at `c.req.param`, so the
+		// id used to be joined into the path after `preventTraversal` had picked its root.
+		const escapingId = encodeURIComponent(`../../${basename(baseDir)}`)
+		const response = await app.request(`/sessions/${escapingId}/files/outside-sessions.txt`)
+
+		expect(response.status).toBe(400)
+		const body = await response.text()
+		expect(body).not.toContain('TOP-SECRET-OUTSIDE-DATA-ROOT')
+		expect(body).not.toContain(basename(baseDir))
+	})
+
+	it('rejects a session id whose encoded slash escapes the workspace route', async () => {
+		const { app } = currentFixture()
+
+		const response = await app.request(`/sessions/${encodeURIComponent('../..')}/workspace/escape.txt`)
+
+		expect(response.status).toBe(400)
+	})
+
+	it('marks served files as non-sniffable', async () => {
+		const { app, sessionDir, sessionId } = currentFixture()
+		await writeFile(join(sessionDir, 'page.html'), '<script>alert(1)</script>')
+
+		const response = await app.request(`/sessions/${sessionId}/files/page.html`)
+
+		expect(response.status).toBe(200)
+		expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff')
+		expect(response.headers.get('Content-Security-Policy')).toBe("default-src 'none'; sandbox")
 	})
 
 	it('keeps missing files as not found', async () => {

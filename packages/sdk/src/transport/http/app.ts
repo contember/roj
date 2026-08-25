@@ -62,6 +62,7 @@ export function createApp(services: AppServices): Hono<AppEnv> {
 			},
 			stats: {
 				sessionCount: stats.sessionCount,
+				loadedSessionCount: stats.loadedSessionCount,
 				pendingAgents: stats.pendingAgents,
 				processingAgents: stats.processingAgents,
 			},
