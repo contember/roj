@@ -191,7 +191,7 @@ describe('applyEvent', () => {
 	})
 
 	describe('mailbox_consumed', () => {
-		it('marks messages as consumed', () => {
+		it('removes consumed message payloads', () => {
 			const agentId = generateTestAgentId()
 			const messageId = generateTestMessageId()
 
@@ -234,7 +234,7 @@ describe('applyEvent', () => {
 
 			session = applyEvent(session, event)
 
-			expect(getAgentMailbox(selectMailboxState(session), agentId)[0].consumed).toBe(true)
+			expect(getAgentMailbox(selectMailboxState(session), agentId)).toHaveLength(0)
 		})
 	})
 
@@ -520,8 +520,8 @@ describe('applyEvent', () => {
 				),
 			)
 
-			// After mailbox_consumed, message should be consumed
-			expect(getAgentMailbox(selectMailboxState(session), agentId)[0].consumed).toBe(true)
+			// After mailbox_consumed, the payload leaves live state.
+			expect(getAgentMailbox(selectMailboxState(session), agentId)).toHaveLength(0)
 
 			// Inference still works after consumption
 			session = applyEvent(
@@ -991,7 +991,7 @@ describe('applyEvent', () => {
 			expect(finalAgent.status).toBe('pending')
 			expect(finalAgent.pendingMessages).toHaveLength(0)
 			expect(finalAgent.pendingToolResults).toHaveLength(0)
-			expect(getAgentMailbox(selectMailboxState(session), agentId)[0].consumed).toBe(true)
+			expect(getAgentMailbox(selectMailboxState(session), agentId)).toHaveLength(0)
 
 			// History contains: assistant (tool call) + tool + user + assistant (final)
 			expect(finalAgent.conversationHistory).toHaveLength(4)

@@ -5,6 +5,7 @@ import { MemoryEventStore } from '~/core/events/index.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { ModelId } from '~/core/llm/schema.js'
 import { generateSessionId } from '~/core/sessions/schema.js'
+import { SessionRuntimeActivityController } from '~/core/sessions/runtime-activity.js'
 import { createSessionState } from '~/core/sessions/state.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import { silentLogger } from '../../lib/logger/logger.js'
@@ -22,6 +23,8 @@ const createTestContext = (): ToolContext => {
 	const sessionId = generateSessionId()
 	const agentId = generateTestAgentId()
 	const sessionState = createSessionState(sessionId, 'test', Date.now())
+	const runtimeActivity = new SessionRuntimeActivityController()
+	let nextMailboxMessageSequence = 1
 	const fileStore = new SessionFileStore('/tmp/test-session', undefined, false, createNodePlatform().fs)
 	const agentState = {
 		id: agentId,
@@ -37,6 +40,7 @@ const createTestContext = (): ToolContext => {
 	return {
 		sessionId,
 		sessionState,
+		getSessionState: () => sessionState,
 		sessionInput: undefined,
 		environment: { sessionDir: '/tmp/test-session', sandboxed: false },
 		llm: MockLLMProvider.withFixedResponse({ content: '', toolCalls: [], finishReason: 'stop' }),
@@ -44,6 +48,9 @@ const createTestContext = (): ToolContext => {
 		eventStore: new MemoryEventStore(),
 		platform: createNodePlatform(),
 		logger: silentLogger,
+		runtimeActivity,
+		reserveSequence: (_name, seed) => seed(),
+		reserveMailboxMessageSequence: () => nextMailboxMessageSequence++,
 		emitEvent: async () => {},
 		emitEvents: async () => {},
 		notify: () => {},

@@ -1,5 +1,6 @@
 import type { DomainEvent } from '~/core/events/types.js'
-import type { ListSessionsOptions, SessionId, SessionMetadata } from '~/core/sessions/schema.js'
+import { sessionMetadataSchema } from '~/core/sessions/schema.js'
+import type { ListSessionsOptions, SessionId, SessionMetadata, SessionMetadataMetrics } from '~/core/sessions/schema.js'
 import { EventStoreError, type EventStore, type LoadRangeOptions, type LoadRangeResult } from './event-store.js'
 import type { MetadataEvent } from './metadata-utils.js'
 import { computeMetadataFromEvents, needsReconciliation } from './metadata-utils.js'
@@ -62,14 +63,19 @@ export abstract class BaseEventStore implements EventStore {
 		update: Partial<SessionMetadata>,
 	): Promise<void> {
 		const existing = await this.readMetadata(sessionId)
-		const metadata: SessionMetadata = {
+		const merged = {
 			...existing,
 			...update,
 			sessionId,
 			lastActivityAt: update.lastActivityAt ?? Date.now(),
-		} as SessionMetadata
+		}
 
-		await this.writeMetadata(sessionId, metadata)
+		// A merge over a missing or unreadable record can be incomplete, and writing that
+		// only replaces one unparseable meta.json with another — the read already reported it.
+		const metadata = sessionMetadataSchema.safeParse(merged)
+		if (!metadata.success) return
+
+		await this.writeMetadata(sessionId, metadata.data)
 	}
 
 	async listSessionsWithMetadata(
@@ -146,18 +152,20 @@ export abstract class BaseEventStore implements EventStore {
 
 		const metadata = await this.readMetadata(sessionId)
 
-		// Start with current metrics or defaults
-		let metrics = metadata?.metrics ?? {
-			totalEvents: 0,
-			totalAgents: 0,
-			totalTokens: 0,
-			totalLLMCalls: 0,
-			inputTokens: 0,
-			outputTokens: 0,
-			totalCost: 0,
-			totalMessages: 0,
-			totalToolCalls: 0,
-		}
+		// Copied: the record may be a store's own cached object and the counters below mutate in place.
+		let metrics: SessionMetadataMetrics = metadata?.metrics
+			? { ...metadata.metrics }
+			: {
+				totalEvents: 0,
+				totalAgents: 0,
+				totalTokens: 0,
+				totalLLMCalls: 0,
+				inputTokens: 0,
+				outputTokens: 0,
+				totalCost: 0,
+				totalMessages: 0,
+				totalToolCalls: 0,
+			}
 
 		const update: Partial<SessionMetadata> = {}
 

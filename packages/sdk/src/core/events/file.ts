@@ -1,8 +1,9 @@
 import { dirname, join } from 'node:path'
 import z from 'zod/v4'
 import type { DomainEvent } from '~/core/events/types.js'
-import type { FileSystem } from '~/platform/fs.js'
-import { domainEventSchema, SessionId, sessionMetadataSchema } from '~/core/sessions/schema.js'
+import { silentLogger, type Logger } from '~/lib/logger/logger.js'
+import type { Dirent, FileSystem } from '~/platform/fs.js'
+import { domainEventSchema, isValidSessionId, SessionId, sessionMetadataSchema } from '~/core/sessions/schema.js'
 import type { SessionMetadata } from '~/core/sessions/schema.js'
 import { BaseEventStore } from './base-event-store.js'
 import type { LoadRangeOptions, LoadRangeResult } from './event-store.js'
@@ -99,6 +100,40 @@ async function readLastLines(fs: FileSystem, filePath: string, lineCount: number
 	}
 }
 
+/** Identity of the meta.json bytes a cached verdict was taken from. */
+interface MetadataSource {
+	mtimeMs: number
+	size: number
+}
+
+/** A parsed record, or the verdict that the bytes it was read from do not parse. */
+type MetadataCacheEntry =
+	| { kind: 'record'; record: SessionMetadata }
+	| { kind: 'invalid'; source: MetadataSource }
+
+function isSameSource(a: MetadataSource, b: MetadataSource): boolean {
+	return a.mtimeMs === b.mtimeMs && a.size === b.size
+}
+
+function errorCode(error: unknown): string | undefined {
+	return error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : undefined
+}
+
+function isNotFound(error: unknown): boolean {
+	return errorCode(error) === 'ENOENT'
+}
+
+/** Before the cache every read parsed fresh JSON — keep that, so a mutating caller cannot corrupt it. */
+function copyMetadata(metadata: SessionMetadata | null): SessionMetadata | null {
+	if (!metadata) return null
+
+	const copy: SessionMetadata = { ...metadata }
+	if (metadata.metrics) copy.metrics = { ...metadata.metrics }
+	if (metadata.tags) copy.tags = [...metadata.tags]
+	if (metadata.custom) copy.custom = { ...metadata.custom }
+	return copy
+}
+
 /**
  * FileEventStore - Persists domain events to JSONL files.
  *
@@ -121,7 +156,28 @@ async function readLastLines(fs: FileSystem, filePath: string, lineCount: number
 export class FileEventStore extends BaseEventStore {
 	private readonly sessionLocks = new Map<SessionId, AsyncMutex>()
 
-	constructor(private readonly basePath: string, private readonly fs: FileSystem) {
+	/**
+	 * Parsed meta.json per session, so a `/status` poll costs one readdir instead of
+	 * one readFile per session directory that ever existed. An `invalid` entry records
+	 * bytes that exist but do not parse, so a corrupt record is reported once rather
+	 * than once per poll, and is re-read as soon as those bytes change.
+	 *
+	 * Coherence rule: writes win. writeMetadata is the only writer, and a read stores
+	 * its result only if the entry did not move while the read was in flight — a read
+	 * is a snapshot of older bytes, so it must never overwrite a newer write. A full
+	 * listing prunes the map to the readdir set, which keeps deletion and out-of-band
+	 * creation self-healing.
+	 */
+	private readonly metadataCache = new Map<SessionId, MetadataCacheEntry>()
+
+	/** Last reported read failure per session, so a permanent EACCES is not logged on every poll. */
+	private readonly reportedReadFailures = new Map<SessionId, string>()
+
+	constructor(
+		private readonly basePath: string,
+		private readonly fs: FileSystem,
+		private readonly logger: Logger = silentLogger,
+	) {
 		super()
 	}
 
@@ -242,11 +298,12 @@ export class FileEventStore extends BaseEventStore {
 
 		try {
 			const entries = await this.fs.readdir(sessionsDir, { withFileTypes: true })
+			// A directory whose name is not a valid id is not a session — the metadata listing drops it too.
 			return entries
-				.filter((entry) => entry.isDirectory())
-				.map((entry) => entry.name as SessionId)
+				.filter((entry) => entry.isDirectory() && isValidSessionId(entry.name))
+				.map((entry) => SessionId(entry.name))
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+			if (isNotFound(error)) {
 				return []
 			}
 			throw error
@@ -326,47 +383,166 @@ export class FileEventStore extends BaseEventStore {
 	// =========================================================================
 
 	protected async readMetadata(sessionId: SessionId): Promise<SessionMetadata | null> {
+		const cached = this.metadataCache.get(sessionId)
+		if (cached?.kind === 'record') return copyMetadata(cached.record)
+
 		const path = this.getMetaPath(sessionId)
 
 		try {
+			// Stat before the read, so a verdict is never keyed to bytes newer than the ones it judged.
+			const source = await this.readMetadataSource(path)
+			// A rejected record stays rejected only for the bytes that were rejected, so a repair is picked up.
+			if (cached && isSameSource(cached.source, source)) return null
+
 			const content = await this.fs.readFile(path, 'utf-8')
-			const parsed = JSON.parse(content)
-			const validated = sessionMetadataSchema.parse(parsed)
-			return validated as SessionMetadata
+			const record = this.parseMetadata(sessionId, content)
+			this.reportedReadFailures.delete(sessionId)
+
+			return copyMetadata(
+				this.commitRead(sessionId, cached, record ? { kind: 'record', record } : { kind: 'invalid', source }),
+			)
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+			if (isNotFound(error)) {
+				// A missing file is never cached — unknown ids must not be able to grow the map.
 				return null
 			}
+			this.reportReadFailure(sessionId, error)
 			throw error
 		}
+	}
+
+	/**
+	 * Cache what the read found, unless a write landed while it was in flight.
+	 *
+	 * A read only ever sees the bytes it started from, so the concurrent writer holds the
+	 * newer record and the reader reports that one instead of overwriting it with its own.
+	 */
+	private commitRead(
+		sessionId: SessionId,
+		before: MetadataCacheEntry | undefined,
+		entry: MetadataCacheEntry,
+	): SessionMetadata | null {
+		const current = this.metadataCache.get(sessionId)
+		if (current !== before) return current?.kind === 'record' ? current.record : null
+
+		this.metadataCache.set(sessionId, entry)
+		return entry.kind === 'record' ? entry.record : null
+	}
+
+	private async readMetadataSource(path: string): Promise<MetadataSource> {
+		const stats = await this.fs.stat(path)
+		return { mtimeMs: stats.mtimeMs, size: stats.size }
+	}
+
+	/** Reports a read that failed for anything but a missing file, once per failure kind. */
+	private reportReadFailure(sessionId: SessionId, error: unknown): void {
+		const code = errorCode(error) ?? 'unknown'
+		if (this.reportedReadFailures.get(sessionId) === code) return
+
+		this.reportedReadFailures.set(sessionId, code)
+		this.logger.error(
+			'Failed to read session metadata',
+			error instanceof Error ? error : new Error(String(error)),
+			{ sessionId },
+		)
+	}
+
+	/**
+	 * Strict on write, tolerant on read.
+	 *
+	 * meta.json is written non-atomically and its schema tightened over time, so a
+	 * single truncated or legacy record must not take the whole listing down with it.
+	 */
+	private parseMetadata(sessionId: SessionId, content: string): SessionMetadata | null {
+		let raw: unknown
+		try {
+			raw = JSON.parse(content)
+		} catch (error) {
+			this.logger.warn('Skipping unreadable session metadata', { sessionId, reason: String(error) })
+			return null
+		}
+
+		const parsed = sessionMetadataSchema.safeParse(raw)
+		if (!parsed.success) {
+			this.logger.warn('Skipping invalid session metadata', { sessionId, reason: parsed.error.message })
+			return null
+		}
+
+		return parsed.data
 	}
 
 	protected async writeMetadata(sessionId: SessionId, metadata: SessionMetadata): Promise<void> {
 		const path = this.getMetaPath(sessionId)
 		await this.fs.mkdir(dirname(path), { recursive: true })
 		await this.fs.writeFile(path, JSON.stringify(metadata, null, 2))
+
+		// The cache may only hold what a read would return, so the record goes in through the same schema.
+		const parsed = sessionMetadataSchema.safeParse(metadata)
+		if (!parsed.success) {
+			this.logger.warn('Not caching invalid session metadata', { sessionId, reason: parsed.error.message })
+			this.metadataCache.delete(sessionId)
+			return
+		}
+
+		// Cached only once the write lands, so a failed write leaves no phantom value.
+		this.metadataCache.set(sessionId, { kind: 'record', record: parsed.data })
+		this.reportedReadFailures.delete(sessionId)
 	}
 
 	protected async getAllSessionMetadata(): Promise<SessionMetadata[]> {
 		const sessionsDir = join(this.basePath, 'sessions')
 
+		let entries: Dirent[]
 		try {
-			const entries = await this.fs.readdir(sessionsDir, { withFileTypes: true })
-			const sessions: SessionMetadata[] = []
-
-			for (const entry of entries) {
-				if (!entry.isDirectory()) continue
-
-				const metadata = await this.readMetadata(entry.name as SessionId)
-				if (metadata) sessions.push(metadata)
-			}
-
-			return sessions
+			entries = await this.fs.readdir(sessionsDir, { withFileTypes: true })
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+			if (isNotFound(error)) {
+				// The data root is gone, so every session cached from it is gone with it.
+				this.forgetAll()
 				return []
 			}
 			throw error
 		}
+
+		const sessions: SessionMetadata[] = []
+		const present = new Set<SessionId>()
+
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue
+
+			const sessionId = SessionId(entry.name)
+			present.add(sessionId)
+
+			const metadata = await this.readMetadataOrSkip(sessionId)
+			if (metadata) sessions.push(metadata)
+		}
+
+		// The directory listing is the only thing that can remove a session, so prune here.
+		this.forgetMissing(present)
+
+		return sessions
+	}
+
+	/** One unreadable session must not take the listing down for every other one. */
+	private async readMetadataOrSkip(sessionId: SessionId): Promise<SessionMetadata | null> {
+		try {
+			return await this.readMetadata(sessionId)
+		} catch {
+			return null // already reported by readMetadata
+		}
+	}
+
+	private forgetMissing(present: Set<SessionId>): void {
+		for (const sessionId of this.metadataCache.keys()) {
+			if (!present.has(sessionId)) this.metadataCache.delete(sessionId)
+		}
+		for (const sessionId of this.reportedReadFailures.keys()) {
+			if (!present.has(sessionId)) this.reportedReadFailures.delete(sessionId)
+		}
+	}
+
+	private forgetAll(): void {
+		this.metadataCache.clear()
+		this.reportedReadFailures.clear()
 	}
 }

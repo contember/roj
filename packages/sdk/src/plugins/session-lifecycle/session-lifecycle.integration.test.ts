@@ -19,6 +19,31 @@ describe('session-lifecycle plugin', () => {
 	// =========================================================================
 
 	describe('sessions.create', () => {
+		it('rejects a caller-supplied sessionId that could escape the data root', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			try {
+				// path.join collapses `..`, so this used to mkdir and write JSONL outside
+				// the data root, and the exists() collision guard was checked on the
+				// traversed path too.
+				for (const sessionId of ['../../../../tmp/pwn', 'a/b', '.hidden', '']) {
+					const result = await harness.sessionManager.createSession('test', { sessionId })
+					expect(result.ok).toBe(false)
+				}
+
+				// A plain uuid — what both platform consumers mint — still works.
+				const ok = await harness.sessionManager.createSession('test', {
+					sessionId: '0195e5b7-1f4a-7c3d-9b21-5e6f7a8b9c0d',
+				})
+				expect(ok.ok).toBe(true)
+			} finally {
+				await harness.shutdown()
+			}
+		})
+
 		it('create session → returns sessionId → session is active', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],

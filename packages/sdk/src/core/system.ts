@@ -127,6 +127,12 @@ export interface CreateSystemOptions<TPlugins extends readonly PluginDefinition<
 	pidRegistry?: ServicePidRegistry
 	/** Host-environment adapters (filesystem, process). */
 	platform: Platform
+	/**
+	 * Evict a resident session runtime after this long idle. Absent or `0` keeps
+	 * every runtime resident, which is the default for programmatic SDK use.
+	 * An evicted runtime is rebuilt from its event log and re-runs `onSessionReady`.
+	 */
+	sessionIdleTimeoutMs?: number
 }
 
 // ============================================================================
@@ -154,6 +160,7 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		portPool,
 		pidRegistry,
 		platform,
+		sessionIdleTimeoutMs,
 	} = options
 
 	// Build plugins accessor — typed record keyed by plugin name
@@ -179,6 +186,7 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		portPool,
 		pidRegistry,
 		platform,
+		sessionIdleTimeoutMs,
 		systemPlugins: [...plugins],
 	})
 
