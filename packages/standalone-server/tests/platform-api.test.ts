@@ -118,7 +118,7 @@ async function createFixture(options: { presets?: Preset[] } = {}) {
 				error: { type: 'validation_error', message: `Unknown method: ${method}`, httpStatus: 400 },
 			}
 		},
-		async getSession(sessionId: SessionId) {
+		async withSessionLease(sessionId: SessionId, reason: string, operation) {
 			const id = String(sessionId)
 			if (cleanupFailure === 'getSession') throw new Error('getSession cleanup failed')
 			if (!activeSessions.has(id)) {
@@ -127,16 +127,18 @@ async function createFixture(options: { presets?: Preset[] } = {}) {
 					error: { type: 'session_not_found', message: `Session not found: ${id}`, httpStatus: 404 },
 				}
 			}
-			return {
-				ok: true,
-				value: {
+			calls.push(`session:lease:acquire:${reason}:${id}`)
+			try {
+				return await operation({
 					async close() {
 						if (cleanupFailure === 'close') throw new Error('close cleanup failed')
 						calls.push(`session:close:${id}`)
 						activeSessions.delete(id)
 						return { ok: true, value: undefined }
 					},
-				},
+				})
+			} finally {
+				calls.push(`session:lease:release:${reason}:${id}`)
 			}
 		},
 		async getStats() {
@@ -372,9 +374,14 @@ describe('standalone platform RPC', () => {
 		expect(first.error.message).toContain('deterministic injection failure')
 		expect(fixture.activeSessions.size).toBe(0)
 		expect(fixture.worktrees.size).toBe(0)
+		const leaseAcquireIndex = fixture.calls.findIndex(call => call.startsWith('session:lease:acquire:standalone:rollback:'))
 		const closeIndex = fixture.calls.findIndex(call => call.startsWith('session:close:'))
+		const leaseReleaseIndex = fixture.calls.findIndex(call => call.startsWith('session:lease:release:standalone:rollback:'))
 		const removeIndex = fixture.calls.findIndex(call => call.startsWith('worktree:remove:'))
+		expect(leaseAcquireIndex).toBeGreaterThan(-1)
 		expect(closeIndex).toBeGreaterThan(-1)
+		expect(closeIndex).toBeGreaterThan(leaseAcquireIndex)
+		expect(leaseReleaseIndex).toBeGreaterThan(closeIndex)
 		expect(removeIndex).toBeGreaterThan(closeIndex)
 
 		const retry = await rpc(fixture.app, 'instances.create', createInstanceInput({
