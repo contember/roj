@@ -64,7 +64,30 @@ Each hook returns `null` (continue) or an action:
 
 Hook context extends plugin context with `agentId`, `agentState`, `agentConfig`, and hook-specific fields (`pendingMessages`, `response`, `toolCall`, `result`, `error`).
 
-Session hooks: `onSessionReady` (once, after init + deps), `onSessionClose` (once on termination).
+Session hooks: `onSessionReady` (after init + deps) and `onSessionClose`. They fire
+**once per resident runtime lifetime, not once per session** — a runtime evicted after
+its idle timeout runs `onSessionClose`, and the next access runs `onSessionReady` again.
+Durable "the session is over" teardown belongs on the `session_closed` event, not here.
+
+### Async work outliving a call
+
+A runtime can be disposed between calls. Anything a plugin starts that outlives the
+handler it was started from — a timer, a background job, a child process, a queued write —
+must hold a lease, or the runtime is torn down underneath it:
+
+```ts
+const release = ctx.runtimeActivity.acquire('my-plugin:job')
+try {
+  await doTheWork()
+} finally {
+  release()
+}
+```
+
+Two rules that follow from it. Release in a `finally`, including on early returns and
+throws — a lease that escapes pins the runtime for the life of the process, which is the
+exact leak eviction exists to prevent. And read state through `ctx.getSessionState()`
+rather than the `ctx.sessionState` snapshot once you have awaited anything.
 
 ---
 
@@ -76,7 +99,8 @@ Every handler receives a context with:
 type Ctx = {
   // session
   sessionId: SessionId
-  sessionState: SessionState              // readonly composed state
+  sessionState: SessionState              // readonly composed state — a SNAPSHOT, stale after an await
+  getSessionState: () => SessionState     // live state; use this across awaits
   environment: SessionEnvironment         // { sessionDir, workspaceDir?, sandboxed, dataDir }
   files: FileStore                        // session-scoped fs
   llm: LLMProvider
@@ -84,6 +108,8 @@ type Ctx = {
   llmLogger?: LLMLogger
   platform: Platform                      // fs/process/env adapters
   logger: Logger
+  runtimeActivity: SessionRuntimeActivity  // lease guard — see "Async work outliving a call"
+  reserveMailboxMessageSequence: () => number  // the only correct source of mailbox message ids
   emitEvent: (event) => Promise<void>
   notify: (type, payload) => void
 
