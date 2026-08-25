@@ -9,10 +9,11 @@ import { agentEvents } from '~/core/agents/state.js'
 import { MemoryEventStore } from '~/core/events'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import { MockLLMProvider } from '~/core/llm/index.js'
-import type { InferenceResponse } from '~/core/llm/provider.js'
+import type { InferenceResponse, LLMError } from '~/core/llm/provider.js'
 import { ModelId } from '~/core/llm/schema.js'
 import { createApplyEvent } from '~/core/sessions/apply-event.js'
 import type { SessionContext } from '~/core/sessions/context.js'
+import { SessionRuntimeActivityController } from '~/core/sessions/runtime-activity.js'
 import { SessionId } from '~/core/sessions/schema.js'
 import { sessionEvents } from '~/core/sessions/state.js'
 import { ToolCallId } from '~/core/tools/schema.js'
@@ -32,6 +33,8 @@ import { Agent, type AgentConfig, type AgentDependencies } from './agent.js'
 
 const TEST_SESSION_ID = SessionId('test-session')
 const TEST_AGENT_ID = AgentId('test-agent-1')
+/** Retryable, with a zero retry-after so the inner LLM retries burn no wall clock. */
+const RATE_LIMITED: LLMError = { type: 'rate_limit', message: 'slow down', retryAfterMs: 0 }
 
 function createLogger() {
 	return new ConsoleLogger({ level: 'error' })
@@ -40,7 +43,14 @@ function createLogger() {
 async function createTestAgent(
 	config: Partial<AgentConfig> = {},
 	llmResponse?: Partial<InferenceResponse>,
-): Promise<{ agent: Agent; store: SessionStore; eventStore: MemoryEventStore; llmProvider: MockLLMProvider }> {
+	provider?: MockLLMProvider,
+): Promise<{
+	agent: Agent
+	store: SessionStore
+	eventStore: MemoryEventStore
+	llmProvider: MockLLMProvider
+	runtimeActivity: SessionRuntimeActivityController
+}> {
 	const eventStore = new MemoryEventStore()
 	const logger = createLogger()
 
@@ -74,7 +84,7 @@ async function createTestAgent(
 		...config,
 	}
 
-	const llmProvider = MockLLMProvider.withFixedResponse({
+	const llmProvider = provider ?? MockLLMProvider.withFixedResponse({
 		content: llmResponse?.content ?? 'Test response',
 		toolCalls: llmResponse?.toolCalls ?? [],
 		finishReason: llmResponse?.finishReason ?? 'stop',
@@ -82,9 +92,12 @@ async function createTestAgent(
 
 	const fileStore = new SessionFileStore('/tmp/test', undefined, false, createNodePlatform().fs)
 
+	const runtimeActivity = new SessionRuntimeActivityController()
+	let nextMailboxMessageSequence = 1
 	const sessionContext: SessionContext = {
 		sessionId: TEST_SESSION_ID,
 		sessionState: store.getState(),
+		getSessionState: () => store.getState(),
 		sessionInput: undefined,
 		environment: { sessionDir: '/tmp/test', sandboxed: false },
 		llm: llmProvider,
@@ -92,6 +105,9 @@ async function createTestAgent(
 		eventStore,
 		platform: createNodePlatform(),
 		logger,
+		runtimeActivity,
+		reserveSequence: (_name, seed) => seed(),
+		reserveMailboxMessageSequence: () => nextMailboxMessageSequence++,
 		emitEvent: async (event) => {
 			await store.emit(withSessionId(TEST_SESSION_ID, event))
 		},
@@ -103,7 +119,7 @@ async function createTestAgent(
 
 	const deps: AgentDependencies = {
 		id: TEST_AGENT_ID,
-		sessionContext,
+		getSessionContext: () => ({ ...sessionContext, sessionState: store.getState() }),
 		store,
 		llmProvider,
 		toolExecutor: new ToolExecutor(logger),
@@ -115,7 +131,7 @@ async function createTestAgent(
 	}
 
 	const agent = new Agent(deps)
-	return { agent, store, eventStore, llmProvider }
+	return { agent, store, eventStore, llmProvider, runtimeActivity }
 }
 
 async function addMailboxMessage(store: SessionStore, content: string) {
@@ -143,6 +159,14 @@ async function closeSession(store: SessionStore) {
  */
 async function flushTimers() {
 	await new Promise<void>((resolve) => setTimeout(resolve, 10))
+}
+
+/** Poll until the condition holds, so timing assertions don't ride on wall clock. */
+async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<void> {
+	const deadline = Date.now() + timeoutMs
+	while (Date.now() < deadline && !condition()) {
+		await new Promise<void>((resolve) => setTimeout(resolve, 5))
+	}
 }
 
 // ============================================================================
@@ -219,21 +243,179 @@ describe('Agent Shutdown', () => {
 	})
 
 	it('shutdown() stops scheduled processing', async () => {
-		const { agent, store, llmProvider } = await createTestAgent({
+		const { agent, store, llmProvider, runtimeActivity } = await createTestAgent({
 			debounceMs: 100,
 		})
 
 		await addMailboxMessage(store, 'Hello')
 		agent.scheduleProcessing()
 		expect(agent.isScheduled()).toBe(true)
+		expect(runtimeActivity.getSnapshot().reasons).toEqual({ [`agent:${TEST_AGENT_ID}:scheduled`]: 1 })
 
 		agent.shutdown()
 		expect(agent.isScheduled()).toBe(false)
+		expect(runtimeActivity.getSnapshot().activeCount).toBe(0)
 
 		// Wait longer than the debounce time
 		await new Promise<void>((resolve) => setTimeout(resolve, 150))
 
 		// LLM should never have been called
 		expect(llmProvider.getCallCount()).toBe(0)
+	})
+
+	it('a throwing debounceCallback releases the scheduled lease', async () => {
+		const { agent, store, runtimeActivity } = await createTestAgent({
+			debounceMs: 0,
+			checkIntervalMs: 5,
+			debounceCallback: () => {
+				throw new Error('preset callback blew up')
+			},
+		})
+
+		await addMailboxMessage(store, 'Hello')
+		agent.scheduleProcessing()
+		expect(runtimeActivity.getSnapshot().activeCount).toBe(1)
+
+		// The timer body must swallow the throw and cancel the schedule; otherwise the
+		// lease is held forever and the runtime can never be evicted.
+		await new Promise<void>((resolve) => setTimeout(resolve, 60))
+
+		expect(agent.isScheduled()).toBe(false)
+		expect(runtimeActivity.getSnapshot().activeCount).toBe(0)
+	})
+
+	it('a rejecting debounceCallback releases the scheduled lease', async () => {
+		const { agent, store, runtimeActivity } = await createTestAgent({
+			debounceMs: 0,
+			checkIntervalMs: 5,
+			debounceCallback: () => Promise.reject(new Error('preset callback rejected')),
+		})
+
+		await addMailboxMessage(store, 'Hello')
+		agent.scheduleProcessing()
+		await new Promise<void>((resolve) => setTimeout(resolve, 60))
+
+		expect(agent.isScheduled()).toBe(false)
+		expect(runtimeActivity.getSnapshot().activeCount).toBe(0)
+	})
+
+	it('continue() releases the scheduled lease even when the session is already closed', async () => {
+		const { agent, store, runtimeActivity } = await createTestAgent({ debounceMs: 100 })
+
+		await addMailboxMessage(store, 'Hello')
+		agent.scheduleProcessing()
+		expect(runtimeActivity.getSnapshot().activeCount).toBe(1)
+
+		// close() runs while the debounce timer is still armed — continue() fires next
+		// and used to early-return above the release.
+		await closeSession(store)
+		await agent.continue()
+
+		expect(runtimeActivity.getSnapshot().activeCount).toBe(0)
+	})
+
+	it('the error-resume backoff holds no lease, so a failing provider stays evictable', async () => {
+		const { agent, store, runtimeActivity } = await createTestAgent(
+			{ errorResumeBackoff: { baseDelayMs: 5_000, maxDelayMs: 5_000 } },
+			undefined,
+			MockLLMProvider.withError(RATE_LIMITED),
+		)
+
+		await addMailboxMessage(store, 'Hello')
+		await agent.continue()
+		// Inverted from "continue() keeps the error-retry lease while its timer is still
+		// armed". Leasing the wait made a session whose provider never recovers
+		// permanently resident — the exact retention this PR bounds. The lease now lives
+		// inside the retry callback, so the backoff itself pins nothing.
+		expect(runtimeActivity.getSnapshot().activeCount).toBe(0)
+
+		// A second continue() (a new user message during the backoff) must not strand one either.
+		await agent.continue()
+		expect(runtimeActivity.getSnapshot().activeCount).toBe(0)
+		expect(runtimeActivity.tryBeginUnload()).toBe(true)
+
+		agent.shutdown()
+	})
+
+	it('the error-retry timer fires, recovers, and leaves no lease behind', async () => {
+		let failNext = true
+		const provider = new MockLLMProvider(() => {
+			if (failNext) throw RATE_LIMITED
+			return { content: 'recovered', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+		})
+		const { agent, store, runtimeActivity } = await createTestAgent(
+			{ errorResumeBackoff: { baseDelayMs: 20, maxDelayMs: 20 } },
+			undefined,
+			provider,
+		)
+
+		await addMailboxMessage(store, 'Hello')
+		await agent.continue()
+		// withLLMRetry burns its five attempts, then the outer backoff takes over — unleased.
+		expect(provider.getCallCount()).toBe(5)
+		expect(runtimeActivity.getSnapshot().activeCount).toBe(0)
+
+		failNext = false
+		// Poll rather than sleep a fixed window: the claim is "the retry fired and the
+		// lease it took is gone", not "that happened inside 200ms of loaded-CI wall clock".
+		await waitUntil(() => provider.getCallCount() >= 6 && runtimeActivity.getSnapshot().activeCount === 0)
+
+		expect(provider.getCallCount()).toBe(6)
+		expect(store.getAgentState(TEST_AGENT_ID)?.status).toBe('pending')
+		expect(runtimeActivity.getSnapshot().activeCount).toBe(0)
+	})
+
+	it('scheduleErrorRetry() refuses to re-arm after shutdown()', async () => {
+		const { agent, store, runtimeActivity } = await createTestAgent(
+			{ errorResumeBackoff: { baseDelayMs: 200, maxDelayMs: 200 } },
+			undefined,
+			MockLLMProvider.withError(RATE_LIMITED),
+		)
+
+		await addMailboxMessage(store, 'Hello')
+		await agent.continue()
+		agent.shutdown()
+
+		// A turn still draining after shutdown() reaches resume_from_error again. The
+		// store is NOT closed on the forced-unload path, so only the abort guard stops it
+		// from arming a timer that keeps this Agent — and through getSessionContext the
+		// whole Session — reachable for the rest of the backoff.
+		await agent.continue()
+		const idleSince = runtimeActivity.getSnapshot().lastActivityAt
+		await new Promise<void>((resolve) => setTimeout(resolve, 400))
+
+		// A fired retry callback would have touched the runtime to take its lease.
+		expect(runtimeActivity.getSnapshot().lastActivityAt).toBe(idleSince)
+	})
+
+	it('waitForIdle() waits for a turn that outlives shutdown()', async () => {
+		let releaseInference = () => {}
+		const inferenceGate = new Promise<void>((resolve) => {
+			releaseInference = resolve
+		})
+		// The mock ignores the abort signal, like a tool that never checks it.
+		const provider = new MockLLMProvider(async () => {
+			await inferenceGate
+			return { content: 'late', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+		})
+		const { agent, store } = await createTestAgent({}, undefined, provider)
+
+		await addMailboxMessage(store, 'Hello')
+		const turn = agent.continue()
+		await new Promise<void>((resolve) => setTimeout(resolve, 20))
+		expect(provider.getCallCount()).toBe(1)
+
+		agent.shutdown()
+		let drained = false
+		const drain = agent.waitForIdle().then(() => {
+			drained = true
+		})
+		await new Promise<void>((resolve) => setTimeout(resolve, 20))
+		expect(drained).toBe(false)
+
+		releaseInference()
+		await drain
+		expect(drained).toBe(true)
+		await turn
 	})
 })

@@ -102,7 +102,7 @@ export interface AgentConfig<TInput = unknown> {
  */
 export interface AgentDependencies {
 	id: AgentId
-	sessionContext: SessionContext
+	getSessionContext: () => SessionContext
 	store: SessionStore
 	llmProvider: LLMProvider
 	/** Named provider instances, passed to InferenceContext for middleware routing */
@@ -141,7 +141,7 @@ export interface AgentDependencies {
 export class Agent {
 	readonly id: AgentId
 	private readonly config: AgentConfig
-	private readonly sessionContext: SessionContext
+	private readonly getSessionContext: () => SessionContext
 	private readonly store: SessionStore
 	private readonly logger: Logger
 	private readonly llmProvider: LLMProvider
@@ -161,9 +161,13 @@ export class Agent {
 	// Scheduler state (embedded)
 	private debounceTimer?: ReturnType<typeof setTimeout>
 	private errorRetryTimer?: ReturnType<typeof setTimeout>
+	private releaseScheduledLease?: () => void
+	private releaseErrorRetryLease?: () => void
 	private processing = false
 	private scheduled = false
 	private pendingReschedule = false
+	/** In-flight continue() calls, so disposal can drain a turn instead of racing it. */
+	private readonly inFlightContinues = new Set<Promise<void>>()
 	private readonly abortController = new AbortController()
 
 	/** Track conversation turn number for handler context */
@@ -172,7 +176,7 @@ export class Agent {
 	constructor(deps: AgentDependencies) {
 		this.id = deps.id
 		this.config = deps.config
-		this.sessionContext = deps.sessionContext
+		this.getSessionContext = deps.getSessionContext
 		this.store = deps.store
 		this.logger = deps.logger
 		this.llmProvider = deps.llmProvider
@@ -221,13 +225,49 @@ export class Agent {
 	// Public API
 	// ============================================================================
 
+	/** Drop the scheduled lease. Idempotent — the release closure self-guards. */
+	private dropScheduledLease(): void {
+		this.releaseScheduledLease?.()
+		this.releaseScheduledLease = undefined
+	}
+
 	/**
 	 * Unified processing entry point - decides what to do next.
 	 * Safe to call multiple times; skips if already processing.
 	 */
-	async continue(): Promise<void> {
+	continue(): Promise<void> {
+		const pending = this.runContinue().finally(() => {
+			this.inFlightContinues.delete(pending)
+		})
+		this.inFlightContinues.add(pending)
+		return pending
+	}
+
+	/**
+	 * Await the turn that is currently running, if any — including work it starts
+	 * while draining. Never rejects: callers use it to drain before teardown, not
+	 * to observe processing errors.
+	 */
+	async waitForIdle(): Promise<void> {
+		while (this.inFlightContinues.size > 0) {
+			await Promise.allSettled([...this.inFlightContinues])
+		}
+	}
+
+	private async runContinue(): Promise<void> {
+		// Release before the guards: both early-return paths are reachable from a
+		// fired timer, and the lease would otherwise outlive the schedule forever.
+		// The retry lease is not touched here — it only ever exists inside the
+		// retry callback, which releases it itself.
+		this.dropScheduledLease()
 		if (this.processing) return
 		if (this.store.isClosed()) return
+		let releaseProcessingLease: (() => void) | undefined
+		try {
+			releaseProcessingLease = this.getSessionContext().runtimeActivity.acquire(`agent:${this.id}:processing`)
+		} catch {
+			return
+		}
 		this.processing = true
 		this.scheduled = false
 
@@ -317,6 +357,7 @@ export class Agent {
 				this.pendingReschedule = false
 				this.scheduleProcessing()
 			}
+			releaseProcessingLease()
 		}
 	}
 
@@ -327,68 +368,37 @@ export class Agent {
 	scheduleProcessing(): void {
 		if (this.scheduled) return
 		if (this.store.isClosed()) return
+		// After shutdown() a fresh schedule would outlive the drain and fire against
+		// a session that already cleared its agents and plugin contexts.
+		if (this.abortController.signal.aborted) return
 		if (this.processing) {
 			this.pendingReschedule = true
 			return
 		}
 
 		this.cancelSchedule()
+		try {
+			this.releaseScheduledLease = this.getSessionContext().runtimeActivity.acquire(`agent:${this.id}:scheduled`)
+		} catch {
+			return
+		}
 		this.scheduled = true
 
 		const agentState = this.state
-		if (!agentState) return
+		if (!agentState) {
+			this.cancelSchedule()
+			return
+		}
 
 		if (this.config.debounceCallback) {
 			// Callback-based debounce using recursive setTimeout
 			const checkInterval = this.config.checkIntervalMs ?? 100
 
 			const scheduleCheck = () => {
-				this.debounceTimer = setTimeout(async () => {
-					// Re-read state fresh each check — no stale data
-					const currentState = this.state
-					if (!currentState) {
-						this.cancelSchedule()
-						return
-					}
-
-					// Guard: schedule could be cancelled between timer fire and here
-					if (!this.scheduled) return
-
-					const sessionState = this.store.getState()
-					const unconsumed = getUnconsumedMessages(sessionState, this.id)
-					const pendingToolResults = currentState.pendingToolResults
-
-					// If no messages, no pending tool results, and no plugin pending, nothing to do
-					if (unconsumed.length === 0 && pendingToolResults.length === 0 && !this.hasPluginPendingMessages()) {
-						this.cancelSchedule()
-						return
-					}
-
-					const oldestTimestamp = unconsumed.length > 0
-						? Math.min(...unconsumed.map((m) => m.timestamp))
-						: Date.now()
-					const oldestWaitingMs = Date.now() - oldestTimestamp
-
-					const decision = await this.config.debounceCallback!({
-						messages: unconsumed,
-						oldestWaitingMs,
-						totalPending: unconsumed.length,
-						pendingToolResults,
-					})
-
-					// Re-check after async callback — schedule could be cancelled during await
-					if (!this.scheduled) return
-
-					if (decision === 'process_now') {
-						this.cancelSchedule()
-						this.continue().catch((err) => {
-							this.logger.error('Unhandled error in continue()', err instanceof Error ? err : undefined, { agentId: this.id })
-						})
-					} else {
-						// Callback said "wait" — schedule next check.
-						// Fresh state will be read on next iteration.
-						scheduleCheck()
-					}
+				this.debounceTimer = setTimeout(() => {
+					// A throw here (hasPluginPendingMessages, or the preset-supplied
+					// debounceCallback — user code) must not strand the scheduled lease.
+					void this.runDebounceCheck(scheduleCheck)
 				}, checkInterval)
 			}
 
@@ -406,6 +416,59 @@ export class Agent {
 		}
 	}
 
+	/** One debounce-callback check. Never rejects: on error it cancels the schedule. */
+	private async runDebounceCheck(scheduleNext: () => void): Promise<void> {
+		try {
+			// Re-read state fresh each check — no stale data
+			const currentState = this.state
+			if (!currentState) {
+				this.cancelSchedule()
+				return
+			}
+
+			// Guard: schedule could be cancelled between timer fire and here
+			if (!this.scheduled) return
+
+			const sessionState = this.store.getState()
+			const unconsumed = getUnconsumedMessages(sessionState, this.id)
+			const pendingToolResults = currentState.pendingToolResults
+
+			// If no messages, no pending tool results, and no plugin pending, nothing to do
+			if (unconsumed.length === 0 && pendingToolResults.length === 0 && !this.hasPluginPendingMessages()) {
+				this.cancelSchedule()
+				return
+			}
+
+			const oldestTimestamp = unconsumed.length > 0
+				? Math.min(...unconsumed.map((m) => m.timestamp))
+				: Date.now()
+			const oldestWaitingMs = Date.now() - oldestTimestamp
+
+			const decision = await this.config.debounceCallback!({
+				messages: unconsumed,
+				oldestWaitingMs,
+				totalPending: unconsumed.length,
+				pendingToolResults,
+			})
+
+			// Re-check after async callback — schedule could be cancelled during await
+			if (!this.scheduled) return
+
+			if (decision === 'process_now') {
+				this.cancelSchedule()
+				this.continue().catch((err) => {
+					this.logger.error('Unhandled error in continue()', err instanceof Error ? err : undefined, { agentId: this.id })
+				})
+			} else {
+				// Callback said "wait" — schedule next check. Fresh state next iteration.
+				scheduleNext()
+			}
+		} catch (err) {
+			this.logger.error('Debounce check failed', err instanceof Error ? err : undefined, { agentId: this.id })
+			this.cancelSchedule()
+		}
+	}
+
 	/**
 	 * Shutdown the agent - cancel any scheduled processing.
 	 */
@@ -420,6 +483,8 @@ export class Agent {
 			clearTimeout(this.errorRetryTimer)
 			this.errorRetryTimer = undefined
 		}
+		this.releaseErrorRetryLease?.()
+		this.releaseErrorRetryLease = undefined
 	}
 
 	/**
@@ -547,9 +612,30 @@ export class Agent {
 	private scheduleErrorRetry(delayMs: number): void {
 		if (this.errorRetryTimer) return
 		if (this.store.isClosed()) return
+		// After shutdown() an armed retry keeps this Agent — and through
+		// getSessionContext the whole Session — reachable for the whole backoff.
+		if (this.abortController.signal.aborted) return
 		this.errorRetryTimer = setTimeout(() => {
 			this.errorRetryTimer = undefined
-			this.scheduleProcessing()
+			// Lease the retry, not the backoff before it: a provider that keeps
+			// failing would otherwise pin the runtime resident forever. The
+			// preserved dequeue token is in the event log, so a rebuilt runtime
+			// still has the work. scheduleProcessing() takes its own lease before
+			// this one drops, so the handover leaves no gap.
+			let release: (() => void) | null = null
+			try {
+				release = this.getSessionContext().runtimeActivity.tryAcquire(`agent:${this.id}:retry`)
+			} catch {
+				return
+			}
+			if (!release) return
+			this.releaseErrorRetryLease = release
+			try {
+				this.scheduleProcessing()
+			} finally {
+				this.releaseErrorRetryLease?.()
+				this.releaseErrorRetryLease = undefined
+			}
 		}, delayMs)
 	}
 
@@ -915,6 +1001,8 @@ export class Agent {
 		}
 		this.scheduled = false
 		this.pendingReschedule = false
+		this.releaseScheduledLease?.()
+		this.releaseScheduledLease = undefined
 	}
 
 	/**
@@ -1068,21 +1156,26 @@ export class Agent {
 	 * Build base AgentContext for handler/hook calls.
 	 */
 	private buildAgentContext(agentState: AgentState): AgentContext {
+		const sessionContext = this.getSessionContext()
 		return {
-			// SessionContext fields (refreshed from store for up-to-date state)
-			sessionId: this.sessionContext.sessionId,
+			// SessionContext fields are rebuilt for up-to-date state.
+			sessionId: sessionContext.sessionId,
 			sessionState: this.store.getState(),
-			sessionInput: this.sessionContext.sessionInput,
-			environment: this.sessionContext.environment,
-			llm: this.sessionContext.llm,
-			files: this.sessionContext.files,
-			eventStore: this.sessionContext.eventStore,
-			llmLogger: this.sessionContext.llmLogger,
-			platform: this.sessionContext.platform,
+			getSessionState: sessionContext.getSessionState,
+			sessionInput: sessionContext.sessionInput,
+			environment: sessionContext.environment,
+			llm: sessionContext.llm,
+			files: sessionContext.files,
+			eventStore: sessionContext.eventStore,
+			llmLogger: sessionContext.llmLogger,
+			platform: sessionContext.platform,
 			logger: this.logger,
-			emitEvent: this.sessionContext.emitEvent,
-			emitEvents: this.sessionContext.emitEvents,
-			notify: this.sessionContext.notify,
+			runtimeActivity: sessionContext.runtimeActivity,
+			reserveSequence: sessionContext.reserveSequence,
+			reserveMailboxMessageSequence: sessionContext.reserveMailboxMessageSequence,
+			emitEvent: sessionContext.emitEvent,
+			emitEvents: sessionContext.emitEvents,
+			notify: sessionContext.notify,
 			// AgentContext fields
 			agentId: this.id,
 			agentState,
