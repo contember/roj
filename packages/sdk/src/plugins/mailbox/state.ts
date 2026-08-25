@@ -19,6 +19,7 @@ export const mailboxEvents = createEventsFactory({
 	events: {
 		mailbox_message: z4.object({
 			toAgentId: agentIdSchema,
+			sequence: z4.number().int().positive().optional(),
 			message: z4.object({
 				id: messageIdSchema,
 				from: z4.union([

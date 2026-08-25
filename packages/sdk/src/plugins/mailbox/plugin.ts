@@ -9,7 +9,7 @@
 import z from "zod/v4";
 import { getAgentRole } from "~/core/agents/agent-roles.js";
 import { type AgentId, agentIdSchema } from "~/core/agents/schema.js";
-import { ValidationErrors } from "~/core/errors.js";
+import { SessionErrors, ValidationErrors } from "~/core/errors.js";
 import { definePlugin } from "~/core/plugins/plugin-builder.js";
 import { createTool } from "~/core/tools/definition.js";
 import type { ToolError } from "~/core/tools/index.js";
@@ -24,11 +24,10 @@ import {
 } from "./prompts.js";
 import {
 	getAgentUnconsumedMailbox,
-	getNextMessageSeq,
 	type MailboxPluginState,
 } from "./query.js";
 import { generateMessageId, type MessageId } from "./schema.js";
-import type { MailboxMessage } from "./schema.js";
+import type { MailboxMessage, MailboxMessageSender } from "./schema.js";
 import { mailboxEvents } from "./state.js";
 
 /**
@@ -52,6 +51,7 @@ export const mailboxPlugin = definePlugin("mailbox")
 		key: "mailbox",
 		initial: (): MailboxPluginState => ({
 			agentMailboxes: new Map(),
+			messageSequence: 0,
 		}),
 		reduce: (state, event) => {
 			switch (event.type) {
@@ -59,9 +59,16 @@ export const mailboxPlugin = definePlugin("mailbox")
 					const agentMailbox = state.agentMailboxes.get(event.toAgentId) ?? [];
 					const newMailboxes = new Map(state.agentMailboxes);
 					newMailboxes.set(event.toAgentId, [...agentMailbox, event.message]);
+					const parsedSequence = /^m(\d+)$/.exec(event.message.id);
+					const messageSequence = Math.max(
+						state.messageSequence ?? 0,
+						event.sequence ?? 0,
+						parsedSequence ? Number(parsedSequence[1]) : (state.messageSequence ?? 0) + 1,
+					);
 					return {
 						...state,
 						agentMailboxes: newMailboxes,
+						messageSequence,
 					};
 				}
 
@@ -70,12 +77,9 @@ export const mailboxPlugin = definePlugin("mailbox")
 					if (!mailbox) return state;
 					const consumedSet = new Set(event.messageIds);
 					const newMailboxes = new Map(state.agentMailboxes);
-					newMailboxes.set(
-						event.agentId,
-						mailbox.map((m) =>
-							consumedSet.has(m.id) ? { ...m, consumed: true } : m,
-						),
-					);
+					const remaining = mailbox.filter((message) => !consumedSet.has(message.id));
+					if (remaining.length === 0) newMailboxes.delete(event.agentId);
+					else newMailboxes.set(event.agentId, remaining);
 					return { ...state, agentMailboxes: newMailboxes };
 				}
 
@@ -95,74 +99,51 @@ export const mailboxPlugin = definePlugin("mailbox")
 		output: z.object({ messageId: z.string() }),
 		handler: async (ctx, input) => {
 			const { toAgentId, content } = input;
-
-			if (input.fromSupervisor) {
-				// System-emitted supervision status — bypasses communication validation.
-				const messageId = generateMessageId(getNextMessageSeq(ctx.pluginState));
-				await ctx.emitEvent(
-					mailboxEvents.create("mailbox_message", {
-						toAgentId,
-						message: {
-							id: messageId,
-							from: "supervisor",
-							content,
-							timestamp: Date.now(),
-							consumed: false,
-						},
-					}),
-				);
-				ctx.scheduleAgent(toAgentId);
-				return Ok({ messageId });
+			if (ctx.getSessionState().status === "closed") {
+				return Err(SessionErrors.closed(String(ctx.sessionId)));
 			}
 
-			if (input.debug) {
-				// Debug messages bypass communication validation
-				const messageId = generateMessageId(getNextMessageSeq(ctx.pluginState));
-				await ctx.emitEvent(
-					mailboxEvents.create("mailbox_message", {
-						toAgentId,
-						message: {
-							id: messageId,
-							from: "debug",
-							content,
-							timestamp: Date.now(),
-							consumed: false,
-						},
-					}),
-				);
-				ctx.scheduleAgent(toAgentId);
-				return Ok({ messageId });
+			let from: MailboxMessageSender;
+			if (input.fromSupervisor) from = "supervisor";
+			else if (input.debug) from = "debug";
+			else {
+				const fromAgentId = input.fromAgentId;
+				if (!fromAgentId) {
+					return Err(
+						ValidationErrors.invalid(
+							"fromAgentId is required for non-debug messages",
+						),
+					);
+				}
+
+				if (!canCommunicateWith(ctx.getSessionState(), fromAgentId, toAgentId)) {
+					const allowed = getCommunicableAgents(ctx.getSessionState(), fromAgentId);
+					const allowedStr = allowed.length > 0 ? allowed.join(", ") : "none";
+					return Err(
+						ValidationErrors.invalid(
+							`Cannot send message to agent ${toAgentId}. You can only communicate with your parent or children. Allowed agents: ${allowedStr}`,
+						),
+					);
+				}
+				from = fromAgentId;
 			}
 
-			const fromAgentId = input.fromAgentId;
-			if (!fromAgentId) {
-				return Err(
-					ValidationErrors.invalid(
-						"fromAgentId is required for non-debug messages",
-					),
-				);
+			let sequence: number;
+			try {
+				sequence = ctx.reserveMailboxMessageSequence();
+			} catch {
+				return Err(SessionErrors.closed(String(ctx.sessionId)));
 			}
-
-			// Validate that the target agent is allowed
-			if (!canCommunicateWith(ctx.sessionState, fromAgentId, toAgentId)) {
-				const allowed = getCommunicableAgents(ctx.sessionState, fromAgentId);
-				const allowedStr = allowed.length > 0 ? allowed.join(", ") : "none";
-				return Err(
-					ValidationErrors.invalid(
-						`Cannot send message to agent ${toAgentId}. You can only communicate with your parent or children. Allowed agents: ${allowedStr}`,
-					),
-				);
-			}
-
-			const messageId = generateMessageId(getNextMessageSeq(ctx.pluginState));
+			const messageId = generateMessageId(sequence);
 			const now = Date.now();
 
 			await ctx.emitEvent(
 				mailboxEvents.create("mailbox_message", {
 					toAgentId,
+					sequence,
 					message: {
 						id: messageId,
-						from: fromAgentId,
+						from,
 						content,
 						timestamp: now,
 						consumed: false,

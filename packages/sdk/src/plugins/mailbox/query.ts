@@ -15,9 +15,11 @@ import type { MailboxMessage } from './schema.js'
  */
 export interface MailboxPluginState {
 	agentMailboxes: Map<AgentId, MailboxMessage[]>
+	/** Highest message sequence observed, including consumed messages. */
+	messageSequence?: number
 }
 
-const defaultState: MailboxPluginState = { agentMailboxes: new Map() }
+const defaultState: MailboxPluginState = { agentMailboxes: new Map(), messageSequence: 0 }
 
 /**
  * Extract MailboxPluginState from SessionState.
@@ -27,7 +29,10 @@ export function selectMailboxState(sessionState: SessionState): MailboxPluginSta
 }
 
 /**
- * Get all mailbox messages for a specific agent.
+ * Get pending mailbox messages for a specific agent.
+ *
+ * Consumed messages are removed from live state and remain available only in
+ * the event log.
  */
 export function getAgentMailbox(pluginState: MailboxPluginState, agentId: AgentId): MailboxMessage[] {
 	return pluginState.agentMailboxes.get(agentId) ?? []
@@ -37,17 +42,20 @@ export function getAgentMailbox(pluginState: MailboxPluginState, agentId: AgentI
  * Get unconsumed mailbox messages for a specific agent.
  */
 export function getAgentUnconsumedMailbox(pluginState: MailboxPluginState, agentId: AgentId): MailboxMessage[] {
-	return getAgentMailbox(pluginState, agentId).filter((m) => !m.consumed)
+	return getAgentMailbox(pluginState, agentId)
 }
 
 /**
  * Get the next message sequence number.
- * Derived from total message count across all mailboxes (replay-safe).
+ * Uses the persistent high-water mark so pruning cannot reuse IDs.
  */
 export function getNextMessageSeq(pluginState: MailboxPluginState): number {
-	let total = 0
+	let highest = pluginState.messageSequence ?? 0
 	for (const messages of pluginState.agentMailboxes.values()) {
-		total += messages.length
+		for (const message of messages) {
+			const match = /^m(\d+)$/.exec(message.id)
+			if (match) highest = Math.max(highest, Number(match[1]))
+		}
 	}
-	return total + 1
+	return highest + 1
 }

@@ -900,12 +900,11 @@ describe('limits-guard plugin', () => {
 			}
 			expect(orchestratorSawChildPaused).toBe(true)
 
-			// And the message is marked consumed in the parent's mailbox.
+			// And the consumed message payload is pruned from the parent's mailbox.
 			const orchestratorId = session.getEntryAgentId()!
 			const mailbox = getAgentMailbox(selectMailboxState(session.state), orchestratorId)
 			const childPausedMsg = mailbox.find((m) => m.content.includes('<child-paused'))
-			expect(childPausedMsg).toBeDefined()
-			expect(childPausedMsg!.consumed).toBe(true)
+			expect(childPausedMsg).toBeUndefined()
 
 			await harness.shutdown()
 		})

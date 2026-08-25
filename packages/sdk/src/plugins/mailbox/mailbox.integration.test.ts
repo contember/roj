@@ -1,9 +1,39 @@
 import { describe, expect, it } from 'bun:test'
 import { AgentId } from '~/core/agents/schema.js'
+import { MemoryEventStore } from '~/core/events/memory.js'
+import { withSessionId } from '~/core/events/test-helpers.js'
+import type { DomainEvent } from '~/core/events/types.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import type { SessionId } from '~/core/sessions/schema.js'
 import { ToolCallId } from '~/core/tools/schema.js'
+import { UploadId } from '~/plugins/uploads/schema.js'
 import { createMultiAgentPreset, createTestPreset, TestHarness } from '~/testing/index.js'
-import { getAgentMailbox, getAgentUnconsumedMailbox, mailboxEvents, selectMailboxState } from './index.js'
+import { getAgentMailbox, getAgentUnconsumedMailbox, mailboxEvents, MessageId, selectMailboxState } from './index.js'
+
+class InterleavedMailboxEventStore extends MemoryEventStore {
+	readonly secondMailboxAppendStarted = Promise.withResolvers<void>()
+	readonly releaseSecondMailboxAppend = Promise.withResolvers<void>()
+	private mailboxAppendCount = 0
+
+	protected override async doAppend(sessionId: SessionId, event: DomainEvent): Promise<void> {
+		if (event.type === 'mailbox_message') {
+			this.mailboxAppendCount++
+			if (this.mailboxAppendCount === 2) {
+				this.secondMailboxAppendStarted.resolve()
+				await this.releaseSecondMailboxAppend.promise
+			}
+		}
+		await super.doAppend(sessionId, event)
+	}
+}
+
+const waitUntil = async (predicate: () => boolean, timeoutMs = 1_000): Promise<void> => {
+	const deadline = Date.now() + timeoutMs
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error('Timed out waiting for condition')
+		await Bun.sleep(5)
+	}
+}
 
 describe('mailbox plugin', () => {
 	// =========================================================================
@@ -408,9 +438,10 @@ describe('mailbox plugin', () => {
 			const session = await harness.createSession('test')
 			await session.sendAndWaitForIdle('Start')
 
-			// Check message order in state
-			const mailboxState = selectMailboxState(session.state)
-			const allMessages = getAgentMailbox(mailboxState, AgentId('worker_1'))
+			// Consumed payloads leave state; the event log remains the durable history.
+			const allMessages = (await session.getEventsByType(mailboxEvents, 'mailbox_message'))
+				.filter((event) => event.toAgentId === AgentId('worker_1'))
+				.map((event) => event.message)
 			expect(allMessages).toHaveLength(3)
 
 			const contents = allMessages.map(m => m.content)
@@ -476,15 +507,17 @@ describe('mailbox plugin', () => {
 			const session = await harness.createSession('test')
 			await session.sendAndWaitForIdle('Start', { timeoutMs: 10000 })
 
-			// Worker should have messages from both orchestrator (initial) and subworker
-			const mailboxState = selectMailboxState(session.state)
-			const workerMailbox = getAgentMailbox(mailboxState, AgentId('worker_1'))
+			// Worker received both messages, while consumed payloads were pruned from state.
+			const workerMailbox = (await session.getEventsByType(mailboxEvents, 'mailbox_message'))
+				.filter((event) => event.toAgentId === AgentId('worker_1'))
+				.map((event) => event.message)
 
 			const fromOrchestrator = workerMailbox.filter(m => m.from === session.getEntryAgentId()!)
 			const fromSubworker = workerMailbox.filter(m => m.from === AgentId('subworker_1'))
 
 			expect(fromOrchestrator).toHaveLength(1)
 			expect(fromSubworker).toHaveLength(1)
+			expect(getAgentMailbox(selectMailboxState(session.state), AgentId('worker_1'))).toHaveLength(0)
 
 			await harness.shutdown()
 		})
@@ -697,6 +730,164 @@ describe('mailbox plugin', () => {
 	// =========================================================================
 
 	describe('send method (direct)', () => {
+		it('reserves unique concurrent IDs before an interleaved consumption', async () => {
+			const eventStore = new InterleavedMailboxEventStore()
+			const seenContent: string[] = []
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				eventStore,
+				mockHandler: (request) => {
+					seenContent.push(request.messages.map((message) =>
+						typeof message.content === 'string' ? message.content : '',
+					).join('\n'))
+					return {
+						content: 'Done',
+						toolCalls: [],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetrics(),
+					}
+				},
+			})
+
+			const session = await harness.createSession('test')
+			const entryAgentId = session.getEntryAgentId()
+			if (!entryAgentId) throw new Error('Expected entry agent')
+			const firstSend = session.callPluginMethod('mailbox.send', {
+				toAgentId: String(entryAgentId),
+				content: 'first concurrent payload',
+				debug: true,
+			})
+			const secondSend = session.callPluginMethod('mailbox.send', {
+				toAgentId: String(entryAgentId),
+				content: 'second concurrent payload',
+				debug: true,
+			})
+
+			await eventStore.secondMailboxAppendStarted.promise
+			await waitUntil(() => eventStore.getEventsByType(
+				session.sessionId,
+				'mailbox_consumed',
+			).length === 1)
+			const firstConsumption = await session.getEventsByType(mailboxEvents, 'mailbox_consumed')
+			expect(firstConsumption[0].messageIds).toEqual([MessageId('m1')])
+
+			eventStore.releaseSecondMailboxAppend.resolve()
+			const results = await Promise.all([firstSend, secondSend])
+			expect(results.every((result) => result.ok)).toBe(true)
+			await session.waitForIdle()
+
+			const messages = await session.getEventsByType(mailboxEvents, 'mailbox_message')
+			expect(messages.map((event) => event.message.id).sort()).toEqual([
+				MessageId('m1'),
+				MessageId('m2'),
+			])
+			expect(seenContent).toHaveLength(2)
+			expect(seenContent[0]).toContain('first concurrent payload')
+			expect(seenContent[0]).not.toContain('second concurrent payload')
+			expect(seenContent[1]).toContain('second concurrent payload')
+			const consumptions = await session.getEventsByType(mailboxEvents, 'mailbox_consumed')
+			expect(consumptions.map((event) => event.messageIds)).toEqual([
+				[MessageId('m1')],
+				[MessageId('m2')],
+			])
+
+			await harness.shutdown()
+		})
+
+		it('returns a domain error when reservation is attempted after close', async () => {
+			const harness = new TestHarness({ presets: [createTestPreset()] })
+			const session = await harness.createSession('test')
+			const entryAgentId = session.getEntryAgentId()
+			if (!entryAgentId) throw new Error('Expected entry agent')
+			await session.close()
+
+			const result = await session.callPluginMethod('mailbox.send', {
+				toAgentId: String(entryAgentId),
+				content: 'late payload',
+				debug: true,
+			})
+			expect(result.ok).toBe(false)
+			if (!result.ok) expect(result.error.type).toBe('session_closed')
+
+			await harness.shutdown()
+		})
+
+		it('legacy replay preserves the sequence and prunes only addressed payloads', async () => {
+			const firstHarness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Done', toolCalls: [] }),
+			})
+			const firstSession = await firstHarness.createSession('test')
+			const sessionId = firstSession.sessionId
+			const entryAgentId = firstSession.getEntryAgentId()
+			if (!entryAgentId) throw new Error('Expected entry agent')
+			const otherAgentId = AgentId('other_1')
+			const eventStore = firstHarness.eventStore
+			await firstHarness.shutdown()
+
+			await eventStore.appendBatch(sessionId, [
+				withSessionId(sessionId, mailboxEvents.create('mailbox_message', {
+					toAgentId: entryAgentId,
+					message: {
+						id: MessageId('m40'),
+						from: 'user',
+						content: 'consumed legacy payload',
+						timestamp: 40,
+						consumed: false,
+						attachments: [{
+							uploadId: UploadId('legacy-upload'),
+							filename: 'large.txt',
+							mimeType: 'text/plain',
+							size: 1000,
+							path: '/legacy/large.txt',
+							extractedContent: 'large extracted content',
+						}],
+					},
+				})),
+				withSessionId(sessionId, mailboxEvents.create('mailbox_message', {
+					toAgentId: otherAgentId,
+					message: {
+						id: MessageId('m41'),
+						from: 'user',
+						content: 'other agent payload',
+						timestamp: 41,
+						consumed: false,
+					},
+				})),
+				withSessionId(sessionId, mailboxEvents.create('mailbox_consumed', {
+					agentId: entryAgentId,
+					messageIds: [MessageId('m40')],
+				})),
+			])
+
+			const secondHarness = new TestHarness({
+				presets: [createTestPreset()],
+				eventStore,
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Done', toolCalls: [] }),
+			})
+			const replayedSession = await secondHarness.openSession(sessionId)
+			const mailboxState = selectMailboxState(replayedSession.state)
+			expect(getAgentMailbox(mailboxState, entryAgentId)).toHaveLength(0)
+			expect(getAgentMailbox(mailboxState, otherAgentId).map((message) => message.id)).toEqual([
+				MessageId('m41'),
+			])
+
+			await replayedSession.callPluginMethod('mailbox.send', {
+				toAgentId: String(entryAgentId),
+				content: 'new payload',
+				debug: true,
+			})
+			await replayedSession.waitForIdle()
+
+			const messages = await replayedSession.getEventsByType(mailboxEvents, 'mailbox_message')
+			const newMessage = messages.find((event) => event.message.content === 'new payload')
+			expect(newMessage?.message.id).toBe(MessageId('m42'))
+			expect(newMessage?.sequence).toBe(42)
+			expect(getAgentMailbox(selectMailboxState(replayedSession.state), entryAgentId)).toHaveLength(0)
+
+			await secondHarness.shutdown()
+		})
+
 		it('mailbox.send between valid agents → message delivered', async () => {
 			let orchestratorCalls = 0
 
