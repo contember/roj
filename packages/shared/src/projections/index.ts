@@ -56,5 +56,5 @@ export type { SessionInfoState } from './session-info.js'
 export { applyEventToSessionInfo, createSessionInfoState } from './session-info.js'
 
 // Services projection
-export type { ServiceEntry, ServicesProjectionState, ServiceStatus } from './services-projection.js'
+export type { ServiceEntry, ServicesProjectionState, ServiceStatus, ServiceStoppedBy } from './services-projection.js'
 export { applyEventToServices, createServicesProjectionState } from './services-projection.js'

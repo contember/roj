@@ -5,13 +5,20 @@
  * Handles service_status_changed and session_restarted events.
  */
 
-import type { ServiceStatus } from '@roj-ai/sdk'
-export type { ServiceStatus } from '@roj-ai/sdk'
+import type { ServiceStatus, ServiceStoppedBy } from '@roj-ai/sdk'
+export type { ServiceStatus, ServiceStoppedBy } from '@roj-ai/sdk'
 import type { ProjectionEvent } from './events.js'
 
 export interface ServiceEntry {
 	serviceType: string
 	status: ServiceStatus
+	/**
+	 * Who stopped the service — `never` while it has not been stopped since its
+	 * last start. An idle eviction stops services and the rebuilt runtime starts
+	 * them again, so this is what separates a parked service from one somebody
+	 * deliberately shut down.
+	 */
+	stoppedBy: ServiceStoppedBy
 	port?: number
 	error?: string
 	startedAt?: number
@@ -45,6 +52,8 @@ export function applyEventToServices(state: ServicesProjectionState, event: Proj
 				newServices.set(event.serviceType, {
 					serviceType: event.serviceType,
 					status: event.toStatus,
+					stoppedBy: 'never',
+					port: event.port,
 					startedAt: event.timestamp,
 				})
 			} else if (existing) {
@@ -58,7 +67,10 @@ export function applyEventToServices(state: ServicesProjectionState, event: Proj
 				}
 				if (event.toStatus === 'starting') {
 					updated.startedAt = event.timestamp
+					updated.stoppedBy = 'never'
 					updated.error = undefined
+					// Assigned, not merged: a restart without a port must clear the old one.
+					updated.port = event.port
 				}
 				if (event.toStatus === 'ready') {
 					updated.readyAt = event.timestamp
@@ -71,6 +83,8 @@ export function applyEventToServices(state: ServicesProjectionState, event: Proj
 				}
 				if (event.toStatus === 'stopped') {
 					updated.stoppedAt = event.timestamp
+					// Absent in logs written before the discriminator existed.
+					updated.stoppedBy = event.stoppedBy ?? 'agent'
 				}
 				newServices.set(event.serviceType, updated)
 			}
@@ -82,9 +96,11 @@ export function applyEventToServices(state: ServicesProjectionState, event: Proj
 			let changed = false
 			const newServices = new Map(state.services)
 			for (const [serviceType, entry] of state.services) {
-				const running = entry.status === 'starting' || entry.status === 'ready'
+				// `stopping` counts as live: a runtime that died mid-stop leaves it
+				// behind and no other path ever clears it.
+				const live = entry.status === 'starting' || entry.status === 'ready' || entry.status === 'stopping'
 				// Any queued revival died with the runtime that held its timer.
-				if (!running && entry.restartAt === undefined) continue
+				if (!live && entry.restartAt === undefined) continue
 
 				const updated: ServiceEntry = {
 					...entry,
@@ -92,8 +108,10 @@ export function applyEventToServices(state: ServicesProjectionState, event: Proj
 					restartAttempt: undefined,
 					restartMaxRetries: undefined,
 				}
-				if (running) {
+				if (live) {
 					updated.status = 'stopped'
+					// The runtime died under it — nobody decided to stop it.
+					updated.stoppedBy = 'eviction'
 					updated.port = undefined
 					updated.stoppedAt = event.timestamp
 				}

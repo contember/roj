@@ -21,3 +21,7 @@ export const AgentId = (id: string): AgentId => id as AgentId
 const chatMessageIdSchema = z.string().brand('ChatMessageId')
 export type ChatMessageId = z.infer<typeof chatMessageIdSchema>
 export const ChatMessageId = (id: string): ChatMessageId => id as ChatMessageId
+
+const uploadIdSchema = z.string().brand('UploadId')
+export type UploadId = z.infer<typeof uploadIdSchema>
+export const UploadId = (id: string): UploadId => id as UploadId

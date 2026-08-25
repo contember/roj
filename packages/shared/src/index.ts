@@ -6,8 +6,8 @@
  */
 
 // ID constructors (branded types — compile-time only)
-export { AgentId, ChatMessageId, SessionId } from './lib/ids.js'
-export type { AgentId as AgentIdType, ChatMessageId as ChatMessageIdType, SessionId as SessionIdType } from './lib/ids.js'
+export { AgentId, ChatMessageId, SessionId, UploadId } from './lib/ids.js'
+export type { AgentId as AgentIdType, ChatMessageId as ChatMessageIdType, SessionId as SessionIdType, UploadId as UploadIdType } from './lib/ids.js'
 
 // Chat protocol types
 export type {
@@ -73,6 +73,7 @@ export type {
 	ServiceEntry,
 	ServicesProjectionState,
 	ServiceStatus,
+	ServiceStoppedBy,
 	SessionInfoState,
 	SystemConversationMessageView,
 	TimelineItem,
