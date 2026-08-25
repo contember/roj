@@ -25,6 +25,21 @@ async function pauseEntryAgent(session: TestSession): Promise<void> {
 	await session.pauseAgent(entryAgentId, 'Keep upload pending for storage test')
 }
 
+/**
+ * Consumption commits *after* `inference_completed` on purpose, so a crash in
+ * the gap re-delivers the message instead of losing it. The agent therefore
+ * reads idle a moment before the consumption events land, and asserting them
+ * straight after `waitForIdle()` is a race that only loses under load.
+ */
+async function waitForEvents<T>(read: () => Promise<T[]>, expected: number, timeoutMs = 2_000): Promise<T[]> {
+	const deadline = Date.now() + timeoutMs
+	for (;;) {
+		const events = await read()
+		if (events.length >= expected || Date.now() >= deadline) return events
+		await new Promise((resolve) => setTimeout(resolve, 5))
+	}
+}
+
 const uploadResultSchema = z.object({
 	uploadId: z.string(),
 	status: z.enum(['ready', 'failed']),
@@ -217,7 +232,7 @@ describe('uploads plugin', () => {
 			expect(attachmentMessage.content).toContain('filename="doc.txt"')
 			expect(attachmentMessage.content).toContain('type="text/plain"')
 
-			const consumedEvents = await session.getEventsByType(agentEvents, 'agent_input_consumed')
+			const consumedEvents = await waitForEvents(() => session.getEventsByType(agentEvents, 'agent_input_consumed'), 1)
 			expect(consumedEvents).toHaveLength(1)
 			expect(consumedEvents[0].sourcePlugins).toContain('uploads')
 
@@ -255,7 +270,7 @@ describe('uploads plugin', () => {
 				expect(requestText).toContain(`filename="${filename}"`)
 			}
 
-			const consumedEvents = await session.getEventsByType(uploadEvents, 'attachments_consumed')
+			const consumedEvents = await waitForEvents(() => session.getEventsByType(uploadEvents, 'attachments_consumed'), 1)
 			expect(consumedEvents).toHaveLength(1)
 			expect(consumedEvents[0].uploadIds).toHaveLength(3)
 

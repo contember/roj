@@ -43,4 +43,12 @@ export interface PendingUpload {
 export interface UploadsState {
 	/** Uploads that have been uploaded but not yet consumed by an agent */
 	pending: PendingUpload[]
+	/**
+	 * Small terminal projection for uploads still visible to the user.
+	 *
+	 * Reconciliation against on-disk metadata keys off this plus
+	 * `UploadMetadata.terminalEventPersisted`; it is idempotent, so no separate
+	 * "awaiting materialization" projection is needed.
+	 */
+	terminal: Record<string, 'ready' | 'failed'>
 }

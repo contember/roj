@@ -9,20 +9,45 @@
 
 import { uuidv7 } from 'uuidv7'
 import z from 'zod/v4'
+import { type DomainError, ValidationErrors } from '~/core/errors.js'
+import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import type { SessionId } from '../../core/sessions/schema.js'
 
 // ============================================================================
 // UploadId - Branded type
 // ============================================================================
 
-/** UploadId schema - validates any string and brands as UploadId. */
-export const uploadIdSchema = z.string().brand('UploadId')
+/**
+ * Characters an upload id may contain.
+ *
+ * Twin of `SESSION_ID_PATTERN`: the id is interpolated straight into filesystem
+ * paths (`sessions/<sessionId>/uploads/<uploadId>`) and into the basePath handed to
+ * the agent, and FileStore containment is lexical and rooted at the data dir, so a
+ * `..` segment reaches a sibling session rather than escaping outright. Generated
+ * ids are UUIDv7, which fits.
+ */
+export const UPLOAD_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
+
+/** True when the value is safe to interpolate into a path. */
+export const isValidUploadId = (id: string): boolean => UPLOAD_ID_PATTERN.test(id)
+
+/** UploadId schema - validates the id shape and brands as UploadId. */
+export const uploadIdSchema = z.string().regex(UPLOAD_ID_PATTERN, 'Invalid upload id').brand('UploadId')
 
 /** Branded UploadId type */
 export type UploadId = z.infer<typeof uploadIdSchema>
 
-/** Constructor for UploadId */
+/**
+ * Unchecked brand — only for ids already known to match `UPLOAD_ID_PATTERN`.
+ *
+ * It does not validate, so it must never see untrusted input. Use `parseUploadId`
+ * at a boundary that is not a method input, and `uploadIdSchema` at one that is.
+ */
 export const UploadId = (id: string): UploadId => id as UploadId
+
+/** Checked UploadId constructor — the form to use on untrusted input. */
+export const parseUploadId = (value: string): Result<UploadId, DomainError> =>
+	isValidUploadId(value) ? Ok(UploadId(value)) : Err(ValidationErrors.invalid('Invalid upload id'))
 
 /** Generate a new UploadId (UUIDv7) */
 export const generateUploadId = (): UploadId => UploadId(uuidv7())
@@ -87,6 +112,8 @@ export interface UploadMetadata {
 	createdAt: number
 	completedAt?: number
 	error?: string
+	/** Set only after the terminal event is durable. */
+	terminalEventPersisted?: boolean
 	/** Set when the upload is attached to a message via sendMessage */
 	usedInMessageId?: string
 }
