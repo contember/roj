@@ -9,6 +9,7 @@ import type { DomainEvent } from '~/core/events/types.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import { SessionId } from '~/core/sessions/schema.js'
+import { sessionEvents } from '~/core/sessions/state.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { silentLogger } from '~/lib/logger/logger.js'
 import type { Dirent, FileSystem } from '~/platform/fs.js'
@@ -58,6 +59,15 @@ const autoStartService: ServiceConfig = {
 	description: 'Auto-starting service',
 	command: 'sleep 60',
 	autoStart: true,
+}
+
+/** Runs happily forever, but never prints what the executor is waiting for. */
+const neverReadyService: ServiceConfig = {
+	type: 'never-ready',
+	description: 'Service whose readiness marker never arrives',
+	command: 'sleep 60',
+	readyPattern: 'NEVER-READY',
+	startupTimeoutMs: 200,
 }
 
 // ============================================================================
@@ -180,6 +190,57 @@ function isProcessAlive(pid: number): boolean {
 	} catch {
 		return false
 	}
+}
+
+/** Wait for a process to go, and never leave a stray one behind if it does not. */
+async function expectProcessGone(pid: number, timeoutMs = 3000): Promise<void> {
+	const deadline = Date.now() + timeoutMs
+	while (Date.now() < deadline && isProcessAlive(pid)) {
+		await new Promise((r) => setTimeout(r, 50))
+	}
+	const alive = isProcessAlive(pid)
+	if (alive) {
+		try {
+			process.kill(-pid, 'SIGKILL')
+		} catch {
+			// Already gone.
+		}
+	}
+	expect(alive).toBe(false)
+}
+
+/**
+ * Create a durable session, shut its runtime down, and spawn a detached process the
+ * way a crashed runtime would have left one behind. The caller then writes the events
+ * that runtime would have written about it and reopens the session.
+ */
+async function seedCrashedRuntime(eventStore: MemoryEventStore): Promise<{ sessionId: SessionId; orphanPid: number }> {
+	const harness = new TestHarness({
+		presets: [createServicesPreset([quickService], ['quick'], new PortPool())],
+		llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+		systemPlugins: [servicePlugin],
+		eventStore,
+	})
+	const sessionId = (await harness.createSession('test')).sessionId
+	await harness.shutdown()
+
+	const orphan = createNodePlatform().process.spawn('/bin/sh', ['-c', 'sleep 60'], { detached: true, stdio: 'ignore' })
+	const orphanPid = orphan.pid
+	if (orphanPid === undefined) throw new Error('Detached orphan did not receive a pid')
+	expect(isProcessAlive(orphanPid)).toBe(true)
+	return { sessionId, orphanPid }
+}
+
+/** Reopen a seeded session on a fresh runtime, which is what fires the reconcile. */
+function reopenOverSameStore(eventStore: MemoryEventStore): TestHarness {
+	const harness = new TestHarness({
+		presets: [createServicesPreset([quickService], ['quick'], new PortPool())],
+		llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+		systemPlugins: [servicePlugin],
+		eventStore,
+	})
+	currentHarness = harness
+	return harness
 }
 
 /** Wait for a condition observed directly off a ServiceExecutor, not a session. */
@@ -1316,6 +1377,215 @@ describe('services plugin', () => {
 			expect(stateAfter?.status).toBe('stopped')
 			expect(stateAfter?.port).toBe(orphanPort)
 			expect(stateAfter?.pid).toBeUndefined()
+		})
+
+		it('reclaims a failed entry a previous runtime left owning a process', async () => {
+			const eventStore = new MemoryEventStore()
+			const { sessionId, orphanPid } = await seedCrashedRuntime(eventStore)
+			const orphanPort = 41_235
+
+			// The shape production leaves behind: the wait gave up, the process did not.
+			for (const event of [
+				serviceEvents.create('service_status_changed', {
+					serviceType: 'quick',
+					toStatus: 'starting',
+					port: orphanPort,
+					pid: orphanPid,
+				}),
+				serviceEvents.create('service_status_changed', {
+					serviceType: 'quick',
+					toStatus: 'failed',
+					port: orphanPort,
+					pid: orphanPid,
+					error: 'Service startup timed out after 30000ms',
+				}),
+			]) {
+				await eventStore.append(sessionId, { ...event, sessionId })
+			}
+
+			const session = await reopenOverSameStore(eventStore).openSession(sessionId)
+			await waitFor(
+				() => selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('quick')?.pid === undefined,
+				() => `pid ${selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('quick')?.pid}`,
+				3000,
+			)
+			await expectProcessGone(orphanPid)
+
+			// Only the claim on the process is taken away — the failure still has to be
+			// legible to the agent and to the SPA.
+			const entry = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('quick')
+			expect(entry?.status).toBe('failed')
+			expect(entry?.error).toBe('Service startup timed out after 30000ms')
+			expect(entry?.port).toBe(orphanPort)
+		})
+
+		it('reclaims an orphan that session_restarted had already marked stopped', async () => {
+			const eventStore = new MemoryEventStore()
+			const { sessionId, orphanPid } = await seedCrashedRuntime(eventStore)
+			const orphanPort = 41_236
+
+			// A runtime that dies mid-run recovers through session_restarted, which lands
+			// before onSessionReady. It settles the service without killing anything, so
+			// the pid it records is the only handle the reconcile has left.
+			for (const event of [
+				serviceEvents.create('service_status_changed', {
+					serviceType: 'quick',
+					toStatus: 'starting',
+					port: orphanPort,
+					pid: orphanPid,
+				}),
+				sessionEvents.create('session_restarted', { resetAgentIds: [], clearedToolAgentIds: [] }),
+			]) {
+				await eventStore.append(sessionId, { ...event, sessionId })
+			}
+
+			const session = await reopenOverSameStore(eventStore).openSession(sessionId)
+			await waitForServiceStateStatus(session, 'quick', 'stopped', 3000)
+			await expectProcessGone(orphanPid)
+
+			const entry = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('quick')
+			expect(entry?.pid).toBeUndefined()
+			// Nobody decided to stop it, so autoStart is still allowed to bring it back.
+			expect(entry?.stoppedBy).toBe('eviction')
+		})
+
+		it('refuses to reclaim an orphan whose pid the kernel has recycled', async () => {
+			const eventStore = new MemoryEventStore()
+			const { sessionId, orphanPid } = await seedCrashedRuntime(eventStore)
+
+			await eventStore.append(sessionId, {
+				...serviceEvents.create('service_status_changed', {
+					serviceType: 'quick',
+					toStatus: 'starting',
+					port: 41_237,
+					pid: orphanPid,
+					// Recorded against a process that has since died and handed its pid on.
+					pidStartTime: 1,
+				}),
+				sessionId,
+			})
+
+			const session = await reopenOverSameStore(eventStore).openSession(sessionId)
+			await waitForServiceStateStatus(session, 'quick', 'stopped', 3000)
+
+			// The pid is somebody else's now, so it is not ours to kill — but the claim
+			// still goes, or every later boot would examine it again.
+			expect(isProcessAlive(orphanPid)).toBe(true)
+			expect(selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('quick')?.pid).toBeUndefined()
+			process.kill(-orphanPid, 'SIGKILL')
+		})
+	})
+
+	describe('reclaiming a failed service', () => {
+		const systemError = (code: string): Error => {
+			const error = new Error(code)
+			Object.defineProperty(error, 'code', { value: code })
+			return error
+		}
+
+		/**
+		 * Drive a real service to `failed` while its process is still running — the
+		 * production shape this whole area exists for. The startup timeout's reap is made
+		 * to fail so the verdict lands on the wait without anything dying; flipping
+		 * `killsLand` afterwards hands the executor a working kill again.
+		 */
+		const startFailedButAlive = async (sessionId: SessionId) => {
+			const platform = createNodePlatform()
+			const seam = { killsLand: false }
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: platform.process,
+				kill: (pid, signal) => {
+					if (!seam.killsLand && signal === 'SIGKILL') throw systemError('EPERM')
+					return process.kill(pid, signal)
+				},
+			})
+			// One entry per spawn — a `failed` change republishes the same pid on purpose.
+			const pids: number[] = []
+			executor.onStatusChanged = (_sessionId, _serviceType, status, details) => {
+				if (status === 'starting' && details.pid !== undefined) pids.push(details.pid)
+			}
+
+			const started = await executor.start(neverReadyService, sessionId)
+			expect(started.ok).toBe(true)
+			await waitFor(
+				() => executor.getStatus('never-ready') === 'failed',
+				() => `status ${executor.getStatus('never-ready')}`,
+			)
+			expect(pids).toHaveLength(1)
+			expect(isProcessAlive(pids[0]!)).toBe(true)
+
+			return { executor, seam, pids, failedPid: pids[0]! }
+		}
+
+		it('stopping a failed service reclaims its process group and settles it', async () => {
+			const sessionId = SessionId('s-stop-failed')
+			const { executor, seam, failedPid } = await startFailedButAlive(sessionId)
+
+			try {
+				seam.killsLand = true
+				const stopped = await executor.stop('never-ready', sessionId)
+
+				expect(stopped.ok).toBe(true)
+				expect(executor.getStatus('never-ready')).toBe('stopped')
+				await expectProcessGone(failedPid)
+			} finally {
+				await executor.close(sessionId).catch(() => {})
+			}
+		})
+
+		it('starting over a failed entry reclaims the process it still owns', async () => {
+			const sessionId = SessionId('s-supersede-failed')
+			const { executor, seam, pids, failedPid } = await startFailedButAlive(sessionId)
+
+			try {
+				seam.killsLand = true
+				// A restart reuses the port on purpose, so the abandoned generation has to go
+				// before the replacement spawns rather than being merely forgotten.
+				const restarted = await executor.start(neverReadyService, sessionId)
+
+				expect(restarted.ok).toBe(true)
+				await expectProcessGone(failedPid)
+				expect(pids).toHaveLength(2)
+				expect(pids[1]).not.toBe(failedPid)
+			} finally {
+				seam.killsLand = true
+				await executor.close(sessionId).catch(() => {})
+			}
+		})
+
+		it('publishes the pid of a failed service, then takes the claim back when it exits', async () => {
+			const portPool = new PortPool()
+			const harness = createServicesHarness({
+				presets: [createServicesPreset([neverReadyService], ['never-ready'], portPool)],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Hi')
+
+			await session.callPluginMethod('services.start', {
+				sessionId: String(session.sessionId),
+				agentId: String(session.getEntryAgentId()!),
+				serviceType: 'never-ready',
+			})
+			await waitForServiceStateStatus(session, 'never-ready', 'failed')
+
+			// The timeout publishes the pid before reclaiming it: if the runtime dies in
+			// between, that record is all the next boot has to find the survivor with.
+			const events = await session.getEventsByType(serviceEvents, 'service_status_changed')
+			const failures = events.filter((e) => e.serviceType === 'never-ready' && e.toStatus === 'failed')
+			expect(failures[0]?.pid).toBeDefined()
+
+			// Once the process is confirmed gone the claim goes with it, so no later boot
+			// hunts for a pid the kernel may have handed to somebody else.
+			await waitFor(
+				() => selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('never-ready')?.pid === undefined,
+				() => `pid ${selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('never-ready')?.pid}`,
+			)
+			const entry = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('never-ready')
+			expect(entry?.status).toBe('failed')
+			expect(entry?.error).toContain('timed out')
 		})
 	})
 

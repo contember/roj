@@ -17,7 +17,7 @@ import type { PortPool } from '~/plugins/services/port-pool.js'
 import type { ServicePidRegistry } from '~/plugins/services/pid-registry.js'
 import type { ServiceConfig, ServiceStartArgs, ServiceStatus, ServiceStopSource } from '~/plugins/services/schema.js'
 import type { ToolError } from '../../core/tools/executor.js'
-import type { Logger } from '../../lib/logger/logger.js'
+import type { LogContext, Logger } from '../../lib/logger/logger.js'
 import { RingBuffer } from '../../lib/logger/ring-buffer.js'
 
 // ============================================================================
@@ -57,15 +57,33 @@ interface RunningService {
 	config: ServiceConfig
 	process: ChildProcess
 	pid: number
+	/** Captured at spawn so a later reap can tell our process from a recycled pid. */
+	pidStartTime?: number
 	status: ServiceStatus
 	port: number
 	cwd?: string
 	command: string
 	logs: RingBuffer
 	forgetPid: () => Promise<void>
+	/** Set once the child's `close` fired, or once we gave up our claim on the group. */
+	exited: boolean
 	/** Who asked for the stop in progress — read back when the child's exit lands. */
 	stopSource?: ServiceStopSource
 }
+
+/** A process we spawned and may still have to reclaim. */
+export interface ReapTarget {
+	pid: number
+	/** Start time captured at spawn; undefined on non-Linux, or when /proc was unreadable. */
+	pidStartTime?: number
+}
+
+/**
+ * What a guarded reap did. `killed` covers a group that was already gone — the signal
+ * had nothing left to reach. `pid-reused` means the kernel handed the pid on and the
+ * process under it is somebody else's.
+ */
+export type ReapOutcome = 'killed' | 'pid-reused'
 
 export interface ServiceStatusChangeDetails {
 	port?: number
@@ -365,7 +383,22 @@ export class ServiceExecutor {
 		if (existing?.status === 'stopping') {
 			return Err({ message: `Service '${config.type}' is stopping, cannot start`, recoverable: true })
 		}
-		if (existing) await existing.forgetPid()
+		if (existing) {
+			// Whatever sits under this type is about to be overwritten — in this map and in
+			// the pid registry, both keyed by (session, type) — and to lose its port to the
+			// process spawned below, since a restart deliberately reuses it. A `failed`
+			// entry can still own a live process group, so reclaim it before its handle is
+			// dropped or nothing will ever be able to find it again.
+			const reaped = await this.reapEntry(existing, 'superseded by a new start')
+			if (!reaped.ok) {
+				this.logger.warn('Could not reclaim the superseded service process group', {
+					serviceType: config.type,
+					pid: existing.pid,
+					error: reaped.error.message,
+				})
+			}
+			await existing.forgetPid()
+		}
 		await this.pidForgets.get(config.type)
 		if (this.closing) return Err({ message: 'Service executor is closing', recoverable: false })
 
@@ -478,10 +511,18 @@ export class ServiceExecutor {
 			const current = this.services.get(config.type)
 			if (current && current.process === child && current.status !== 'stopped' && current.status !== 'failed') {
 				current.status = 'failed'
+				// The pid rides along on purpose — see the startup timeout below.
 				this.notifyStatusChanged(sessionId, config.type, 'failed', {
 					error: error.message,
 					cwd,
 					command,
+					pid: current.pid,
+					pidStartTime: current.pidStartTime,
+				})
+				void this.reapEntry(current, 'process error').then((reaped) => {
+					if (!reaped.ok) {
+						this.logger.error('Could not kill errored service process group', reaped.error, { serviceType: config.type, pid: current.pid })
+					}
 				})
 			}
 		})
@@ -628,12 +669,14 @@ export class ServiceExecutor {
 			config,
 			process: child,
 			pid: child.pid,
+			pidStartTime,
 			status: 'starting',
 			port,
 			cwd,
 			command,
 			logs,
 			forgetPid,
+			exited: false,
 		}
 		this.services.set(config.type, entry)
 
@@ -705,17 +748,23 @@ export class ServiceExecutor {
 				const errorMsg = `Service startup timed out after ${startupTimeoutMs}ms`
 				this.logger.error(errorMsg, undefined, { serviceType: config.type })
 				clearReadinessTimers()
+				// The pid rides along on purpose: should this agent die before the reap
+				// below completes, the recorded pid is all a later boot has to find the
+				// survivor. The child's exit takes the claim away again.
 				this.notifyStatusChanged(sessionId, config.type, 'failed', {
 					port: current.port,
 					cwd: current.cwd,
 					command: current.command,
 					error: errorMsg,
+					pid: current.pid,
+					pidStartTime: current.pidStartTime,
 				})
 
-				const killed = this.killProcessGroup(current.pid)
-				if (!killed.ok) {
-					this.logger.error('Could not kill timed-out service process group', killed.error, { serviceType: config.type, pid: current.pid })
-				}
+				void this.reapEntry(current, 'startup timeout').then((reaped) => {
+					if (!reaped.ok) {
+						this.logger.error('Could not kill timed-out service process group', reaped.error, { serviceType: config.type, pid: current.pid })
+					}
+				})
 			}, startupTimeoutMs)
 		}
 
@@ -732,6 +781,7 @@ export class ServiceExecutor {
 		const handleClose = (code: number | null) => {
 			if (closeHandled) return
 			closeHandled = true
+			entry.exited = true
 			clearReadinessTimers()
 			// A replacement must not be recorded until this deletion finishes.
 			void forgetPid()
@@ -802,6 +852,12 @@ export class ServiceExecutor {
 					serviceType: config.type,
 					code,
 				})
+			} else if (current.status === 'failed') {
+				// The process this entry still claimed is now confirmed gone — a startup
+				// timeout or a process error published the pid without being able to
+				// confirm the kill. Take the claim away so no later boot goes looking for
+				// it; the status and the error that explain the failure stay as they are.
+				this.notifyStatusChanged(sessionId, config.type, 'failed')
 			}
 		}
 		child.on('close', handleClose)
@@ -1011,6 +1067,8 @@ export class ServiceExecutor {
 			}
 			throw stopped.error
 		}
+		// The group is confirmed gone, so nothing may offer this pid up for a reap again.
+		entry.exited = true
 		await entry.forgetPid()
 		if (this.services.get(serviceType) === entry) {
 			entry.status = 'stopped'
@@ -1119,9 +1177,57 @@ export class ServiceExecutor {
 	}
 
 	/**
+	 * Reclaim a service process group we spawned, unless the kernel recycled its pid.
+	 *
+	 * Every path that gives up on a service comes through here, because ending the
+	 * *wait* is not ending the *process*: a dev server that missed its readiness
+	 * window keeps its several hundred MB of RSS until somebody kills it, which on a
+	 * memory-starved box is what makes the next startup miss its window too.
+	 *
+	 * `pidStartTime` was captured at spawn, so a different current start time means
+	 * the pid now belongs to an unrelated process and killing it would be disastrous.
+	 * An unknown start time (non-Linux, no /proc) leaves only the kill-and-hope path.
+	 */
+	async reapProcessGroup(target: ReapTarget, context: LogContext = {}): Promise<Result<ReapOutcome, Error>> {
+		const currentStartTime = await getProcessStartTime(this.fs, target.pid)
+		if (target.pidStartTime !== undefined && currentStartTime !== undefined && currentStartTime !== target.pidStartTime) {
+			this.logger.warn('PID reuse detected — refusing to kill service process group', {
+				...context,
+				pid: target.pid,
+				storedStartTime: target.pidStartTime,
+				currentStartTime,
+			})
+			return Ok('pid-reused')
+		}
+
+		const killed = this.killProcessGroup(target.pid)
+		if (!killed.ok) return killed
+		return Ok('killed')
+	}
+
+	/**
+	 * Reclaim the process group of an entry we are giving up on or replacing.
+	 *
+	 * A no-op once the child's `close` has fired: there is nothing left to reclaim,
+	 * and skipping it also keeps the non-Linux kill-and-hope path away from a pid the
+	 * kernel may since have handed to somebody else. A settled reap ends our claim,
+	 * so the entry is never offered up twice.
+	 */
+	private async reapEntry(entry: RunningService, reason: string): Promise<Result<void, Error>> {
+		if (entry.exited) return Ok(undefined)
+		const reaped = await this.reapProcessGroup(
+			{ pid: entry.pid, pidStartTime: entry.pidStartTime },
+			{ serviceType: entry.config.type, reason },
+		)
+		if (!reaped.ok) return reaped
+		entry.exited = true
+		return Ok(undefined)
+	}
+
+	/**
 	 * SIGKILL a process group through the injectable kill seam, without waiting
-	 * for it to go. For the places with no child handle left to await — a
-	 * startup timeout, or an orphan a previous runtime left behind.
+	 * for it to go. Reached through {@link reapProcessGroup} wherever a recorded
+	 * pid could have been recycled.
 	 */
 	killProcessGroup(pid: number): Result<void, Error> {
 		try {
@@ -1178,9 +1284,14 @@ export class ServiceExecutor {
 			return Err({ message: `Service '${serviceType}' not found`, recoverable: false })
 		}
 		if (entry.status !== 'starting' && entry.status !== 'ready') {
-			// A failed service with a revival queued is really "about to restart",
-			// and calling that off is a legitimate stop rather than an error.
-			if (hadPendingRestart) {
+			// `failed` says the start gave up, not that the process did — and refusing to
+			// stop it left the platform-side reaper, the one caller that can free a leaked
+			// dev server's memory, with no way to do so. A failed service with a revival
+			// queued is on top of that really "about to restart", and calling that off is a
+			// legitimate stop rather than an error.
+			if (entry.status === 'failed' || hadPendingRestart) {
+				const reaped = await this.reapEntry(entry, 'stopped while failed')
+				if (!reaped.ok) return Err({ message: reaped.error.message, recoverable: true })
 				try {
 					await entry.forgetPid()
 				} catch (error) {
@@ -1213,6 +1324,8 @@ export class ServiceExecutor {
 			}
 			return Err({ message: stopped.error.message, recoverable: true })
 		}
+		// The group is confirmed gone, so nothing may offer this pid up for a reap again.
+		entry.exited = true
 		try {
 			await entry.forgetPid()
 		} catch (error) {
