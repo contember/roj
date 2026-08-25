@@ -19,7 +19,7 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import { AgentId } from '~/core/agents/schema.js'
 import type { DomainError } from '~/core/errors.js'
 import { type CallerContext, DEFAULT_CALLER } from '~/core/plugins/plugin-builder.js'
-import { SessionId } from '~/core/sessions/schema.js'
+import { parseSessionId } from '~/core/sessions/schema.js'
 import type { SessionManager } from '~/core/sessions/session-manager.js'
 import { getServices } from '../context.js'
 import type { AppEnv } from '../context.js'
@@ -54,7 +54,12 @@ async function dispatchMethod(
 
 	// 2. Try session plugin methods (require sessionId in input)
 	if (typeof input === 'object' && input !== null && 'sessionId' in input && typeof input.sessionId === 'string') {
-		const sessionId = SessionId(input.sessionId)
+		// Checked before the lease: acquiring one loads the session, which joins the id into a path.
+		const sessionIdResult = parseSessionId(input.sessionId)
+		if (!sessionIdResult.ok) {
+			return { httpStatus: 400, body: formatError(sessionIdResult.error) }
+		}
+		const sessionId = sessionIdResult.value
 		const agentId = 'agentId' in input && typeof input.agentId === 'string' ? AgentId(input.agentId) : undefined
 
 		// Extract caller context injected by worker, strip from input
@@ -63,19 +68,22 @@ async function dispatchMethod(
 			: DEFAULT_CALLER
 		const { _caller: _, ...cleanInput } = input as Record<string, unknown>
 
-		const sessionResult = await sessionRuntime.getSession(sessionId)
+		const sessionResult = await sessionRuntime.acquireSessionLease(sessionId, `http:rpc:${method}`)
 		if (sessionResult.ok) {
-			const session = sessionResult.value
-			const pluginMethods = session.getPluginMethods()
+			try {
+				const pluginMethods = sessionResult.value.session.getPluginMethods()
 
-			if (pluginMethods.has(method)) {
-				const result = await sessionRuntime.callPluginMethod(sessionId, method, cleanInput, agentId, caller)
+				if (pluginMethods.has(method)) {
+					const result = await sessionRuntime.callPluginMethod(sessionId, method, cleanInput, agentId, caller)
 
-				if (!result.ok) {
-					return { httpStatus: 200, body: formatError(result.error) }
+					if (!result.ok) {
+						return { httpStatus: 200, body: formatError(result.error) }
+					}
+
+					return { httpStatus: 200, body: { ok: true, value: result.value } }
 				}
-
-				return { httpStatus: 200, body: { ok: true, value: result.value } }
+			} finally {
+				sessionResult.value.release()
 			}
 		} else if (sessionResult.error.type === 'session_not_found') {
 			return { httpStatus: 200, body: formatError(sessionResult.error) }
@@ -87,7 +95,18 @@ async function dispatchMethod(
 }
 
 interface BatchRequest {
-	batch: Array<{ method: string; input?: unknown }>
+	batch: unknown[]
+}
+
+interface BatchCall {
+	method: string
+	input?: unknown
+}
+
+/** Items stay `unknown` until here — `{"batch":[null]}` used to reach `call.method` and 500. */
+function isBatchCall(value: unknown): value is BatchCall {
+	return typeof value === 'object' && value !== null && 'method' in value && typeof value.method === 'string'
+		&& value.method !== ''
 }
 
 function isBatchRequest(body: unknown): body is BatchRequest {
@@ -112,26 +131,35 @@ export function createRpcRoutes(): Hono<AppEnv> {
 			)
 		}
 
-		const { sessionRuntime } = getServices(c)
+		const { sessionRuntime, logger } = getServices(c)
 
-		// Batch request
+		// Batch request. The status describes the envelope, never an item: the body is
+		// `{results}` with no top-level `error`, so a non-2xx here reads as a transport
+		// failure and hides the per-item error the client would otherwise surface.
 		if (isBatchRequest(body)) {
 			const results: MethodResult[] = []
 
 			for (const call of body.batch) {
-				if (!call.method || typeof call.method !== 'string') {
+				if (!isBatchCall(call)) {
 					results.push({ ok: false, error: { type: 'missing_method', message: "Missing 'method' field in batch call" } })
 					break
 				}
 
-				const { body: resultBody } = await dispatchMethod(sessionRuntime, call.method, call.input)
-
-				if (!resultBody.ok) {
-					results.push(resultBody)
+				let resultBody: MethodResult
+				try {
+					resultBody = (await dispatchMethod(sessionRuntime, call.method, call.input)).body
+				} catch (error) {
+					// Earlier items are already committed to the event log — dropping their
+					// envelopes would leave the client unable to tell what to retry.
+					logger.error('Batch RPC call failed', error instanceof Error ? error : new Error(String(error)), {
+						method: call.method,
+					})
+					results.push({ ok: false, error: { type: 'internal_error', message: 'Internal server error' } })
 					break
 				}
 
 				results.push(resultBody)
+				if (!resultBody.ok) break
 			}
 
 			return c.json({ results })

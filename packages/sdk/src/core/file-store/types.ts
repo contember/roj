@@ -39,7 +39,13 @@ export interface FileStore {
 	/** Remove a file. */
 	remove(path: string): Promise<Result<void, string>>
 
-	/** Resolve an agent-visible path to real filesystem path. */
+	/**
+	 * Resolve an agent-visible path to a real filesystem path.
+	 *
+	 * Lexical only — unlike `fs.realpath` it does not follow symlinks, so it
+	 * cannot decide containment on its own. Anything serving the result to a
+	 * caller must realpath both ends as well (see `transport/http/path-containment.ts`).
+	 */
 	realPath(path: string): Result<string, string>
 
 	/** Get the agent-visible root paths (virtual when sandboxed, real otherwise) */

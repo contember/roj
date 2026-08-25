@@ -7,6 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { Hono } from 'hono'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import { definePlugin, z } from '~/index.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 import { bootstrapForTesting } from '../../../testing/bootstrap-for-testing.js'
 import type { AppEnv } from '../context.js'
@@ -243,5 +244,127 @@ describe('RPC integration', () => {
 			expect(json.ok).toBe(false)
 			expect(json.error!.type).toBe('session_not_found')
 		})
+
+		it('session id that could escape the data root → validation_error, id not echoed', async () => {
+			const res = await rpcCall(app, 'user-chat.sendMessage', { sessionId: '../../etc', content: 'x' })
+
+			expect(res.status).toBe(400)
+			const json: RpcResponse = JSON.parse(await res.text())
+			expect(json.ok).toBe(false)
+			expect(json.error!.type).toBe('validation_error')
+			expect(json.error!.message).not.toContain('..')
+		})
+	})
+})
+
+// =========================================================================
+// Lease release and batch resilience — needs eviction on, so it runs its own harness
+// =========================================================================
+
+/** A session method that throws rather than returning an Err envelope. */
+const batchProbePlugin = definePlugin('batch-probe')
+	.method('boom', {
+		input: z.object({ sessionId: z.string() }),
+		output: z.object({}),
+		handler: async () => {
+			throw new Error('handler exploded')
+		},
+	})
+	.build()
+
+describe('RPC session leases', () => {
+	let app: Hono<AppEnv>
+	let harness: TestHarness
+
+	beforeEach(() => {
+		harness = new TestHarness({
+			presets: [createTestPreset()],
+			llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			// Eviction on: without it the lease bookkeeping the routes depend on is never exercised.
+			sessionIdleTimeoutMs: 60_000,
+			systemPlugins: [batchProbePlugin],
+		})
+
+		const baseServices = bootstrapForTesting(undefined, [createTestPreset()])
+
+		app = new Hono<AppEnv>()
+		app.use('*', async (c, next) => {
+			c.set('services', {
+				...baseServices,
+				sessionRuntime: harness.sessionManager,
+			})
+			await next()
+		})
+		app.route('/rpc', createRpcRoutes())
+	})
+
+	afterEach(async () => {
+		await harness.shutdown()
+	})
+
+	/** Every `http:` lease the routes took must be gone by the time the response is written. */
+	function httpLeaseReasons(): string[] {
+		return harness.sessionManager.getRuntimeCacheStats().sessions
+			.flatMap(session => Object.keys(session.leaseReasons))
+			.filter(reason => reason.startsWith('http:'))
+	}
+
+	async function createSession(): Promise<string> {
+		const res = await rpcCall(app, 'sessions.create', { presetId: 'test' })
+		const json: RpcResponse<{ sessionId: string }> = JSON.parse(await res.text())
+		expect(json.ok).toBe(true)
+		return json.value!.sessionId
+	}
+
+	it('releases the lease when the dispatched method is unknown', async () => {
+		const sessionId = await createSession()
+
+		const res = await rpcCall(app, 'nonexistent.method', { sessionId })
+
+		expect(res.status).toBe(400)
+		expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(1)
+		expect(httpLeaseReasons()).toEqual([])
+	})
+
+	it('releases the lease when the plugin handler throws', async () => {
+		const sessionId = await createSession()
+
+		const res = await rpcCall(app, 'batch-probe.boom', { sessionId })
+
+		expect(res.status).toBe(500)
+		expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(1)
+		expect(httpLeaseReasons()).toEqual([])
+	})
+
+	it('keeps the already-committed results when a batch item throws', async () => {
+		const sessionId = await createSession()
+
+		const res = await rpcBatch(app, [
+			{ method: 'presets.list', input: {} },
+			{ method: 'batch-probe.boom', input: { sessionId } },
+			{ method: 'presets.list', input: {} },
+		])
+
+		expect(res.status).toBe(200)
+		const json: BatchResponse = JSON.parse(await res.text())
+		expect(json.results).toHaveLength(2)
+		expect(json.results[0].ok).toBe(true)
+		expect(json.results[1].ok).toBe(false)
+		expect(json.results[1].error!.type).toBe('internal_error')
+		expect(httpLeaseReasons()).toEqual([])
+	})
+
+	it('reports a non-object batch item instead of throwing on it', async () => {
+		const res = await app.request('/rpc', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: '{"batch":[null]}',
+		})
+
+		expect(res.status).toBe(200)
+		const json: BatchResponse = JSON.parse(await res.text())
+		expect(json.results).toHaveLength(1)
+		expect(json.results[0].ok).toBe(false)
+		expect(json.results[0].error!.type).toBe('missing_method')
 	})
 })

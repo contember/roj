@@ -6,10 +6,12 @@
  */
 
 import { Hono } from 'hono'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { resolve } from 'node:path'
 import { getMimeType, preventTraversal } from '~/plugins/filesystem/listing.js'
-import { SessionId } from '~/core/sessions/schema.js'
+import { parseSessionId, type SessionId } from '~/core/sessions/schema.js'
 import { type AppContext, type AppEnv, getServices } from '../context.js'
+import { resolveCanonicalPath } from '../path-containment.js'
+import { invalidSessionId } from '../responses.js'
 
 // ============================================================================
 // Helpers
@@ -31,34 +33,6 @@ function extractWildcardPath(c: AppContext, marker: string): string {
 	}
 }
 
-type CanonicalPathResult =
-	| { status: 'ok'; path: string }
-	| { status: 'not_found' }
-	| { status: 'forbidden' }
-
-async function resolveCanonicalPath(c: AppContext, rootPath: string, targetPath: string): Promise<CanonicalPathResult> {
-	const { platform } = getServices(c)
-	let canonicalRoot: string
-	let canonicalTarget: string
-	try {
-		canonicalRoot = await platform.fs.realpath(rootPath)
-		canonicalTarget = await platform.fs.realpath(targetPath)
-	} catch {
-		return { status: 'not_found' }
-	}
-
-	const relativeTarget = relative(canonicalRoot, canonicalTarget)
-	const isContained = relativeTarget === '' || (
-		!isAbsolute(relativeTarget)
-		&& relativeTarget !== '..'
-		&& !relativeTarget.startsWith(`..${sep}`)
-	)
-
-	return isContained
-		? { status: 'ok', path: canonicalTarget }
-		: { status: 'forbidden' }
-}
-
 async function serveFile(c: AppContext, filePath: string, mimePath: string): Promise<Response> {
 	const { platform } = getServices(c)
 	let data: Buffer
@@ -78,15 +52,22 @@ async function serveFile(c: AppContext, filePath: string, mimePath: string): Pro
 			'Content-Type': contentType,
 			'Content-Length': data.length.toString(),
 			'Cache-Control': 'public, max-age=3600',
+			// Bodies here are attacker-influenced (uploads, injected resources, anything the agent writes).
+			'X-Content-Type-Options': 'nosniff',
+			'Content-Security-Policy': "default-src 'none'; sandbox",
 		},
 	})
 }
 
-async function resolveWorkspaceDir(c: AppContext, sessionId: string): Promise<string | null> {
+async function resolveWorkspaceDir(c: AppContext, sessionId: SessionId): Promise<string | null> {
 	const { sessionRuntime } = getServices(c)
-	const result = await sessionRuntime.getSession(SessionId(sessionId))
+	const result = await sessionRuntime.acquireSessionLease(sessionId, 'http:files')
 	if (!result.ok) return null
-	return result.value.state.workspaceDir ?? null
+	try {
+		return result.value.session.state.workspaceDir ?? null
+	} finally {
+		result.value.release()
+	}
 }
 
 // ============================================================================
@@ -104,8 +85,9 @@ export function createFileRoutes(): Hono<AppEnv> {
 
 	// --- Serve session file ---
 	app.get('/:sessionId/files/*', async (c: AppContext) => {
-		const { config } = getServices(c)
-		const sessionId = c.req.param('sessionId')!
+		const { dataFileStore } = getServices(c)
+		const sessionIdResult = parseSessionId(c.req.param('sessionId')!)
+		if (!sessionIdResult.ok) return invalidSessionId(c, sessionIdResult.error)
 		const filePath = extractWildcardPath(c, 'files')
 
 		if (!filePath) {
@@ -115,7 +97,17 @@ export function createFileRoutes(): Hono<AppEnv> {
 			)
 		}
 
-		const sessionDir = resolve(config.dataPath, 'sessions', sessionId)
+		// Build the root through the store's guard: `resolve(dataPath, ...)` would happily
+		// escape the data root on an id Hono decoded from `%2F`.
+		const sessionDirResult = dataFileStore.realPath(`sessions/${sessionIdResult.value}`)
+		if (!sessionDirResult.ok) {
+			return c.json(
+				{ error: { type: 'forbidden', message: 'Path traversal not allowed' } },
+				403,
+			)
+		}
+
+		const sessionDir = sessionDirResult.value
 		const resolvedPath = preventTraversal(sessionDir, filePath)
 
 		if (!resolvedPath) {
@@ -144,7 +136,8 @@ export function createFileRoutes(): Hono<AppEnv> {
 
 	// --- Serve workspace file ---
 	app.get('/:sessionId/workspace/*', async (c: AppContext) => {
-		const sessionId = c.req.param('sessionId')!
+		const sessionIdResult = parseSessionId(c.req.param('sessionId')!)
+		if (!sessionIdResult.ok) return invalidSessionId(c, sessionIdResult.error)
 		const filePath = extractWildcardPath(c, 'workspace')
 
 		if (!filePath) {
@@ -154,7 +147,7 @@ export function createFileRoutes(): Hono<AppEnv> {
 			)
 		}
 
-		const workspaceDir = await resolveWorkspaceDir(c, sessionId)
+		const workspaceDir = await resolveWorkspaceDir(c, sessionIdResult.value)
 		if (!workspaceDir) {
 			return c.json(
 				{ error: { type: 'not_found', message: 'No workspace configured for this session' } },

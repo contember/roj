@@ -47,8 +47,12 @@ export class SessionFileStore implements FileStore {
 		const resolved = this.resolvePath(path)
 		if (!resolved.ok) return resolved
 
-		await this.fs.mkdir(dirname(resolved.value), { recursive: true })
-		await this.fs.writeFile(resolved.value, content)
+		try {
+			await this.fs.mkdir(dirname(resolved.value), { recursive: true })
+			await this.fs.writeFile(resolved.value, content)
+		} catch {
+			return Err(`Failed to write: ${path}`)
+		}
 
 		return Ok({ path: this.toAgentPath(resolved.value) })
 	}
@@ -166,10 +170,12 @@ export class SessionFileStore implements FileStore {
 		}
 	}
 
+	/** Lexical resolution only — despite the name it never follows a symlink. See FileStore.realPath. */
 	realPath(path: string): Result<string, string> {
 		return this.resolvePath(path)
 	}
 
+	/** Throws on a path it cannot resolve — never hand it unvalidated request data; use `realPath` there. */
 	scoped(basePath: string): SessionFileStore {
 		// Resolve basePath relative to current scope
 		const resolved = this.resolvePath(basePath)
