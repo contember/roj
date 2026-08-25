@@ -24,6 +24,7 @@
 		"@types/react": "19.2.14",
 		"@types/react-dom": "19.2.3",
 		"@vitejs/plugin-react": "^4.3.4",
+		"serve": "^14.2.6",
 		"tailwindcss": "^4.1.7",
 		"typescript": "catalog:build",
 		"vite": "^6.0.5",

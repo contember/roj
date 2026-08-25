@@ -11,24 +11,63 @@
  * To replay the build turn without network access:
  *   LIVE_TESTS=1 bun test packages/demo/tests/app-builder.e2e.test.ts
  *
- * The default CI command runs only the REST-surface smoke test.
+ * The snapshot key covers the system prompt, so anything that changes it —
+ * preset, model, tool set, workspace path — needs a re-record. CI replays the
+ * build turn; `bun run test` alone runs only the REST-surface smoke test.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { createRojClient } from '@roj-ai/client/platform'
-import { createSnapshotLLMMiddleware, normalizeStripRuntime } from '@roj-ai/sdk/llm/snapshot-middleware'
+import {
+	composeStrippers,
+	createSnapshotLLMMiddleware,
+	normalizeWith,
+	stripEphemeralPorts,
+	stripUuids,
+} from '@roj-ai/sdk/llm/snapshot-middleware'
 import { startStandaloneServer, type StandaloneHandle } from '@roj-ai/standalone-server'
 import { waitForAllAgentsIdle } from '@roj-ai/sdk/testing'
 import { appBuilderPreset } from '../agent/preset'
 
 const SNAPSHOTS_DIR = join(import.meta.dir, '__snapshots__', 'app-builder')
-// Stable workspace path (no {sessionId} template and no PID) — the cached
-// LLM response embeds the exact path it saw at record time, so any per-run
-// variation makes cached responses reference non-existent dirs. Shared across
-// sessions within one test run; cleaned up in beforeAll + afterAll.
+// Own data root, so nothing lands in the repo's ./data.
+const DATA_DIR = '/tmp/roj-demo-e2e-data'
+// The recorded assistant turn contains a `write_file` call with the absolute
+// workspace path it saw while recording, so that path has to be identical on
+// every replay — a per-session directory makes every snapshot dead on arrival.
+// The platform REST `sessions.create` mints its own UUID and puts the session in
+// a git worktree, so the build turn creates its session through the manager with
+// a fixed workspace instead; REST create is covered by the eviction e2e.
 const WORKSPACE_DIR = '/tmp/roj-demo-e2e'
+
+// The dev service runs with its cwd inside the session workspace, which sits
+// outside the repo — `bunx serve` there resolves nothing locally and downloads
+// the package on every cold run. Point it at the devDependency instead, so the
+// service reaching `ready` (part of the snapshot key) needs no network. The
+// command itself is not hashed; only the service's description and status are.
+const SERVE_BIN = fileURLToPath(import.meta.resolve('serve/build/main.js'))
+
+const testPreset = {
+	...appBuilderPreset,
+	orchestrator: {
+		...appBuilderPreset.orchestrator,
+		services: appBuilderPreset.orchestrator.services?.map((service) =>
+			service.type === 'dev'
+				? { ...service, command: ({ port }: { port: number }) => `bun ${SERVE_BIN} -l ${port} .` }
+				: service,
+		),
+	},
+}
+
+// The directory listing the agent is primed with reports every file's size, and
+// the session log's size depends on how much the run happened to log — it moved
+// between this machine and CI and busted the key. `formatSize` is the only
+// numeric token left in the digest that the environment gets to decide.
+const stripFileSizes = (text: string) => text.replace(/\((?:\d+B|\d+\.\d+(?:KB|MB))\)/g, '(__SIZE__)')
+const normalizeRequest = normalizeWith(composeStrippers(stripUuids, stripEphemeralPorts, stripFileSizes))
 
 const hasApiKey = !!process.env.ANTHROPIC_API_KEY || !!process.env.OPENROUTER_API_KEY
 const hasSnapshots =
@@ -45,11 +84,10 @@ describe('App Builder e2e', () => {
 
 	beforeAll(async () => {
 		mkdirSync(SNAPSHOTS_DIR, { recursive: true })
+		rmSync(DATA_DIR, { recursive: true, force: true })
+		mkdirSync(DATA_DIR, { recursive: true })
 		rmSync(WORKSPACE_DIR, { recursive: true, force: true })
 		mkdirSync(WORKSPACE_DIR, { recursive: true })
-
-		// Override workspaceDir so it is stable across runs (snapshots pin it).
-		const testPreset = { ...appBuilderPreset, workspaceDir: WORKSPACE_DIR }
 
 		handle = await startStandaloneServer({
 			presets: [testPreset],
@@ -57,6 +95,7 @@ describe('App Builder e2e', () => {
 				port: 0,
 				host: '127.0.0.1',
 				persistence: 'memory',
+				dataPath: DATA_DIR,
 				// Register whichever provider we have a key for — middleware below
 				// intercepts before any real call once a snapshot exists.
 				anthropicApiKey: process.env.ANTHROPIC_API_KEY,
@@ -69,9 +108,9 @@ describe('App Builder e2e', () => {
 			llmMiddleware: [
 				createSnapshotLLMMiddleware({
 					snapshotsDir: SNAPSHOTS_DIR,
-					// Strip session UUIDs and randomly-assigned dev-service ports from
-					// the request before hashing, so snapshots match across runs.
-					normalize: normalizeStripRuntime,
+					// Strip everything the run gets to decide — session UUIDs, the
+					// dev-service port, file sizes — before hashing.
+					normalize: normalizeRequest,
 					mode: recordSnapshots ? 'record' : 'replay',
 				}),
 			],
@@ -82,6 +121,7 @@ describe('App Builder e2e', () => {
 
 	afterAll(async () => {
 		await handle?.shutdown()
+		rmSync(DATA_DIR, { recursive: true, force: true })
 		rmSync(WORKSPACE_DIR, { recursive: true, force: true })
 	})
 
@@ -95,11 +135,9 @@ describe('App Builder e2e', () => {
 	})
 
 	test.skipIf(!canRunBuildTurn)('session completes a simple build turn', async () => {
-		const session = await client.sessions.create({
-			instanceId: handle.instance.id,
-			presetId: 'app-builder',
-		})
-		expect(session.sessionId).toBeTruthy()
+		const created = await handle.sessionManager.createSession('app-builder', { workspaceDir: WORKSPACE_DIR })
+		if (!created.ok) throw new Error(`createSession failed: ${created.error.message}`)
+		const sessionId = String(created.value.id)
 
 		// Send the initial prompt over the platform RPC surface (instance-scoped path).
 		const sendResp = await fetch(
@@ -110,7 +148,7 @@ describe('App Builder e2e', () => {
 				body: JSON.stringify({
 					method: 'user-chat.sendMessage',
 					input: {
-						sessionId: session.sessionId,
+						sessionId,
 						content: 'Create an index.html file with the text "Hello from roj".',
 					},
 				}),
@@ -120,11 +158,7 @@ describe('App Builder e2e', () => {
 		const sendBody = (await sendResp.json()) as { ok: boolean; error?: { message: string } }
 		if (!sendBody.ok) throw new Error(`sendMessage failed: ${sendBody.error?.message}`)
 
-		// Grab the in-memory session from the manager and wait for agents to quiesce.
-		// Exposed on StandaloneHandle specifically for test-facing introspection.
-		const sessionObj = await handle.sessionManager.getSession(session.sessionId as any)
-		if (!sessionObj.ok) throw new Error(`getSession failed: ${sessionObj.error.message}`)
-		await waitForAllAgentsIdle(sessionObj.value, { timeoutMs: 120_000 })
+		await waitForAllAgentsIdle(created.value, { timeoutMs: 120_000 })
 
 		// At least one LLM call happened — snapshot files exist.
 		const snapshots = readdirSync(SNAPSHOTS_DIR).filter((f) => f.endsWith('.json'))
