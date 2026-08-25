@@ -9,7 +9,7 @@ import type { PortPool } from './port-pool.js'
 import { buildServiceStatusMessage } from './prompt.js'
 import type { ServiceConfig, ServiceEntry } from './schema.js'
 import type { ServicePidRegistry } from './pid-registry.js'
-import { getProcessStartTime, ServiceExecutor } from './service.js'
+import { ServiceExecutor } from './service.js'
 import type { RuntimeLeaseRelease } from '~/core/sessions/runtime-activity.js'
 
 export const serviceEvents = createEventsFactory({
@@ -116,10 +116,13 @@ export const servicePlugin = definePlugin('services')
 								updated.command = event.command
 							}
 						}
-						if (event.toStatus === 'failed' && event.error) {
-							updated.error = event.error
-							updated.pid = undefined
-							updated.pidStartTime = undefined
+						if (event.toStatus === 'failed') {
+							if (event.error) updated.error = event.error
+							// `pid` is a claim on a process we spawned and have not seen exit — the
+							// only handle a later boot has on it. A `failed` change carries it while
+							// the process may still be alive, and omits it once the exit is confirmed.
+							updated.pid = event.pid
+							updated.pidStartTime = event.pidStartTime
 						}
 						if (event.toStatus === 'stopped') {
 							updated.stoppedAt = event.timestamp
@@ -154,9 +157,10 @@ export const servicePlugin = definePlugin('services')
 							// The runtime died under it — nobody decided to stop it.
 							updated.stoppedBy = 'eviction'
 							updated.port = undefined
-							updated.pid = undefined
-							updated.pidStartTime = undefined
 							updated.stoppedAt = event.timestamp
+							// `pid` deliberately survives: nothing killed that process, and this is
+							// the only handle left to find it with. This event is emitted immediately
+							// before `onSessionReady`, whose reconcile is what reclaims it.
 						}
 						newServices.set(serviceType, updated)
 						changed = true
@@ -481,61 +485,57 @@ export const servicePlugin = definePlugin('services')
 		},
 	})
 	.sessionHook('onSessionReady', async (ctx) => {
-		// Reconcile: kill orphaned process groups from previous server instance
-		// and mark corresponding services as stopped. Port is preserved in state
-		// so the next start() reuses it via preferredPort.
-		// Also re-notify running services so DO re-registers their URLs.
+		// Reconcile what a previous runtime left behind: kill orphaned process groups and
+		// settle the entries that claimed them. Port is preserved in state so the next
+		// start() reuses it via preferredPort. Also re-notify running services so DO
+		// re-registers their URLs.
+		//
+		// Driven off the recorded pid rather than a list of running statuses: a process we
+		// spawned and never saw exit is an orphan whatever the entry says, and `failed` or
+		// `stopped` reaches the next boot still owning one just as often as `ready` does.
 		for (const [serviceType, entry] of ctx.pluginState) {
-			// `stopping` is in the match because a runtime that died mid-stop leaves it
-			// behind, and it is reachable by no other recovery path.
-			if (entry.status === 'starting' || entry.status === 'ready' || entry.status === 'stopping') {
-				const executorStatus = ctx.pluginContext.executor.getStatus(serviceType)
-				if (!executorStatus) {
-					if (entry.pid !== undefined) {
-						// PID-reuse guard: only kill if we can confirm this PID still
-						// belongs to the process we spawned. If we stored a pidStartTime,
-						// the current start time must match — a mismatch means the kernel
-						// recycled the PID for an unrelated process and SIGKILL would be
-						// disastrous. On non-Linux (no /proc), start times are always
-						// undefined and we fall back to the pre-existing kill-and-hope path.
-						const currentStartTime = await getProcessStartTime(ctx.platform.fs, entry.pid)
-						const pidReused = entry.pidStartTime !== undefined
-							&& currentStartTime !== undefined
-							&& currentStartTime !== entry.pidStartTime
+			// `stopping` counts as live: a runtime that died mid-stop leaves it behind, and
+			// it is reachable by no other recovery path.
+			const live = entry.status === 'starting' || entry.status === 'ready' || entry.status === 'stopping'
+			if (!live && entry.pid === undefined) continue
 
-						if (pidReused) {
-							ctx.logger.warn('PID reuse detected during orphan reconcile — refusing to kill', {
-								serviceType,
-								pid: entry.pid,
-								storedStartTime: entry.pidStartTime,
-								currentStartTime,
-							})
-						} else {
-							// Through the executor's kill seam, and loud when it fails: a signal
-							// that did not land must not look like one that did.
-							const killed = ctx.pluginContext.executor.killProcessGroup(entry.pid)
-							if (killed.ok) {
-								ctx.logger.info('Killed orphaned service process group', { serviceType, pid: entry.pid })
-							} else {
-								ctx.logger.warn('Could not kill orphaned service process group', {
-									serviceType,
-									pid: entry.pid,
-									error: killed.error.message,
-								})
-							}
-						}
-					}
-					await ctx.emitEvent(serviceEvents.create('service_status_changed', {
-						serviceType,
-						toStatus: 'stopped',
-						// The runtime died under it — nobody decided to stop it, so autoStart may revive it.
-						stoppedBy: 'eviction',
-					}))
-				} else if (executorStatus === 'ready' && entry.port) {
+			const executorStatus = ctx.pluginContext.executor.getStatus(serviceType)
+			if (executorStatus) {
+				if (executorStatus === 'ready' && entry.port) {
 					// Re-notify so DO can re-register service URL after reconnect
 					ctx.notify('serviceStatus', { sessionId: String(ctx.sessionId), serviceType, status: 'ready', port: entry.port })
 				}
+				continue
 			}
+
+			if (entry.pid !== undefined) {
+				// Guarded and loud when it fails: a signal that did not land must not look
+				// like one that did.
+				const reaped = await ctx.pluginContext.executor.reapProcessGroup(
+					{ pid: entry.pid, pidStartTime: entry.pidStartTime },
+					{ serviceType },
+				)
+				if (!reaped.ok) {
+					ctx.logger.warn('Could not kill orphaned service process group', {
+						serviceType,
+						pid: entry.pid,
+						error: reaped.error.message,
+					})
+				} else if (reaped.value === 'killed') {
+					ctx.logger.info('Killed orphaned service process group', { serviceType, pid: entry.pid })
+				}
+			}
+
+			// A `failed` entry keeps its status and the error that explains it — only its
+			// claim on a process is taken away. Everything else settles as stopped.
+			await ctx.emitEvent(serviceEvents.create('service_status_changed', entry.status === 'failed'
+				? { serviceType, toStatus: 'failed' }
+				: {
+					serviceType,
+					toStatus: 'stopped',
+					// The runtime died under it — nobody decided to stop it, so autoStart may revive it.
+					stoppedBy: 'eviction',
+				}))
 		}
 
 		// Auto-start services configured with autoStart
