@@ -54,6 +54,20 @@ For deterministic e2e tests, inject `llmMiddleware: [createSnapshotLLMMiddleware
 from `@roj-ai/sdk/llm/snapshot-middleware` — see `packages/demo/tests/` for a
 worked example.
 
+## Session runtime eviction
+
+Standalone evicts a session runtime after **10 minutes idle**
+(`DEFAULT_SESSION_IDLE_TIMEOUT_MS` in `server.ts`). Override with
+`SESSION_IDLE_TIMEOUT_MS`, or set it to `0` to keep every runtime resident.
+The SDK itself defaults to no eviction — this default belongs to standalone, not
+to `loadConfig()`, so embedding the SDK directly does not inherit it.
+
+An evicted session is rebuilt from its event log on next access, which re-runs
+every `onSessionReady` hook: orphan-PID reconciliation, `autoStart` service spawn,
+worker relaunch. Sessions holding a runtime lease — a live service, a running
+upload or worker, an in-flight request — stay resident regardless of idle time.
+`sessionManager.getRuntimeCacheStats()` shows which leases are held and why.
+
 ## Platform RPC surface
 
 Implemented:

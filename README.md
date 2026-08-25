@@ -152,6 +152,7 @@ The server reads these environment variables (see
 | `ANTHROPIC_API_KEY` | — | Anthropic provider |
 | `OPENROUTER_API_KEY` | — | OpenRouter provider (fallback) |
 | `DEFAULT_MODEL` | `anthropic/claude-haiku-4.5` | Model when a preset does not set one |
+| `SESSION_IDLE_TIMEOUT_MS` | `600000` (standalone) | Evict a session runtime after this long idle; `0` disables. Unset means no eviction for embedders that call `loadConfig()` directly |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / `console` | Logging |
 
 Per-preset and per-agent settings (plugins, tools, workspace, services) live in
