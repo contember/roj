@@ -1,5 +1,5 @@
 // Plugin
-export { workerPlugin } from './plugin.js'
+export { MAX_CONCURRENT_WORKERS, WORKER_EFFECT_DRAIN_TIMEOUT_MS, WORKER_STOP_TIMEOUT_MS, workerPlugin } from './plugin.js'
 export type { WorkerAgentConfig, WorkerPresetConfig } from './plugin.js'
 
 // Events (now in plugin.ts)

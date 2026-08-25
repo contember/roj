@@ -101,6 +101,13 @@ export interface WorkerDefinition<
 	/**
 	 * Main execution logic.
 	 * The worker runs until completion, failure, or cancellation.
+	 *
+	 * Re-entrant, and must be idempotent: a rebuilt session runtime and
+	 * `workers.resume` both call this again from the top, with `context.resumed`
+	 * true and the state already replayed from the event log. Drive the loop from
+	 * `context.getState()` and emit the event that records a side effect before
+	 * performing it — never from local variables seeded at entry, which a re-entry
+	 * resets while the persisted state moves on.
 	 */
 	execute(
 		config: TConfig,
