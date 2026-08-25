@@ -33,7 +33,11 @@ interface RpcError {
 interface PlatformSessionManager {
 	callManagerMethod(method: string, input: unknown): Promise<Result<unknown, RpcError>>
 	callPluginMethod(sessionId: SessionId, method: string, input: unknown): Promise<Result<unknown, RpcError>>
-	getSession(sessionId: SessionId): Promise<Result<Pick<Session, 'close'>, RpcError>>
+	withSessionLease(
+		sessionId: SessionId,
+		reason: string,
+		operation: (session: Pick<Session, 'close'>) => Promise<Result<void, RpcError>>,
+	): Promise<Result<void, RpcError>>
 	getStats(): Promise<{
 		sessions: Array<{ id: SessionId; presetId: string; status: string }>
 	}>
@@ -536,35 +540,29 @@ async function injectRegistryFile(deps: Deps, sessionId: string, selection: Reso
 }
 
 async function rollbackCreatedSession(deps: Deps, sessionId: string): Promise<void> {
-	let sessionResult: Awaited<ReturnType<PlatformSessionManager['getSession']>> | null = null
+	let closeAttempted = false
 	try {
-		sessionResult = await deps.sessionManager.getSession(SessionId(sessionId))
+		const closeResult = await deps.sessionManager.withSessionLease(
+			SessionId(sessionId),
+			'standalone:rollback',
+			async (session) => {
+				closeAttempted = true
+				return session.close()
+			},
+		)
+		if (!closeResult.ok) {
+			deps.logger.error(
+				closeAttempted ? 'Failed to close session during rollback' : 'Failed to load session for rollback',
+				undefined,
+				{ sessionId, error: closeResult.error },
+			)
+		}
 	} catch (error) {
 		deps.logger.error(
-			'Failed to load session for rollback',
+			closeAttempted ? 'Failed to close session during rollback' : 'Failed to load session for rollback',
 			error instanceof Error ? error : new Error(String(error)),
 			{ sessionId },
 		)
-	}
-
-	if (sessionResult && !sessionResult.ok) {
-		deps.logger.error('Failed to load session for rollback', undefined, {
-			sessionId,
-			error: sessionResult.error,
-		})
-	} else if (sessionResult) {
-		try {
-			const closed = await sessionResult.value.close()
-			if (!closed.ok) {
-				deps.logger.error('Failed to close session during rollback', undefined, { sessionId, error: closed.error })
-			}
-		} catch (error) {
-			deps.logger.error(
-				'Failed to close session during rollback',
-				error instanceof Error ? error : new Error(String(error)),
-				{ sessionId },
-			)
-		}
 	}
 
 	await removeWorktreeAfterFailure(deps, sessionId)

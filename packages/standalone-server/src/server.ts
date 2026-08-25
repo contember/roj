@@ -56,12 +56,20 @@ export interface StandaloneHandle {
 	shutdown(): Promise<void>
 }
 
+/** Evict a session runtime after this long idle. Override with SESSION_IDLE_TIMEOUT_MS. */
+const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 600_000
+
 export async function startStandaloneServer(options: StartStandaloneOptions): Promise<StandaloneHandle> {
 	const envConfig = loadConfig()
 	const config: Config = {
 		...envConfig,
 		...options.config,
 		host: resolveStandaloneHost(options.config?.host, process.env.HOST),
+		// Standalone is a long-lived single-instance runtime, so it evicts idle
+		// session runtimes by default. SESSION_IDLE_TIMEOUT_MS=0 turns it off.
+		sessionIdleTimeoutMs: options.config?.sessionIdleTimeoutMs
+			?? envConfig.sessionIdleTimeoutMs
+			?? DEFAULT_SESSION_IDLE_TIMEOUT_MS,
 	}
 
 	const errors = validateConfig(config)
