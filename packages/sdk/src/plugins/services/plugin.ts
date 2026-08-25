@@ -10,18 +10,25 @@ import { buildServiceStatusMessage } from './prompt.js'
 import type { ServiceConfig, ServiceEntry } from './schema.js'
 import type { ServicePidRegistry } from './pid-registry.js'
 import { getProcessStartTime, ServiceExecutor } from './service.js'
+import type { RuntimeLeaseRelease } from '~/core/sessions/runtime-activity.js'
 
 export const serviceEvents = createEventsFactory({
 	events: {
 		service_status_changed: z.object({
 			serviceType: z.string(),
-			toStatus: z.enum(['stopped', 'starting', 'ready', 'stopping', 'failed', 'paused']),
+			toStatus: z.enum(['stopped', 'starting', 'ready', 'stopping', 'failed']),
 			port: z.number().optional(),
 			error: z.string().optional(),
 			cwd: z.string().optional(),
 			command: z.string().optional(),
 			pid: z.number().optional(),
 			pidStartTime: z.number().optional(),
+			/**
+			 * Who asked for the stop, on a `stopped` change. Absent from logs written
+			 * before the discriminator existed — the reducer reads those as `agent`,
+			 * the only default that cannot resurrect a service meant to stay down.
+			 */
+			stoppedBy: z.enum(['agent', 'eviction']).optional(),
 			/**
 			 * Set on a `failed` change when the `restartPolicy` has already queued a
 			 * revival, so that no consumer — agent prompt, SPA, platform — mistakes it
@@ -70,6 +77,7 @@ export const servicePlugin = definePlugin('services')
 						newServices.set(event.serviceType, {
 							serviceType: event.serviceType,
 							status: event.toStatus,
+							stoppedBy: 'never',
 							port: event.port,
 							cwd: event.cwd,
 							command: event.command,
@@ -88,6 +96,7 @@ export const servicePlugin = definePlugin('services')
 						}
 						if (event.toStatus === 'starting') {
 							updated.startedAt = event.timestamp
+							updated.stoppedBy = 'never'
 							updated.error = undefined
 							updated.port = event.port
 							updated.cwd = event.cwd
@@ -114,6 +123,7 @@ export const servicePlugin = definePlugin('services')
 						}
 						if (event.toStatus === 'stopped') {
 							updated.stoppedAt = event.timestamp
+							updated.stoppedBy = event.stoppedBy ?? 'agent'
 							updated.pid = undefined
 							updated.pidStartTime = undefined
 						}
@@ -127,9 +137,11 @@ export const servicePlugin = definePlugin('services')
 					let changed = false
 					const newServices = new Map(services)
 					for (const [serviceType, entry] of services) {
-						const running = entry.status === 'starting' || entry.status === 'ready'
+						// `stopping` counts as live: a runtime that died mid-stop leaves it
+						// behind and no other path ever clears it.
+						const live = entry.status === 'starting' || entry.status === 'ready' || entry.status === 'stopping'
 						// Any queued revival died with the runtime that held its timer.
-						if (!running && entry.restartAt === undefined) continue
+						if (!live && entry.restartAt === undefined) continue
 
 						const updated: ServiceEntry = {
 							...entry,
@@ -137,8 +149,10 @@ export const servicePlugin = definePlugin('services')
 							restartAttempt: undefined,
 							restartMaxRetries: undefined,
 						}
-						if (running) {
+						if (live) {
 							updated.status = 'stopped'
+							// The runtime died under it — nobody decided to stop it.
+							updated.stoppedBy = 'eviction'
 							updated.port = undefined
 							updated.pid = undefined
 							updated.pidStartTime = undefined
@@ -156,39 +170,159 @@ export const servicePlugin = definePlugin('services')
 		},
 	})
 	.context(async (ctx, pluginConfig) => {
-		const executor = new ServiceExecutor(ctx.logger, pluginConfig.portPool, {
+		const logger = ctx.logger
+		const emitEvent = ctx.emitEvent
+		const notify = ctx.notify
+		const runtimeActivity = ctx.runtimeActivity
+		interface ServiceLease {
+			release: RuntimeLeaseRelease
+			terminalPending: boolean
+		}
+		const serviceLeases = new Map<string, ServiceLease>()
+		/** Status publications still in flight per type — a lease has to outlive them. */
+		const pendingPublications = new Map<string, number>()
+		const statusEffects = new Set<Promise<void>>()
+		let statusEffectTail = Promise.resolve()
+		let publicationEnabled = true
+		const executor = new ServiceExecutor(logger, pluginConfig.portPool, {
 			fs: ctx.platform.fs,
 			process: ctx.platform.process,
 			pidRegistry: pluginConfig.pidRegistry,
 		})
-		executor.onStatusChanged = (sessionId, serviceType, status, details) => {
-			void ctx.emitEvent(serviceEvents.create('service_status_changed', {
-				serviceType,
-				toStatus: status,
-				port: details.port,
-				error: details.error,
-				cwd: details.cwd,
-				command: details.command,
-				pid: details.pid,
-				pidStartTime: details.pidStartTime,
-				restartAt: details.restartAt,
-				restartAttempt: details.restartAttempt,
-				restartMaxRetries: details.restartMaxRetries,
-			}))
-			// Broadcast service status to connected clients (DO → SPA) via WS.
-			// restartAt rides along so a consumer can hold on to a preview URL it
-			// would otherwise tear down on `failed`.
-			ctx.notify('serviceStatus', {
-				sessionId: String(sessionId),
-				serviceType,
-				status,
-				port: details.port,
-				restartAt: details.restartAt,
-				restartAttempt: details.restartAttempt,
-				restartMaxRetries: details.restartMaxRetries,
-			})
+		const beginLifecycle = (serviceType: string): ServiceLease | undefined => {
+			const existing = serviceLeases.get(serviceType)
+			if (existing && !existing.terminalPending) return existing
+
+			// Undefined once the runtime unloads — the close tail that runs then is
+			// already awaited by disposal, so nothing is left unguarded.
+			const release = runtimeActivity.tryAcquire(`service:${serviceType}`)
+			if (!release) return undefined
+			const lease: ServiceLease = { release, terminalPending: false }
+			serviceLeases.set(serviceType, lease)
+			return lease
 		}
-		return { executor }
+		const releaseLease = (serviceType: string, lease: ServiceLease): void => {
+			if (serviceLeases.get(serviceType) === lease) serviceLeases.delete(serviceType)
+			lease.release()
+		}
+		/**
+		 * A healthy service must not pin its runtime: eviction stops services and the
+		 * rebuild starts them again, so a dev server sitting at `ready` for hours is
+		 * exactly what eviction is for. Only work that cannot survive disposal keeps
+		 * the lease — a transition in progress, a queued revival, an unpublished status.
+		 */
+		const needsRuntime = (serviceType: string): boolean => {
+			if ((pendingPublications.get(serviceType) ?? 0) > 0) return true
+			const status = executor.getStatus(serviceType)
+			return status === 'starting' || status === 'stopping' || executor.hasScheduledRestart(serviceType)
+		}
+		const releaseLeaseWhenIdle = (serviceType: string, lease: ServiceLease): void => {
+			if (serviceLeases.get(serviceType) !== lease || lease.terminalPending) return
+			if (!needsRuntime(serviceType)) releaseLease(serviceType, lease)
+		}
+		const startService = async (
+			config: ServiceConfig,
+			sessionId: Parameters<ServiceExecutor['start']>[1],
+			workspaceDir?: string,
+			preferredPort?: number,
+		) => {
+			const lease = beginLifecycle(config.type)
+			try {
+				return await executor.start(config, sessionId, workspaceDir, preferredPort)
+			} finally {
+				if (lease) releaseLeaseWhenIdle(config.type, lease)
+			}
+		}
+		const restartService = async (
+			config: ServiceConfig,
+			sessionId: Parameters<ServiceExecutor['restart']>[1],
+			workspaceDir?: string,
+			preferredPort?: number,
+		) => {
+			const lease = beginLifecycle(config.type)
+			try {
+				return await executor.restart(config, sessionId, workspaceDir, preferredPort)
+			} finally {
+				if (lease) releaseLeaseWhenIdle(config.type, lease)
+			}
+		}
+		const waitForStatusEffects = async (): Promise<void> => {
+			while (statusEffects.size > 0) {
+				await Promise.allSettled([...statusEffects])
+			}
+		}
+		executor.onStartSettled = (serviceType) => {
+			const lease = serviceLeases.get(serviceType)
+			if (lease) releaseLeaseWhenIdle(serviceType, lease)
+		}
+		executor.onStatusChanged = (sessionId, serviceType, status, details) => {
+			if (!publicationEnabled) return
+			const terminal = status === 'stopped' || (status === 'failed' && details.restartAt === undefined)
+			const lease = terminal ? serviceLeases.get(serviceType) : beginLifecycle(serviceType)
+			if (terminal && lease) lease.terminalPending = true
+			pendingPublications.set(serviceType, (pendingPublications.get(serviceType) ?? 0) + 1)
+
+			const effect = statusEffectTail.then(async () => {
+				try {
+					await emitEvent(serviceEvents.create('service_status_changed', {
+						serviceType,
+						toStatus: status,
+						port: details.port,
+						error: details.error,
+						cwd: details.cwd,
+						command: details.command,
+						pid: details.pid,
+						pidStartTime: details.pidStartTime,
+						stoppedBy: details.stoppedBy,
+						restartAt: details.restartAt,
+						restartAttempt: details.restartAttempt,
+						restartMaxRetries: details.restartMaxRetries,
+					}))
+					// Broadcast only after the durable projection catches up.
+					notify('serviceStatus', {
+						sessionId: String(sessionId),
+						serviceType,
+						status,
+						port: details.port,
+						restartAt: details.restartAt,
+						restartAttempt: details.restartAttempt,
+						restartMaxRetries: details.restartMaxRetries,
+					})
+				} catch (error) {
+					logger.error('Failed to publish service status', error instanceof Error ? error : new Error(String(error)), {
+						serviceType,
+						status,
+					})
+				} finally {
+					const remaining = (pendingPublications.get(serviceType) ?? 1) - 1
+					if (remaining > 0) pendingPublications.set(serviceType, remaining)
+					else pendingPublications.delete(serviceType)
+					if (lease) {
+						if (terminal) releaseLease(serviceType, lease)
+						else releaseLeaseWhenIdle(serviceType, lease)
+					}
+				}
+			})
+			statusEffectTail = effect.then(() => undefined, () => undefined)
+			statusEffects.add(effect)
+			const removeEffect = () => statusEffects.delete(effect)
+			void effect.then(removeEffect, removeEffect)
+		}
+		const close = async (
+			sessionId: Parameters<ServiceExecutor['close']>[0],
+			reason: Parameters<ServiceExecutor['close']>[1],
+		): Promise<void> => {
+			try {
+				await executor.close(sessionId, reason)
+			} finally {
+				publicationEnabled = false
+				executor.onStatusChanged = undefined
+				executor.onStartSettled = undefined
+				await waitForStatusEffects()
+				for (const [serviceType, lease] of serviceLeases) releaseLease(serviceType, lease)
+			}
+		}
+		return { executor, startService, restartService, close }
 	})
 	.agentConfig<ServiceAgentConfig>()
 	.method('start', {
@@ -214,7 +348,7 @@ export const servicePlugin = definePlugin('services')
 				}
 
 				const preferredPort = ctx.pluginState.get(input.serviceType)?.port
-				const startResult = await ctx.pluginContext.executor.start(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, preferredPort)
+				const startResult = await ctx.pluginContext.startService(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, preferredPort)
 				if (!startResult.ok) return Err(ValidationErrors.invalid(startResult.error.message))
 				started.push(input.serviceType)
 			} else {
@@ -229,7 +363,7 @@ export const servicePlugin = definePlugin('services')
 							}
 						} else {
 							const preferredPort = ctx.pluginState.get(svcConfig.type)?.port
-							const startResult = await ctx.pluginContext.executor.start(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, preferredPort)
+							const startResult = await ctx.pluginContext.startService(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, preferredPort)
 							if (!startResult.ok) return Err(ValidationErrors.invalid(startResult.error.message))
 							started.push(svcConfig.type)
 						}
@@ -269,7 +403,7 @@ export const servicePlugin = definePlugin('services')
 			if (!svcConfig) return Err(ValidationErrors.invalid(`Service ${input.serviceType} not found`))
 
 			const preferredPort = ctx.pluginState.get(input.serviceType)?.port
-			const result = await ctx.pluginContext.executor.restart(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, preferredPort)
+			const result = await ctx.pluginContext.restartService(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, preferredPort)
 			if (!result.ok) return Err(ValidationErrors.invalid(result.error.message))
 			return Ok({})
 		},
@@ -352,7 +486,9 @@ export const servicePlugin = definePlugin('services')
 		// so the next start() reuses it via preferredPort.
 		// Also re-notify running services so DO re-registers their URLs.
 		for (const [serviceType, entry] of ctx.pluginState) {
-			if (entry.status === 'starting' || entry.status === 'ready' || entry.status === 'paused') {
+			// `stopping` is in the match because a runtime that died mid-stop leaves it
+			// behind, and it is reachable by no other recovery path.
+			if (entry.status === 'starting' || entry.status === 'ready' || entry.status === 'stopping') {
 				const executorStatus = ctx.pluginContext.executor.getStatus(serviceType)
 				if (!executorStatus) {
 					if (entry.pid !== undefined) {
@@ -375,17 +511,25 @@ export const servicePlugin = definePlugin('services')
 								currentStartTime,
 							})
 						} else {
-							try {
-								process.kill(-entry.pid, 'SIGKILL')
+							// Through the executor's kill seam, and loud when it fails: a signal
+							// that did not land must not look like one that did.
+							const killed = ctx.pluginContext.executor.killProcessGroup(entry.pid)
+							if (killed.ok) {
 								ctx.logger.info('Killed orphaned service process group', { serviceType, pid: entry.pid })
-							} catch (err) {
-								ctx.logger.debug('Orphaned service process already gone', { serviceType, pid: entry.pid, err })
+							} else {
+								ctx.logger.warn('Could not kill orphaned service process group', {
+									serviceType,
+									pid: entry.pid,
+									error: killed.error.message,
+								})
 							}
 						}
 					}
 					await ctx.emitEvent(serviceEvents.create('service_status_changed', {
 						serviceType,
 						toStatus: 'stopped',
+						// The runtime died under it — nobody decided to stop it, so autoStart may revive it.
+						stoppedBy: 'eviction',
 					}))
 				} else if (executorStatus === 'ready' && entry.port) {
 					// Re-notify so DO can re-register service URL after reconnect
@@ -396,28 +540,27 @@ export const servicePlugin = definePlugin('services')
 
 		// Auto-start services configured with autoStart
 		for (const svcConfig of ctx.pluginConfig.services) {
-			if (svcConfig.autoStart) {
-				const status = ctx.pluginContext.executor.getStatus(svcConfig.type)
-				if (status !== 'ready' && status !== 'starting') {
-					const preferredPort = ctx.pluginState.get(svcConfig.type)?.port
-					const startResult = await ctx.pluginContext.executor.start(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, preferredPort)
-					if (!startResult.ok) {
-						ctx.logger.debug('Auto-start service skipped', { serviceType: svcConfig.type, error: startResult.error.message })
-					}
-				}
+			if (!svcConfig.autoStart) continue
+			const status = ctx.pluginContext.executor.getStatus(svcConfig.type)
+			if (status === 'ready' || status === 'starting') continue
+
+			// On a fresh runtime the executor knows nothing, so the persisted decision is
+			// the only thing that can tell an evicted service (bring it back) from one the
+			// agent stopped on purpose (leave it down).
+			const entry = ctx.pluginState.get(svcConfig.type)
+			if (entry?.status === 'stopped' && entry.stoppedBy === 'agent') {
+				ctx.logger.debug('Auto-start skipped — the agent stopped this service', { serviceType: svcConfig.type })
+				continue
+			}
+
+			const startResult = await ctx.pluginContext.startService(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, entry?.port)
+			if (!startResult.ok) {
+				ctx.logger.debug('Auto-start service skipped', { serviceType: svcConfig.type, error: startResult.error.message })
 			}
 		}
 	})
 	.sessionHook('onSessionClose', async (ctx) => {
-		for (const svcConfig of ctx.pluginConfig.services) {
-			const status = ctx.pluginContext.executor.getStatus(svcConfig.type)
-			// A queued revival outlives the session otherwise: its timer holds the
-			// executor alive and spawns a process into a session that is already gone.
-			const revivalQueued = ctx.pluginContext.executor.hasScheduledRestart(svcConfig.type)
-			if (status === 'ready' || status === 'starting' || status === 'paused' || revivalQueued) {
-				await ctx.pluginContext.executor.stop(svcConfig.type, ctx.sessionId)
-			}
-		}
+		await ctx.pluginContext.close(ctx.sessionId, ctx.reason)
 	})
 	.tools((ctx) => {
 		const serviceMap = new Map(ctx.pluginConfig.services.map((svc) => [svc.type, svc]))

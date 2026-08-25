@@ -13,7 +13,17 @@
 /**
  * Service lifecycle status.
  */
-export type ServiceStatus = 'stopped' | 'starting' | 'ready' | 'stopping' | 'failed' | 'paused'
+export type ServiceStatus = 'stopped' | 'starting' | 'ready' | 'stopping' | 'failed'
+
+/**
+ * Who asked for a stop. Every runtime-lifecycle stop — idle eviction, session
+ * close, server shutdown — records `eviction`, because none of them is the
+ * agent's decision and all of them may be undone by the next runtime.
+ */
+export type ServiceStopSource = 'agent' | 'eviction'
+
+/** `never` means the service has not been stopped since its last start. */
+export type ServiceStoppedBy = ServiceStopSource | 'never'
 
 // ============================================================================
 // Service Config (declared in presets)
@@ -123,8 +133,6 @@ export interface ServiceConfig {
 		/** Uptime that counts as healthy and resets the budget (default: 60000) */
 		healthyAfterMs?: number
 	}
-	/** Auto-pause configuration (interface prepared, not yet implemented) */
-	autoPause?: { inactivityMs: number }
 	/**
 	 * When false, the service is hidden from the owning agent: excluded from its
 	 * service_* tools and the session-context status block. It still runs at the
@@ -146,6 +154,12 @@ export interface ServiceConfig {
 export interface ServiceEntry {
 	serviceType: string
 	status: ServiceStatus
+	/**
+	 * Who stopped the service. An idle eviction stops services and the rebuilt
+	 * runtime starts them again, so autoStart needs this to tell a parked
+	 * service from one the agent deliberately shut down and expects to stay down.
+	 */
+	stoppedBy: ServiceStoppedBy
 	port?: number
 	error?: string
 	/** Resolved working directory used for the current/last start. */

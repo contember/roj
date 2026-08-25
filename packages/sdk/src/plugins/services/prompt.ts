@@ -31,12 +31,7 @@ export function buildServiceStatusMessage(
 		const status = entry?.status ?? 'stopped'
 		let line = `- ${config.type}: ${config.description} — ${status}`
 
-		if (
-			entry?.port !== undefined
-			&& entry.status !== 'stopped'
-			&& entry.status !== 'failed'
-			&& entry.status !== 'paused'
-		) {
+		if (entry?.port !== undefined && entry.status !== 'stopped' && entry.status !== 'failed') {
 			line += ` (port ${entry.port})`
 		}
 		if (entry?.error) {

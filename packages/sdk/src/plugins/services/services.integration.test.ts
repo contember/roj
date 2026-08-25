@@ -5,11 +5,13 @@ import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MemoryEventStore } from '~/core/events/memory.js'
+import type { DomainEvent } from '~/core/events/types.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import { SessionId } from '~/core/sessions/schema.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { silentLogger } from '~/lib/logger/logger.js'
+import type { Dirent, FileSystem } from '~/platform/fs.js'
 import type { ExecFileResult, ProcessRunner } from '~/platform/process.js'
 import { createNodePlatform } from '~/testing/node-platform.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
@@ -96,6 +98,39 @@ function createServicesHarness(options: Omit<ConstructorParameters<typeof TestHa
 	return harness
 }
 
+class GatedServiceStatusEventStore extends MemoryEventStore {
+	private armed = false
+	private markStarted = () => {}
+	private releaseAppend = () => {}
+	private readonly gate = new Promise<void>((resolve) => {
+		this.releaseAppend = resolve
+	})
+	readonly appendStarted = new Promise<void>((resolve) => {
+		this.markStarted = resolve
+	})
+	completed = false
+
+	arm(): void {
+		this.armed = true
+	}
+
+	release(): void {
+		this.releaseAppend()
+	}
+
+	override async append(sessionId: SessionId, event: DomainEvent): Promise<void> {
+		if (this.armed && event.type === 'service_status_changed') {
+			this.armed = false
+			this.markStarted()
+			await this.gate
+			await super.append(sessionId, event)
+			this.completed = true
+			return
+		}
+		await super.append(sessionId, event)
+	}
+}
+
 /** Wait for a service status change event of a specific type */
 async function waitForServiceStatus(
 	session: Awaited<ReturnType<TestHarness['createSession']>>,
@@ -138,6 +173,15 @@ async function waitForServiceStateStatus(
 	)
 }
 
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0)
+		return true
+	} catch {
+		return false
+	}
+}
+
 /** Wait for a condition observed directly off a ServiceExecutor, not a session. */
 async function waitFor(
 	condition: () => boolean,
@@ -166,6 +210,251 @@ async function waitForAsync(condition: () => Promise<boolean>, describeState: ()
 // ============================================================================
 
 describe('services plugin', () => {
+	it('keeps a runtime resident while a service is still starting, and evicts it once stopped', async () => {
+		const slowService: ServiceConfig = {
+			type: 'slow-start',
+			description: 'Never prints its ready marker',
+			command: 'sleep 60',
+			readyPattern: 'NEVER-PRINTED',
+			startupTimeoutMs: 30_000,
+		}
+		const harness = createServicesHarness({
+			presets: [createServicesPreset([slowService], ['slow-start'], new PortPool())],
+			sessionIdleTimeoutMs: 15,
+		})
+		const session = await harness.createSession('test')
+		const started = await session.callPluginMethod('services.start', { serviceType: 'slow-start' })
+		expect(started.ok).toBe(true)
+		await waitForServiceStateStatus(session, 'slow-start', 'starting')
+		await Bun.sleep(50)
+
+		// A start still in flight cannot survive disposal, so it holds the lease.
+		const resident = harness.sessionManager.getRuntimeCacheStats()
+		expect(resident.loadedSessionCount).toBe(1)
+		expect(resident.sessions[0]?.leaseReasons).toEqual({ 'service:slow-start': 1 })
+
+		const stopped = await session.callPluginMethod('services.stop', { serviceType: 'slow-start' })
+		expect(stopped.ok).toBe(true)
+		await waitFor(
+			() => harness.sessionManager.getRuntimeCacheStats().loadedSessionCount === 0,
+			() => JSON.stringify(harness.sessionManager.getRuntimeCacheStats()),
+		)
+	})
+
+	it('evicts an idle session whose service is ready, stopping it and freeing its port', async () => {
+		const portPool = new PortPool()
+		const harness = createServicesHarness({
+			presets: [createServicesPreset([quickService], ['quick'], portPool)],
+			sessionIdleTimeoutMs: 100,
+		})
+		const session = await harness.createSession('test')
+		const started = await session.callPluginMethod('services.start', { serviceType: 'quick', waitForReady: true })
+		expect(started.ok).toBe(true)
+		await waitForServiceStateStatus(session, 'quick', 'ready')
+		const entry = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('quick')
+		const pid = entry?.pid
+		const port = entry?.port
+		if (pid === undefined || port === undefined) throw new Error('Service did not report its pid and port')
+
+		// A dev server that sits at `ready` for hours used to hold its lease for just
+		// as long, which is why an idle sweep never evicted the session paying for it.
+		await waitFor(
+			() => harness.sessionManager.getRuntimeCacheStats().loadedSessionCount === 0,
+			() => JSON.stringify(harness.sessionManager.getRuntimeCacheStats()),
+		)
+		expect(harness.sessionManager.getRuntimeCacheStats().evictions).toBeGreaterThanOrEqual(1)
+		await waitFor(() => !isProcessAlive(pid), () => `pid ${pid} is still alive`)
+
+		// portPool is process-global: an eviction that keeps the port loses it for the
+		// life of the server, and the rebuilt runtime cannot reclaim its preview URL.
+		expect(portPool.tryAllocate(port)).toBe(true)
+		portPool.release(port)
+
+		const stopEvents = (await session.getEventsByType(serviceEvents, 'service_status_changed'))
+			.filter((event) => event.serviceType === 'quick' && event.toStatus === 'stopped')
+		expect(stopEvents).toHaveLength(1)
+		expect(stopEvents[0]?.stoppedBy).toBe('eviction')
+	})
+
+	it('a rebuilt runtime restarts a service the eviction stopped', async () => {
+		const harness = createServicesHarness({
+			presets: [createServicesPreset([autoStartService], ['auto-start'], new PortPool())],
+			sessionIdleTimeoutMs: 100,
+		})
+		const session = await harness.createSession('test')
+		await waitForServiceStateStatus(session, 'auto-start', 'ready')
+		await waitFor(
+			() => harness.sessionManager.getRuntimeCacheStats().loadedSessionCount === 0,
+			() => JSON.stringify(harness.sessionManager.getRuntimeCacheStats()),
+		)
+
+		const parked = (await session.getEventsByType(serviceEvents, 'service_status_changed'))
+			.filter((event) => event.serviceType === 'auto-start')
+		expect(parked.at(-1)?.toStatus).toBe('stopped')
+		expect(parked.at(-1)?.stoppedBy).toBe('eviction')
+
+		await harness.openSession(session.sessionId)
+		await waitForAsync(
+			async () =>
+				(await session.getEventsByType(serviceEvents, 'service_status_changed'))
+					.filter((event) => event.serviceType === 'auto-start' && event.toStatus === 'starting').length === 2,
+			() => 'waiting for the rebuilt runtime to auto-start the service again',
+		)
+	})
+
+	it('a rebuilt runtime leaves a service the agent stopped alone', async () => {
+		const harness = createServicesHarness({
+			presets: [createServicesPreset([autoStartService], ['auto-start'], new PortPool())],
+			sessionIdleTimeoutMs: 100,
+		})
+		const session = await harness.createSession('test')
+		await waitForServiceStateStatus(session, 'auto-start', 'ready')
+		const stopped = await session.callPluginMethod('services.stop', { serviceType: 'auto-start' })
+		expect(stopped.ok).toBe(true)
+		await waitForServiceStateStatus(session, 'auto-start', 'stopped')
+
+		const stopEvents = (await session.getEventsByType(serviceEvents, 'service_status_changed'))
+			.filter((event) => event.serviceType === 'auto-start' && event.toStatus === 'stopped')
+		expect(stopEvents.at(-1)?.stoppedBy).toBe('agent')
+
+		await waitFor(
+			() => harness.sessionManager.getRuntimeCacheStats().loadedSessionCount === 0,
+			() => JSON.stringify(harness.sessionManager.getRuntimeCacheStats()),
+		)
+
+		const reopened = await harness.openSession(session.sessionId)
+		await Bun.sleep(300)
+
+		const starts = (await session.getEventsByType(serviceEvents, 'service_status_changed'))
+			.filter((event) => event.serviceType === 'auto-start' && event.toStatus === 'starting')
+		expect(starts).toHaveLength(1)
+		expect(selectPluginState<Map<string, ServiceEntry>>(reopened.state, 'services')?.get('auto-start')?.status).toBe('stopped')
+	})
+
+	it('keeps a runtime resident while an automatic restart is pending', async () => {
+		const restartingService: ServiceConfig = {
+			type: 'restarting',
+			description: 'Fails and waits before restarting',
+			command: 'exit 1',
+			restartPolicy: { maxRetries: 1, initialDelayMs: 500 },
+		}
+		const harness = createServicesHarness({
+			presets: [createServicesPreset([restartingService], ['restarting'], new PortPool())],
+			sessionIdleTimeoutMs: 15,
+		})
+		const session = await harness.createSession('test')
+		const started = await session.callPluginMethod('services.start', { serviceType: 'restarting' })
+		expect(started.ok).toBe(true)
+		await waitForServiceStateStatus(session, 'restarting', 'failed')
+		await Bun.sleep(50)
+
+		const resident = harness.sessionManager.getRuntimeCacheStats()
+		expect(resident.loadedSessionCount).toBe(1)
+		expect(resident.sessions[0]?.leaseReasons).toEqual({ 'service:restarting': 1 })
+
+		const stopped = await session.callPluginMethod('services.stop', { serviceType: 'restarting' })
+		expect(stopped.ok).toBe(true)
+		await waitFor(
+			() => harness.sessionManager.getRuntimeCacheStats().loadedSessionCount === 0,
+			() => JSON.stringify(harness.sessionManager.getRuntimeCacheStats()),
+		)
+	})
+
+	it('releases a restart lease when the deferred start becomes unavailable', async () => {
+		let available = true
+		const restartingService: ServiceConfig = {
+			type: 'conditional-restart',
+			description: 'Becomes unavailable before its deferred restart',
+			command: 'exit 1',
+			availableWhen: () => available,
+			restartPolicy: { maxRetries: 1, initialDelayMs: 100 },
+		}
+		const harness = createServicesHarness({
+			presets: [createServicesPreset([restartingService], ['conditional-restart'], new PortPool())],
+			sessionIdleTimeoutMs: 20,
+		})
+		const session = await harness.createSession('test')
+		const started = await session.callPluginMethod('services.start', { serviceType: 'conditional-restart' })
+		expect(started.ok).toBe(true)
+		await waitForServiceStateStatus(session, 'conditional-restart', 'failed')
+		available = false
+
+		await waitFor(
+			() => harness.sessionManager.getRuntimeCacheStats().sessions[0]?.activeLeaseCount === 0,
+			() => JSON.stringify(harness.sessionManager.getRuntimeCacheStats()),
+		)
+		await waitFor(
+			() => harness.sessionManager.getRuntimeCacheStats().loadedSessionCount === 0,
+			() => JSON.stringify(harness.sessionManager.getRuntimeCacheStats()),
+		)
+	})
+
+	it('drains a pending status append before explicit disposal completes', async () => {
+		const eventStore = new GatedServiceStatusEventStore()
+		const harness = createServicesHarness({
+			presets: [createServicesPreset([quickService], ['quick'], new PortPool())],
+			eventStore,
+		})
+		const session = await harness.createSession('test')
+		const started = await session.callPluginMethod('services.start', { serviceType: 'quick', waitForReady: true })
+		expect(started.ok).toBe(true)
+		eventStore.arm()
+
+		let closeSettled = false
+		const close = session.close().then(() => {
+			closeSettled = true
+		})
+		try {
+			await eventStore.appendStarted
+			await Bun.sleep(10)
+
+			expect(closeSettled).toBe(false)
+			expect(eventStore.completed).toBe(false)
+		} finally {
+			eventStore.release()
+		}
+		await close
+		expect(eventStore.completed).toBe(true)
+		expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
+	})
+
+	it('disables late status publication when executor close rejects', async () => {
+		let executor: ServiceExecutor | undefined
+		const restoreObserver = setServiceExecutorObserverForTesting((created) => {
+			executor = created
+		})
+		const harness = createServicesHarness({
+			presets: [createServicesPreset([quickService], ['quick'], new PortPool())],
+		})
+		const session = await harness.createSession('test')
+		const started = await session.callPluginMethod('services.start', { serviceType: 'quick', waitForReady: true })
+		expect(started.ok).toBe(true)
+		if (!executor) throw new Error('Expected observed service executor')
+		const observedExecutor = executor
+		const originalClose = observedExecutor.close.bind(observedExecutor)
+		const lateStatusCallback = observedExecutor.onStatusChanged
+		observedExecutor.close = async () => {
+			throw new Error('Controlled termination failure')
+		}
+
+		try {
+			await session.close()
+			const statusCount = (await session.getEventsByType(serviceEvents, 'service_status_changed')).length
+			const notificationCount = session.getNotifications().filter((notification) => notification.type === 'serviceStatus').length
+
+			expect(observedExecutor.onStatusChanged).toBeUndefined()
+			lateStatusCallback?.(String(session.sessionId), 'quick', 'failed', { error: 'late failure' })
+			await Bun.sleep(10)
+
+			expect((await session.getEventsByType(serviceEvents, 'service_status_changed')).length).toBe(statusCount)
+			expect(session.getNotifications().filter((notification) => notification.type === 'serviceStatus')).toHaveLength(notificationCount)
+			expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
+		} finally {
+			await originalClose(session.sessionId)
+			restoreObserver()
+		}
+	})
+
 	// =========================================================================
 	// Service lifecycle via methods
 	// =========================================================================
@@ -607,7 +896,7 @@ describe('services plugin', () => {
 				expect(failure?.details.restartMaxRetries).toBe(1)
 				expect(failure?.details.restartAt).toBeGreaterThan(Date.now())
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-missed-close'))
 			}
 		})
 
@@ -666,7 +955,7 @@ describe('services plugin', () => {
 					expect(logs.value[2]?.length).toBe(16_384)
 				}
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-loud-crash'))
 			}
 		})
 
@@ -706,7 +995,7 @@ describe('services plugin', () => {
 				await waitFor(() => observed.includes('failed'), () => `[${observed.join(', ')}]`)
 				expect(observed).toEqual(['starting', 'failed'])
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-already-reaped'))
 			}
 		})
 
@@ -758,7 +1047,7 @@ describe('services plugin', () => {
 				await waitFor(() => executor.getStatus('ready-before-truncation') === 'failed', () => String(executor.getStatus('ready-before-truncation')))
 			} finally {
 				releaseRecord.resolve()
-				await executor.shutdown()
+				await executor.close(SessionId('s-ready-before-truncation'))
 			}
 		})
 
@@ -800,7 +1089,7 @@ describe('services plugin', () => {
 				expect(logs.ok).toBe(true)
 				if (logs.ok) expect(logs.value).toEqual(['[stderr] err', 'out-done'])
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-interleaved-output'))
 			}
 		})
 
@@ -841,7 +1130,7 @@ describe('services plugin', () => {
 				expect(logs.ok).toBe(true)
 				if (logs.ok) expect(logs.value).toEqual(['[stderr] stderr-partial', 'stdout-partial'])
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-partial-output-order'))
 			}
 		})
 	})
@@ -1060,82 +1349,39 @@ describe('services plugin', () => {
 			expect(stoppedEvent).toBeDefined()
 		})
 
-		it('closing a session stops a paused service through its lifecycle hook', async () => {
+		it('restarting a running service replaces its process', async () => {
 			const config: ServiceConfig = {
-				type: 'paused-close',
-				description: 'Paused process closed with its session',
+				type: 'restart-svc',
+				description: 'Restarted through the plugin method',
 				command: 'sleep 60',
 				gracefulStopMs: 50,
 			}
-			const executorCreated = Promise.withResolvers<ServiceExecutor>()
-			const stopObserving = setServiceExecutorObserverForTesting((executor) => executorCreated.resolve(executor))
-			try {
-				const harness = createServicesHarness({
-					presets: [createServicesPreset([config], ['paused-close'], new PortPool())],
-					llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
-				})
-				const session = await harness.createSession('test')
-				const executor = await executorCreated.promise
+			const harness = createServicesHarness({
+				presets: [createServicesPreset([config], ['restart-svc'], new PortPool())],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+			const session = await harness.createSession('test')
 
-				await session.callPluginMethod('services.start', { serviceType: 'paused-close' })
-				await waitForServiceStateStatus(session, 'paused-close', 'ready')
-				const paused = await executor.pause('paused-close', session.sessionId)
-				expect(paused.ok).toBe(true)
-				await waitForServiceStateStatus(session, 'paused-close', 'paused')
-				const pid = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('paused-close')?.pid
-				if (pid === undefined) throw new Error('Service did not report its pid')
+			await session.callPluginMethod('services.start', { serviceType: 'restart-svc' })
+			await waitForServiceStateStatus(session, 'restart-svc', 'ready')
+			const originalPid = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('restart-svc')?.pid
+			if (originalPid === undefined) throw new Error('Service did not report its pid')
 
-				await session.close()
-				await waitForServiceStateStatus(session, 'paused-close', 'stopped')
-				expect(() => process.kill(pid, 0)).toThrow()
-			} finally {
-				stopObserving()
-			}
+			const restarted = await session.callPluginMethod('services.restart', { serviceType: 'restart-svc' })
+			expect(restarted.ok).toBe(true)
+			await waitForServiceStateStatus(session, 'restart-svc', 'ready')
+			const replacementPid = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('restart-svc')?.pid
+			expect(replacementPid).toBeDefined()
+			expect(replacementPid).not.toBe(originalPid)
+			expect(() => process.kill(originalPid, 0)).toThrow()
 		})
 
-		it('restarting a paused service replaces its process', async () => {
-			const config: ServiceConfig = {
-				type: 'paused-restart',
-				description: 'Paused process restarted through the plugin method',
-				command: 'sleep 60',
-				gracefulStopMs: 50,
-			}
-			const executorCreated = Promise.withResolvers<ServiceExecutor>()
-			const stopObserving = setServiceExecutorObserverForTesting((executor) => executorCreated.resolve(executor))
-			try {
-				const harness = createServicesHarness({
-					presets: [createServicesPreset([config], ['paused-restart'], new PortPool())],
-					llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
-				})
-				const session = await harness.createSession('test')
-				const executor = await executorCreated.promise
-
-				await session.callPluginMethod('services.start', { serviceType: 'paused-restart' })
-				await waitForServiceStateStatus(session, 'paused-restart', 'ready')
-				const originalPid = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('paused-restart')?.pid
-				if (originalPid === undefined) throw new Error('Service did not report its pid')
-				const paused = await executor.pause('paused-restart', session.sessionId)
-				expect(paused.ok).toBe(true)
-				await waitForServiceStateStatus(session, 'paused-restart', 'paused')
-
-				const restarted = await session.callPluginMethod('services.restart', { serviceType: 'paused-restart' })
-				expect(restarted.ok).toBe(true)
-				await waitForServiceStateStatus(session, 'paused-restart', 'ready')
-				const replacementPid = selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('paused-restart')?.pid
-				expect(replacementPid).toBeDefined()
-				expect(replacementPid).not.toBe(originalPid)
-				expect(() => process.kill(originalPid, 0)).toThrow()
-			} finally {
-				stopObserving()
-			}
-		})
-
-		it('an externally killed paused service transitions to failed', async () => {
+		it('an externally killed service transitions to failed', async () => {
 			const platform = createNodePlatform()
 			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: platform.process })
 			const config: ServiceConfig = {
-				type: 'paused-crash',
-				description: 'Paused process killed externally',
+				type: 'crash-svc',
+				description: 'Process killed externally',
 				command: 'sleep 60',
 			}
 			let pid: number | undefined
@@ -1144,17 +1390,86 @@ describe('services plugin', () => {
 			}
 
 			try {
-				await executor.start(config, SessionId('s-paused-crash'))
-				const paused = await executor.pause('paused-crash', SessionId('s-paused-crash'))
-				expect(paused.ok).toBe(true)
+				await executor.start(config, SessionId('s-external-crash'))
 				if (pid === undefined) throw new Error('Service did not report its pid')
 				process.kill(-pid, 'SIGKILL')
 				await waitFor(
-					() => executor.getStatus('paused-crash') === 'failed',
-					() => String(executor.getStatus('paused-crash')),
+					() => executor.getStatus('crash-svc') === 'failed',
+					() => String(executor.getStatus('crash-svc')),
 				)
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-external-crash'))
+			}
+		})
+	})
+
+	// =========================================================================
+	// Lifecycle deadlines (ServiceExecutor unit-level)
+	// =========================================================================
+
+	describe('lifecycle transition deadlines', () => {
+		it('fails a start whose command resolver never settles', async () => {
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: platform.process,
+				hookTimeoutMs: 50,
+			})
+			const config: ServiceConfig = {
+				type: 'wedged-resolver',
+				description: 'Command resolver never settles',
+				command: () => new Promise<string>(() => {}),
+			}
+			const observed: ServiceStatus[] = []
+			executor.onStatusChanged = (_sessionId, _serviceType, status) => {
+				observed.push(status)
+			}
+
+			try {
+				const result = await executor.start(config, SessionId('s-wedged-resolver'))
+				expect(result.ok).toBe(false)
+				if (result.ok) throw new Error('Expected the start to fail')
+				expect(result.error.message).toContain('command resolver did not settle')
+				expect(observed).toEqual(['failed'])
+			} finally {
+				await executor.close(SessionId('s-wedged-resolver'))
+			}
+		})
+
+		it('kills the child and fails the start when the PID registry never settles', async () => {
+			const platform = createNodePlatform()
+			const killed: Array<{ pid: number; signal: string | number | undefined }> = []
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: platform.process,
+				hookTimeoutMs: 50,
+				kill: (pid, signal) => {
+					killed.push({ pid, signal: signal === undefined ? undefined : signal })
+					return process.kill(pid, signal)
+				},
+				pidRegistry: {
+					record: () => new Promise<void>(() => {}),
+					forget: async () => {},
+				},
+			})
+			const config: ServiceConfig = {
+				type: 'wedged-registry',
+				description: 'PID registry never settles',
+				command: 'sleep 60',
+			}
+
+			try {
+				const result = await executor.start(config, SessionId('s-wedged-registry'))
+				expect(result.ok).toBe(false)
+				if (result.ok) throw new Error('Expected the start to fail')
+				expect(result.error.message).toContain('could not record its PID')
+				// An unrecorded child could never be reaped after a crash, so the failed
+				// start must not leave it running.
+				expect(killed).toHaveLength(1)
+				expect(killed[0].signal).toBe('SIGKILL')
+				expect(killed[0].pid).toBeLessThan(0)
+			} finally {
+				await executor.close(SessionId('s-wedged-registry'))
 			}
 		})
 	})
@@ -1164,6 +1479,94 @@ describe('services plugin', () => {
 	// =========================================================================
 
 	describe('port conflict recovery and concurrent start', () => {
+		it('drains a start blocked before PID registration during disposal', async () => {
+			const child = new ChildProcess()
+			Object.defineProperties(child, {
+				pid: { value: 424_900 },
+				stdin: { value: null },
+				stdout: { value: new EventEmitter() },
+				stderr: { value: new EventEmitter() },
+			})
+			const recordStarted = Promise.withResolvers<void>()
+			const releaseRecord = Promise.withResolvers<void>()
+			let spawnCount = 0
+			let killed = false
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: {
+					spawn: () => {
+						spawnCount++
+						return child
+					},
+					execFile: async () => {
+						throw new Error('Unexpected execFile call')
+					},
+				},
+				pidRegistry: {
+					record: async () => {
+						recordStarted.resolve()
+						await releaseRecord.promise
+					},
+					forget: async () => {},
+				},
+				kill: () => {
+					killed = true
+					return true
+				},
+			})
+			const config: ServiceConfig = { type: 'blocked-register', description: 'Blocked registration', command: 'unused' }
+			const sessionId = SessionId('s-blocked-register')
+
+			const start = executor.start(config, sessionId)
+			await recordStarted.promise
+			const close = executor.close(sessionId)
+			const lateStart = await executor.start(config, sessionId)
+			expect(lateStart.ok).toBe(false)
+			expect(spawnCount).toBe(1)
+			releaseRecord.resolve()
+			expect((await start).ok).toBe(false)
+			await close
+			expect(killed).toBe(true)
+			expect(executor.getStatus(config.type)).toBeNull()
+		})
+
+		it('cancels a queued port-conflict retry during disposal', async () => {
+			const child = new ChildProcess()
+			const stdout = new EventEmitter()
+			const stderr = new EventEmitter()
+			Object.defineProperties(child, {
+				pid: { value: 424_950 },
+				stdin: { value: null },
+				stdout: { value: stdout },
+				stderr: { value: stderr },
+			})
+			let spawnCount = 0
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: {
+					spawn: () => {
+						spawnCount++
+						return child
+					},
+					execFile: async () => {
+						throw new Error('Unexpected execFile call')
+					},
+				},
+			})
+			const config: ServiceConfig = { type: 'queued-conflict', description: 'Queued conflict', command: 'unused' }
+			const sessionId = SessionId('s-queued-conflict')
+
+			expect((await executor.start(config, sessionId)).ok).toBe(true)
+			stderr.emit('data', Buffer.from('listen EADDRINUSE\n'))
+			child.emit('close', 1)
+			await executor.close(sessionId)
+			await new Promise((resolve) => setTimeout(resolve, 20))
+			expect(spawnCount).toBe(1)
+			expect((await executor.start(config, sessionId)).ok).toBe(false)
+		})
+
 		const waitUntil = async (predicate: () => boolean, timeoutMs = 8000): Promise<void> => {
 			const deadline = Date.now() + timeoutMs
 			while (Date.now() < deadline) {
@@ -1196,7 +1599,7 @@ describe('services plugin', () => {
 				// Without the in-flight lock both starts spawn and the file gets two lines.
 				expect(lines.length).toBe(1)
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-concurrent'))
 				await rm(marker, { force: true })
 			}
 		})
@@ -1240,7 +1643,7 @@ describe('services plugin', () => {
 				// The transient EADDRINUSE must NOT surface as a terminal failure.
 				expect(observed.some((e) => e.status === 'failed')).toBe(false)
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-flaky'))
 				await rm(marker, { force: true })
 			}
 		})
@@ -1336,7 +1739,7 @@ describe('services plugin', () => {
 			} finally {
 				releaseFirstRecord.resolve()
 				releaseForget.resolve()
-				await executor.shutdown()
+				await executor.close(SessionId('s-controlled-conflict'))
 			}
 		})
 
@@ -1428,7 +1831,7 @@ describe('services plugin', () => {
 				expect(operations.slice(0, 4)).toEqual(['record:425100', 'forget:start', 'forget:end', 'record:425101'])
 			} finally {
 				releaseForget.resolve()
-				await executor.shutdown()
+				await executor.close(SessionId(`s-pid-forget-${mode}`))
 			}
 		}
 
@@ -1457,6 +1860,84 @@ describe('services plugin', () => {
 				return true
 			}
 		}
+
+		it('detaches status callbacks when close cannot terminate a service', async () => {
+			const child = new ChildProcess()
+			Object.defineProperties(child, {
+				pid: { value: 425_900 },
+				stdin: { value: null },
+				stdout: { value: new EventEmitter() },
+				stderr: { value: new EventEmitter() },
+			})
+			const processRunner: ProcessRunner = {
+				spawn: () => child,
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: platform.fs,
+				process: processRunner,
+				kill: (_pid, signal) => {
+					if (signal === 0) return true
+					throw systemError('EIO')
+				},
+			})
+			const observed: ServiceStatus[] = []
+			executor.onStatusChanged = (_sessionId, _serviceType, status) => observed.push(status)
+			await executor.start({
+				type: 'failed-close',
+				description: 'Cannot be terminated during close',
+				command: 'unused',
+			}, SessionId('s-failed-close'))
+
+			await expect(executor.close(SessionId('s-failed-close'))).rejects.toThrow('Failed to send SIGTERM')
+			expect(executor.onStatusChanged).toBeUndefined()
+			const observedCount = observed.length
+			child.emit('close', 1)
+			expect(observed).toHaveLength(observedCount)
+		})
+
+		it('releases the port and clears state even when close cannot signal the process', async () => {
+			const child = new ChildProcess()
+			Object.defineProperties(child, {
+				pid: { value: 427_000 },
+				stdin: { value: null },
+				stdout: { value: new EventEmitter() },
+				stderr: { value: new EventEmitter() },
+			})
+			const processRunner: ProcessRunner = {
+				spawn: () => child,
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			const platform = createNodePlatform()
+			const portPool = new PortPool()
+			const executor = new ServiceExecutor(silentLogger, portPool, {
+				fs: platform.fs,
+				process: processRunner,
+				kill: (_pid, signal) => {
+					if (signal === 0) return true
+					throw systemError('EIO')
+				},
+			})
+			let port: number | undefined
+			executor.onStatusChanged = (_sessionId, _serviceType, _status, details) => {
+				if (details.port !== undefined) port = details.port
+			}
+			const sessionId = SessionId('s-port-leak')
+			await executor.start({ type: 'stubborn', description: 'Refuses SIGTERM', command: 'unused' }, sessionId)
+			expect(port).toBeDefined()
+
+			await expect(executor.close(sessionId)).rejects.toThrow('Failed to send SIGTERM')
+
+			// The tail after the stop loop must still run. portPool is process-global, so
+			// skipping the release loses that port for the life of the server.
+			expect(portPool.tryAllocate(port!)).toBe(true)
+			expect(executor.getStatus('stubborn')).toBeNull()
+		})
 
 		it('keeps stop retryable across permission and probe errors, then accepts ESRCH', async () => {
 			const child = new ChildProcess()
@@ -1506,7 +1987,7 @@ describe('services plugin', () => {
 			const gone = await executor.stop('retryable-stop', SessionId('s-retryable-stop'))
 			expect(gone.ok).toBe(true)
 			expect(executor.getStatus('retryable-stop')).toBe('stopped')
-			await executor.shutdown()
+			await executor.close(SessionId('s-retryable-stop'))
 		})
 
 		it('does not restore a live status when close wins a later probe error', async () => {
@@ -1550,10 +2031,84 @@ describe('services plugin', () => {
 			expect(stopped.ok).toBe(false)
 			expect(executor.getStatus('close-before-probe-error')).toBe('stopped')
 			expect(observed).toEqual(['starting', 'ready', 'stopping', 'stopped'])
-			await executor.shutdown()
+			await executor.close(SessionId('s-close-before-probe-error'))
 		})
 
-		it('a failed shutdown retries entries already marked stopping', async () => {
+		it('waits for a concurrent failed stop and force-stops it before releasing state', async () => {
+			const child = new ChildProcess()
+			Object.defineProperties(child, {
+				pid: { value: 426_003 },
+				stdin: { value: null },
+				stdout: { value: new EventEmitter() },
+				stderr: { value: new EventEmitter() },
+			})
+			const processRunner: ProcessRunner = {
+				spawn: () => child,
+				execFile: async (): Promise<ExecFileResult> => {
+					throw new Error('Unexpected execFile call')
+				},
+			}
+			const probeStarted = Promise.withResolvers<void>()
+			const releaseProbe = Promise.withResolvers<void>()
+			const platform = createNodePlatform()
+			let gateProbe = true
+			function readdir(path: string): Promise<string[]>
+			function readdir(path: string, options: { withFileTypes: true }): Promise<Dirent[]>
+			async function readdir(path: string, options?: { withFileTypes: true }): Promise<string[] | Dirent[]> {
+				if (path === '/proc' && options === undefined) {
+					if (gateProbe) {
+						gateProbe = false
+						probeStarted.resolve()
+						await releaseProbe.promise
+					}
+					return []
+				}
+				return options ? platform.fs.readdir(path, options) : platform.fs.readdir(path)
+			}
+			const fs: FileSystem = { ...platform.fs, readdir }
+			let termAttempts = 0
+			let processGone = false
+			const portPool = new PortPool(12_345, 12_345)
+			const executor = new ServiceExecutor(silentLogger, portPool, {
+				fs,
+				process: processRunner,
+				kill: (_pid, signal) => {
+					if (signal !== 'SIGTERM') return true
+					termAttempts++
+					if (termAttempts === 1) throw systemError('EIO')
+					processGone = true
+					throw systemError('ESRCH')
+				},
+			})
+			const sessionId = SessionId('s-concurrent-stop-close')
+			await executor.start({
+				type: 'concurrent-stop-close',
+				description: 'Stop blocked during close',
+				command: 'unused',
+			}, sessionId, undefined, 12_345)
+
+			const stop = executor.stop('concurrent-stop-close', sessionId)
+			await probeStarted.promise
+			let closeSettled = false
+			const close = executor.close(sessionId).then(() => {
+				closeSettled = true
+			})
+			await Bun.sleep(0)
+			expect(closeSettled).toBe(false)
+			expect(executor.getStatus('concurrent-stop-close')).toBe('stopping')
+			expect(portPool.tryAllocate(12_345)).toBe(false)
+
+			releaseProbe.resolve()
+			expect((await stop).ok).toBe(false)
+			await close
+			expect(processGone).toBe(true)
+			expect(termAttempts).toBe(2)
+			expect(executor.getStatus('concurrent-stop-close')).toBeNull()
+			expect(portPool.tryAllocate(12_345)).toBe(true)
+			portPool.release(12_345)
+		})
+
+		it('a close that cannot terminate leaves a reap-able status, not a stranded stopping', async () => {
 			const child = new ChildProcess()
 			Object.defineProperties(child, {
 				pid: { value: 426_001 },
@@ -1567,29 +2122,30 @@ describe('services plugin', () => {
 					throw new Error('Unexpected execFile call')
 				},
 			}
-			let permissionDenied = true
 			const platform = createNodePlatform()
 			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
 				fs: platform.fs,
 				process: processRunner,
 				kill: () => {
-					throw systemError(permissionDenied ? 'EPERM' : 'ESRCH')
+					throw systemError('EPERM')
 				},
 			})
+			const observed: ServiceStatus[] = []
+			executor.onStatusChanged = (_sessionId, _serviceType, status) => observed.push(status)
 			await executor.start({
-				type: 'retryable-shutdown',
-				description: 'Shutdown retries stopping entries',
+				type: 'stranded-stopping',
+				description: 'Cannot be signalled at all',
 				command: 'unused',
-			}, SessionId('s-retryable-shutdown'))
+			}, SessionId('s-stranded-stopping'))
 
-			await expect(executor.shutdown()).rejects.toThrow('SIGTERM')
-			expect(executor.getStatus('retryable-shutdown')).toBe('stopping')
-			permissionDenied = false
-			await executor.shutdown()
-			expect(executor.getStatus('retryable-shutdown')).toBeNull()
+			await expect(executor.close(SessionId('s-stranded-stopping'))).rejects.toThrow('SIGTERM')
+			// `stopping` matches neither the onSessionReady reconcile nor the
+			// session_restarted reset, so a close that failed must not leave it as the
+			// last word — the next runtime would never reap the process.
+			expect(observed).toEqual(['starting', 'ready', 'stopping', 'ready', 'stopping', 'ready'])
 		})
 
-		const exerciseTermination = async (mode: 'stop' | 'shutdown'): Promise<void> => {
+		const exerciseTermination = async (mode: 'stop' | 'close'): Promise<void> => {
 			const platform = createNodePlatform()
 			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: platform.fs, process: platform.process })
 			const fixtureDir = await mkdtemp(join(tmpdir(), `roj-svc-group-${mode}-`))
@@ -1625,13 +2181,13 @@ describe('services plugin', () => {
 					const result = await executor.stop(serviceType, SessionId(`s-${serviceType}`))
 					expect(result.ok).toBe(true)
 				} else {
-					await executor.shutdown()
+					await executor.close(SessionId(`s-${serviceType}`))
 				}
 
 				expect(await isPidTerminated(childPid)).toBe(true)
 				expect(await isPidTerminated(grandchildPid)).toBe(true)
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId(`s-${serviceType}`))
 				if (leaderPid !== undefined) {
 					try {
 						process.kill(-leaderPid, 'SIGKILL')
@@ -1647,8 +2203,8 @@ describe('services plugin', () => {
 			await exerciseTermination('stop')
 		})
 
-		it('shutdown waits for child and grandchild processes after the leader exits', async () => {
-			await exerciseTermination('shutdown')
+		it('close waits for child and grandchild processes after the leader exits', async () => {
+			await exerciseTermination('close')
 		})
 	})
 
@@ -1710,7 +2266,7 @@ describe('services plugin', () => {
 				// The preview URL must survive the bounce.
 				expect(new Set(ports).size).toBe(1)
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-revive'))
 				await rm(path, { force: true })
 			}
 		})
@@ -1736,7 +2292,7 @@ describe('services plugin', () => {
 				expect(await spawnCount(path)).toBe(3)
 				expect(executor.getStatus('budget-svc')).toBe('failed')
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-budget'))
 				await rm(path, { force: true })
 			}
 		})
@@ -1759,7 +2315,7 @@ describe('services plugin', () => {
 				await new Promise((r) => setTimeout(r, 300))
 				expect(await spawnCount(path)).toBe(1)
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-nopolicy'))
 				await rm(path, { force: true })
 			}
 		})
@@ -1797,7 +2353,7 @@ describe('services plugin', () => {
 				expect(revivalStart).toBeDefined()
 				expect(revivalStart!.details.restartAt).toBeUndefined()
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-event'))
 				await rm(path, { force: true })
 			}
 		})
@@ -1826,7 +2382,7 @@ describe('services plugin', () => {
 				expect(failures[1]?.restartAt).toBeUndefined()
 				expect(failures[1]?.restartAttempt).toBeUndefined()
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-terminal'))
 				await rm(path, { force: true })
 			}
 		})
@@ -1915,7 +2471,7 @@ describe('services plugin', () => {
 				await new Promise((r) => setTimeout(r, 2000))
 				expect(await spawnCount(path)).toBe(1)
 			} finally {
-				await executor.shutdown()
+				await executor.close(SessionId('s-stop'))
 				await rm(path, { force: true })
 			}
 		})
@@ -1989,6 +2545,7 @@ describe('services plugin', () => {
 				[{
 					serviceType: 'quick',
 					status: 'ready',
+					stoppedBy: 'never',
 					port: 4321,
 					cwd: '/home/user/sessions/0000-real-host-path/packages/web',
 				}],
