@@ -1,5 +1,5 @@
 import type { AskUserInputType, ChatMessage } from '@roj-ai/shared'
-import { AgentId, ChatMessageId, SessionId } from '@roj-ai/shared'
+import { AgentId, ChatMessageId, SessionId, UploadId } from '@roj-ai/shared'
 import { useEffect } from 'react'
 import { create } from 'zustand'
 import { api, configureProjectId, instanceApi, unwrap } from '@roj-ai/client'
@@ -322,7 +322,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 		// `processing` is also a server-known state worth deleting; `uploading`
 		// hasn't reached the server yet so there's nothing to call.
 		if (sessionId && attachment && (attachment.status === 'ready' || attachment.status === 'processing')) {
-			api.call('uploads.delete', { sessionId, uploadId }).then(r => unwrap(r)).catch((error: unknown) => {
+			api.call('uploads.delete', { sessionId, uploadId: UploadId(uploadId) }).then(r => unwrap(r)).catch((error: unknown) => {
 				console.error('Failed to delete upload on server:', error)
 			})
 		}

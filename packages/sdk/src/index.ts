@@ -37,7 +37,7 @@ export { Agent } from '~/core/agents/agent.js'
 export type { AgentConfig } from '~/core/agents/agent.js'
 export { SessionManager } from '~/core/sessions/session-manager.js'
 export type { SessionManagerOptions } from '~/core/sessions/session-manager.js'
-export { SessionStore } from '~/core/sessions/session-store.js'
+export { SessionRuntimeDetachedError, SessionStore } from '~/core/sessions/session-store.js'
 export { Session } from '~/core/sessions/session.js'
 export type { UserOutputCallback } from '~/core/sessions/session.js'
 
@@ -65,7 +65,8 @@ export type { InferenceCompletedEvent, InferenceFailedEvent, InferenceStartedEve
 export { estimateTokens } from '~/core/llm/tokens.js'
 export { applyEvent } from '~/core/sessions/apply-event.js'
 export { selectPluginState } from '~/core/sessions/reducer.js'
-export { SessionId } from '~/core/sessions/schema.js'
+export { isValidSessionId, parseSessionId, SessionId } from '~/core/sessions/schema.js'
+export type { RuntimeLeaseRelease, SessionRuntimeActivity, SessionRuntimeActivitySnapshot } from '~/core/sessions/runtime-activity.js'
 export type { SessionMetadata } from '~/core/sessions/schema.js'
 // Exported so a consumer can validate a callManagerMethod('sessions.list')
 // result — that call is typed Result<unknown>, so the plugin's output schema
@@ -80,14 +81,15 @@ export {
 	sessionOverridesPatchSchema,
 } from '~/core/sessions/state.js'
 export type { SessionState } from '~/core/sessions/state.js'
-export type { ToolCallId } from '~/core/tools/schema.js'
+export { ToolCallId } from '~/core/tools/schema.js'
 export type { ToolStartedEvent } from '~/core/tools/state.js'
 export { getAgentMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
 export type { MailboxPluginState } from '~/plugins/mailbox/query.js'
 export { MessageId } from '~/plugins/mailbox/schema.js'
 export type { MailboxMessage } from '~/plugins/mailbox/schema.js'
-export type { ServiceStatus } from '~/plugins/services/schema.js'
+export type { ServiceStatus, ServiceStoppedBy, ServiceStopSource } from '~/plugins/services/schema.js'
 export { ChatMessageId } from '~/plugins/user-chat/schema.js'
+export { isValidUploadId, parseUploadId, UploadId } from '~/plugins/uploads/schema.js'
 export type { AskUserInputType, AskUserInputTypeSchema, AskUserOption } from '~/plugins/user-chat/schema.js'
 export type { BuiltinEvent } from './builtin-events.js'
 
@@ -147,7 +149,7 @@ export type { WorkerError, WorkerResult } from '~/plugins/workers/index.js'
 
 // Plugin builder
 export { definePlugin } from '~/core/plugins/plugin-builder.js'
-export type { CallerContext, ConfiguredPlugin, PluginDefinition } from '~/core/plugins/plugin-builder.js'
+export type { CallerContext, ConfiguredPlugin, PluginDefinition, SessionCloseReason } from '~/core/plugins/plugin-builder.js'
 
 // Zod (re-export for presets that need schemas)
 export { default as z } from 'zod/v4'
