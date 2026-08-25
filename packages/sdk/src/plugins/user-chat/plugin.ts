@@ -16,6 +16,7 @@ import { ValidationErrors } from "~/core/errors.js";
 import { createEventsFactory } from "~/core/events/types.js";
 import { estimateTokens, truncateByTokens } from "~/core/llm/tokens.js";
 import { definePlugin } from "~/core/plugins/plugin-builder.js";
+import { selectPluginState } from "~/core/sessions/reducer.js";
 import { sessionIdSchema } from "~/core/sessions/schema.js";
 import { getEntryAgentId } from "~/core/sessions/state.js";
 import { createTool } from "~/core/tools/definition.js";
@@ -67,6 +68,7 @@ export const userChatEvents = createEventsFactory({
 		user_chat_messages_consumed: z.object({
 			agentId: agentIdSchema,
 			messageIds: z.array(chatMessageIdSchema),
+			ordinals: z.array(z.number().int().positive()).optional(),
 		}),
 	},
 });
@@ -124,15 +126,18 @@ export type ChatMessage =
 // ============================================================================
 
 export interface PendingInboundMessage {
+	ordinal: number;
 	messageId: ChatMessageId;
 	agentId: AgentId;
-	content: string;
-	timestamp: number;
-	consumed: boolean;
+	/** Stable index into visible message history for user messages. */
+	messageIndex?: number;
 	/** For answers: the question's message ID */
 	questionId?: ChatMessageId;
-	/** The answer value, only present for answers */
-	answerValue?: unknown;
+}
+
+export interface PendingAnswerRecord {
+	questionId: ChatMessageId;
+	answerValue: unknown;
 }
 
 // ============================================================================
@@ -143,6 +148,14 @@ export interface UserChatState {
 	messages: ChatMessage[];
 	counter: number;
 	pendingInbound: PendingInboundMessage[];
+	/** Immutable answer payloads retained only until dequeue consumption. */
+	pendingAnswers?: Map<number, PendingAnswerRecord>;
+	/** Highest reducer-assigned inbound occurrence. */
+	nextInboundOrdinal?: number;
+}
+
+interface UserChatPluginContext {
+	nextMessageSequence: number;
 }
 
 // ============================================================================
@@ -293,18 +306,84 @@ const MESSAGE_TRUNCATION_TARGET = 5_000;
 // Helpers
 // ============================================================================
 
+function findQuestion(
+	messages: ChatMessage[],
+	questionId: ChatMessageId,
+): AskUserChatMessage | undefined {
+	for (const message of messages) {
+		if (message.type === "ask_user" && message.questionId === questionId) {
+			return message;
+		}
+	}
+	return undefined;
+}
+
+function findUserMessage(
+	messages: ChatMessage[],
+	messageId: ChatMessageId,
+): UserChatMessage | undefined {
+	for (const message of messages) {
+		if (message.type === "user_message" && message.messageId === messageId) {
+			return message;
+		}
+	}
+	return undefined;
+}
+
+function messageSequence(messageId: ChatMessageId): number {
+	const match = /^m(\d+)$/.exec(messageId);
+	return match ? Number(match[1]) : 0;
+}
+
+function nextStateCounter(state: UserChatState, messageId: ChatMessageId): number {
+	return Math.max(state.counter + 1, messageSequence(messageId));
+}
+
+function nextMessageSequence(state: UserChatState | undefined): number {
+	if (!state) return 1;
+	let highest = state.counter;
+	for (const message of state.messages) {
+		const messageId = message.type === "ask_user" ? message.questionId : message.messageId;
+		highest = Math.max(highest, messageSequence(messageId));
+	}
+	for (const pending of state.pendingInbound) {
+		highest = Math.max(highest, messageSequence(pending.messageId));
+	}
+	return highest + 1;
+}
+
+function reserveMessageSequence(context: UserChatPluginContext): number {
+	const sequence = context.nextMessageSequence;
+	context.nextMessageSequence++;
+	return sequence;
+}
+
 /**
  * Format pending inbound messages for the LLM.
  */
-function formatPendingForLLM(pending: PendingInboundMessage[]): string {
+function formatPendingForLLM(
+	messages: ChatMessage[],
+	pending: PendingInboundMessage[],
+	pendingAnswers: ReadonlyMap<number, PendingAnswerRecord> | undefined,
+): string {
 	const parts: string[] = [];
 	for (const msg of pending) {
 		if (msg.questionId !== undefined) {
+			const answer = pendingAnswers?.get(msg.ordinal);
+			const answerValue = answer
+				? answer.answerValue
+				: findQuestion(messages, msg.questionId)?.answer;
 			parts.push(
-				`[User answered question ${msg.questionId}]: ${JSON.stringify(msg.answerValue)}`,
+				`[User answered question ${msg.questionId}]: ${JSON.stringify(answerValue)}`,
 			);
 		} else {
-			parts.push(`[User]: ${msg.content}`);
+			const indexedMessage = msg.messageIndex === undefined
+				? undefined
+				: messages[msg.messageIndex];
+			const userMessage = indexedMessage?.type === "user_message"
+				? indexedMessage
+				: findUserMessage(messages, msg.messageId);
+			if (userMessage) parts.push(`[User]: ${userMessage.content}`);
 		}
 	}
 	return parts.join("\n");
@@ -367,16 +446,24 @@ function decodeAskUserDisplayStrings(input: AskUserInputType): AskUserInputType 
 export const userChatPlugin = definePlugin("user-chat")
 	.pluginConfig<UserChatPresetConfig>()
 	.events([userChatEvents])
+	.context(async (ctx): Promise<UserChatPluginContext> => ({
+		nextMessageSequence: nextMessageSequence(
+			selectPluginState<UserChatState>(ctx.sessionState, "messages"),
+		),
+	}))
 	.state<UserChatState>({
 		key: "messages",
 		initial: (): UserChatState => ({
 			messages: [],
 			counter: 0,
 			pendingInbound: [],
+			pendingAnswers: new Map(),
+			nextInboundOrdinal: 0,
 		}),
 		reduce: (state, event) => {
 			switch (event.type) {
 				case "user_chat_message_received": {
+					const ordinal = (state.nextInboundOrdinal ?? 0) + 1;
 					const userMessage: UserChatMessage = {
 						type: "user_message",
 						messageId: event.messageId,
@@ -384,20 +471,22 @@ export const userChatPlugin = definePlugin("user-chat")
 						timestamp: event.timestamp,
 					};
 					const pending: PendingInboundMessage = {
+						ordinal,
 						messageId: event.messageId,
 						agentId: event.agentId,
-						content: event.content,
-						timestamp: event.timestamp,
-						consumed: false,
+						messageIndex: state.messages.length,
 					};
 					return {
 						messages: [...state.messages, userMessage],
-						counter: state.counter + 1,
+						counter: nextStateCounter(state, event.messageId),
 						pendingInbound: [...state.pendingInbound, pending],
+						pendingAnswers: state.pendingAnswers,
+						nextInboundOrdinal: ordinal,
 					};
 				}
 
 				case "user_chat_answer_received": {
+					const ordinal = (state.nextInboundOrdinal ?? 0) + 1;
 					// Update the question in messages as answered
 					const updatedMessages = state.messages.map((msg) =>
 						msg.type === "ask_user" && msg.questionId === event.questionId
@@ -405,31 +494,61 @@ export const userChatPlugin = definePlugin("user-chat")
 							: msg,
 					);
 					const pending: PendingInboundMessage = {
+						ordinal,
 						messageId: event.messageId,
 						agentId: event.agentId,
-						content: JSON.stringify(event.answerValue),
-						timestamp: event.timestamp,
-						consumed: false,
+						questionId: event.questionId,
+					};
+					const pendingAnswers = new Map(state.pendingAnswers ?? []);
+					pendingAnswers.set(ordinal, {
 						questionId: event.questionId,
 						answerValue: event.answerValue,
-					};
+					});
 					return {
 						messages: updatedMessages,
-						counter: state.counter + 1,
+						counter: nextStateCounter(state, event.messageId),
 						pendingInbound: [...state.pendingInbound, pending],
+						pendingAnswers,
+						nextInboundOrdinal: ordinal,
 					};
 				}
 
 				case "user_chat_messages_consumed": {
-					const consumedSet = new Set(event.messageIds.map(String));
+					const consumedOrdinals = new Set<number>();
+					if (event.ordinals) {
+						for (const ordinal of event.ordinals) consumedOrdinals.add(ordinal);
+					} else {
+						const remainingById = new Map<string, number>();
+						for (const messageId of event.messageIds) {
+							const key = String(messageId);
+							remainingById.set(key, (remainingById.get(key) ?? 0) + 1);
+						}
+						for (const pending of state.pendingInbound) {
+							if (pending.agentId !== event.agentId) continue;
+							const key = String(pending.messageId);
+							const remaining = remainingById.get(key) ?? 0;
+							if (remaining === 0) continue;
+							consumedOrdinals.add(pending.ordinal);
+							remainingById.set(key, remaining - 1);
+						}
+					}
+					const pendingAnswers = new Map(state.pendingAnswers ?? []);
+					for (const pending of state.pendingInbound) {
+						if (
+							pending.agentId === event.agentId &&
+							consumedOrdinals.has(pending.ordinal)
+						) {
+							pendingAnswers.delete(pending.ordinal);
+						}
+					}
 					return {
 						...state,
-						pendingInbound: state.pendingInbound.map((msg) =>
-							consumedSet.has(String(msg.messageId)) &&
-							msg.agentId === event.agentId
-								? { ...msg, consumed: true }
-								: msg,
+						pendingInbound: state.pendingInbound.filter(
+							(msg) =>
+								msg.agentId !== event.agentId ||
+								!consumedOrdinals.has(msg.ordinal),
 						),
+						pendingAnswers,
 					};
 				}
 
@@ -445,7 +564,7 @@ export const userChatPlugin = definePlugin("user-chat")
 					return {
 						...state,
 						messages: [...state.messages, askMessage],
-						counter: state.counter + 1,
+						counter: nextStateCounter(state, event.messageId),
 					};
 				}
 
@@ -460,7 +579,7 @@ export const userChatPlugin = definePlugin("user-chat")
 					return {
 						...state,
 						messages: [...state.messages, agentMessage],
-						counter: state.counter + 1,
+						counter: nextStateCounter(state, event.messageId),
 					};
 				}
 
@@ -497,7 +616,9 @@ export const userChatPlugin = definePlugin("user-chat")
 			messageId: z.string(),
 		}),
 		handler: async (ctx, input) => {
-			const messageId = generateChatMessageId(ctx.pluginState.counter + 1);
+			const messageId = generateChatMessageId(
+				reserveMessageSequence(ctx.pluginContext),
+			);
 			const timestamp = Date.now();
 			await ctx.emitEvent(
 				userChatEvents.create("user_question_asked", {
@@ -528,7 +649,9 @@ export const userChatPlugin = definePlugin("user-chat")
 			messageId: z.string(),
 		}),
 		handler: async (ctx, input) => {
-			const messageId = generateChatMessageId(ctx.pluginState.counter + 1);
+			const messageId = generateChatMessageId(
+				reserveMessageSequence(ctx.pluginContext),
+			);
 			const timestamp = Date.now();
 			await ctx.emitEvent(
 				userChatEvents.create("user_message_sent", {
@@ -572,7 +695,9 @@ export const userChatPlugin = definePlugin("user-chat")
 				);
 			}
 
-			const messageId = generateChatMessageId(ctx.pluginState.counter + 1);
+			const messageId = generateChatMessageId(
+				reserveMessageSequence(ctx.pluginContext),
+			);
 
 			// Soft truncation — save full content to file, pass truncated + reference
 			let content = input.content;
@@ -582,7 +707,18 @@ export const userChatPlugin = definePlugin("user-chat")
 					: null;
 			if (truncation) {
 				const filePath = `.user-messages/${messageId}.md`;
-				await ctx.files.session.write(filePath, input.content);
+				const writeResult = await ctx.files.session.write(
+					filePath,
+					input.content,
+				);
+				if (!writeResult.ok) {
+					// Without the full copy on disk the truncated message would silently lose content.
+					return Err(
+						ValidationErrors.invalid(
+							`Failed to store full message: ${writeResult.error}`,
+						),
+					);
+				}
 				content = `${truncation.content}\n\n[Full message saved to: ${filePath} — use read_file to access it]`;
 			}
 
@@ -606,7 +742,9 @@ export const userChatPlugin = definePlugin("user-chat")
 		}),
 		output: z.object({}),
 		handler: async (ctx, input) => {
-			const messageId = generateChatMessageId(ctx.pluginState.counter + 1);
+			const messageId = generateChatMessageId(
+				reserveMessageSequence(ctx.pluginContext),
+			);
 			await ctx.emitEvent(
 				userChatEvents.create("user_chat_answer_received", {
 					agentId: input.agentId,
@@ -633,18 +771,28 @@ export const userChatPlugin = definePlugin("user-chat")
 	})
 	.dequeue({
 		hasPendingMessages: (ctx) =>
-			ctx.pluginState.pendingInbound.some(
-				(m) => !m.consumed && m.agentId === ctx.agentId,
-			),
+			ctx.pluginState.pendingInbound.some((m) => m.agentId === ctx.agentId),
 
 		getPendingMessages: (ctx) => {
 			const pending = ctx.pluginState.pendingInbound.filter(
-				(m) => !m.consumed && m.agentId === ctx.agentId,
+				(m) => m.agentId === ctx.agentId,
 			);
 			if (pending.length === 0) return null;
 			return {
-				messages: [{ role: "user", content: formatPendingForLLM(pending) }],
-				token: pending.map((m) => m.messageId),
+				messages: [
+					{
+						role: "user",
+						content: formatPendingForLLM(
+							ctx.pluginState.messages,
+							pending,
+							ctx.pluginState.pendingAnswers,
+						),
+					},
+				],
+				token: pending.map((message) => ({
+					messageId: message.messageId,
+					ordinal: message.ordinal,
+				})),
 			};
 		},
 
@@ -652,7 +800,8 @@ export const userChatPlugin = definePlugin("user-chat")
 			await ctx.emitEvent(
 				userChatEvents.create("user_chat_messages_consumed", {
 					agentId: ctx.agentId,
-					messageIds: token,
+					messageIds: token.map((item) => item.messageId),
+					ordinals: token.map((item) => item.ordinal),
 				}),
 			);
 		},
@@ -666,12 +815,12 @@ export const userChatPlugin = definePlugin("user-chat")
 
 		const userTagRegex = /<user>([\s\S]*?)<\/user>/g;
 		let match: RegExpExecArray | null;
-		let localCounter = ctx.pluginState.counter;
 		while ((match = userTagRegex.exec(responseContent)) !== null) {
 			const content = match[1].trim();
 			if (!content) continue;
-			localCounter++;
-			const chatMessageId = generateChatMessageId(localCounter);
+			const chatMessageId = generateChatMessageId(
+				reserveMessageSequence(ctx.pluginContext),
+			);
 			await ctx.emitEvent(
 				userChatEvents.create("user_message_sent", {
 					agentId: ctx.agentId,

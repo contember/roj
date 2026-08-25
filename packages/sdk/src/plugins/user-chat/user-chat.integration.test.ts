@@ -1,10 +1,24 @@
 import { describe, expect, it } from 'bun:test'
+import { AgentId } from '~/core/agents/schema.js'
+import { withSessionId } from '~/core/events/test-helpers.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 import { userChatEvents, userChatPlugin } from './index.js'
 import type { UserChatState } from './plugin.js'
+import { ChatMessageId } from './schema.js'
+
+const waitUntilAsync = async (
+	predicate: () => Promise<boolean>,
+	timeoutMs = 1_000,
+): Promise<void> => {
+	const deadline = Date.now() + timeoutMs
+	while (!(await predicate())) {
+		if (Date.now() >= deadline) throw new Error('Timed out waiting for condition')
+		await Bun.sleep(5)
+	}
+}
 
 describe('user-chat plugin', () => {
 	// =========================================================================
@@ -87,7 +101,7 @@ describe('user-chat plugin', () => {
 			await harness.shutdown()
 		})
 
-		it('sendMessage → pending inbound message created and marked consumed after inference', async () => {
+		it('sendMessage → consumed inbound payload is pruned while UI history remains', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
 				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
@@ -100,12 +114,364 @@ describe('user-chat plugin', () => {
 			const consumedEvents = await session.getEventsByType('user_chat_messages_consumed')
 			expect(consumedEvents.length).toBeGreaterThanOrEqual(1)
 
-			// After consumption, pending messages should be marked consumed in state
-			const pendingInbound = selectPluginState<UserChatState>(session.state, 'messages')?.pendingInbound ?? []
-			const unconsumed = pendingInbound.filter((m) => !m.consumed)
-			expect(unconsumed).toHaveLength(0)
+			const state = selectPluginState<UserChatState>(session.state, 'messages')
+			expect(state?.pendingInbound).toHaveLength(0)
+			expect(state?.messages).toContainEqual(expect.objectContaining({
+				type: 'user_message',
+				content: 'Test',
+			}))
 
 			await harness.shutdown()
+		})
+
+		it('pending inbound keeps only a reference to canonical UI content', async () => {
+			let releaseInference: (() => void) | undefined
+			const inferenceGate = new Promise<void>((resolve) => {
+				releaseInference = resolve
+			})
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				mockHandler: async () => {
+					await inferenceGate
+					return {
+						content: 'Done',
+						toolCalls: [],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetrics(),
+					}
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendMessage('Canonical payload')
+
+			const pendingState = selectPluginState<UserChatState>(session.state, 'messages')
+			expect(pendingState?.pendingInbound).toHaveLength(1)
+			expect(pendingState?.pendingInbound[0]).not.toHaveProperty('content')
+			expect(pendingState?.messages).toContainEqual(expect.objectContaining({
+				type: 'user_message',
+				content: 'Canonical payload',
+			}))
+
+			releaseInference?.()
+			await session.waitForIdle()
+			expect(selectPluginState<UserChatState>(session.state, 'messages')?.pendingInbound).toHaveLength(0)
+
+			await harness.shutdown()
+		})
+
+		it('concurrent sends allocate unique IDs and deliver immutable content once', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Done', toolCalls: [] }),
+			})
+			const session = await harness.createSession('test')
+			const entryAgentId = session.getEntryAgentId()
+			if (!entryAgentId) throw new Error('Expected entry agent')
+			await session.pauseAgent(entryAgentId, 'Inspect pending input')
+
+			const [first, second] = await Promise.all([
+				session.callPluginMethod('user-chat.sendMessage', {
+					agentId: String(entryAgentId),
+					content: 'Concurrent A',
+				}),
+				session.callPluginMethod('user-chat.sendMessage', {
+					agentId: String(entryAgentId),
+					content: 'Concurrent B',
+				}),
+			])
+			expect(first.ok).toBe(true)
+			expect(second.ok).toBe(true)
+
+			const pendingState = selectPluginState<UserChatState>(session.state, 'messages')
+			expect(pendingState?.pendingInbound.map((message) => message.messageId).sort()).toEqual([
+				ChatMessageId('m1'),
+				ChatMessageId('m2'),
+			])
+			expect(pendingState?.messages.filter((message) => message.type === 'user_message')).toEqual([
+				expect.objectContaining({ messageId: ChatMessageId('m1'), content: 'Concurrent A' }),
+				expect.objectContaining({ messageId: ChatMessageId('m2'), content: 'Concurrent B' }),
+			])
+
+			await session.resumeAgent(entryAgentId)
+			await session.waitForIdle()
+			const requestText = harness.llmProvider.getCallHistory().flatMap((request) =>
+				request.messages.map((message) =>
+					typeof message.content === 'string' ? message.content : '',
+				),
+			).join('\n')
+			expect(requestText.split('Concurrent A')).toHaveLength(2)
+			expect(requestText.split('Concurrent B')).toHaveLength(2)
+
+			await harness.shutdown()
+		})
+
+		it('retryable provider failure preserves pending input until recovery', async () => {
+			let inferenceCount = 0
+			const seenContent: string[] = []
+			const preset = createTestPreset()
+			preset.orchestrator.errorResumeBackoff = { baseDelayMs: 250, maxDelayMs: 250 }
+			const harness = new TestHarness({
+				presets: [preset],
+				mockHandler: (request) => {
+					inferenceCount++
+					seenContent.push(request.messages.map((message) =>
+						typeof message.content === 'string' ? message.content : '',
+					).join('\n'))
+					if (inferenceCount <= 5) {
+						throw { type: 'server_error', message: 'temporary outage', retryAfterMs: 0 }
+					}
+					return {
+						content: 'Recovered',
+						toolCalls: [],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetrics(),
+					}
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendMessage('Retry payload')
+			await waitUntilAsync(async () =>
+				(await session.getEventsByType('inference_failed')).length === 1,
+			)
+
+			const failedState = selectPluginState<UserChatState>(session.state, 'messages')
+			expect(failedState?.pendingInbound).toHaveLength(1)
+			expect(await session.getEventsByType('user_chat_messages_consumed')).toHaveLength(0)
+
+			await session.waitForIdle({ timeoutMs: 5_000 })
+			expect(inferenceCount).toBe(6)
+			expect(seenContent[0]).toContain('Retry payload')
+			expect(seenContent[5]).toContain('Retry payload')
+			expect(selectPluginState<UserChatState>(session.state, 'messages')?.pendingInbound).toHaveLength(0)
+
+			await harness.shutdown()
+		})
+
+		it('consumption replay preserves UI history without rebuilding pending work', async () => {
+			const firstHarness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Done', toolCalls: [] }),
+			})
+			const firstSession = await firstHarness.createSession('test')
+			await firstSession.sendAndWaitForIdle('Persisted UI message')
+			const sessionId = firstSession.sessionId
+			const eventStore = firstHarness.eventStore
+			await firstHarness.shutdown()
+
+			const secondHarness = new TestHarness({
+				presets: [createTestPreset()],
+				eventStore,
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Done', toolCalls: [] }),
+			})
+			const replayedSession = await secondHarness.openSession(sessionId)
+			const replayedState = selectPluginState<UserChatState>(replayedSession.state, 'messages')
+			expect(replayedState?.pendingInbound).toHaveLength(0)
+			expect(replayedState?.messages).toContainEqual(expect.objectContaining({
+				type: 'user_message',
+				content: 'Persisted UI message',
+			}))
+
+			await secondHarness.shutdown()
+		})
+
+		it('replays duplicate message IDs as distinct ordered occurrences', async () => {
+			const firstHarness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Done', toolCalls: [] }),
+			})
+			const firstSession = await firstHarness.createSession('test')
+			const sessionId = firstSession.sessionId
+			const entryAgentId = firstSession.getEntryAgentId()
+			if (!entryAgentId) throw new Error('Expected entry agent')
+			const eventStore = firstHarness.eventStore
+			await firstHarness.shutdown()
+
+			await eventStore.appendBatch(sessionId, [
+				withSessionId(sessionId, userChatEvents.create('user_chat_message_received', {
+					agentId: entryAgentId,
+					messageId: ChatMessageId('m1'),
+					content: 'Duplicate A',
+					timestamp: 1,
+				})),
+				withSessionId(sessionId, userChatEvents.create('user_chat_message_received', {
+					agentId: entryAgentId,
+					messageId: ChatMessageId('m1'),
+					content: 'Duplicate B',
+					timestamp: 2,
+				})),
+			])
+
+			const secondHarness = new TestHarness({
+				presets: [createTestPreset()],
+				eventStore,
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Done', toolCalls: [] }),
+			})
+			const replayedSession = await secondHarness.openSession(sessionId)
+			await replayedSession.waitForIdle()
+			const requestText = secondHarness.llmProvider.getCallHistory().flatMap((request) =>
+				request.messages.map((message) =>
+					typeof message.content === 'string' ? message.content : '',
+				),
+			).join('\n')
+			const firstIndex = requestText.indexOf('Duplicate A')
+			const secondIndex = requestText.indexOf('Duplicate B')
+			expect(firstIndex).toBeGreaterThanOrEqual(0)
+			expect(secondIndex).toBeGreaterThan(firstIndex)
+			expect(requestText.split('Duplicate A')).toHaveLength(2)
+			expect(requestText.split('Duplicate B')).toHaveLength(2)
+			const consumed = await replayedSession.getEventsByType(
+				userChatEvents,
+				'user_chat_messages_consumed',
+			)
+			expect(consumed.at(-1)?.messageIds).toEqual([
+				ChatMessageId('m1'),
+				ChatMessageId('m1'),
+			])
+			expect(consumed.at(-1)?.ordinals).toEqual([1, 2])
+
+			await secondHarness.shutdown()
+		})
+
+		it('legacy consumption removes only the targeted duplicate occurrence and agent', async () => {
+			const firstHarness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Done', toolCalls: [] }),
+			})
+			const firstSession = await firstHarness.createSession('test')
+			const sessionId = firstSession.sessionId
+			const entryAgentId = firstSession.getEntryAgentId()
+			if (!entryAgentId) throw new Error('Expected entry agent')
+			await firstSession.pauseAgent(entryAgentId, 'Inspect replay')
+			const otherAgentId = AgentId('other_1')
+			const eventStore = firstHarness.eventStore
+			await firstHarness.shutdown()
+
+			await eventStore.appendBatch(sessionId, [
+				withSessionId(sessionId, userChatEvents.create('user_chat_message_received', {
+					agentId: entryAgentId,
+					messageId: ChatMessageId('m1'),
+					content: 'Already consumed',
+					timestamp: 1,
+				})),
+				withSessionId(sessionId, userChatEvents.create('user_chat_message_received', {
+					agentId: otherAgentId,
+					messageId: ChatMessageId('m1'),
+					content: 'Other agent pending',
+					timestamp: 2,
+				})),
+				withSessionId(sessionId, userChatEvents.create('user_chat_messages_consumed', {
+					agentId: entryAgentId,
+					messageIds: [ChatMessageId('m1')],
+				})),
+				withSessionId(sessionId, userChatEvents.create('user_chat_message_received', {
+					agentId: entryAgentId,
+					messageId: ChatMessageId('m1'),
+					content: 'Later duplicate',
+					timestamp: 3,
+				})),
+			])
+
+			const secondHarness = new TestHarness({
+				presets: [createTestPreset()],
+				eventStore,
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Done', toolCalls: [] }),
+			})
+			const replayedSession = await secondHarness.openSession(sessionId)
+			const replayedState = selectPluginState<UserChatState>(replayedSession.state, 'messages')
+			const entryPending = replayedState?.pendingInbound.filter(
+				(message) => message.agentId === entryAgentId,
+			) ?? []
+			const otherPending = replayedState?.pendingInbound.filter(
+				(message) => message.agentId === otherAgentId,
+			) ?? []
+			expect(entryPending.map((message) => message.ordinal)).toEqual([3])
+			expect(otherPending.map((message) => message.ordinal)).toEqual([2])
+
+			await replayedSession.resumeAgent(entryAgentId)
+			await replayedSession.waitForIdle()
+			const requestText = secondHarness.llmProvider.getCallHistory().flatMap((request) =>
+				request.messages.map((message) =>
+					typeof message.content === 'string' ? message.content : '',
+				),
+			).join('\n')
+			expect(requestText).toContain('Later duplicate')
+			expect(requestText).not.toContain('Already consumed')
+			expect(selectPluginState<UserChatState>(replayedSession.state, 'messages')?.pendingInbound).toEqual([
+				expect.objectContaining({ ordinal: 2, agentId: otherAgentId }),
+			])
+
+			await secondHarness.shutdown()
+		})
+
+		it('replays each immutable answer value, including an orphaned legacy answer', async () => {
+			const firstHarness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Done', toolCalls: [] }),
+			})
+			const firstSession = await firstHarness.createSession('test')
+			const sessionId = firstSession.sessionId
+			const entryAgentId = firstSession.getEntryAgentId()
+			if (!entryAgentId) throw new Error('Expected entry agent')
+			const eventStore = firstHarness.eventStore
+			await firstHarness.shutdown()
+
+			await eventStore.appendBatch(sessionId, [
+				withSessionId(sessionId, userChatEvents.create('user_question_asked', {
+					agentId: entryAgentId,
+					messageId: ChatMessageId('m10'),
+					question: 'Choose once',
+					inputType: { type: 'text' },
+				})),
+				withSessionId(sessionId, userChatEvents.create('user_chat_answer_received', {
+					agentId: entryAgentId,
+					messageId: ChatMessageId('m11'),
+					questionId: ChatMessageId('m10'),
+					answerValue: 'first answer',
+					timestamp: 11,
+				})),
+				withSessionId(sessionId, userChatEvents.create('user_chat_answer_received', {
+					agentId: entryAgentId,
+					messageId: ChatMessageId('m11'),
+					questionId: ChatMessageId('m10'),
+					answerValue: 'second answer',
+					timestamp: 12,
+				})),
+				withSessionId(sessionId, userChatEvents.create('user_chat_answer_received', {
+					agentId: entryAgentId,
+					messageId: ChatMessageId('m12'),
+					questionId: ChatMessageId('missing-question'),
+					answerValue: 'orphan answer',
+					timestamp: 13,
+				})),
+			])
+
+			const secondHarness = new TestHarness({
+				presets: [createTestPreset()],
+				eventStore,
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Done', toolCalls: [] }),
+			})
+			const replayedSession = await secondHarness.openSession(sessionId)
+			await replayedSession.waitForIdle()
+			const requestText = secondHarness.llmProvider.getCallHistory().flatMap((request) =>
+				request.messages.map((message) =>
+					typeof message.content === 'string' ? message.content : '',
+				),
+			).join('\n')
+			const firstIndex = requestText.indexOf('first answer')
+			const secondIndex = requestText.indexOf('second answer')
+			expect(firstIndex).toBeGreaterThanOrEqual(0)
+			expect(secondIndex).toBeGreaterThan(firstIndex)
+			expect(requestText).toContain('orphan answer')
+
+			const replayedState = selectPluginState<UserChatState>(replayedSession.state, 'messages')
+			const question = replayedState?.messages.find((message) => message.type === 'ask_user')
+			expect(question).toEqual(expect.objectContaining({ answered: true, answer: 'second answer' }))
+			expect(replayedState?.pendingInbound).toHaveLength(0)
+			expect(replayedState?.pendingAnswers?.size).toBe(0)
+
+			await secondHarness.shutdown()
 		})
 	})
 
@@ -559,6 +925,7 @@ describe('user-chat plugin', () => {
 				answered: true,
 				answer: true,
 			})
+			expect(selectPluginState<UserChatState>(session.state, 'messages')?.pendingInbound).toHaveLength(0)
 
 			await harness.shutdown()
 		})
