@@ -238,9 +238,27 @@ type HookMap<TCtx> = {
 	onPause: (ctx: TCtx & { reason?: string }) => Promise<OnPauseResult>
 }
 
+/**
+ * Why a resident session runtime is being closed.
+ *
+ * `evicted` parks an idle runtime that will be rebuilt on the next access, so
+ * close hooks must keep anything the session still needs; `closed` and
+ * `shutdown` end it for good.
+ */
+export type SessionCloseReason = 'closed' | 'evicted' | 'shutdown'
+
 type SessionHookMap<TCtx> = {
+	/**
+	 * Runs once per resident runtime lifetime, not once per session — an evicted
+	 * runtime is rebuilt from its event log and runs this hook again.
+	 */
 	onSessionReady: (ctx: TCtx) => Promise<void>
-	onSessionClose: (ctx: TCtx) => Promise<void>
+	/**
+	 * Runs once per resident runtime lifetime, not once per session — an idle
+	 * eviction runs it too, and the next access runs `onSessionReady` again.
+	 * Check `reason` before destroying anything the session still needs.
+	 */
+	onSessionClose: (ctx: TCtx & { reason: SessionCloseReason }) => Promise<void>
 	beforeMethod: (ctx: TCtx & { method: string; input: unknown; agentId?: AgentId }) => Promise<BeforeMethodResult>
 }
 
@@ -316,8 +334,10 @@ type ErasedAgentHookMap = {
  * Session-level hook map with proper return types but erased context.
  */
 type ErasedSessionHookMap = {
+	/** Fires once per resident runtime lifetime — a rebuilt runtime runs it again. */
 	onSessionReady: (ctx: BaseSessionHookContext) => Promise<void>
-	onSessionClose: (ctx: BaseSessionHookContext) => Promise<void>
+	/** Fires once per resident runtime lifetime — `reason` says whether the session ends or is only parked. */
+	onSessionClose: (ctx: BaseSessionHookContext & { reason: SessionCloseReason }) => Promise<void>
 	beforeMethod: (ctx: BaseSessionHookContext & { method: string; input: unknown; agentId?: AgentId }) => Promise<BeforeMethodResult>
 }
 
@@ -713,6 +733,16 @@ export class PluginBuilder<
 		return this
 	}
 
+	/**
+	 * Register a session-level hook.
+	 *
+	 * `onSessionReady` and `onSessionClose` bracket one *resident runtime*, not
+	 * one session: an idle runtime is evicted (close hook runs with
+	 * `reason: 'evicted'`) and rebuilt from the event log on the next access,
+	 * which runs `onSessionReady` again. Only `reason: 'closed'` / `'shutdown'`
+	 * mean the session is really over — anything destructive belongs behind that
+	 * check.
+	 */
 	sessionHook<TName extends keyof SessionHookMap<PluginSessionHookContext<TConfig, TMethods, TContext, TState, TNotifications, TDeps>>>(
 		name: TName,
 		fn: SessionHookMap<PluginSessionHookContext<TConfig, TMethods, TContext, TState, TNotifications, TDeps>>[TName],

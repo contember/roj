@@ -9,19 +9,45 @@
 
 import { uuidv7 } from 'uuidv7'
 import z from 'zod/v4'
+import { type DomainError, ValidationErrors } from '~/core/errors.js'
+import { Err, Ok } from '~/lib/utils/result.js'
+import type { Result } from '~/lib/utils/result.js'
 
 // ============================================================================
 // SessionId - Branded type
 // ============================================================================
 
-/** SessionId schema - validates any string and brands as SessionId. */
-export const sessionIdSchema = z.string().brand('SessionId')
+/**
+ * Characters a session id may contain.
+ *
+ * A session id is interpolated straight into filesystem paths (the session dir,
+ * the event log, the file logger target), so anything that could traverse or
+ * escape the data root has to be rejected before a path is derived from it.
+ * Generated ids are UUIDv7; callers may supply their own, and both known
+ * platform consumers mint `crypto.randomUUID()`, which fits.
+ */
+export const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
+
+/** True when the value is safe to interpolate into a path. */
+export const isValidSessionId = (id: string): boolean => SESSION_ID_PATTERN.test(id)
+
+/** SessionId schema - validates the id shape and brands as SessionId. */
+export const sessionIdSchema = z.string().regex(SESSION_ID_PATTERN, 'Invalid session id').brand('SessionId')
 
 /** Branded SessionId type */
 export type SessionId = z.infer<typeof sessionIdSchema>
 
-/** Constructor for SessionId */
+/**
+ * Unchecked brand — only for ids already known to match `SESSION_ID_PATTERN`.
+ *
+ * It does not validate, so it must never see untrusted input: the id is
+ * interpolated into filesystem paths. Use `parseSessionId` at every boundary.
+ */
 export const SessionId = (id: string): SessionId => id as SessionId
+
+/** Checked SessionId constructor — the form to use on untrusted input. */
+export const parseSessionId = (value: string): Result<SessionId, DomainError> =>
+	isValidSessionId(value) ? Ok(SessionId(value)) : Err(ValidationErrors.invalid('Invalid session id'))
 
 /** Generate a new SessionId (UUIDv7) */
 export const generateSessionId = (): SessionId => SessionId(uuidv7())

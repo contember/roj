@@ -643,3 +643,13 @@ export const getAgentState = (state: SessionState, agentId: AgentId): AgentState
 export const getNextAgentSeq = (state: SessionState, definitionName: string): number => {
 	return (state.agentCounters.get(definitionName) ?? 0) + 1
 }
+
+/**
+ * Reservation key for the per-definition agent sequence.
+ *
+ * Both spawn paths reserve through `SessionContext.reserveSequence` — deriving the
+ * sequence from the projection instead lets two concurrent spawns read the same
+ * counter and mint the same agent id, and the second one then overwrites the first
+ * in the agent map while both callers are told they spawned an agent.
+ */
+export const agentSequenceKey = (definitionName: string): string => `agent.${definitionName}`
