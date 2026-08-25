@@ -238,7 +238,10 @@ export class ZipPreprocessor implements Preprocessor {
 
 		// Write full manifest to disk
 		if (signal.aborted) return Err(preprocessingAbortError(signal))
-		await ctx.files.write('content.txt', fullManifest)
+		const manifestWrite = await ctx.files.write('content.txt', fullManifest)
+		if (!manifestWrite.ok) {
+			return Err(new Error(`Failed to write ZIP manifest: ${manifestWrite.error}`))
+		}
 		derivedPaths.push('content.txt')
 
 		this.logger.debug('ZIP processed', {
