@@ -31,11 +31,19 @@ jobs:
       - name: Run TypeScript build
         run: bun run ts:build
 
-      - name: Type-check SDK tests
-        run: bunx tsc -p packages/sdk/tsconfig.test.json --noEmit
+      - name: Type-check tests
+        run: |
+          bunx tsc -p packages/sdk/tsconfig.test.json --noEmit
+          bunx tsc -p packages/standalone-server/tsconfig.test.json --noEmit
 
       - name: Run tests
         run: bun run test
+
+      # Replays committed LLM snapshots — no provider key, no network calls.
+      # Guards the full client → REST → standalone-server → agent path, which
+      # the default run only smoke-tests.
+      - name: Run demo e2e (snapshot replay)
+        run: LIVE_TESTS=1 bun test packages/demo/tests/app-builder.e2e.test.ts
 
       - name: Run release tooling tests
         run: bun run test:release

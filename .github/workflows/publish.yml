@@ -52,8 +52,10 @@ jobs:
       - name: TypeScript build
         run: bun run ts:build
 
-      - name: Type-check SDK tests
-        run: bunx tsc -p packages/sdk/tsconfig.test.json --noEmit
+      - name: Type-check tests
+        run: |
+          bunx tsc -p packages/sdk/tsconfig.test.json --noEmit
+          bunx tsc -p packages/standalone-server/tsconfig.test.json --noEmit
 
       - name: Run tests
         run: bun run test
