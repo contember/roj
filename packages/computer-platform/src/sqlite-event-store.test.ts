@@ -2,7 +2,7 @@ import { Database } from 'bun:sqlite'
 import type { SQLQueryBindings } from 'bun:sqlite'
 import { beforeEach, describe, expect, test } from 'bun:test'
 import { isDomainEvent, SessionId } from '@roj-ai/sdk'
-import type { DomainEvent } from '@roj-ai/sdk'
+import type { DomainEvent, SessionMetadata } from '@roj-ai/sdk'
 import { EventAppendError, EventStoreError } from '@roj-ai/sdk'
 import { SqliteEventStore } from './sqlite-event-store.js'
 import type { SqlCursorLike, SqlStorageHost, SqlStorageLike } from './sqlite-event-store.js'
@@ -58,6 +58,14 @@ const sessionCreated = (sessionId: SessionId, presetId: string, timestamp?: numb
 
 const agentSpawned = (sessionId: SessionId, definitionName: string, timestamp?: number) =>
 	makeEvent(sessionId, 'agent_spawned', { agentId: `agent-${definitionName}`, definitionName, parentId: null }, timestamp)
+
+/** `updateMetadata` drops a partial it cannot complete, so a metadata-only session needs a whole record. */
+const metadataOnly: Partial<SessionMetadata> = {
+	presetId: 'test-preset',
+	createdAt: 1000,
+	status: 'active',
+	name: 'metadata only',
+}
 
 describe('SqliteEventStore', () => {
 	let storage: FakeSqlStorage
@@ -314,7 +322,7 @@ describe('SqliteEventStore', () => {
 		})
 
 		test('stays false for a session that only has metadata', async () => {
-			await store.updateMetadata(sessionId, { name: 'metadata only' })
+			await store.updateMetadata(sessionId, metadataOnly)
 			expect(await store.exists(sessionId)).toBe(false)
 		})
 	})
@@ -351,7 +359,7 @@ describe('SqliteEventStore', () => {
 		})
 
 		test('includes a session that only has metadata', async () => {
-			await store.updateMetadata(sessionId, { name: 'metadata only' })
+			await store.updateMetadata(sessionId, metadataOnly)
 			expect(await store.listSessions()).toEqual([sessionId])
 		})
 
@@ -526,7 +534,7 @@ describe('SqliteEventStore', () => {
 		})
 
 		test('removes a session that only has metadata', async () => {
-			await store.updateMetadata(sessionId, { name: 'metadata only' })
+			await store.updateMetadata(sessionId, metadataOnly)
 
 			expect(await store.deleteSession(sessionId)).toBe(0)
 			expect(await store.listSessions()).toEqual([])
