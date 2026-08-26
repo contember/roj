@@ -337,7 +337,7 @@ describe('Agent Shutdown', () => {
 		agent.shutdown()
 	})
 
-	it('the error-retry timer fires, recovers, and leaves no lease behind', async () => {
+	it('the error-retry wake fires, recovers, and leaves no lease behind', async () => {
 		let failNext = true
 		const provider = new MockLLMProvider(() => {
 			if (failNext) throw RATE_LIMITED
@@ -356,9 +356,15 @@ describe('Agent Shutdown', () => {
 		expect(runtimeActivity.getSnapshot().activeCount).toBe(0)
 
 		failNext = false
-		// Poll rather than sleep a fixed window: the claim is "the retry fired and the
-		// lease it took is gone", not "that happened inside 200ms of loaded-CI wall clock".
-		await waitUntil(() => provider.getCallCount() >= 6 && runtimeActivity.getSnapshot().activeCount === 0)
+		// The retry is a scheduler wake now, and a bare agent has no manager to deliver
+		// one — so stand in for it, once the backoff a host would have waited out has
+		// passed: continue() re-checks what is left of it and re-arms if it has not.
+		// 'retry' re-schedules, 'debounce' runs the turn; the claim is unchanged, that
+		// the backoff between them holds nothing.
+		await waitUntil(() => Date.now() >= (store.getAgentState(TEST_AGENT_ID)?.lastInferenceFailureAt ?? 0) + 20)
+		await agent.deliverWake('retry')
+		expect(runtimeActivity.getSnapshot().activeCount).toBe(1)
+		await agent.deliverWake('debounce')
 
 		expect(provider.getCallCount()).toBe(6)
 		expect(store.getAgentState(TEST_AGENT_ID)?.status).toBe('pending')

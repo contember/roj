@@ -57,17 +57,18 @@ export function createApp(services: AppServices<PluginProfile>): Hono<AppEnv> {
 	 *
 	 * Two kinds of number, deliberately named apart:
 	 *
-	 * - **Live** — `lastActivityAt`, `stats.sessionCount`, `pendingAgents`,
-	 *   `processingAgents` and `sessions[]` describe what this instance holds in
-	 *   memory *now*. On a host that can be evicted (a Durable Object) that is
-	 *   whatever survived the last eviction, so they move with isolate lifetime,
-	 *   and `lastActivityAt` is null whenever nothing is loaded. A liveness
-	 *   signal, not a history.
-	 * - **Durable** — `stats.storedSessionCount` is every session the event store
-	 *   holds, of any status, and does not move when the isolate is recycled.
+	 * - **Live** — `stats.loadedSessionCount`, `pendingAgents`, `processingAgents`
+	 *   and `sessions[]` describe what this instance holds in memory *now*. On a
+	 *   host that can be evicted (a Durable Object) that is whatever survived the
+	 *   last eviction, so they move with isolate lifetime. A liveness signal, not
+	 *   a history.
+	 * - **Durable** — `stats.sessionCount` counts the open sessions the event
+	 *   store holds and `stats.storedSessionCount` counts them of any status;
+	 *   `lastActivityAt` comes off stored metadata. None of these move when the
+	 *   isolate is recycled.
 	 *
-	 * So `storedSessionCount > 0 && sessionCount === 0` reads as "sessions exist,
-	 * none are loaded" rather than as "there are no sessions". Per-session detail
+	 * So `storedSessionCount > 0 && loadedSessionCount === 0` reads as "sessions
+	 * exist, none are loaded" rather than as "there are no sessions". Per-session detail
 	 * beyond the live set — status, metrics, paging — is what the `sessions.list`
 	 * RPC is for; it costs one metadata read per session, which this endpoint is
 	 * polled too often to pay.

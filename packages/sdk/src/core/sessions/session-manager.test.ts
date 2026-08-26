@@ -99,8 +99,9 @@ describe('SessionManager session counts', () => {
 		eventStore.loadCalls = 0
 
 		const stats = await harness.sessionManager.getStats()
-		expect(stats.sessionCount).toBe(0)
-		expect(stats.lastActivityAt).toBeNull()
+		// Nothing resident; the stored pair still shows in the durable count.
+		expect(stats.loadedSessionCount).toBe(0)
+		expect(stats.sessionCount).toBe(2)
 
 		expect(await harness.sessionManager.countStoredSessions()).toBe(2)
 		// Replay is the expensive operation; counting must never pay for it.

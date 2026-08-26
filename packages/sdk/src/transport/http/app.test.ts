@@ -67,6 +67,7 @@ const statusSchema = z4.object({
 	lastActivityAt: z4.number().nullable(),
 	stats: z4.object({
 		sessionCount: z4.number(),
+		loadedSessionCount: z4.number(),
 		pendingAgents: z4.number(),
 		processingAgents: z4.number(),
 		storedSessionCount: z4.number(),
@@ -155,9 +156,8 @@ describe('/status separates what is live from what exists', () => {
 
 		try {
 			const body = await status(evicted)
-			expect(body.stats).toMatchObject({ sessionCount: 0, storedSessionCount: 1 })
 			// Live and durable disagreeing is now readable rather than silent.
-			expect(body.lastActivityAt).toBeNull()
+			expect(body.stats).toMatchObject({ loadedSessionCount: 0, storedSessionCount: 1 })
 		} finally {
 			await evicted.shutdown()
 		}
