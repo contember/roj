@@ -5,7 +5,7 @@
  */
 
 import { extname, join, resolve } from 'node:path'
-import type { FileSystem } from '~/platform/fs.js'
+import type { FileSystem, WalkEntry } from '~/platform/fs.js'
 
 // ============================================================================
 // Constants
@@ -154,6 +154,34 @@ export function preventTraversal(baseDir: string, requestedPath: string): string
 	return resolved
 }
 
+/** Path under `baseDir`, with the separator dropped. */
+function relativeUnder(path: string, baseDir: string): string {
+	return path.slice(baseDir.endsWith('/') ? baseDir.length : baseDir.length + 1)
+}
+
+/** A walked entry as this plugin reports it; `relativeTo` adds the `path` the recursive listing carries. */
+function toDirectoryEntry(entry: WalkEntry, relativeTo?: string): DirectoryEntry {
+	const name = entry.path.slice(entry.path.lastIndexOf('/') + 1)
+	const isDir = entry.type === 'directory'
+	const out: DirectoryEntry = {
+		name,
+		...(relativeTo === undefined ? {} : { path: relativeUnder(entry.path, relativeTo) }),
+		type: isDir ? 'directory' : 'file',
+		size: isDir ? 0 : entry.size,
+	}
+	if (!isDir) out.mimeType = getMimeType(name)
+	return out
+}
+
+/** Directories first, then alphabetical — applied to whichever path produced the entries. */
+function sortEntries(entries: DirectoryEntry[]): DirectoryEntry[] {
+	entries.sort((a, b) => {
+		if (a.type !== b.type) return a.type === 'directory' ? -1 : 1
+		return a.name.localeCompare(b.name)
+	})
+	return entries
+}
+
 /**
  * List a single directory level, returning sorted DirectoryEntry[].
  * Directories first, then alphabetical within each group.
@@ -164,6 +192,23 @@ export async function listDirectory(fs: FileSystem, baseDir: string, subPath: st
 		throw new ListingError('forbidden', 'Path traversal not allowed')
 	}
 
+	if (fs.walk) {
+		let found: WalkEntry[]
+		try {
+			found = await fs.walk(targetDir, { depth: 1, excludeHidden: true })
+		} catch {
+			throw new ListingError('not_found', 'Directory not found')
+		}
+		return sortEntries(found.map((entry) => toDirectoryEntry(entry)))
+	}
+
+	// The readdir and a stat per entry are one question asked in pieces, so let a
+	// platform that can share those reads see them as one.
+	const read = (): Promise<DirectoryEntry[]> => readLevel(fs, targetDir)
+	return fs.scopeReads ? fs.scopeReads(read) : read()
+}
+
+async function readLevel(fs: FileSystem, targetDir: string): Promise<DirectoryEntry[]> {
 	let dirents: import('node:fs').Dirent[]
 	try {
 		dirents = await fs.readdir(targetDir, { withFileTypes: true })
@@ -199,13 +244,7 @@ export async function listDirectory(fs: FileSystem, baseDir: string, subPath: st
 		entries.push(entry)
 	}
 
-	// Sort: directories first, then alphabetical
-	entries.sort((a, b) => {
-		if (a.type !== b.type) return a.type === 'directory' ? -1 : 1
-		return a.name.localeCompare(b.name)
-	})
-
-	return entries
+	return sortEntries(entries)
 }
 
 /**
@@ -213,9 +252,19 @@ export async function listDirectory(fs: FileSystem, baseDir: string, subPath: st
  * Skips hidden files and IGNORED_DIRS.
  */
 export async function listDirectoryRecursive(fs: FileSystem, baseDir: string): Promise<DirectoryEntry[]> {
+	if (fs.walk) {
+		try {
+			const found = await fs.walk(baseDir, { exclude: [...IGNORED_DIRS], excludeHidden: true })
+			return found.map((entry) => toDirectoryEntry(entry, baseDir))
+		} catch {
+			// The loop below answers an unreadable directory with an empty listing, not a throw.
+			return []
+		}
+	}
+
 	const entries: DirectoryEntry[] = []
 
-	async function walk(dir: string, prefix: string) {
+	async function walk(dir: string, prefix: string): Promise<void> {
 		let dirents: import('node:fs').Dirent[]
 		try {
 			dirents = await fs.readdir(dir, { withFileTypes: true })
@@ -258,8 +307,13 @@ export async function listDirectoryRecursive(fs: FileSystem, baseDir: string): P
 		}
 	}
 
-	await walk(baseDir, '')
-	return entries
+	// Every stat here follows a readdir the level above already read past, so a
+	// platform that can share those reads should be given the chance to.
+	const run = async (): Promise<DirectoryEntry[]> => {
+		await walk(baseDir, '')
+		return entries
+	}
+	return fs.scopeReads ? fs.scopeReads(run) : run()
 }
 
 // ============================================================================

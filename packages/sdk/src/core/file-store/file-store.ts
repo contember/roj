@@ -13,7 +13,7 @@
 
 import { dirname, join, normalize, resolve } from 'node:path'
 import type { FileEntry, FileStore } from '~/core/file-store/types.js'
-import type { FileSystem } from '~/platform/fs.js'
+import type { FileSystem, WalkEntry } from '~/platform/fs.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { Result } from '~/lib/utils/result.js'
 
@@ -107,8 +107,17 @@ export class SessionFileStore implements FileStore {
 		if (maxDepth < 1) return Ok([])
 
 		try {
+			// A readdir plus a stat per file is one question asked in pieces. Where
+			// the platform takes it whole, ask it whole.
+			if (this.fs.walk) {
+				const base = resolved.value
+				const found = await this.fs.walk(base, { depth: maxDepth })
+				return Ok(found.map((entry) => toFileEntry(entry, base)))
+			}
+
 			const entries: FileEntry[] = []
-			await this.walkInto(resolved.value, '', maxDepth, entries)
+			const readAll = (): Promise<void> => this.walkInto(resolved.value, '', maxDepth, entries)
+			await (this.fs.scopeReads ? this.fs.scopeReads(readAll) : readAll())
 			return Ok(entries)
 		} catch {
 			return Err(`Directory not found: ${path}`)
@@ -297,5 +306,15 @@ export class SessionFileStore implements FileStore {
 
 		// Path is outside known roots - return as-is
 		return realPath
+	}
+}
+
+/** A walked entry as the store reports it: name relative to the listed directory. */
+function toFileEntry(entry: WalkEntry, baseDir: string): FileEntry {
+	const prefixLength = baseDir.endsWith('/') ? baseDir.length : baseDir.length + 1
+	return {
+		name: entry.path.slice(prefixLength),
+		type: entry.type,
+		size: entry.type === 'file' ? entry.size : undefined,
 	}
 }
