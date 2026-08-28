@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import type { Platform, SessionLogPage, SessionLogStore } from '~/platform/index.js'
 import { createNodePlatform } from '~/testing/node-platform.js'
 import type { Logger } from './logger.js'
+import { flushFileLogs } from './file.js'
 import { createSessionLogger } from './session-log.js'
 
 const SESSION_ID = '01900000-0000-7000-8000-000000000001'
@@ -70,7 +71,7 @@ describe('createSessionLogger', () => {
 		const logger = createSessionLogger(platform, SESSION_ID, logPath)
 		logger.info('hello', { agentId: 'a1' })
 		// The append is fire-and-forget, so the assertion has to outlive the microtask.
-		await Bun.sleep(20)
+		await flushFileLogs(logPath)
 
 		expect(await fileEntries(logPath)).toEqual([
 			{ level: 'info', message: 'hello', sessionId: SESSION_ID, agentId: 'a1' },
@@ -83,7 +84,7 @@ describe('createSessionLogger', () => {
 
 		const logger = createSessionLogger({ ...platform, sessionLog: store }, SESSION_ID, logPath)
 		logger.info('hello', { agentId: 'a1' })
-		await Bun.sleep(20)
+		await flushFileLogs(logPath)
 
 		expect(store.bySession.get(SESSION_ID)).toHaveLength(1)
 		expect(await platform.fs.exists(logPath)).toBe(false)
@@ -101,7 +102,7 @@ describe('createSessionLogger', () => {
 		}
 		write(createSessionLogger(platform, SESSION_ID, logPath))
 		write(createSessionLogger({ ...platform, sessionLog: store }, SESSION_ID, logPath))
-		await Bun.sleep(20)
+		await flushFileLogs(logPath)
 
 		const fromFile = await fileEntries(logPath)
 		expect(entries(store.bySession.get(SESSION_ID) ?? [])).toEqual(fromFile)
@@ -125,7 +126,7 @@ describe('createSessionLogger', () => {
 
 		const logger = createSessionLogger({ ...platform, sessionLog: store }, SESSION_ID, logPath)
 		logger.child({ agentId: 'a1' }).child({ toolName: 't' }).info('nested')
-		await Bun.sleep(20)
+		await flushFileLogs(logPath)
 
 		expect(entries(store.bySession.get(SESSION_ID) ?? [])).toEqual([
 			{ level: 'info', message: 'nested', sessionId: SESSION_ID, agentId: 'a1', toolName: 't' },
@@ -154,6 +155,6 @@ describe('createSessionLogger', () => {
 		const logger = createSessionLogger(platform, SESSION_ID, join(tmpdir(), 'roj-session-log-missing', 'session.log'))
 
 		expect(() => logger.info('hello')).not.toThrow()
-		await Bun.sleep(20)
+		await flushFileLogs()
 	})
 })
