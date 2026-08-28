@@ -124,7 +124,7 @@ export class ZipPreprocessor implements Preprocessor {
 
 		// Extract to disk via unzip
 		const extractStore = ctx.files.scoped('extracted')
-		const extractDirResult = extractStore.realPath('')
+		const extractDirResult = await extractStore.containedPath('')
 		if (!extractDirResult.ok) {
 			return Err(new Error('Failed to resolve extraction directory'))
 		}
@@ -162,7 +162,7 @@ export class ZipPreprocessor implements Preprocessor {
 				return { manifestEntry: '', derivedPaths: collectedPaths }
 			}
 
-			const fileRealPath = extractStore.realPath(file.name)
+			const fileRealPath = await extractStore.containedPath(file.name)
 			if (!fileRealPath.ok) {
 				return {
 					manifestEntry: `- ${file.name} (path resolution failed)`,

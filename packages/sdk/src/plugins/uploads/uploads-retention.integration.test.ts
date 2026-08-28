@@ -142,6 +142,10 @@ class SelectiveFailureStore implements FileStore {
 		return this.delegate.realPath(path)
 	}
 
+	containedPath(path: string): Promise<Result<string, string>> {
+		return this.delegate.containedPath(path)
+	}
+
 	getRoots(): { session: string; workspace?: string } {
 		return this.delegate.getRoots()
 	}

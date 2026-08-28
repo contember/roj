@@ -5,6 +5,7 @@
  */
 
 import { extname, join, resolve } from 'node:path'
+import { containmentOf } from '~/core/file-store/containment.js'
 import type { FileSystem, WalkEntry } from '~/platform/fs.js'
 
 // ============================================================================
@@ -145,6 +146,9 @@ export function getMimeType(filePath: string): string {
 
 /**
  * Prevent path traversal — returns resolved path if safe, null otherwise.
+ *
+ * Lexical only. Callers that then touch the filesystem must also check the real
+ * target with `containmentOf`.
  */
 export function preventTraversal(baseDir: string, requestedPath: string): string | null {
 	const resolved = resolve(baseDir, requestedPath)
@@ -188,7 +192,7 @@ function sortEntries(entries: DirectoryEntry[]): DirectoryEntry[] {
  */
 export async function listDirectory(fs: FileSystem, baseDir: string, subPath: string): Promise<DirectoryEntry[]> {
 	const targetDir = subPath ? preventTraversal(baseDir, subPath) : baseDir
-	if (!targetDir) {
+	if (!targetDir || (await containmentOf(fs, [baseDir], targetDir)) !== 'inside') {
 		throw new ListingError('forbidden', 'Path traversal not allowed')
 	}
 

@@ -13,10 +13,15 @@ import type { FilesystemPresetConfig } from './plugin.js'
 // ============================================================================
 
 let fixtureDir: string
+let outsideDir: string
 
 beforeAll(() => {
-	fixtureDir = `/tmp/roj-fs-test-${Math.random().toString(36).slice(2)}`
+	const suffix = Math.random().toString(36).slice(2)
+	fixtureDir = `/tmp/roj-fs-test-${suffix}`
+	outsideDir = `/tmp/roj-fs-test-outside-${suffix}`
 	fs.mkdirSync(fixtureDir, { recursive: true })
+	fs.mkdirSync(outsideDir, { recursive: true })
+	fs.writeFileSync(path.join(outsideDir, 'outside.txt'), 'Outside the root')
 
 	// Create test files
 	fs.writeFileSync(path.join(fixtureDir, 'hello.txt'), 'Hello, world!')
@@ -41,6 +46,7 @@ beforeAll(() => {
 
 afterAll(() => {
 	fs.rmSync(fixtureDir, { recursive: true, force: true })
+	fs.rmSync(outsideDir, { recursive: true, force: true })
 })
 
 // ============================================================================
@@ -420,6 +426,121 @@ describe('filesystem plugin', () => {
 			const content = toolMessages[0].content
 			expect(content).toContain('is not a directory')
 
+			await harness.shutdown()
+		})
+	})
+
+	// =========================================================================
+	// Path containment
+	// =========================================================================
+
+	describe('path containment', () => {
+		it('read through a link that stays inside the root → allowed', async () => {
+			const linkPath = path.join(fixtureDir, 'hello-link.txt')
+			fs.symlinkSync(path.join(fixtureDir, 'hello.txt'), linkPath)
+			const harness = createFsHarness({
+				presets: [createFsPreset()],
+				llmProvider: MockLLMProvider.withSequence([
+					{
+						toolCalls: [{
+							id: ToolCallId('tc1'),
+							name: 'read_file',
+							input: { path: linkPath },
+						}],
+					},
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Read file')
+
+			const callHistory = harness.llmProvider.getCallHistory()
+			const toolMessages = callHistory[1].messages.filter((m) => m.role === 'tool')
+			const result = JSON.parse(contentToString(toolMessages[0].content))
+			expect(result.content).toBe('Hello, world!')
+
+			fs.unlinkSync(linkPath)
+			await harness.shutdown()
+		})
+
+		it('read through a link that leaves the root → rejected', async () => {
+			const linkPath = path.join(fixtureDir, 'escape.txt')
+			fs.symlinkSync(path.join(outsideDir, 'outside.txt'), linkPath)
+			const harness = createFsHarness({
+				presets: [createFsPreset()],
+				llmProvider: MockLLMProvider.withSequence([
+					{
+						toolCalls: [{
+							id: ToolCallId('tc1'),
+							name: 'read_file',
+							input: { path: linkPath },
+						}],
+					},
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Read file')
+
+			const callHistory = harness.llmProvider.getCallHistory()
+			const toolMessages = callHistory[1].messages.filter((m) => m.role === 'tool')
+			const content = contentToString(toolMessages[0].content)
+			expect(content).toContain('outside allowed directories')
+			expect(content).not.toContain('Outside the root')
+
+			fs.unlinkSync(linkPath)
+			await harness.shutdown()
+		})
+
+		it('write through a directory link that leaves the root → rejected', async () => {
+			const linkDir = path.join(fixtureDir, 'escape-dir')
+			fs.symlinkSync(outsideDir, linkDir)
+			const harness = createFsHarness({
+				presets: [createFsPreset()],
+				llmProvider: MockLLMProvider.withSequence([
+					{
+						toolCalls: [{
+							id: ToolCallId('tc1'),
+							name: 'write_file',
+							input: { path: path.join(linkDir, 'planted.txt'), content: 'Planted' },
+						}],
+					},
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Write file')
+
+			expect(fs.existsSync(path.join(outsideDir, 'planted.txt'))).toBe(false)
+
+			fs.unlinkSync(linkDir)
+			await harness.shutdown()
+		})
+
+		it('the listing methods refuse a sub-path that leaves the root', async () => {
+			const linkDir = path.join(fixtureDir, 'escape-listing')
+			fs.symlinkSync(outsideDir, linkDir)
+			const harness = createFsHarness({
+				presets: [createFsPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Done', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			for (const recursive of [false, true]) {
+				const result = await session.callPluginMethod('filesystem.listWorkspace', {
+					path: 'escape-listing',
+					recursive,
+				})
+				expect(result.ok).toBe(false)
+			}
+			// The same directory reached without the link still lists.
+			const allowed = await session.callPluginMethod('filesystem.listWorkspace', { path: 'subdir' })
+			expect(allowed.ok).toBe(true)
+
+			fs.unlinkSync(linkDir)
 			await harness.shutdown()
 		})
 	})

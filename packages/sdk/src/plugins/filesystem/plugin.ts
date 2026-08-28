@@ -2,6 +2,7 @@ import { join, relative, resolve } from 'node:path'
 import z from 'zod/v4'
 import { agentEvents } from '~/core/agents/state.js'
 import { ValidationErrors } from '~/core/errors.js'
+import { containmentOf } from '~/core/file-store/containment.js'
 import type { FileEntry } from '~/core/file-store/types.js'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import { truncateByTokens } from '~/core/llm/tokens.js'
@@ -160,11 +161,11 @@ export const filesystemPlugin = definePlugin('filesystem')
 
 					// Image files → return as multimodal image content.
 					// Store the agent-visible input.path (not the resolved real path):
-					// the URL survives into conversationHistory and gets re-resolved
-					// via fileStore.realPath() on every subsequent inference. In
-					// sandboxed mode, realPath() rejects already-resolved disk paths
-					// (only accepts the virtual prefix), so storing realPath would
-					// surface as "[Image unavailable: …]" on every later turn.
+					// the URL survives into conversationHistory and is re-resolved via
+					// fileStore.containedPath() on every later inference — which checks
+					// containment again, because what the path names can change in
+					// between. A resolved disk path would be rejected there when
+					// sandboxed, surfacing as "[Image unavailable: …]" on every turn.
 					const mimeType = getImageMimeType(input.path)
 					if (mimeType) {
 						return Ok([
@@ -439,7 +440,7 @@ export const filesystemPlugin = definePlugin('filesystem')
 			try {
 				if (input.recursive) {
 					const targetDir = subPath ? preventTraversal(resolvedWorkspace, subPath) : resolvedWorkspace
-					if (!targetDir) {
+					if (!targetDir || (await containmentOf(ctx.platform.fs, [resolvedWorkspace], targetDir)) !== 'inside') {
 						return Err(ValidationErrors.invalid('Path traversal not allowed'))
 					}
 					const entries = await listDirectoryRecursive(ctx.platform.fs, targetDir)

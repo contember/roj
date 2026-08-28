@@ -80,7 +80,9 @@ export class DefaultImageProcessor implements ImageProcessor {
 			return { type: 'text', text: `[Image unavailable: ${path} - unsupported format]` }
 		}
 
-		const resolved = fileStore.realPath(path)
+		// Not `realPath`: the URL comes back from conversation history, and what it
+		// names may have become a link out of the store since it was first read.
+		const resolved = await fileStore.containedPath(path)
 		if (!resolved.ok) {
 			return { type: 'text', text: `[Image unavailable: ${path} - ${resolved.error}]` }
 		}

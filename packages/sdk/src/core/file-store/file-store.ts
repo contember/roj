@@ -5,6 +5,11 @@
  * validation, agent-visible path mapping). Replaces the separate path-resolver
  * functions for FileStore consumers.
  *
+ * Every operation resolves the path lexically and then checks that its real
+ * target is still inside the area the store may touch — session and workspace
+ * together, or whatever root a `scoped()` sub-store was carved out of. Links
+ * are not banned: one whose target lands back inside stays usable.
+ *
  * Three scopes:
  * - 'full': accepts agent-visible paths (/home/user/session/... or real paths)
  * - 'session': paths relative to sessionDir
@@ -12,6 +17,7 @@
  */
 
 import { dirname, join, normalize, resolve } from 'node:path'
+import { containmentOf } from '~/core/file-store/containment.js'
 import type { FileEntry, FileStore } from '~/core/file-store/types.js'
 import type { FileSystem, WalkEntry } from '~/platform/fs.js'
 import { Err, Ok } from '~/lib/utils/result.js'
@@ -23,6 +29,19 @@ const VIRTUAL_WORKSPACE = '/home/user/workspace'
 
 type FileStoreScope = 'full' | 'session' | 'workspace'
 
+/** A lexically resolved path plus the roots its real target must stay inside. */
+interface ResolvedPath {
+	absolute: string
+	roots: readonly string[]
+}
+
+/**
+ * What the operation does with the final link, which decides what an
+ * unresolvable one means: `follow` leaves it to the operation, `create` refuses
+ * it because writing would create the target, `entry` checks the parent instead.
+ */
+type ContainmentMode = 'follow' | 'create' | 'entry'
+
 export class SessionFileStore implements FileStore {
 	constructor(
 		private readonly sessionDir: string,
@@ -30,21 +49,23 @@ export class SessionFileStore implements FileStore {
 		private readonly sandboxed: boolean,
 		private readonly fs: FileSystem,
 		private readonly scope: FileStoreScope = 'full',
+		/** Set by `scoped()` so a sub-store cannot escape the roots it was carved out of. */
+		private readonly containmentRoots?: readonly string[],
 	) {}
 
 	/** Create a session-scoped FileStore (relative paths → sessionDir) */
 	get session(): SessionFileStore {
-		return new SessionFileStore(this.sessionDir, this.workspaceDir, this.sandboxed, this.fs, 'session')
+		return new SessionFileStore(this.sessionDir, this.workspaceDir, this.sandboxed, this.fs, 'session', this.containmentRoots)
 	}
 
 	/** Create a workspace-scoped FileStore (relative paths → workspaceDir), or undefined if no workspace */
 	get workspace(): SessionFileStore | undefined {
 		if (!this.workspaceDir) return undefined
-		return new SessionFileStore(this.sessionDir, this.workspaceDir, this.sandboxed, this.fs, 'workspace')
+		return new SessionFileStore(this.sessionDir, this.workspaceDir, this.sandboxed, this.fs, 'workspace', this.containmentRoots)
 	}
 
 	async write(path: string, content: string | Buffer): Promise<Result<{ path: string }, string>> {
-		const resolved = this.resolvePath(path)
+		const resolved = await this.resolveContained(path, 'create')
 		if (!resolved.ok) return resolved
 
 		try {
@@ -60,7 +81,7 @@ export class SessionFileStore implements FileStore {
 	async read(path: string): Promise<Result<string, string>>
 	async read(path: string, opts: { type: 'buffer' }): Promise<Result<Buffer, string>>
 	async read(path: string, opts?: { type: 'buffer' }): Promise<Result<string | Buffer, string>> {
-		const resolved = this.resolvePath(path)
+		const resolved = await this.resolveContained(path, 'follow')
 		if (!resolved.ok) return resolved
 
 		try {
@@ -74,21 +95,22 @@ export class SessionFileStore implements FileStore {
 	}
 
 	async exists(path: string): Promise<Result<boolean, string>> {
-		const resolved = this.resolvePath(path)
+		const resolved = await this.resolveContained(path, 'follow')
 		if (!resolved.ok) return resolved
 
 		return Ok(await this.fs.exists(resolved.value))
 	}
 
 	async stat(path: string): Promise<Result<FileEntry, string>> {
-		const resolved = this.resolvePath(path)
+		const resolved = await this.resolveContained(path, 'follow')
 		if (!resolved.ok) return resolved
 
 		try {
+			// `stat` follows links on purpose — a link to a file inside the root is a file here.
 			const s = await this.fs.stat(resolved.value)
 			return Ok({
 				size: s.size,
-				type: s.isFile() ? 'file' : s.isDirectory() ? 'directory' : s.isSymbolicLink() ? 'symlink' : 'other',
+				type: s.isFile() ? 'file' : s.isDirectory() ? 'directory' : 'other',
 				name: resolved.value.split('/').pop() || '',
 			})
 		} catch {
@@ -100,7 +122,7 @@ export class SessionFileStore implements FileStore {
 		path: string,
 		options?: { maxDepth?: number; gitIgnore?: boolean },
 	): Promise<Result<FileEntry[], string>> {
-		const resolved = this.resolvePath(path)
+		const resolved = await this.resolveContained(path, 'follow')
 		if (!resolved.ok) return resolved
 
 		const maxDepth = options?.maxDepth ?? 1
@@ -155,7 +177,7 @@ export class SessionFileStore implements FileStore {
 	}
 
 	async remove(path: string): Promise<Result<void, string>> {
-		const resolved = this.resolvePath(path)
+		const resolved = await this.resolveContained(path, 'entry')
 		if (!resolved.ok) return resolved
 
 		try {
@@ -181,24 +203,58 @@ export class SessionFileStore implements FileStore {
 
 	/** Lexical resolution only — despite the name it never follows a symlink. See FileStore.realPath. */
 	realPath(path: string): Result<string, string> {
-		return this.resolvePath(path)
+		const resolved = this.resolveScoped(path)
+		return resolved.ok ? Ok(resolved.value.absolute) : resolved
+	}
+
+	/** See FileStore.containedPath. */
+	containedPath(path: string): Promise<Result<string, string>> {
+		return this.resolveContained(path, 'create')
 	}
 
 	/** Throws on a path it cannot resolve — never hand it unvalidated request data; use `realPath` there. */
 	scoped(basePath: string): SessionFileStore {
 		// Resolve basePath relative to current scope
-		const resolved = this.resolvePath(basePath)
+		const resolved = this.resolveScoped(basePath)
 		if (!resolved.ok) {
 			throw new Error(`Cannot scope to invalid path: ${basePath}`)
 		}
-		return new SessionFileStore(resolved.value, undefined, false, this.fs, 'session')
+		return new SessionFileStore(resolved.value.absolute, undefined, false, this.fs, 'session', resolved.value.roots)
 	}
 
 	// ============================================================================
 	// Path resolution
 	// ============================================================================
 
-	private resolvePath(path: string): Result<string, string> {
+	/**
+	 * Lexical resolution, plus a check that the real target has not left the roots.
+	 * `mode` says what the operation does with the final link — see ContainmentMode.
+	 */
+	private async resolveContained(path: string, mode: ContainmentMode): Promise<Result<string, string>> {
+		const resolved = this.resolveScoped(path)
+		if (!resolved.ok) return resolved
+
+		const { absolute, roots } = resolved.value
+		const subject = mode === 'entry' ? dirname(absolute) : absolute
+		switch (await containmentOf(this.fs, roots, subject)) {
+			case 'outside':
+				return Err(`Path '${path}' resolves outside allowed directories`)
+			case 'unresolvable':
+				return mode === 'create' ? Err(`Path '${path}' cannot be resolved`) : Ok(absolute)
+			case 'inside':
+				return Ok(absolute)
+		}
+	}
+
+	/** The area this store may touch — both roots where a workspace is configured. */
+	private allowedRoots(): readonly string[] {
+		if (this.containmentRoots) return this.containmentRoots
+		const roots = [resolve(this.sessionDir)]
+		if (this.workspaceDir) roots.push(resolve(this.workspaceDir))
+		return roots
+	}
+
+	private resolveScoped(path: string): Result<ResolvedPath, string> {
 		switch (this.scope) {
 			case 'full':
 				return this.resolveAgentPath(path)
@@ -211,7 +267,7 @@ export class SessionFileStore implements FileStore {
 	}
 
 	/** Resolve a relative path within a root directory */
-	private resolveRelativePath(path: string, rootDir: string): Result<string, string> {
+	private resolveRelativePath(path: string, rootDir: string): Result<ResolvedPath, string> {
 		const normalized = normalize(path)
 		if (normalized.startsWith('..') || normalized.startsWith('/')) {
 			return Err(`Path traversal not allowed: ${path}`)
@@ -220,18 +276,18 @@ export class SessionFileStore implements FileStore {
 		if (!absolute.startsWith(rootDir)) {
 			return Err(`Path traversal not allowed: ${path}`)
 		}
-		return Ok(absolute)
+		return Ok({ absolute, roots: this.allowedRoots() })
 	}
 
 	/** Resolve an agent-visible path to real filesystem path (handles sandboxed virtual paths) */
-	private resolveAgentPath(agentPath: string): Result<string, string> {
+	private resolveAgentPath(agentPath: string): Result<ResolvedPath, string> {
 		if (this.sandboxed) {
 			return this.resolveSandboxedPath(agentPath)
 		}
 		return this.resolveNonSandboxedPath(agentPath)
 	}
 
-	private resolveSandboxedPath(agentPath: string): Result<string, string> {
+	private resolveSandboxedPath(agentPath: string): Result<ResolvedPath, string> {
 		if (agentPath.startsWith(VIRTUAL_SESSION + '/') || agentPath === VIRTUAL_SESSION) {
 			const relative = agentPath.slice(VIRTUAL_SESSION.length)
 			const absolutePath = resolve(this.sessionDir, relative.slice(1) || '.')
@@ -254,7 +310,7 @@ export class SessionFileStore implements FileStore {
 		return Err(`Path must start with ${validPrefixes}. Got: '${agentPath}'`)
 	}
 
-	private resolveNonSandboxedPath(agentPath: string): Result<string, string> {
+	private resolveNonSandboxedPath(agentPath: string): Result<ResolvedPath, string> {
 		const absolutePath = resolve(agentPath)
 		const normalizedSession = resolve(this.sessionDir)
 		const normalizedWorkspace = this.workspaceDir ? resolve(this.workspaceDir) : null
@@ -267,10 +323,10 @@ export class SessionFileStore implements FileStore {
 			return Err(`Path '${agentPath}' is outside allowed directories`)
 		}
 
-		return Ok(absolutePath)
+		return Ok({ absolute: absolutePath, roots: this.allowedRoots() })
 	}
 
-	private validateWithinRoot(absolutePath: string, rootDir: string, originalPath: string): Result<string, string> {
+	private validateWithinRoot(absolutePath: string, rootDir: string, originalPath: string): Result<ResolvedPath, string> {
 		const normalizedRoot = resolve(rootDir)
 		const isWithin = absolutePath === normalizedRoot || absolutePath.startsWith(normalizedRoot + '/')
 
@@ -278,7 +334,7 @@ export class SessionFileStore implements FileStore {
 			return Err(`Path '${originalPath}' resolves outside allowed directories`)
 		}
 
-		return Ok(absolutePath)
+		return Ok({ absolute: absolutePath, roots: this.allowedRoots() })
 	}
 
 	// ============================================================================

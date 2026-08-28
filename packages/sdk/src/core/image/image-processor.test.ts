@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, mock, spyOn } from 'bun:test'
+import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { SessionFileStore } from '~/core/file-store/file-store.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import type { ChatMessageContentItem, ToolResultContent } from '~/core/llm/llm-log-types.js'
 import { Err, Ok } from '~/lib/utils/result.js'
@@ -129,7 +131,7 @@ describe('DefaultImageProcessor', () => {
 		await Bun.write(testPath, Buffer.from('fake-png-data'))
 
 		const fileStore = {
-			realPath: (path: string) => Ok(testPath),
+			containedPath: async (_path: string) => Ok(testPath),
 		} as FileStore
 
 		const processor = createProcessor()
@@ -148,9 +150,9 @@ describe('DefaultImageProcessor', () => {
 		await import('node:fs/promises').then(fs => fs.unlink(testPath).catch(() => {}))
 	})
 
-	it('returns text placeholder when FileStore.realPath fails', async () => {
+	it('returns text placeholder when the store refuses the path', async () => {
 		const fileStore = {
-			realPath: (_path: string) => Err('path outside sandbox'),
+			containedPath: async (_path: string) => Err('path outside sandbox'),
 		} as FileStore
 
 		const processor = createProcessor()
@@ -165,6 +167,38 @@ describe('DefaultImageProcessor', () => {
 		if (item.type === 'text') {
 			expect(item.text).toContain('path outside sandbox')
 		}
+	})
+
+	it('refuses a stored path that has become a link out of the store', async () => {
+		// The URL is re-resolved on every later inference, so what it names can be a
+		// link now even though it was an ordinary file when the tool first read it.
+		const base = await mkdtemp(join(tmpdir(), 'roj-image-containment-'))
+		const sessionDir = join(base, 'session')
+		const outsideDir = join(base, 'outside')
+		await mkdir(sessionDir, { recursive: true })
+		await mkdir(outsideDir, { recursive: true })
+		await Bun.write(join(outsideDir, 'secret.png'), Buffer.from('outside-bytes'))
+		await Bun.write(join(sessionDir, 'own.png'), Buffer.from('own-bytes'))
+		await symlink(join(outsideDir, 'secret.png'), join(sessionDir, 'swapped.png'))
+
+		const fileStore = new SessionFileStore(sessionDir, undefined, false, createNodeFileSystem(), 'session')
+		const processor = createProcessor()
+		const resolve = async (name: string): Promise<ChatMessageContentItem> => {
+			const out = await processor.resolveContent([{ type: 'image_url', imageUrl: { url: `file://${name}` } }], fileStore)
+			return (out as ChatMessageContentItem[])[0]
+		}
+
+		const own = await resolve('own.png')
+		expect(own.type).toBe('image_url')
+
+		const swapped = await resolve('swapped.png')
+		expect(swapped.type).toBe('text')
+		if (swapped.type === 'text') {
+			expect(swapped.text).toContain('outside allowed directories')
+			expect(swapped.text).not.toContain('outside-bytes')
+		}
+
+		await rm(base, { recursive: true, force: true })
 	})
 
 	it('passes maxFileSizeBytes to resizer', async () => {
