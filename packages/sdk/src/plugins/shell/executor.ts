@@ -12,6 +12,13 @@ import type { ShellGrant, ShellRunner, ShellRunOptions } from '~/platform/shell.
 const VIRTUAL_SESSION = '/home/user/session'
 const VIRTUAL_WORKSPACE = '/home/user/workspace'
 
+/** The sandbox covers these with a tmpfs, so only what a grant mounts back exists under them. */
+const HIDDEN_ROOTS = ['/home', '/root']
+
+function isWithin(path: string, root: string): boolean {
+	return path === root || path.startsWith(root + '/')
+}
+
 // ============================================================================
 // Shell escaping
 // ============================================================================
@@ -221,7 +228,9 @@ export class ShellExecutor {
 		// A sandboxed agent sends virtual paths: the shell presents them, or we resolve them here.
 		let cwd: string
 		if (sandboxEnabled) {
-			cwd = input.cwd ?? VIRTUAL_SESSION
+			const cwdResult = await this.resolveSandboxCwd(input.cwd ?? VIRTUAL_SESSION, sessionDir, workspaceDir)
+			if (!cwdResult.ok) return cwdResult
+			cwd = cwdResult.value
 		} else if (this.config.sandboxed && input.cwd) {
 			const cwdResult = await resolveAgentPath(this.fs, input.cwd, sessionDir, workspaceDir, this.config.sandboxed)
 			if (!cwdResult.ok) return cwdResult
@@ -278,6 +287,61 @@ export class ShellExecutor {
 				details: error instanceof Error && 'details' in error ? error.details : { durationMs },
 			})
 		}
+	}
+
+	/**
+	 * Keep the working directory inside what the sandbox mounts, before the host chdirs into it.
+	 * Paths under the hidden home roots exist only where a grant mounts them back; the rest of
+	 * the tree the sandbox binds read-only, so a directory there grants nothing.
+	 */
+	private async resolveSandboxCwd(
+		agentCwd: string,
+		sessionDir: string,
+		workspaceDir: string | undefined,
+	): Promise<Result<string, ToolError>> {
+		const normalized = resolve(agentCwd)
+
+		if (isWithin(normalized, VIRTUAL_SESSION) || isWithin(normalized, VIRTUAL_WORKSPACE)) {
+			const contained = await resolveAgentPath(this.fs, agentCwd, sessionDir, workspaceDir, true)
+			if (!contained.ok) return contained
+			return this.requireExists(contained.value, agentCwd, normalized)
+		}
+
+		for (const root of this.boundRoots()) {
+			if (!isWithin(normalized, root.seen)) continue
+			const hostPath = resolve(root.host + normalized.slice(root.seen.length))
+			if (await checkSymlinkEscape(this.fs, hostPath, root.host)) {
+				return Err({ message: `Path '${agentCwd}' resolves outside its bind mount via symlink`, recoverable: false })
+			}
+			return this.requireExists(hostPath, agentCwd, normalized)
+		}
+
+		if (HIDDEN_ROOTS.some((root) => isWithin(normalized, root))) {
+			const mounted = [
+				VIRTUAL_SESSION,
+				...(workspaceDir ? [VIRTUAL_WORKSPACE] : []),
+				...this.boundRoots().map((root) => root.seen),
+			]
+			return Err({
+				message: `Path '${agentCwd}' is not mounted in this sandbox. Mounted roots: ${mounted.join(', ')}`,
+				recoverable: false,
+			})
+		}
+
+		return Ok(normalized)
+	}
+
+	private async requireExists(hostPath: string, agentCwd: string, seen: string): Promise<Result<string, ToolError>> {
+		if (await this.fs.exists(hostPath)) return Ok(seen)
+		return Err({ message: `Working directory '${agentCwd}' does not exist`, recoverable: false })
+	}
+
+	/** Granted roots beyond the session and workspace, as the command sees them and where the host keeps them. */
+	private boundRoots(): { seen: string; host: string }[] {
+		return [
+			...(this.config.extraBinds ?? []).map((bind) => ({ seen: resolve(bind.destPath ?? bind.path), host: resolve(bind.path) })),
+			...(this.config.sandbox?.writablePaths ?? []).map((path) => ({ seen: resolve(path), host: resolve(path) })),
+		]
 	}
 
 	/** Session and workspace keep their agent-visible names; everything else stays where it is. */
