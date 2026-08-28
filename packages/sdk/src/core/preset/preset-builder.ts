@@ -9,6 +9,7 @@
 
 import type { Preset } from '~/core/preset/index.js'
 import type { AgentDefinition, AnyAgentDefinition, BaseAgentConfig, OrchestratorConfig } from '../agents/config.js'
+import { childAgentRefs } from '../agents/config.js'
 
 // ============================================================================
 // Helper types
@@ -23,7 +24,7 @@ interface ObjectRefs {
  * `agents: string[]` → `agents: AnyAgentDefinition[]`
  */
 type WithObjectRefs<T> =
-	& Omit<T, 'spawnableAgents' | 'agents'>
+	& Omit<T, 'spawnableAgents' | 'agents' | typeof childAgentRefs>
 	& ObjectRefs
 
 // ============================================================================
@@ -40,39 +41,28 @@ export type CreateOrchestratorInput = WithObjectRefs<BaseAgentConfig>
 export type CreatePresetInput = Omit<Preset, 'agents'>
 
 // ============================================================================
-// Internal: ref storage & resolution
+// Internal: ref resolution
 // ============================================================================
-
-/** Stores original object refs for each resolved config, keyed by identity */
-const refStore = new WeakMap<object, ObjectRefs>()
-
-function resolveAndStore<T extends object>(
-	refs: ObjectRefs,
-	resolved: T,
-): T {
-	refStore.set(resolved, refs)
-	return resolved
-}
 
 interface ResolvedRefs {
 	agents: string[]
+	readonly [childAgentRefs]: readonly AnyAgentDefinition[]
 }
 
 function resolveRefs(refs: ObjectRefs): ResolvedRefs {
+	const agents = refs.agents ?? []
 	return {
-		agents: (refs.agents ?? []).map((a) => a.name),
+		agents: agents.map((a) => a.name),
+		[childAgentRefs]: agents,
 	}
 }
 
 /** Recursively collect agents from a config node */
-export function collectFromTree(root: object): { agents: AnyAgentDefinition[] } {
+export function collectFromTree(root: BaseAgentConfig): { agents: AnyAgentDefinition[] } {
 	const agents = new Set<AnyAgentDefinition>()
 
-	function visit(node: object) {
-		const refs = refStore.get(node)
-		if (!refs) return
-
-		for (const agent of refs.agents ?? []) {
+	function visit(node: BaseAgentConfig) {
+		for (const agent of node[childAgentRefs] ?? []) {
 			if (!agents.has(agent)) {
 				agents.add(agent)
 				visit(agent)
@@ -96,7 +86,7 @@ export function collectFromTree(root: object): { agents: AnyAgentDefinition[] } 
  */
 export function defineAgent<TInput = unknown>(input: DefineAgentInput<TInput>): AgentDefinition<TInput> {
 	const { agents, ...rest } = input
-	return resolveAndStore({ agents }, { ...rest, ...resolveRefs({ agents }) })
+	return { ...rest, ...resolveRefs({ agents }) }
 }
 
 /**
@@ -107,5 +97,5 @@ export function defineAgent<TInput = unknown>(input: DefineAgentInput<TInput>): 
  */
 export function createOrchestrator(input: CreateOrchestratorInput): OrchestratorConfig {
 	const { agents, ...rest } = input
-	return resolveAndStore({ agents }, { ...rest, ...resolveRefs({ agents }) })
+	return { ...rest, ...resolveRefs({ agents }) }
 }

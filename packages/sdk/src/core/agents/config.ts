@@ -24,6 +24,12 @@ import type { ServiceConfig } from '~/plugins/services/schema.js'
 export type UserCommunicationMode = 'tool' | 'xml' | 'both'
 
 /**
+ * Key holding the object refs behind `agents: string[]`. A symbol so it rides
+ * along on a spread or a clone without ever showing up in JSON or Object.keys.
+ */
+export const childAgentRefs = Symbol('roj.childAgentRefs')
+
+/**
  * Base configuration shared by all agent types.
  */
 export interface BaseAgentConfig<TInput = unknown> {
@@ -37,6 +43,8 @@ export interface BaseAgentConfig<TInput = unknown> {
 	tools?: ToolDefinition<any>[]
 	/** Names of agents this agent can spawn */
 	agents?: string[]
+	/** Object refs behind `agents`, set by defineAgent/createOrchestrator. */
+	readonly [childAgentRefs]?: readonly AnyAgentDefinition[]
 	/** Per-plugin agent-level configs */
 	plugins?: AgentPluginConfig[]
 	/** Debounce time in ms before processing mailbox. Default: 500ms */
