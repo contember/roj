@@ -45,6 +45,7 @@ export const agentStoppedNotificationSchema = z.object({
 export type AgentStoppedNotification = z.infer<typeof agentStoppedNotificationSchema>
 
 export const agentStatusPlugin = definePlugin('agent-status')
+	.order(50)
 	.notification('agentStatus', {
 		schema: z.object({
 			sessionId: sessionIdSchema,

@@ -110,6 +110,7 @@ const replaceInFileInputSchema = z.object({
 // ============================================================================
 
 export const filesystemPlugin = definePlugin('filesystem')
+	.order(110)
 	.pluginConfig<FilesystemPresetConfig>()
 	.context(async () => {
 		return {} // No plugin-specific context needed

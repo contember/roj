@@ -44,6 +44,7 @@ export interface MailboxAgentConfig {
 }
 
 export const mailboxPlugin = definePlugin("mailbox")
+	.order(30)
 	.pluginConfig<MailboxPresetConfig>()
 	.agentConfig<MailboxAgentConfig>()
 	.events([mailboxEvents])

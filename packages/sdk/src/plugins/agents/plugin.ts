@@ -235,6 +235,7 @@ function createStartAgentSchema(agent: SpawnableAgentInfo) {
 }
 
 export const agentsPlugin = definePlugin(PLUGIN_NAME)
+	.order(40)
 	.pluginConfig<AgentsPluginConfig>()
 	.dependencies([mailboxPlugin])
 	.isEnabled((ctx) => {

@@ -444,6 +444,7 @@ function decodeAskUserDisplayStrings(input: AskUserInputType): AskUserInputType 
 // ============================================================================
 
 export const userChatPlugin = definePlugin("user-chat")
+	.order(60)
 	.pluginConfig<UserChatPresetConfig>()
 	.events([userChatEvents])
 	.context(async (ctx): Promise<UserChatPluginContext> => ({

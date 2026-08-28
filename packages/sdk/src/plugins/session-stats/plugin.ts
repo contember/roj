@@ -86,6 +86,7 @@ export function selectSessionStats(sessionState: SessionState): SessionStatsStat
 // ============================================================================
 
 export const sessionStatsPlugin = definePlugin('session-stats')
+	.order(130)
 	.events([agentEvents, llmEvents, toolEvents, contextEvents, userChatEvents])
 	.state({
 		key: PLUGIN_STATE_KEY,

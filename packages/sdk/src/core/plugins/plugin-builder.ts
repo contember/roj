@@ -349,8 +349,16 @@ type ErasedSessionHookMap = {
  * ConfiguredPlugin — runtime-ready plugin instance with config bound.
  * This is the shape that session/runtime code consumes.
  */
+/**
+ * Hook precedence for a plugin that declares none. Sorts after every built-in,
+ * so preset and third-party plugins keep running in registration order.
+ */
+export const DEFAULT_PLUGIN_ORDER = 1000
+
 export interface ConfiguredPlugin {
 	name: string
+	/** Hook precedence — see PluginBuilder.order(). Absent means DEFAULT_PLUGIN_ORDER. */
+	order?: number
 	methods: Record<string, {
 		input: z4.ZodType
 		output: z4.ZodType
@@ -411,6 +419,8 @@ export interface PluginDefinition<
 	TMethods extends Record<string, MethodEntry> = {},
 > {
 	name: TName
+	/** Hook precedence — see PluginBuilder.order(). Absent means DEFAULT_PLUGIN_ORDER. */
+	order?: number
 	create(...args: TConfig extends void ? [] : [config: TConfig]): ConfiguredPlugin
 	configure(...args: TConfig extends void ? [] : [config: TConfig]): SessionPluginConfig<TName, TConfig>
 	configureAgent(...args: TAgentConfig extends void ? [] : [config: TAgentConfig]): AgentPluginConfig<TName, TAgentConfig>
@@ -440,6 +450,8 @@ interface StaticToolSpec {
 
 interface BuilderConfig {
 	name: string
+	/** Hook precedence — see PluginBuilder.order(). */
+	order: number | undefined
 	events: readonly EventSourceRef[]
 	/** Names of dependency plugins — stored for runtime wiring */
 	dependencyNames: string[]
@@ -501,6 +513,7 @@ export class PluginBuilder<
 		this._name = name
 		this._cfg = cfg ?? {
 			name,
+			order: undefined,
 			events: [],
 			dependencyNames: [],
 			stateConfig: undefined,
@@ -522,6 +535,17 @@ export class PluginBuilder<
 	}
 
 	// --- Setup ---
+
+	/**
+	 * Declare where this plugin sits in hook order. Lower runs first, which for
+	 * the agent hooks — first non-null result wins — decides who gets to act.
+	 * Built-ins occupy 10…150 (see `plugins/builtin.ts`); anything that declares
+	 * no order runs after them, in registration order.
+	 */
+	order(value: number): this {
+		this._cfg.order = value
+		return this
+	}
 
 	pluginConfig<T>(): PluginBuilder<TName, T, TContext, TState, TMethods, TManagerMethods, TAgentConfig, TFactories, TNotifications, TDeps> {
 		return this as unknown as PluginBuilder<TName, T, TContext, TState, TMethods, TManagerMethods, TAgentConfig, TFactories, TNotifications, TDeps>
@@ -819,6 +843,7 @@ export class PluginBuilder<
 
 		const def: PluginDefinition<TName, TConfig, TAgentConfig, TManagerMethods, TMethods> = {
 			name,
+			order: cfg.order,
 			create: ((...args: unknown[]) => {
 				const pluginConfig = args[0]
 				return buildConfiguredPlugin(cfg, pluginConfig)
@@ -961,6 +986,7 @@ function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): Confi
 
 	return {
 		name: cfg.name,
+		order: cfg.order,
 		methods: wrappedMethods,
 		notifications: cfg.notifications,
 		dependencyNames: cfg.dependencyNames,

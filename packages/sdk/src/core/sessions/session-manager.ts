@@ -19,6 +19,7 @@ import type { DomainEvent } from '~/core/events/types.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import type { LLMLogger } from '~/core/llm/logger.js'
 import type { LLMProvider } from '~/core/llm/provider.js'
+import { DEFAULT_PLUGIN_ORDER } from '~/core/plugins/plugin-builder.js'
 import type { CallerContext, ConfiguredPlugin, ManagerMethodContext, PluginDefinition, SessionCloseReason } from '~/core/plugins/plugin-builder.js'
 import { AGENT_CALLER } from '~/core/plugins/plugin-builder.js'
 import type { Preset } from '~/core/preset/index.js'
@@ -965,13 +966,18 @@ export class SessionManager {
 	// ============================================================================
 
 	/**
-	 * Build ConfiguredPlugin[] for a session.
+	 * Build ConfiguredPlugin[] for a session, in hook order.
 	 *
 	 * Iterates all system-registered plugins. For each:
 	 * 1. Check if preset has explicit SessionPluginConfig → use that config
 	 * 2. If not, try auto-deriving infrastructure config (agents, uploads, services)
 	 * 3. If no config at all → call .create() with no args (void config)
 	 * 4. Check isSessionEnabled — skip plugin if not enabled
+	 *
+	 * The result is sorted by each plugin's declared `.order()`. Agent, session
+	 * and dequeue hooks all run in this order, and most agent hooks stop at the
+	 * first non-null result — so this is the precedence between plugins that
+	 * both want to act on the same hook.
 	 */
 	private buildPlugins(preset: Preset): ConfiguredPlugin[] {
 		// Build a lookup from preset Sessionplugins
@@ -1045,7 +1051,8 @@ export class SessionManager {
 			}
 		}
 
-		return plugins
+		// Stable, so plugins that declare no order keep their registration order.
+		return plugins.sort((a, b) => (a.order ?? DEFAULT_PLUGIN_ORDER) - (b.order ?? DEFAULT_PLUGIN_ORDER))
 	}
 
 	/**
