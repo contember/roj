@@ -87,10 +87,10 @@ export class PdfPreprocessor implements Preprocessor {
 		throwIfPreprocessingAborted(signal)
 		this.logger.info('PDF processing started', { filePath })
 
-		const contentPathResult = ctx.files.realPath('content.md')
+		const contentPathResult = await ctx.files.containedPath('content.md')
 		if (!contentPathResult.ok) return Err(new Error('Failed to resolve content output path'))
 
-		const imagesDirResult = ctx.files.scoped('images').realPath('')
+		const imagesDirResult = await ctx.files.scoped('images').containedPath('')
 		if (!imagesDirResult.ok) return Err(new Error('Failed to resolve images output path'))
 
 		await this.fs.mkdir(dirname(contentPathResult.value), { recursive: true })

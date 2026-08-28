@@ -41,7 +41,10 @@ describe('listDirectory with and without walk', () => {
 			const viaBatch = await listDirectory(batch.fs, root, subPath)
 
 			expect(viaBatch).toEqual(viaLoop)
-			expect(batch.calls).toEqual({ walk: 1 })
+			// Neither path is the other in disguise: one asked `walk`, one asked readdir.
+			// Below the root the containment check canonicalizes both ends; the root is
+			// its own root, so listing it asks nothing extra.
+			expect(batch.calls).toEqual(subPath ? { walk: 1, realpath: 2 } : { walk: 1 })
 			expect(loop.calls.walk).toBeUndefined()
 			expect(loop.calls.readdir).toBe(1)
 		})

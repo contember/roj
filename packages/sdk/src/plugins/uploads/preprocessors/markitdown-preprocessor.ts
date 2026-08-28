@@ -126,7 +126,7 @@ export class MarkitdownPreprocessor implements Preprocessor {
 
 		this.logger.info('Markitdown processing started', { filePath, mimeType })
 
-		const contentPathResult = ctx.files.realPath('content.md')
+		const contentPathResult = await ctx.files.containedPath('content.md')
 		if (!contentPathResult.ok) {
 			return Err(new Error('Failed to resolve output path'))
 		}
@@ -222,7 +222,7 @@ export class MarkitdownPreprocessor implements Preprocessor {
 	): Promise<Array<{ relativePath: string; description: string }>> {
 		if (signal.aborted) return []
 		const mediaStore = ctx.files.scoped('media')
-		const mediaDirResult = mediaStore.realPath('')
+		const mediaDirResult = await mediaStore.containedPath('')
 		if (!mediaDirResult.ok) return []
 
 		const format = PANDOC_FORMAT_MAP[mimeType]
@@ -360,7 +360,7 @@ export async function classifyExtractedImages(
 	// Stat + density filter, then keep the top MAX_IMAGES by file size.
 	const inspected = await mapWithConcurrency(candidates, 8, async (entry) => {
 		if (signal.aborted) return null
-		const pathResult = imageStore.realPath(entry.name)
+		const pathResult = await imageStore.containedPath(entry.name)
 		if (!pathResult.ok) return null
 
 		let sizeBytes = 0
@@ -398,7 +398,7 @@ export async function classifyExtractedImages(
 
 	const settled = await mapWithConcurrency(filtered, IMAGE_CLASSIFY_CONCURRENCY, async (imgFile) => {
 		if (signal.aborted) return null
-		const imgPathResult = imageStore.realPath(imgFile.name)
+		const imgPathResult = await imageStore.containedPath(imgFile.name)
 		if (!imgPathResult.ok) return null
 
 		const imgMime = guessImageMime(imgFile.name)
