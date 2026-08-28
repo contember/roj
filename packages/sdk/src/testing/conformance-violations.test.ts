@@ -30,6 +30,7 @@ import type {
 	LiveScheduler,
 	LLMCallStore,
 	Platform,
+	ProcessRunner,
 	ReadFilesEntry,
 	SessionLogStore,
 	WakeHandler,
@@ -38,6 +39,7 @@ import type {
 	WriteFilesEntry,
 	WriteFilesOptions,
 } from '~/platform/index.js'
+import { createBunShellRunner } from '~/bun-platform/shell.js'
 import { createNodePlatform } from './node-platform.js'
 
 // ============================================================================
@@ -268,6 +270,23 @@ function targetOf(name: string, breakIt: (platform: Platform) => Platform): Conf
 
 const equipped = targetOf('equipped', (platform) => platform)
 
+/** Name no host has on its PATH, so every confined run fails to spawn. */
+const MISSING_SANDBOX = 'roj-conformance-no-such-sandbox-binary'
+
+/**
+ * The CI shape: a runner that still declares `paths` confinement, with the
+ * sandbox binary gone. Confined runs reject; unconfined ones are untouched.
+ */
+function withoutSandbox(platform: Platform): Platform {
+	const process: ProcessRunner = {
+		execFile: (file, args, options) => platform.process.execFile(file, args, options),
+		spawn: (command, args, options) => platform.process.spawn(command === 'bwrap' ? MISSING_SANDBOX : command, args, options),
+	}
+	return { ...platform, process, shell: createBunShellRunner(process) }
+}
+
+const sandboxless = targetOf('no sandbox binary', withoutSandbox)
+
 // ============================================================================
 // Running the checks outside bun:test's declaration
 // ============================================================================
@@ -404,6 +423,26 @@ const violations: Violation[] = [
 		},
 	},
 	{
+		name: 'shell declares paths confinement but ignores the grants',
+		ports: ['shell', 'shell.paths'],
+		caughtBy: 'a granted path is reachable and one outside the grants is not',
+		break: (platform) => {
+			const shell = platform.shell
+			if (!shell) throw new Error('the equipped platform answers shell')
+			return {
+				...platform,
+				shell: {
+					confinement: 'paths',
+					// Runs where the grant points, but unconfined — so the probe still resolves.
+					run: (options) => {
+						const first = options.grants?.[0]
+						return shell.run({ ...options, cwd: first ? first.source ?? first.path : options.cwd, grants: undefined })
+					},
+				},
+			}
+		},
+	},
+	{
 		name: 'git.log reports seconds where the port says milliseconds',
 		ports: ['git'],
 		caughtBy: 'log returns commits newest first, in milliseconds, and honours depth',
@@ -446,10 +485,16 @@ function addingScheduler(): LiveScheduler {
 // Tests
 // ============================================================================
 
+/** The two facets a single host cannot both answer, or answer off this machine. */
+const CONFINEMENT_FACETS: readonly ConformancePort[] = ['shell.paths', 'shell.host']
+
 describe('the conformance suite over a platform that answers every port', () => {
-	test('reports every port as exercised', async () => {
+	test('answers every port a single host can answer', async () => {
 		const support = await probePlatformPorts(equipped)
-		expect(support.filter((entry) => !entry.answered).map((entry) => entry.port)).toEqual(['shell.host'])
+		const unanswered = support.filter((entry) => !entry.answered)
+		console.log(`[equipped] not answered: ${unanswered.map((entry) => `${entry.port} (${entry.note})`).join(', ') || 'none'}`)
+
+		expect(unanswered.map((entry) => entry.port).filter((port) => !CONFINEMENT_FACETS.includes(port))).toEqual([])
 	}, 30_000)
 
 	test('passes every check', async () => {
@@ -457,6 +502,18 @@ describe('the conformance suite over a platform that answers every port', () => 
 		console.log(`[equipped] ${checksFor(answered).length} checks over ${answered.length} ports`)
 		expect(await failingChecks(equipped)).toEqual([])
 	}, 120_000)
+})
+
+describe('a host that declares a confinement it cannot deliver', () => {
+	test('skips shell.paths with a reason, and still runs the rest of the shell section', async () => {
+		const support = await probePlatformPorts(sandboxless)
+		const paths = support.find((entry) => entry.port === 'shell.paths')
+		console.log(`[sandboxless] shell.paths answered=${paths?.answered} note=${paths?.note}`)
+
+		expect(paths?.answered).toBe(false)
+		expect(paths?.note).toContain('cannot run a confined command')
+		expect(await failingChecks(sandboxless, ['shell'])).toEqual([])
+	}, 60_000)
 })
 
 describe('the conformance suite catches one broken clause at a time', () => {
