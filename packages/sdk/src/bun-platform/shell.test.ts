@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test'
 import { ChildProcess } from 'node:child_process'
 import { PassThrough, Writable } from 'node:stream'
 import type { ExecFileResult, ProcessRunner, ShellRunOptions } from '../platform/index.js'
-import { buildBwrapArgs, createBunShellRunner } from './shell.js'
+import { buildBwrapArgs, createBunShellRunner, splitLimitNotices } from './shell.js'
 
 // ============================================================================
 // Test Helpers
@@ -202,11 +202,41 @@ describe('createBunShellRunner', () => {
 		}))
 
 		expect(spawned?.command).toBe('bwrap')
-		expect(spawned?.args.slice(-3)).toEqual([
-			'/bin/sh',
-			'-c',
-			'ulimit -v 524288 -f 204800 -u 64 -t 4 2>/dev/null; ls',
-		])
+		expect(spawned?.args.slice(-2, -1)).toEqual(['-c'])
+		// What the limits do is asserted against /proc/self/limits in shell-limits.smoke.test.ts.
+		expect(spawned?.args[spawned.args.length - 1].endsWith('\nls')).toBe(true)
+	})
+
+	it('keeps a limit notice out of the command stderr and tells the host once', async () => {
+		const warnings: string[] = []
+		const stderr = new PassThrough()
+		const child = new ChildProcess()
+		Object.defineProperties(child, {
+			pid: { value: 424_251 },
+			stdin: { value: null },
+			stdout: { value: null },
+			stderr: { value: stderr },
+		})
+		const runner = createBunShellRunner(
+			stubProcessRunner(() => {
+				stderr.end('roj-shell: limit unavailable: file size\ncommand output\n')
+				setTimeout(() => child.emit('close', 0, null), 0)
+				return child
+			}),
+			(message) => warnings.push(message),
+		)
+
+		const result = await runner.run(runOptions({ command: 'ls', grants: [{ path: '/tmp', mode: 'rw' }] }))
+
+		expect(result.stderr).toBe('command output')
+		expect(warnings).toEqual(['shell: this shell applies no file size limit; commands run without it'])
+	})
+
+	it('splits limit notices from the command stderr', () => {
+		const split = splitLimitNotices('roj-shell: limit unavailable: file size\nboom\n')
+
+		expect(split.unavailable).toEqual(['file size'])
+		expect(split.stderr).toBe('boom\n')
 	})
 
 	it('rejects when stdin delivery fails before a zero exit', async () => {
