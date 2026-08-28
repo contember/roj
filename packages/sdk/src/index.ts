@@ -29,8 +29,8 @@ export type { ConsoleLoggerConfig } from '~/lib/logger/index.js'
 export type { LogLevel, Logger } from '~/lib/logger/logger.js'
 
 // User config
-export { defineConfig } from './user-config.js'
-export type { LocalResource, RojConfig } from './user-config.js'
+export { defineConfig, parseExtraBinds } from './user-config.js'
+export type { LocalResource, RojConfig, SessionDefaults } from './user-config.js'
 
 // Transport adapters
 export { ClientAdapter, createAgentTransport, ServerAdapter } from './transport/adapter/index.js'
