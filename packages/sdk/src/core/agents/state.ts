@@ -236,6 +236,8 @@ export interface AgentState {
 	typedInput?: unknown
 	/** Whether onStart handler has been executed (for first-run initialization) */
 	onStartCalled?: boolean
+	/** Inference turns committed so far — persisted, so compaction can't erase it. */
+	turnNumber?: number
 	/** Reason for pause (set when status is 'paused') */
 	pauseReason?: AgentPauseReason
 	/** Human-readable pause message */

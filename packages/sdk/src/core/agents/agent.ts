@@ -176,9 +176,6 @@ export class Agent {
 	private readonly inFlightContinues = new Set<Promise<void>>()
 	private readonly abortController = new AbortController()
 
-	/** Track conversation turn number for handler context */
-	private turnNumber = 0
-
 	constructor(deps: AgentDependencies) {
 		this.id = deps.id
 		this.config = deps.config
@@ -196,12 +193,14 @@ export class Agent {
 		this.pluginMethodCaller = deps.pluginMethodCaller
 		this.scheduleCallback = deps.schedule
 		this.tools = this.buildToolsMap()
+	}
 
-		// Initialize turn number from conversation history
-		const state = this.state
-		if (state) {
-			this.turnNumber = state.conversationHistory.filter((m) => m.role === 'assistant').length
-		}
+	/**
+	 * Turn the agent is working on: committed turns plus the one in flight.
+	 * Read from persisted state so a reload or a compaction can't reset it.
+	 */
+	private get turnNumber(): number {
+		return (this.state?.turnNumber ?? 0) + 1
 	}
 
 	/**
@@ -658,8 +657,6 @@ export class Agent {
 		// Need either tool results or plugin messages to process
 		if (!hasToolResults && pluginDequeued.length === 0) return
 
-		this.turnNumber++
-
 		// 0. beforeInference handler - can skip LLM entirely or pause
 		const beforeResult = await this.executeBeforeInference(agentState)
 		if (beforeResult !== null) {
@@ -916,8 +913,7 @@ export class Agent {
 						this.store.sessionId,
 						llmEvents.create('inference_retried', { agentId: this.id }),
 					))
-					// Retry inference - decrement turn number and recursively call with fresh state
-					this.turnNumber--
+					// Retry inference — the turn never committed, so it keeps its number.
 					const freshState = this.state
 					if (!freshState) return
 					await this.runInference(freshState, retryCount + 1)

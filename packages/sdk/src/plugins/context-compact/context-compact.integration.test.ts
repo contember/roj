@@ -1,14 +1,18 @@
 import { describe, expect, it } from 'bun:test'
 import z from 'zod/v4'
 import { contextEvents } from '~/core/context/state.js'
+import { MemoryEventStore } from '~/core/events/memory.js'
 import { llmEvents } from '~/core/llm/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import type { InferenceRequest, LLMMessage } from '~/core/llm/provider.js'
 import { ModelId } from '~/core/llm/schema.js'
 import type { Preset } from '~/core/preset/index.js'
+import type { AgentId } from '~/core/agents/schema.js'
+import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { createTool } from '~/core/tools/definition.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { selectSessionStats, sessionStatsPlugin } from '~/plugins/session-stats/index.js'
+import type { TestSession } from '~/testing/index.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 import { contextCompactPlugin } from './index.js'
 
@@ -73,6 +77,15 @@ function expectToolPairing(messages: LLMMessage[]): void {
 			expect(declaredToolCallIds.has(message.toolCallId)).toBe(true)
 		}
 	}
+}
+
+async function waitForAgentPaused(session: TestSession, agentId: AgentId, timeoutMs = 10000): Promise<void> {
+	const deadline = Date.now() + timeoutMs
+	while (Date.now() < deadline) {
+		if (session.state.agents.get(agentId)?.status === 'paused') return
+		await new Promise(r => setTimeout(r, 10))
+	}
+	throw new Error(`waitForAgentPaused timed out for agent ${agentId}`)
 }
 
 // ============================================================================
@@ -147,6 +160,95 @@ describe('context-compact plugin', () => {
 			expect(compactedEvents).toHaveLength(0)
 
 			await harness.shutdown()
+		})
+	})
+
+	// =========================================================================
+	// Turn numbering
+	// =========================================================================
+
+	describe('turn numbering', () => {
+		it('an attempt that commits nothing does not consume a turn number', async () => {
+			// Deliberate change from the pre-persistence counter, which incremented
+			// per attempt: a paused attempt runs again on the same pending messages,
+			// so it is the same turn, and only a committed turn can be persisted.
+			const turnNumbers: number[] = []
+			let paused = false
+			const pauseOnce = definePlugin('pause-once')
+				.hook('beforeInference', async (ctx) => {
+					turnNumbers.push(ctx.turnNumber)
+					if (paused) return null
+					paused = true
+					return { action: 'pause', reason: 'probe' }
+				})
+				.build()
+
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				systemPlugins: [pauseOnce],
+			})
+
+			const session = await harness.createSession('test')
+			const entryAgentId = session.getEntryAgentId()!
+			await session.sendMessage('First message')
+			await waitForAgentPaused(session, entryAgentId)
+			await session.resumeAgent(entryAgentId)
+			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Second message')
+
+			// The paused attempt and its retry are turn 1; only the commit advances it.
+			expect(turnNumbers).toEqual([1, 1, 2])
+
+			await harness.shutdown()
+		})
+
+		it('keeps counting turns across a compaction and a reload', async () => {
+			const turnNumbers: number[] = []
+			const turnProbe = definePlugin('turn-probe')
+				.hook('beforeInference', async (ctx) => {
+					turnNumbers.push(ctx.turnNumber)
+					return null
+				})
+				.build()
+
+			const mockHandler = (request: InferenceRequest) => ({
+				content: isSummarizationRequest(request)
+					? 'Summary of conversation so far.'
+					: 'Agent response with some content to increase token count.',
+				toolCalls: [],
+				finishReason: 'stop' as const,
+				metrics: MockLLMProvider.defaultMetrics(),
+			})
+
+			const eventStore = new MemoryEventStore()
+			const harnessOptions = {
+				eventStore,
+				presets: [createCompactPreset(10)],
+				systemPlugins: [contextCompactPlugin, turnProbe],
+				mockHandler,
+			}
+
+			const harness = new TestHarness(harnessOptions)
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('First message')
+			await session.sendAndWaitForIdle('Second message')
+			await session.sendAndWaitForIdle('Third message triggers compaction')
+			const sessionId = session.sessionId
+
+			const compactions = await session.getEventsByType(contextEvents, 'context_compacted')
+			expect(compactions.length).toBeGreaterThan(0)
+			await harness.shutdown()
+
+			// Fresh runtime over the same log — the turn count has to come from the
+			// event log, not from counting assistant messages the compaction ate.
+			const restarted = new TestHarness(harnessOptions)
+			const reopened = await restarted.openSession(sessionId)
+			await reopened.sendAndWaitForIdle('Fourth message')
+
+			expect(turnNumbers).toEqual([1, 2, 3, 4])
+
+			await restarted.shutdown()
 		})
 	})
 
