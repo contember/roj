@@ -8,15 +8,21 @@
  */
 
 import type { Platform } from '@roj-ai/sdk/platform'
-import { runPlatformConformance } from '@roj-ai/sdk/testing/conformance'
+import { GIT_FIXTURE, runPlatformConformance } from '@roj-ai/sdk/testing/conformance'
 import { createGit, Workspace } from 'kompjutr'
 import { createKompjutrPlatform } from './index.js'
 import { BunSqliteStorage } from './testing/storage.js'
 
 const ROOT = '/conformance'
 
-/** The suite hands back a `PlatformInstance`, and a symlink needs the workspace behind it. */
+/** The suite hands back a `PlatformInstance`; symlinks and the git fixture need the workspace behind it. */
 const workspaces = new WeakMap<Platform, Workspace>()
+
+function workspaceOf(platform: Platform): Workspace {
+	const workspace = workspaces.get(platform)
+	if (workspace === undefined) throw new Error('no workspace for this platform')
+	return workspace
+}
 
 runPlatformConformance({
 	name: 'kompjutr',
@@ -37,9 +43,30 @@ runPlatformConformance({
 
 	// The default shells out to `ln -s`, and this host has nothing to shell out to.
 	async symlink(instance, targetPath, linkPath) {
-		const workspace = workspaces.get(instance.platform)
-		if (workspace === undefined) throw new Error('no workspace for this platform')
-		workspace.filesystem.symlink(targetPath, linkPath)
+		workspaceOf(instance.platform).filesystem.symlink(targetPath, linkPath)
 		await Promise.resolve()
+	},
+
+	// Likewise: the default runs the `git` binary. This builds GIT_FIXTURE natively.
+	async buildGitRepo(instance, dir) {
+		const workspace = workspaceOf(instance.platform)
+		const { filesystem, git } = workspace
+		const write = (path: string, content: string): void => filesystem.writeFile(path, new TextEncoder().encode(content))
+
+		filesystem.mkdir(dir, { recursive: true })
+		await git.init({ dir, defaultBranch: GIT_FIXTURE.base })
+
+		write(`${dir}/${GIT_FIXTURE.modified}`, 'first\n')
+		await git.add({ dir, paths: [GIT_FIXTURE.modified] })
+		await git.commit({ dir, message: GIT_FIXTURE.baseSubject })
+
+		// Moves HEAD without touching the worktree, so `feature` forks at `first`.
+		await git.branch({ dir, name: GIT_FIXTURE.branch, checkout: true })
+		write(`${dir}/${GIT_FIXTURE.modified}`, 'second\n')
+		await git.add({ dir, paths: [GIT_FIXTURE.modified] })
+		await git.commit({ dir, message: GIT_FIXTURE.headSubject })
+
+		write(`${dir}/${GIT_FIXTURE.modified}`, 'second, and then edited\n')
+		write(`${dir}/${GIT_FIXTURE.untracked}`, 'untracked\n')
 	},
 })

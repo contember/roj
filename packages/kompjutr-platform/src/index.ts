@@ -8,8 +8,9 @@
 
 import type { Platform, Scheduler } from '@roj-ai/sdk/platform'
 import { createTimerScheduler } from '@roj-ai/sdk/platform'
-import type { Workspace } from 'kompjutr'
+import type { Git, Workspace } from 'kompjutr'
 import { createKompjutrFileSystem } from './fs.js'
+import { createKompjutrGitClient } from './git.js'
 import { createUnsupportedProcessRunner } from './process.js'
 
 export interface KompjutrPlatformOptions {
@@ -28,14 +29,27 @@ export function createKompjutrPlatform(workspace: Workspace, options: KompjutrPl
 	// A fresh workspace holds only `/`, and the port promises tmpDir is there.
 	workspace.filesystem.mkdir(tmpDir, { recursive: true })
 
+	const git = workspaceGit(workspace)
+
 	return {
 		fs: createKompjutrFileSystem({ compat: workspace.fs, filesystem: workspace.filesystem }),
 		process: createUnsupportedProcessRunner(),
+		git: git && createKompjutrGitClient(git),
 		scheduler: options.scheduler ?? createTimerScheduler(),
 		tmpDir,
 	}
 }
 
+/** The getter throws unless `WorkspaceOptions.git` was set — the only signal a workspace gives. */
+function workspaceGit(workspace: Workspace): Git | undefined {
+	try {
+		return workspace.git
+	} catch {
+		return undefined
+	}
+}
+
 export { createKompjutrFileSystem } from './fs.js'
 export type { KompjutrFileSystemOptions } from './fs.js'
+export { createKompjutrGitClient } from './git.js'
 export { createUnsupportedProcessRunner } from './process.js'
