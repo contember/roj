@@ -16,6 +16,12 @@ import { SessionId, sessionIdSchema, sessionMetadataSchema } from '~/core/sessio
 import { agentOverridesSchema, getEntryAgentId, sessionEvents, sessionOverridesPatchSchema } from '~/core/sessions/state.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 
+/** Events returned by `sessions.getEvents` when the caller passes no `limit`. */
+const DEFAULT_EVENT_PAGE_SIZE = 100
+
+/** How far `sessions.getEvents` reads to fill that page when given no `limit`. */
+const DEFAULT_EVENT_READ_WINDOW = 1000
+
 // ============================================================================
 // Presets Plugin — provides presets.list
 // ============================================================================
@@ -328,34 +334,39 @@ export const sessionLifecyclePlugin = definePlugin('sessions')
 			lastIndex: z4.number(),
 		}),
 		handler: async (ctx, input) => {
-			// Use loadRange for efficient partial loading
-			const { events: loadedEvents, toIndex } = await ctx.eventStore.loadRange(
+			const limit = input.limit ?? DEFAULT_EVENT_PAGE_SIZE
+			// Offset pagination (only when not using since) slices after the read.
+			const offset = input.since === undefined ? (input.offset ?? 0) : 0
+			// Read past the page: type/agentId filter after the read, so a window
+			// only as wide as the page starves a filtered query. `offset` counts
+			// matches, so it is covered here only when nothing is filtered out.
+			const readLimit = Math.max(input.limit ?? DEFAULT_EVENT_READ_WINDOW, offset + limit)
+
+			const { events: loadedEvents, fromIndex, toIndex } = await ctx.eventStore.loadRange(
 				ctx.sessionId,
 				{
 					since: input.since,
-					limit: input.limit ?? 1000,
+					limit: readLimit,
 				},
 			)
 
-			// Filter by type/agentId
-			let filtered = loadedEvents
-			if (input.type) {
-				filtered = filtered.filter((e) => e.type === input.type)
-			}
-			if (input.agentId) {
-				filtered = filtered.filter(
-					(e) => 'agentId' in e && e.agentId === input.agentId,
+			// Filter by type/agentId, keeping each event's absolute index
+			const matched = loadedEvents
+				.map((event, i) => ({ event, index: fromIndex + i }))
+				.filter(({ event }) =>
+					(!input.type || event.type === input.type)
+					&& (!input.agentId || ('agentId' in event && event.agentId === input.agentId))
 				)
-			}
 
-			// Offset pagination (only when not using since)
-			const offset = input.since === undefined ? (input.offset ?? 0) : 0
-			const paginated = filtered.slice(offset, offset + (input.limit ?? 100))
+			const page = matched.slice(offset, offset + limit)
+			const truncated = matched.length > offset + limit
+			const lastOnPage = page[page.length - 1]
 
 			return Ok({
-				events: paginated,
-				total: filtered.length,
-				lastIndex: toIndex,
+				events: page.map(({ event }) => event),
+				total: matched.length,
+				// A truncated page must not report a cursor past the events it dropped.
+				lastIndex: truncated && lastOnPage !== undefined ? lastOnPage.index : toIndex,
 			})
 		},
 	})

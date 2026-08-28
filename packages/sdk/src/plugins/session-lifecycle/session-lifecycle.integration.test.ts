@@ -503,6 +503,70 @@ describe('session-lifecycle plugin', () => {
 
 			await harness.shutdown()
 		})
+
+		it('a filter with no limit reaches past the first page', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			for (let turn = 0; turn < 40 && (await session.getEvents()).length <= 120; turn++) {
+				await session.sendAndWaitForIdle(`Hello ${turn}`)
+			}
+			const all = await session.getEvents()
+			expect(all.length).toBeGreaterThan(100)
+
+			// Matches are spread over the whole log, so most of them sit past the
+			// first page — a read window only as wide as the page would drop them.
+			const expected = all.filter((event) => event.type === 'inference_completed').length
+			expect(expected).toBeGreaterThan(0)
+
+			const data = okValue(await session.callPluginMethod('sessions.getEvents', {
+				type: 'inference_completed',
+			}))
+
+			expect(data.total).toBe(expected)
+			expect(data.events).toHaveLength(expected)
+
+			await harness.shutdown()
+		}, 30000)
+
+		it('paging with the default limit walks every event', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			// Enough turns to overflow one default-sized page.
+			for (let turn = 0; turn < 40 && (await session.getEvents()).length <= 120; turn++) {
+				await session.sendAndWaitForIdle(`Hello ${turn}`)
+			}
+			const all = await session.getEvents()
+			expect(all.length).toBeGreaterThan(100)
+
+			const collected: unknown[] = []
+			let since = -1
+			for (let page = 0; page < 50; page++) {
+				const data = okValue(await session.callPluginMethod('sessions.getEvents', { since }))
+				const events = data.events
+				if (!Array.isArray(events) || events.length === 0) break
+				if (page === 0) {
+					expect(events).toHaveLength(100)
+					// Ends at the 100th event, not at the end of the wider read window.
+					expect(data.lastIndex).toBe(99)
+				}
+				collected.push(...events)
+				since = Number(data.lastIndex)
+			}
+
+			// The cursor used to report the end of the (larger) read window, so a
+			// caller who omitted `limit` skipped everything between page and window.
+			expect(collected).toHaveLength(all.length)
+
+			await harness.shutdown()
+		}, 30000)
 	})
 
 	// =========================================================================
