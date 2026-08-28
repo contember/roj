@@ -74,6 +74,11 @@
 			"import": "./dist/testing/index.js",
 			"default": "./dist/testing/index.js"
 		},
+		"./testing/conformance": {
+			"types": "./dist/testing/conformance.d.ts",
+			"import": "./dist/testing/conformance.js",
+			"default": "./dist/testing/conformance.js"
+		},
 		"./tools/filesystem": {
 			"types": "./dist/plugins/filesystem/index.d.ts",
 			"import": "./dist/plugins/filesystem/index.js",
