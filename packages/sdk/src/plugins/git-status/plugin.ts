@@ -1,125 +1,238 @@
 /**
  * Git Status Plugin
  *
- * Polls git state (commits ahead of the default branch, uncommitted files,
- * last commit metadata) inside the session's workspace directory every few
- * seconds and emits a `git_status_changed` notification when the snapshot
- * changes. The worker DO persists the last snapshot into its session table so
- * versions sidebar and publish bars can render without reaching into the
- * sandbox on every page view.
+ * Reports the git state of a session's workspace — commits ahead of the default
+ * branch, uncommitted files, last commit metadata — as a `git_status_changed`
+ * notification whenever the snapshot moves. The worker DO persists the last one
+ * into its session table so versions sidebars and publish bars render without
+ * reaching into the sandbox on every page view.
+ *
+ * `platform.git` answers the four questions directly, which is how a host with no
+ * process table takes part. Without the port the plugin shells out to `git`, as
+ * it always has.
+ *
+ * *When* it reads is a host question too, because who may write the workspace is.
+ * Where the scheduler delivers its own wakes the process outlives them, so roj is
+ * not the only writer — an editor and dev servers touch the same directory, and
+ * nothing but a clock sees those: the 2 s poll runs there exactly as before. A
+ * host evicted between wakes has no such writer, and a repeating wake would keep
+ * it awake replaying its event log every period. So there nothing is armed: the
+ * plugin refreshes at the turn boundary that follows a tool call, and answers
+ * `git-status.refresh` when a client pulls.
+ *
+ * Where `platform.fsRevision` exists, the answer already in hand is replayed while
+ * that counter stands still. It covers the whole host filesystem, so a write in a
+ * neighbouring session costs this one a recomputation it did not need — the only
+ * direction a cache over a working tree may err.
  */
 
-import z from 'zod/v4'
 import { definePlugin } from '~/core/plugins/index.js'
+import type { SessionId } from '~/core/sessions/schema.js'
 import { sessionIdSchema } from '~/core/sessions/schema.js'
+import type { Logger } from '~/lib/logger/logger.js'
+import { Ok } from '~/lib/utils/result.js'
+import type { FsRevision } from '~/platform/fs-revision.js'
+import type { GitClient } from '~/platform/git.js'
 import type { ProcessRunner } from '~/platform/process.js'
+import { isLiveScheduler } from '~/platform/scheduler.js'
+import z from 'zod/v4'
 
 const POLL_INTERVAL_MS = 2000
 const GIT_TIMEOUT_MS = 5000
 const DEFAULT_BRANCH_FALLBACK = 'main'
 
-interface GitStatusSnapshot {
-	committedAhead: number
-	uncommittedFiles: number
-	lastCommitAt: number | null
-	lastCommitMessage: string | null
+const gitStatusSnapshotSchema = z.object({
+	committedAhead: z.number(),
+	uncommittedFiles: z.number(),
+	lastCommitAt: z.number().nullable(),
+	lastCommitMessage: z.string().nullable(),
+})
+
+const gitStatusChangedSchema = z.object({
+	sessionId: sessionIdSchema,
+	...gitStatusSnapshotSchema.shape,
+	updatedAt: z.number(),
+})
+
+type GitStatusSnapshot = z.infer<typeof gitStatusSnapshotSchema>
+type GitStatusChanged = z.infer<typeof gitStatusChangedSchema>
+
+interface SessionGitStatus {
+	/** Whether this host has a clock of its own; false means nothing may be armed. */
+	polls: boolean
+	/** The 2 s interval, on polling hosts only. */
+	interval?: ReturnType<typeof setInterval>
+	/** Last snapshot handed to clients — what a new one is compared against. */
+	lastSnapshot?: GitStatusSnapshot
+	/** Last snapshot and the filesystem revision it was read at, replayed while that revision stands. */
+	gated?: { revision: number; snapshot: GitStatusSnapshot }
+	defaultBranch?: string
+	/** A tool wrote in this workspace since the last turn boundary. */
+	touched: boolean
 }
 
 interface GitStatusPluginContext {
-	intervals: Map<string, NodeJS.Timeout>
-	lastSnapshots: Map<string, GitStatusSnapshot>
-	defaultBranches: Map<string, string>
-	active: boolean
+	sessions: Map<SessionId, SessionGitStatus>
+}
+
+/**
+ * The slice of a context a read needs. Session hooks, agent hooks and the method
+ * handler all satisfy it, so all three share one code path.
+ */
+interface GitStatusCallContext {
+	sessionId: SessionId
+	sessionState: { workspaceDir?: string }
+	platform: { git?: GitClient; process: ProcessRunner; fsRevision?: FsRevision }
+	logger: Logger
+	notify: (type: 'git_status_changed', payload: GitStatusChanged) => void
+	pluginContext: GitStatusPluginContext
 }
 
 export const gitStatusPlugin = definePlugin('git-status')
-	.notification('git_status_changed', {
-		schema: z.object({
-			sessionId: sessionIdSchema,
-			committedAhead: z.number(),
-			uncommittedFiles: z.number(),
-			lastCommitAt: z.number().nullable(),
-			lastCommitMessage: z.string().nullable(),
-			updatedAt: z.number(),
-		}),
+	.notification('git_status_changed', { schema: gitStatusChangedSchema })
+	.context(async (): Promise<GitStatusPluginContext> => ({ sessions: new Map() }))
+	.method('refresh', {
+		input: z.object({}),
+		output: z.object({ snapshot: gitStatusSnapshotSchema.nullable() }),
+		// The pull half of the contract: a client that just opened the session, or a
+		// host with no clock, asks instead of waiting for a poll to notice.
+		handler: async (ctx) => Ok({ snapshot: await refresh(ctx) }),
 	})
-	.context(async (): Promise<GitStatusPluginContext> => ({
-		intervals: new Map(),
-		lastSnapshots: new Map(),
-		defaultBranches: new Map(),
-		active: true,
-	}))
 	.sessionHook('onSessionReady', async (ctx) => {
-		const workdir = ctx.sessionState.workspaceDir
-		if (!workdir) return
+		if (!ctx.sessionState.workspaceDir) return
 
-		const sessionId = ctx.sessionId
-		const pluginCtx = ctx.pluginContext
-		const processRunner = ctx.platform.process
-		const logger = ctx.logger
-		const notify = ctx.notify
-		pluginCtx.active = true
+		const polls = isLiveScheduler(ctx.platform.scheduler)
+		const entry: SessionGitStatus = { polls, touched: false }
+		ctx.pluginContext.sessions.set(ctx.sessionId, entry)
+		if (!polls) return
 
-		const tick = async () => {
-			if (!pluginCtx.active) return
-			let baseBranch = pluginCtx.defaultBranches.get(sessionId)
-			if (!baseBranch) {
-				baseBranch = await detectDefaultBranch(processRunner, workdir) ?? DEFAULT_BRANCH_FALLBACK
-				if (!pluginCtx.active) return
-				pluginCtx.defaultBranches.set(sessionId, baseBranch)
-			}
-
-			const snapshot = await computeGitStatus(processRunner, workdir, baseBranch)
-			if (!pluginCtx.active) return
-			if (!snapshot) {
-				logger.warn('git-status: snapshot failed', { sessionId, workdir, baseBranch })
-				return
-			}
-
-			const last = pluginCtx.lastSnapshots.get(sessionId)
-			if (last && snapshotsEqual(last, snapshot)) return
-
-			pluginCtx.lastSnapshots.set(sessionId, snapshot)
-			notify('git_status_changed', {
-				sessionId,
-				committedAhead: snapshot.committedAhead,
-				uncommittedFiles: snapshot.uncommittedFiles,
-				lastCommitAt: snapshot.lastCommitAt,
-				lastCommitMessage: snapshot.lastCommitMessage,
-				updatedAt: Date.now(),
-			})
-		}
-
-		const runTick = () => {
-			tick().catch((err) => {
-				logger.warn('git-status tick failed', { sessionId, err: err instanceof Error ? err.message : String(err) })
-			})
-		}
-
-		runTick()
-		const interval = setInterval(runTick, POLL_INTERVAL_MS)
-
-		pluginCtx.intervals.set(sessionId, interval)
+		void refresh(ctx)
+		entry.interval = setInterval(() => void refresh(ctx), POLL_INTERVAL_MS)
+	})
+	.hook('afterToolCall', async (ctx) => {
+		// Only a mark: the read itself waits for the turn to end, and is skipped if no tool ran.
+		const entry = ctx.pluginContext.sessions.get(ctx.sessionId)
+		if (entry) entry.touched = true
+		return null
+	})
+	.hook('onComplete', async (ctx) => {
+		const entry = ctx.pluginContext.sessions.get(ctx.sessionId)
+		// A polling host already has this covered; elsewhere the turn boundary is the
+		// one moment the workspace demonstrably changed and nothing is armed.
+		if (!entry || entry.polls || !entry.touched) return null
+		entry.touched = false
+		await refresh(ctx)
+		return null
 	})
 	.sessionHook('onSessionClose', async (ctx) => {
-		const sessionId = ctx.sessionId
-		const pluginCtx = ctx.pluginContext
-		pluginCtx.active = false
-		const interval = pluginCtx.intervals.get(sessionId)
-		if (interval) {
-			clearInterval(interval)
-			pluginCtx.intervals.delete(sessionId)
-		}
-		pluginCtx.lastSnapshots.delete(sessionId)
-		pluginCtx.defaultBranches.delete(sessionId)
+		const entry = ctx.pluginContext.sessions.get(ctx.sessionId)
+		if (entry?.interval) clearInterval(entry.interval)
+		ctx.pluginContext.sessions.delete(ctx.sessionId)
 	})
 	.build()
+
+/** Read the workspace's git state, notifying if it moved. Never rejects. */
+async function refresh(ctx: GitStatusCallContext): Promise<GitStatusSnapshot | null> {
+	const sessionId = ctx.sessionId
+	const entry = ctx.pluginContext.sessions.get(sessionId)
+	const workdir = ctx.sessionState.workspaceDir
+	if (!entry || !workdir) return null
+
+	try {
+		// Read the revision before the git calls, never after: a write landing while
+		// they run belongs to the next answer, and stamping the revision it produced
+		// would bury it.
+		const revision = await currentRevision(ctx)
+		const gated = entry.gated
+		if (revision !== undefined && gated?.revision === revision) return gated.snapshot
+
+		const git = ctx.platform.git
+		const processRunner = ctx.platform.process
+
+		let baseBranch = entry.defaultBranch
+		if (!baseBranch) {
+			const detected = git
+				? await detectDefaultBranchOverPort(git, workdir)
+				: await detectDefaultBranch(processRunner, workdir)
+			baseBranch = detected ?? DEFAULT_BRANCH_FALLBACK
+			entry.defaultBranch = baseBranch
+		}
+
+		const snapshot = git
+			? await computeGitStatusOverPort(git, workdir, baseBranch)
+			: await computeGitStatus(processRunner, workdir, baseBranch)
+		if (!snapshot) {
+			ctx.logger.warn('git-status: snapshot failed', { sessionId, workdir, baseBranch })
+			return null
+		}
+
+		// The runtime may have been unloaded while the reads ran — onSessionClose drops
+		// the entry — and a notification then lands on nobody.
+		if (ctx.pluginContext.sessions.get(sessionId) !== entry) return null
+
+		// Only a completed read is worth gating on; a failure is not the filesystem's doing.
+		if (revision !== undefined) entry.gated = { revision, snapshot }
+
+		const last = entry.lastSnapshot
+		entry.lastSnapshot = snapshot
+		if (!last || !snapshotsEqual(last, snapshot)) {
+			ctx.notify('git_status_changed', { sessionId, ...snapshot, updatedAt: Date.now() })
+		}
+		return snapshot
+	} catch (err) {
+		ctx.logger.warn('git-status refresh failed', { sessionId, err: err instanceof Error ? err.message : String(err) })
+		return null
+	}
+}
+
+/**
+ * The host's filesystem revision, or `undefined` when there is none to read.
+ *
+ * Defensive beyond the port's contract on purpose: this is an optimisation, and a
+ * host that answers badly must lose the optimisation, not the feature.
+ */
+async function currentRevision(ctx: GitStatusCallContext): Promise<number | undefined> {
+	try {
+		return await ctx.platform.fsRevision?.current()
+	} catch {
+		return undefined
+	}
+}
 
 function snapshotsEqual(a: GitStatusSnapshot, b: GitStatusSnapshot): boolean {
 	return a.committedAhead === b.committedAhead
 		&& a.uncommittedFiles === b.uncommittedFiles
 		&& a.lastCommitAt === b.lastCommitAt
 		&& a.lastCommitMessage === b.lastCommitMessage
+}
+
+async function computeGitStatusOverPort(git: GitClient, workdir: string, baseBranch: string): Promise<GitStatusSnapshot | null> {
+	try {
+		const [committedAhead, commits, status] = await Promise.all([
+			git.countAhead({ dir: workdir, base: baseBranch }),
+			git.log({ dir: workdir, depth: 1 }),
+			git.status({ dir: workdir }),
+		])
+
+		const head = commits[0]
+		return {
+			committedAhead,
+			uncommittedFiles: status.length,
+			lastCommitAt: head?.committedAt ?? null,
+			// The shell path reads `%s`, the subject — so take the same first line here.
+			lastCommitMessage: head ? subjectOf(head.message) : null,
+		}
+	} catch {
+		return null
+	}
+}
+
+async function detectDefaultBranchOverPort(git: GitClient, workdir: string): Promise<string | null> {
+	try {
+		return await git.defaultBranch({ dir: workdir }) ?? null
+	} catch {
+		return null
+	}
 }
 
 async function computeGitStatus(process: ProcessRunner, workdir: string, baseBranch: string): Promise<GitStatusSnapshot | null> {
@@ -164,6 +277,10 @@ async function runGit(process: ProcessRunner, workdir: string, args: string[]): 
 	} catch {
 		return null
 	}
+}
+
+function subjectOf(message: string): string | null {
+	return message.split('\n', 1)[0]?.trim() || null
 }
 
 function countNonEmptyLines(output: string): number {
