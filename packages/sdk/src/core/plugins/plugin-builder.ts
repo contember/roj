@@ -60,7 +60,7 @@ type ManagerMethodEntry = { input: unknown; output: unknown }
 
 /**
  * Notification entry — registered via .notification() on PluginBuilder.
- * Schema is stored for documentation/validation but not enforced at runtime.
+ * The schema is enforced at runtime: see `guardNotify`.
  */
 type NotificationEntry = { schema: z4.ZodType }
 
@@ -843,7 +843,40 @@ export class PluginBuilder<
 // Build configured plugin — binds config into all closures
 // ============================================================================
 
+type NotifyFn = (type: string, payload: unknown) => void
+
+/**
+ * Hold `ctx.notify` to the contract the plugin declared with `.notification()`:
+ * an undeclared type or a payload that fails its schema is logged and dropped
+ * rather than broadcast, so clients never see a shape nothing promised.
+ */
+function guardNotify(
+	pluginName: string,
+	notifications: Record<string, { schema: z4.ZodType }>,
+	ctx: { notify: NotifyFn; logger: Logger },
+): NotifyFn {
+	return (type, payload) => {
+		const declared = notifications[type]
+		if (!declared) {
+			ctx.logger.error(`Plugin "${pluginName}" emitted undeclared notification "${type}"`)
+			return
+		}
+
+		const parsed = declared.schema.safeParse(payload)
+		if (!parsed.success) {
+			ctx.logger.error(`Plugin "${pluginName}" notification "${type}" does not match its declared schema`, undefined, {
+				issues: parsed.error.message,
+			})
+			return
+		}
+
+		ctx.notify(type, payload)
+	}
+}
+
 function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): ConfiguredPlugin {
+	const notifyFor = (ctx: { notify: NotifyFn; logger: Logger }): NotifyFn => guardNotify(cfg.name, cfg.notifications, ctx)
+
 	let slice: StateSlice | undefined
 	if (cfg.stateConfig) {
 		const stateReduce = cfg.stateConfig.reduce
@@ -862,7 +895,7 @@ function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): Confi
 				name,
 				// Agent.ts provides the full context with extra fields (pendingMessages, turnNumber, etc.)
 				// — this wrapper just injects pluginConfig at the boundary
-				(ctx: BasePluginHookContext) => fn({ ...ctx, pluginConfig }),
+				(ctx: BasePluginHookContext) => fn({ ...ctx, pluginConfig, notify: notifyFor(ctx) }),
 			]),
 		) as Partial<ErasedAgentHookMap>
 		: undefined
@@ -874,7 +907,7 @@ function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): Confi
 				name,
 				// Session.ts provides the full context with extra fields (method, input,
 				// agentId for beforeMethod) — this wrapper just injects pluginConfig.
-				(ctx: BaseSessionHookContext) => fn({ ...ctx, pluginConfig }),
+				(ctx: BaseSessionHookContext) => fn({ ...ctx, pluginConfig, notify: notifyFor(ctx) }),
 			]),
 		) as Partial<ErasedSessionHookMap>
 		: undefined
@@ -885,7 +918,7 @@ function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): Confi
 	let getTools: ((ctx: BasePluginHookContext) => ToolDefinition<any>[]) | undefined
 	if (staticToolSpecs.length > 0 || dynamicToolsFn) {
 		getTools = (ctx: BasePluginHookContext) => {
-			const enrichedCtx: BasePluginHookContext = { ...ctx, pluginConfig }
+			const enrichedCtx: BasePluginHookContext = { ...ctx, pluginConfig, notify: notifyFor(ctx) }
 			const tools: ToolDefinition<any>[] = []
 			// Static tools — create ToolDefinition from StaticToolSpec using closure
 			for (const spec of staticToolSpecs) {
@@ -907,32 +940,32 @@ function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): Confi
 	// Wrap createContext to pass pluginConfig
 	const contextFactory = cfg.contextFactory
 	const wrappedContextFactory = contextFactory
-		? (ctx: SessionContext) => contextFactory(ctx, pluginConfig)
+		? (ctx: SessionContext) => contextFactory({ ...ctx, notify: notifyFor(ctx) }, pluginConfig)
 		: undefined
 
 	// Wrap status/systemPrompt/dequeue to inject pluginConfig
 	const statusFn = cfg.statusFn
 	const wrappedStatus = statusFn
-		? (ctx: BasePluginHookContext) => statusFn({ ...ctx, pluginConfig })
+		? (ctx: BasePluginHookContext) => statusFn({ ...ctx, pluginConfig, notify: notifyFor(ctx) })
 		: undefined
 
 	const systemPromptFn = cfg.systemPromptFn
 	const wrappedSystemPrompt = systemPromptFn
-		? (ctx: BasePluginHookContext) => systemPromptFn({ ...ctx, pluginConfig })
+		? (ctx: BasePluginHookContext) => systemPromptFn({ ...ctx, pluginConfig, notify: notifyFor(ctx) })
 		: undefined
 
 	const dequeueHook = cfg.dequeueHook
 	const wrappedDequeue = dequeueHook
 		? {
-			hasPendingMessages: (ctx: BasePluginHookContext) => dequeueHook.hasPendingMessages({ ...ctx, pluginConfig }),
-			getPendingMessages: (ctx: BasePluginHookContext) => dequeueHook.getPendingMessages({ ...ctx, pluginConfig }),
-			markConsumed: (ctx: BasePluginHookContext, token: unknown) => dequeueHook.markConsumed({ ...ctx, pluginConfig }, token),
+			hasPendingMessages: (ctx: BasePluginHookContext) => dequeueHook.hasPendingMessages({ ...ctx, pluginConfig, notify: notifyFor(ctx) }),
+			getPendingMessages: (ctx: BasePluginHookContext) => dequeueHook.getPendingMessages({ ...ctx, pluginConfig, notify: notifyFor(ctx) }),
+			markConsumed: (ctx: BasePluginHookContext, token: unknown) => dequeueHook.markConsumed({ ...ctx, pluginConfig, notify: notifyFor(ctx) }, token),
 		}
 		: undefined
 
 	const beforeDequeueFn = cfg.beforeDequeueFn
 	const wrappedBeforeDequeue = beforeDequeueFn
-		? (ctx: BasePluginHookContext & { sourcePlugin: string }) => beforeDequeueFn({ ...ctx, pluginConfig })
+		? (ctx: BasePluginHookContext & { sourcePlugin: string }) => beforeDequeueFn({ ...ctx, pluginConfig, notify: notifyFor(ctx) })
 		: undefined
 
 	// Wrap isEnabled to pass pluginConfig
@@ -955,7 +988,7 @@ function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): Confi
 		wrappedMethods[name] = {
 			input: method.input,
 			output: method.output,
-			handler: (ctx, input) => method.handler({ ...ctx, pluginConfig }, input),
+			handler: (ctx, input) => method.handler({ ...ctx, pluginConfig, notify: notifyFor(ctx) }, input),
 		}
 	}
 

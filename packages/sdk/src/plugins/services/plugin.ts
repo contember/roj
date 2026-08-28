@@ -43,6 +43,17 @@ export const serviceEvents = createEventsFactory({
 
 export type ServiceStatusChangedEvent = (typeof serviceEvents)['Events']['service_status_changed']
 
+/** Ephemeral status broadcast — mirrors the durable event, minus the fields no client reads. */
+const serviceStatusNotificationSchema = z.object({
+	sessionId: z.string(),
+	serviceType: z.string(),
+	status: z.enum(['stopped', 'starting', 'ready', 'stopping', 'failed']),
+	port: z.number().optional(),
+	restartAt: z.number().optional(),
+	restartAttempt: z.number().optional(),
+	restartMaxRetries: z.number().optional(),
+})
+
 /**
  * Session-wide service configuration.
  */
@@ -62,6 +73,7 @@ export interface ServiceAgentConfig {
 
 export const servicePlugin = definePlugin('services')
 	.pluginConfig<ServicePluginConfig>()
+	.notification('serviceStatus', { schema: serviceStatusNotificationSchema })
 	.isSessionEnabled(({ pluginConfig }) => pluginConfig !== undefined && pluginConfig.services.length > 0)
 	.events([serviceEvents, sessionEvents])
 	.state({
