@@ -12,7 +12,7 @@
  *   GET  /health                                  — health check
  */
 
-import type { Config, LLMMiddleware, LocalResource, Logger, Preset, SessionId, SessionManager } from '@roj-ai/sdk'
+import type { Config, LLMMiddleware, LocalResource, Logger, SessionDefaults, SessionId, SessionManager } from '@roj-ai/sdk'
 import { bootstrap, createSystemFromServices, loadConfig, validateConfig } from '@roj-ai/sdk'
 import { createApp } from '@roj-ai/sdk/transport/http/app'
 import { createAgentTransport, ServerAdapter } from '@roj-ai/sdk/transport/adapter'
@@ -29,8 +29,7 @@ import { proxyPreview } from './preview-proxy.js'
 import { createSessionFileRoute } from './session-file-route.js'
 import { generateTokenSecret } from './signed-token.js'
 
-export interface StartStandaloneOptions {
-	presets: Preset[]
+export interface StartStandaloneOptions extends SessionDefaults {
 	config?: Partial<Config>
 	instanceId?: string
 	instanceName?: string
@@ -85,7 +84,8 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 		}))
 		: options.presets
 
-	const services = bootstrap(config, { presets }, createBunPlatform())
+	// Forwarded whole: bootstrap folds the SessionDefaults, so nothing is dropped here.
+	const services = bootstrap(config, { ...options, presets }, createBunPlatform())
 	const { logger } = services
 	warnIfStandaloneExposed(config.host, logger)
 

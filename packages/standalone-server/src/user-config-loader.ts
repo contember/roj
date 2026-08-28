@@ -6,7 +6,7 @@
  */
 
 import type { LocalResource, Preset, RojConfig } from '@roj-ai/sdk'
-import { validatePreset } from '@roj-ai/sdk'
+import { parseExtraBinds, validatePreset } from '@roj-ai/sdk'
 import { existsSync } from 'node:fs'
 import { dirname, isAbsolute, resolve } from 'node:path'
 
@@ -70,38 +70,9 @@ export async function loadUserConfig(configPath: string): Promise<RojConfig> {
 		presets,
 		sandboxed: typedConfig.sandboxed as boolean | undefined,
 		snapshotter: typedConfig.snapshotter as RojConfig['snapshotter'],
-		extraBinds: parseExtraBinds(typedConfig.extraBinds, absolutePath),
+		extraBinds: parseExtraBinds(typedConfig.extraBinds, configDir, absolutePath),
 		localResources,
 	}
-}
-
-type ExtraBind = NonNullable<RojConfig['extraBinds']>[number]
-
-function parseExtraBinds(raw: unknown, configPath: string): ExtraBind[] | undefined {
-	if (raw === undefined) return undefined
-	if (!Array.isArray(raw)) {
-		throw new Error(`'extraBinds' must be an array: ${configPath}`)
-	}
-
-	const entries: unknown[] = raw
-	return entries.map((entry, i) => {
-		if (typeof entry !== 'object' || entry === null) {
-			throw new Error(`extraBinds[${i}] must be an object: ${configPath}`)
-		}
-		const path = 'path' in entry ? entry.path : undefined
-		const mode = 'mode' in entry ? entry.mode : undefined
-		const destPath = 'destPath' in entry ? entry.destPath : undefined
-		if (typeof path !== 'string' || !path) {
-			throw new Error(`extraBinds[${i}] missing required 'path': ${configPath}`)
-		}
-		if (mode !== 'rw' && mode !== 'ro') {
-			throw new Error(`extraBinds[${i}] 'mode' must be 'rw' or 'ro': ${configPath}`)
-		}
-		if (destPath !== undefined && (typeof destPath !== 'string' || !destPath)) {
-			throw new Error(`extraBinds[${i}] 'destPath' must be a non-empty string: ${configPath}`)
-		}
-		return { path, mode, destPath }
-	})
 }
 
 function parseLocalResources(raw: unknown, configDir: string, configPath: string): LocalResource[] | undefined {
