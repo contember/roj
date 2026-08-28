@@ -15,7 +15,6 @@ export type {
 	ConnectionState,
 	HandlerContext,
 	Protocol,
-	ProtocolCaller,
 	ProtocolDef,
 	ProtocolHandlers,
 	ProtocolNotifier,
@@ -23,4 +22,4 @@ export type {
 	TransportEventListener,
 } from '../core/index.js'
 
-export { defineProtocol, method, notification } from '../core/index.js'
+export { defineProtocol, notification } from '../core/index.js'

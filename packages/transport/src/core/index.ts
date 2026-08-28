@@ -14,33 +14,19 @@ export type { Result } from './result.js'
 export { Err, flatMapResult, isErr, isOk, mapResult, Ok, unwrapOr, unwrapOrThrow } from './result.js'
 
 // Protocol Definition
-export { defineProtocol, method, notification } from './protocol.js'
+export { defineProtocol, notification } from './protocol.js'
 export type {
-	CallerFor,
-	EndpointDef,
-	EndpointHandler,
-	ExtractProtocolDef,
 	HandlerContext,
-	HandlersFor,
-	InferError,
 	InferInput,
-	InferOutput,
-	IsMethod,
-	IsNotification,
-	MethodCaller,
-	MethodDef,
-	MethodHandler,
-	MethodOptions,
 	NotificationDef,
 	NotificationHandler,
 	NotificationNotifier,
 	NotificationOptions,
-	NotifierFor,
 	Protocol,
-	ProtocolCaller,
 	ProtocolDef,
 	ProtocolHandlers,
 	ProtocolNotifier,
+	SafeParseResult,
 } from './protocol.js'
 
 // Message Router

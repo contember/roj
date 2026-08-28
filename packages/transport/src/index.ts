@@ -1,7 +1,7 @@
 /**
  * @roj-ai/transport
  *
- * Platform-agnostic WebSocket transport infrastructure with RPC-like protocol API.
+ * Platform-agnostic WebSocket transport infrastructure with a typed notification protocol API.
  */
 
 // ============================================================================
@@ -9,33 +9,19 @@
 // ============================================================================
 
 // Protocol Definition API
-export { defineProtocol, method, notification } from './core/protocol.js'
+export { defineProtocol, notification } from './core/protocol.js'
 export type {
-	CallerFor,
-	EndpointDef,
-	EndpointHandler,
-	ExtractProtocolDef,
 	HandlerContext,
-	HandlersFor,
-	InferError,
 	InferInput,
-	InferOutput,
-	IsMethod,
-	IsNotification,
-	MethodCaller,
-	MethodDef,
-	MethodHandler,
-	MethodOptions,
 	NotificationDef,
 	NotificationHandler,
 	NotificationNotifier,
 	NotificationOptions,
-	NotifierFor,
 	Protocol,
-	ProtocolCaller,
 	ProtocolDef,
 	ProtocolHandlers,
 	ProtocolNotifier,
+	SafeParseResult,
 } from './core/protocol.js'
 
 // Result Type
