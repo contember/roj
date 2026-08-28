@@ -16,6 +16,17 @@ export interface PendingQuestion {
 	timestamp: number
 }
 
+function unansweredQuestions(messages: ChatMessage[]): PendingQuestion[] {
+	return messages
+		.filter((msg): msg is Extract<ChatMessage, { type: 'ask_user' }> => msg.type === 'ask_user' && !msg.answered)
+		.map((msg) => ({
+			questionId: msg.questionId,
+			question: msg.question,
+			inputType: msg.inputType,
+			timestamp: msg.timestamp,
+		}))
+}
+
 interface PendingMessageData {
 	content: string
 	timestamp: number
@@ -161,11 +172,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 				})
 			}
 
-			// Find ALL pending questions
-			const pendingQuestionMsgs = messages.filter(
-				(m): m is Extract<ChatMessage, { type: 'ask_user' }> => m.type === 'ask_user' && !m.answered,
-			)
-
 			// Stale check before writing final state
 			if (thisGeneration !== loadGeneration) return
 
@@ -176,12 +182,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 				entryAgentId: session.entryAgentId,
 				messages,
 				pendingAttachments: restoredAttachments,
-				pendingQuestions: pendingQuestionMsgs.map((msg) => ({
-					questionId: msg.questionId,
-					question: msg.question,
-					inputType: msg.inputType,
-					timestamp: msg.timestamp,
-				})),
+				pendingQuestions: unansweredQuestions(messages),
 				draftAnswers: new Map(),
 				questionSubmitStatus: new Map(),
 				// If agents are already connected, mark init as ready immediately
@@ -195,6 +196,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 			// Fetch session state (plugin may not be configured — ignore errors)
 			api.call('sessionState.get', { sessionId })
 				.then(result => {
+					if (thisGeneration !== loadGeneration) return
 					if (result.ok && typeof result.value === 'object' && result.value !== null && 'state' in result.value) {
 						set({ sessionState: (result.value as { state: Record<string, unknown> }).state })
 					}
@@ -768,12 +770,33 @@ export function useSessionMessageHandler(): void {
 				if (status === 'connected' && prevStatus === 'reconnecting') {
 					const { sessionId, fetchAllServiceUrls } = useSessionStore.getState()
 					if (sessionId) {
+						// A loadSession while these are in flight makes them the wrong
+						// session's answers — same guard loadSession uses on its own writes.
+						const thisGeneration = loadGeneration
 						// Drop stale agent activity — we may have missed `idle` events while disconnected.
 						useSessionStore.setState({ activeAgents: new Map(), isAgentTyping: false })
 						fetchAllServiceUrls(sessionId)
+						// Chat notifications sent during the gap were never delivered.
+						api.call('user-chat.getMessages', { sessionId })
+							.then(result => {
+								if (thisGeneration !== loadGeneration) return
+								if (!result.ok) return
+								const messages = result.value.messages.filter(isChatMessage)
+								if (messages.length === 0) return
+								const { pendingMessages, messages: shown } = useSessionStore.getState()
+								const onServer = new Set(messages.flatMap(m => (m.type === 'user_message' ? [m.messageId] : [])))
+								// A send still in flight is not on the server yet — keep it on screen.
+								const inFlight = shown.filter(m => m.type === 'user_message' && pendingMessages.has(m.messageId) && !onServer.has(m.messageId))
+								useSessionStore.setState({
+									messages: [...messages, ...inFlight],
+									pendingQuestions: unansweredQuestions(messages),
+								})
+							})
+							.catch(() => {})
 						// Refetch session state
 						api.call('sessionState.get', { sessionId })
 							.then(result => {
+								if (thisGeneration !== loadGeneration) return
 								if (result.ok && typeof result.value === 'object' && result.value !== null && 'state' in result.value) {
 									useSessionStore.setState({ sessionState: (result.value as { state: Record<string, unknown> }).state })
 								}
