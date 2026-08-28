@@ -97,7 +97,7 @@ describe('RPC integration', () => {
 			expect(json.results[1].value).toHaveProperty('presets', expect.any(Array))
 		})
 
-		it('batch stops on first error', async () => {
+		it('runs every item after a failing one', async () => {
 			const res = await rpcBatch(app, [
 				{ method: 'sessions.create', input: { presetId: 'test' } },
 				{ method: 'sessions.get', input: { sessionId: 'nonexistent' } },
@@ -107,15 +107,52 @@ describe('RPC integration', () => {
 			expect(res.status).toBe(200)
 			const json: BatchResponse = JSON.parse(await res.text())
 
-			// First result succeeds
+			// One envelope per requested call — a short array cannot be told from a completed batch
+			expect(json.results).toHaveLength(3)
+
 			expect(json.results[0].ok).toBe(true)
 
-			// Second result fails (session not found)
 			expect(json.results[1].ok).toBe(false)
 			expect(json.results[1].error!.type).toBe('session_not_found')
 
-			// Third result should not be present (batch stops on first error)
+			expect(json.results[2].ok).toBe(true)
+		})
+
+		it('refuses a batch longer than the cap', async () => {
+			const calls = Array.from({ length: 101 }, () => ({ method: 'presets.list', input: {} }))
+
+			const res = await rpcBatch(app, calls)
+
+			expect(res.status).toBe(400)
+			const json: RpcResponse = JSON.parse(await res.text())
+			expect(json.ok).toBe(false)
+			expect(json.error!.type).toBe('batch_too_large')
+		})
+
+		it('runs a batch that sits on the cap', async () => {
+			const calls = Array.from({ length: 100 }, () => ({ method: 'presets.list', input: {} }))
+
+			const res = await rpcBatch(app, calls)
+
+			expect(res.status).toBe(200)
+			const json: BatchResponse = JSON.parse(await res.text())
+			expect(json.results).toHaveLength(100)
+			expect(json.results.every((entry) => entry.ok)).toBe(true)
+		})
+
+		it('reports a malformed item and keeps going', async () => {
+			const res = await app.request('/rpc', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: '{"batch":[null,{"method":"presets.list","input":{}}]}',
+			})
+
+			expect(res.status).toBe(200)
+			const json: BatchResponse = JSON.parse(await res.text())
 			expect(json.results).toHaveLength(2)
+			expect(json.results[0].ok).toBe(false)
+			expect(json.results[0].error!.type).toBe('missing_method')
+			expect(json.results[1].ok).toBe(true)
 		})
 	})
 
@@ -336,7 +373,7 @@ describe('RPC session leases', () => {
 		expect(httpLeaseReasons()).toEqual([])
 	})
 
-	it('keeps the already-committed results when a batch item throws', async () => {
+	it('settles every item when one of them throws', async () => {
 		const sessionId = await createSession()
 
 		const res = await rpcBatch(app, [
@@ -347,10 +384,11 @@ describe('RPC session leases', () => {
 
 		expect(res.status).toBe(200)
 		const json: BatchResponse = JSON.parse(await res.text())
-		expect(json.results).toHaveLength(2)
+		expect(json.results).toHaveLength(3)
 		expect(json.results[0].ok).toBe(true)
 		expect(json.results[1].ok).toBe(false)
 		expect(json.results[1].error!.type).toBe('internal_error')
+		expect(json.results[2].ok).toBe(true)
 		expect(httpLeaseReasons()).toEqual([])
 	})
 
