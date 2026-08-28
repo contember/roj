@@ -93,6 +93,14 @@ describe('applySandboxSettings', () => {
 			expect(result.plugins).toBe(plugins)
 		})
 
+		it('treats an explicit empty top-level list as a declaration, like a preset-level one', () => {
+			const config: RojConfig = {
+				extraBinds: [],
+				presets: [preset('a', { plugins: [shellPlugin.configure({ cwd: '/tmp' })] })],
+			}
+			expect(pluginConfigOf(applySandboxSettings(config)[0])).toEqual({ cwd: '/tmp', extraBinds: [] })
+		})
+
 		it('is a no-op for a preset that configures no plugins', () => {
 			const result = applySandboxSettings({ extraBinds: [bind], presets: [preset('a')] })[0]
 			expect(result.plugins).toBeUndefined()

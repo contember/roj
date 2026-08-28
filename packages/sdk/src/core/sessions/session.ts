@@ -930,6 +930,11 @@ export class Session {
 		}
 	}
 
+	/** What plugins and tools see. Read-only, so a host can assert the posture it resolved. */
+	get environment(): SessionEnvironment {
+		return this.getSessionEnvironment()
+	}
+
 	/**
 	 * Get session environment for tool context.
 	 */

@@ -45,7 +45,7 @@ import { sessionStatePlugin } from './plugins/session-state/plugin.js'
 import { resourcesPlugin } from './plugins/resources/plugin.js'
 import { uploadsPlugin } from './plugins/uploads/plugin.js'
 import { userChatPlugin } from './plugins/user-chat/plugin.js'
-import type { RojConfig } from './user-config.js'
+import { applySandboxSettings, describeSandboxPosture, type RojConfig } from './user-config.js'
 
 /**
  * All built-in plugin definitions passed to createSystem for type inference.
@@ -174,8 +174,10 @@ export function bootstrap(config: Config, userConfig: RojConfig, platform: Platf
 
 	const { llmProvider, llmProviders, llmLogger } = createLLMProvider(config, logger, platform)
 
-	const presets = new Map(userConfig.presets.map(p => [p.id, p]))
-	logger.info('Loaded presets', { count: presets.size })
+	// The one place the declared sandbox settings are folded in — every host lands here.
+	const resolvedPresets = applySandboxSettings(userConfig)
+	const presets = new Map(resolvedPresets.map(p => [p.id, p]))
+	logger.info('Loaded presets', { count: presets.size, sandbox: describeSandboxPosture(resolvedPresets) })
 
 	const toolExecutor = new ToolExecutorImpl(logger)
 	const dataFileStore = new SessionFileStore(config.dataPath, undefined, false, platform.fs, 'session')
