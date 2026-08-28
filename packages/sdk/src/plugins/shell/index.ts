@@ -3,8 +3,7 @@
  */
 
 export {
-	createRestrictedShellConfig,
-	createSafeShellConfig,
+	createSandboxedShellConfig,
 	type ExtraBind as ShellExtraBind,
 	type ShellAgentConfig,
 	shellPlugin,

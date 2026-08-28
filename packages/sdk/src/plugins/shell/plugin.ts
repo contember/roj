@@ -107,12 +107,7 @@ export const shellPlugin = definePlugin('shell')
 	})
 	.build()
 
-/** Safe shell config for typical development tasks */
-export function createSafeShellConfig(cwd: string): ShellPresetConfig {
-	return { cwd, timeout: 60000, sandbox: { enabled: true } }
-}
-
-/** Restrictive shell config for untrusted agents */
-export function createRestrictedShellConfig(cwd: string): ShellPresetConfig {
-	return { cwd, timeout: 30000, sandbox: { enabled: true } }
+/** Sandboxed shell config; the command timeout is the only knob it sets. */
+export function createSandboxedShellConfig(cwd: string, timeout = 60000): ShellPresetConfig {
+	return { cwd, timeout, sandbox: { enabled: true } }
 }
