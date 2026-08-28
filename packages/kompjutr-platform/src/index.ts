@@ -35,6 +35,11 @@ export function createKompjutrPlatform(workspace: Workspace, options: KompjutrPl
 		fs: createKompjutrFileSystem({ compat: workspace.fs, filesystem: workspace.filesystem }),
 		process: createUnsupportedProcessRunner(),
 		git: git && createKompjutrGitClient(git),
+		// One counter for the whole workspace, bumped once per mutating call. It is
+		// a gate against an unnecessary read, never a scope: a write in one session
+		// invalidates another's cached answer, and the error is always a
+		// recomputation nobody needed rather than a stale answer.
+		fsRevision: { current: async () => workspace.filesystem.rev() },
 		scheduler: options.scheduler ?? createTimerScheduler(),
 		tmpDir,
 	}
