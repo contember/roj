@@ -10,6 +10,7 @@ import { type ChildProcess, execFile as execFileCb, spawn as nodeSpawn } from 'n
 import * as fsp from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { promisify } from 'node:util'
+import { createTimerScheduler } from '~/platform/index.js'
 import type { FileSystem, Platform, ProcessRunner } from '~/platform/index.js'
 
 const execFileP = promisify(execFileCb)
@@ -75,6 +76,7 @@ export function createNodePlatform(): Platform {
 	return {
 		fs: createNodeFileSystem(),
 		process: createNodeProcessRunner(),
+		scheduler: createTimerScheduler(),
 		tmpDir: tmpdir(),
 	}
 }

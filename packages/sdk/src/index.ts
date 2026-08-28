@@ -9,8 +9,8 @@ export { loadConfig, validateConfig } from './config.js'
 export type { Config } from './config.js'
 
 // Bootstrap
-export { bootstrap, createSystemFromServices } from './bootstrap.js'
-export type { Services } from './bootstrap.js'
+export { bootstrap, createSystemFromServices, fullPlugins, isolatePlugins } from './bootstrap.js'
+export type { BootstrapOptions, BuiltinMethodSchemas, IsolateMethodSchemas, PluginProfile, Services } from './bootstrap.js'
 
 // System
 export { createSystem } from './core/system.js'

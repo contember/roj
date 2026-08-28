@@ -49,9 +49,13 @@ import type { RojConfig } from './user-config.js'
 
 /**
  * All built-in plugin definitions passed to createSystem for type inference.
- * These are always registered in every session (see SessionManager.createSessionInstance).
+ * Registered in every session under the default `full` profile (see
+ * SessionManager.createSessionInstance).
+ *
+ * This set is also the RPC contract: `BuiltinMethodSchemas` — and through it
+ * every client's method types — derives from it whichever profile a host registers.
  */
-const builtinPlugins = [
+export const fullPlugins = [
 	sessionLifecyclePlugin,
 	presetsPlugin,
 	mailboxPlugin,
@@ -69,13 +73,55 @@ const builtinPlugins = [
 	gitStatusPlugin,
 ] as const
 
+/**
+ * Built-in plugins that run without an OS process table, for hosts like a Worker
+ * isolate. Drops `uploads`, `resources` and `services` — each of them shells out
+ * (pdftotext/markitdown, unzip, dev servers).
+ *
+ * `satisfies` keeps this a strict subset of `fullPlugins`, so it cannot name a
+ * plugin the RPC contract does not know about.
+ */
+export const isolatePlugins = [
+	sessionLifecyclePlugin,
+	presetsPlugin,
+	mailboxPlugin,
+	agentsPlugin,
+	agentStatusPlugin,
+	userChatPlugin,
+	llmDebugPlugin,
+	filesystemPlugin,
+	logsPlugin,
+	sessionStatsPlugin,
+	sessionStatePlugin,
+	gitStatusPlugin,
+] as const satisfies readonly (typeof fullPlugins)[number][]
+
+/** Which built-in plugin set a host registers. */
+export type PluginProfile = 'full' | 'isolate'
+
 /** Method schemas inferred from all built-in plugins */
-export type BuiltinMethodSchemas = AllMethodSchemas<typeof builtinPlugins>
+export type BuiltinMethodSchemas = AllMethodSchemas<typeof fullPlugins>
+
+/** Method schemas the `isolate` profile actually registers */
+export type IsolateMethodSchemas = AllMethodSchemas<typeof isolatePlugins>
+
+/** Options for {@link bootstrap}. */
+export interface BootstrapOptions<TProfile extends PluginProfile = PluginProfile> {
+	/** Built-in plugin set to register. Defaults to `full`. */
+	pluginProfile?: TProfile
+	/**
+	 * Event store to use instead of the one `config.persistence` names.
+	 *
+	 * A host whose durable storage is neither a file tree nor memory passes its own
+	 * here, rather than having the store it wants patched in after the fact.
+	 */
+	eventStore?: EventStore
+}
 
 /**
  * Container for all bootstrapped services
  */
-export interface Services {
+export interface Services<TProfile extends PluginProfile = 'full'> {
 	eventStore: EventStore
 	llmProvider: LLMProvider
 	/** Named provider instances for middleware routing (e.g. useProvider('anthropic')) */
@@ -94,24 +140,37 @@ export interface Services {
 	pidRegistry: ServicePidRegistry
 	/** Preprocessor registry for upload content extraction */
 	preprocessorRegistry: PreprocessorRegistry
-	/** Host-environment adapters (filesystem, process). */
+	/** Host-environment adapters (filesystem, process, scheduler). */
 	platform: Platform
+	/** Built-in plugin set chosen at bootstrap — selects what createSystemFromServices registers. */
+	pluginProfile: TProfile
 }
 
 /**
  * Bootstrap all services based on configuration.
  *
- * `platform` provides runtime adapters (fs, process). Callers pass concrete
- * impls from their runtime package (e.g. `createBunPlatform()` from
+ * `platform` provides runtime adapters (fs, process, scheduler). Callers pass
+ * concrete impls from their runtime package (e.g. `createBunPlatform()` from
  * `@roj-ai/sdk/bun-platform`).
+ *
+ * `options.pluginProfile` picks the built-in plugin set; it defaults to `full`.
  */
-export function bootstrap(config: Config, userConfig: RojConfig, platform: Platform): Services {
+export function bootstrap<TProfile extends PluginProfile>(
+	config: Config,
+	userConfig: RojConfig,
+	platform: Platform,
+	options: BootstrapOptions<TProfile> & { pluginProfile: TProfile },
+): Services<TProfile>
+export function bootstrap(config: Config, userConfig: RojConfig, platform: Platform, options?: BootstrapOptions): Services
+export function bootstrap(config: Config, userConfig: RojConfig, platform: Platform, options?: BootstrapOptions): Services<PluginProfile> {
+	const pluginProfile = options?.pluginProfile ?? 'full'
 	const logger = createLogger(config)
-	logger.info('Bootstrapping agent server', { persistence: config.persistence, logLevel: config.logLevel })
+	logger.info('Bootstrapping agent server', { persistence: config.persistence, logLevel: config.logLevel, pluginProfile })
 
-	const eventStore = config.persistence === 'memory'
-		? new MemoryEventStore()
-		: new FileEventStore(config.dataPath, platform.fs, logger)
+	const eventStore = options?.eventStore
+		?? (config.persistence === 'memory'
+			? new MemoryEventStore()
+			: new FileEventStore(config.dataPath, platform.fs, logger))
 
 	const { llmProvider, llmProviders, llmLogger } = createLLMProvider(config, logger, platform)
 
@@ -156,6 +215,7 @@ export function bootstrap(config: Config, userConfig: RojConfig, platform: Platf
 		pidRegistry,
 		preprocessorRegistry,
 		platform,
+		pluginProfile,
 	}
 }
 
@@ -235,18 +295,13 @@ function createLLMProvider(config: Config, logger: Logger, platform: Platform): 
 	}
 }
 
-/**
- * Create a System wired to bootstrapped services.
- * Returns the full System object with SessionManager, typed method schemas, and lifecycle methods.
- */
-export function createSystemFromServices(
-	services: Services,
-	options?: {
-		onUserOutput?: UserOutputCallback
-	},
-): System<BuiltinMethodSchemas, typeof builtinPlugins> {
-	return createSystem({
-		plugins: builtinPlugins,
+interface CreateSystemFromServicesOptions {
+	onUserOutput?: UserOutputCallback
+}
+
+/** Everything a System needs except the plugin set, which the profile picks. */
+function buildSystem(services: Services<PluginProfile>, options?: CreateSystemFromServicesOptions) {
+	const wiring = {
 		eventStore: services.eventStore,
 		llmProvider: services.llmProvider,
 		llmProviders: services.llmProviders,
@@ -264,7 +319,32 @@ export function createSystemFromServices(
 		pidRegistry: services.pidRegistry,
 		platform: services.platform,
 		sessionIdleTimeoutMs: services.config.sessionIdleTimeoutMs,
-	})
+	}
+
+	return services.pluginProfile === 'isolate'
+		? createSystem({ ...wiring, plugins: isolatePlugins })
+		: createSystem({ ...wiring, plugins: fullPlugins })
+}
+
+/**
+ * Create a System wired to bootstrapped services.
+ * Returns the full System object with SessionManager, typed method schemas, and lifecycle methods.
+ *
+ * Which plugins get registered follows the profile `services` was bootstrapped
+ * with. `BuiltinMethodSchemas` still covers every built-in plugin, so a client
+ * may name a method the running profile does not register — that call comes back
+ * as a method-not-found error, the same as any unknown method.
+ */
+export function createSystemFromServices(
+	services: Services<'isolate'>,
+	options?: CreateSystemFromServicesOptions,
+): System<IsolateMethodSchemas, typeof isolatePlugins>
+export function createSystemFromServices(
+	services: Services,
+	options?: CreateSystemFromServicesOptions,
+): System<BuiltinMethodSchemas, typeof fullPlugins>
+export function createSystemFromServices(services: Services<PluginProfile>, options?: CreateSystemFromServicesOptions) {
+	return buildSystem(services, options)
 }
 
 /**
@@ -272,12 +352,10 @@ export function createSystemFromServices(
  * @deprecated Use createSystemFromServices() instead for typed method registry.
  */
 export function createSessionManager(
-	services: Services,
-	options?: {
-		onUserOutput?: UserOutputCallback
-	},
+	services: Services<PluginProfile>,
+	options?: CreateSystemFromServicesOptions,
 ): SessionManager {
-	return createSystemFromServices(services, options).sessionManager
+	return buildSystem(services, options).sessionManager
 }
 
 /**
