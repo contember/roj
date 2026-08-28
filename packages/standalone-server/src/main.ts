@@ -8,6 +8,7 @@
  */
 
 import { resolve } from 'node:path'
+import { applySandboxSettings, describeSandboxPosture } from '@roj-ai/sdk/user-config'
 import { startStandaloneServer } from './server.js'
 import { loadUserConfig } from './user-config-loader.js'
 
@@ -29,8 +30,11 @@ async function main() {
 		process.exit(1)
 	}
 
+	const presets = applySandboxSettings(userConfig)
+	console.log(`  Sandbox: ${describeSandboxPosture(presets)}`)
+
 	await startStandaloneServer({
-		presets: userConfig.presets,
+		presets,
 		localResources: userConfig.localResources,
 	})
 }
