@@ -10,7 +10,7 @@
 import { join } from 'node:path'
 import z4 from 'zod/v4'
 import { COMMUNICATOR_ROLE, ORCHESTRATOR_ROLE } from '~/core/agents/agent-roles.js'
-import { parseAgentWakeKey } from '~/core/agents/agent.js'
+import { parseAgentWakeKey, parsePluginWakeKey } from '~/core/wake-key.js'
 import { AgentId, generateAgentId } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { type DomainError, PresetErrors, SessionErrors, ValidationErrors } from '~/core/errors.js'
@@ -116,39 +116,6 @@ const RUNTIME_DISPOSAL_CLOSE_REASON: Record<RuntimeDisposalCause, SessionCloseRe
 export interface AcquiredSessionLease {
 	session: Session
 	release: () => void
-}
-
-export interface PluginWake {
-	sessionId: SessionId
-	pluginName: string
-	method: string
-	agentId: AgentId | undefined
-}
-
-/**
- * Routing key for a plugin wake: `plugin:<sessionId>:<pluginName>:<method>[:<agentId>]`.
- *
- * Like an agent wake it carries no closure — the method is re-entered on a
- * session loaded by id, so a process that never armed it can still deliver it.
- */
-export function pluginWakeKey(sessionId: SessionId, pluginName: string, method: string, agentId?: AgentId): string {
-	const base = `plugin:${sessionId}:${pluginName}:${method}`
-	return agentId === undefined ? base : `${base}:${agentId}`
-}
-
-/** Read a key back, or null when it is not one `pluginWakeKey` minted. */
-export function parsePluginWakeKey(key: string): PluginWake | null {
-	const parts = key.split(':')
-	if (parts.length !== 4 && parts.length !== 5) return null
-	const [prefix, sessionId, pluginName, method, agentId] = parts
-	if (prefix !== 'plugin' || pluginName === '' || method === '') return null
-	if (agentId === '' || !isValidSessionId(sessionId)) return null
-	return {
-		sessionId: SessionId(sessionId),
-		pluginName,
-		method,
-		agentId: agentId === undefined ? undefined : AgentId(agentId),
-	}
 }
 
 /**

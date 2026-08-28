@@ -10,6 +10,7 @@
 import z from 'zod/v4'
 import { DebounceCallback } from '~/core/agents/debounce.js'
 import { AgentId } from '~/core/agents/schema.js'
+import { agentWakeKey, type AgentWakeKind } from '~/core/wake-key.js'
 import type { AgentState, HandlerResult, ReasoningDetails, ThinkingBlocks } from '~/core/agents/state.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
@@ -125,39 +126,6 @@ export interface AgentDependencies {
 	pluginMethodCaller?: PluginMethodCaller
 	/** Callback for scheduling this agent for processing */
 	schedule?: () => void
-}
-
-// ============================================================================
-// Wake keys
-// ============================================================================
-
-/** Which delayed re-entry a wake stands for. */
-export type AgentWakeKind = 'debounce' | 'retry'
-
-export interface AgentWake {
-	sessionId: SessionId
-	agentId: AgentId
-	kind: AgentWakeKind
-}
-
-/**
- * Routing key for an agent wake: `agent:<sessionId>:<agentId>:<kind>`.
- *
- * A wake must be dispatchable after the process that armed it is gone, so it
- * carries no closure — the key is the whole routing table.
- */
-export function agentWakeKey(sessionId: SessionId, agentId: AgentId, kind: AgentWakeKind): string {
-	return `agent:${sessionId}:${agentId}:${kind}`
-}
-
-/** Read a key back, or null when it is not one this module minted. */
-export function parseAgentWakeKey(key: string): AgentWake | null {
-	const parts = key.split(':')
-	if (parts.length !== 4 || parts[0] !== 'agent') return null
-	const [, sessionId, agentId, kind] = parts
-	if (kind !== 'debounce' && kind !== 'retry') return null
-	if (agentId === '' || !isValidSessionId(sessionId)) return null
-	return { sessionId: SessionId(sessionId), agentId: AgentId(agentId), kind }
 }
 
 // ============================================================================

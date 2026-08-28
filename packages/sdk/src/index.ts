@@ -12,6 +12,10 @@ export type { Config } from './config.js'
 export { bootstrap, createSystemFromServices, fullPlugins, isolatePlugins } from './bootstrap.js'
 export type { BootstrapOptions, BuiltinMethodSchemas, IsolateMethodSchemas, PluginProfile, Services } from './bootstrap.js'
 
+// Scheduler wake keys — a host delivering its own wakes mints and reads them
+export { agentWakeKey, parseAgentWakeKey, pluginWakeKey, parsePluginWakeKey } from './core/wake-key.js'
+export type { AgentWake, AgentWakeKind, PluginWake } from './core/wake-key.js'
+
 // System
 export { createSystem } from './core/system.js'
 export type { CreateSystemOptions, System } from './core/system.js'
