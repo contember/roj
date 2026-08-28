@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { loadUserConfig } from './user-config-loader.js'
 
 const PRESET = `{ id: 'a', name: 'A', orchestrator: { system: 's', model: 'mock', tools: [], agents: [] }, agents: [] }`
@@ -37,6 +37,17 @@ describe('loadUserConfig', () => {
 	it('leaves extraBinds undefined when the config omits them', async () => {
 		const config = await loadUserConfig(await writeConfig(`sandboxed: false`))
 		expect(config.extraBinds).toBeUndefined()
+	})
+
+	it('resolves a relative bind path against the config directory', async () => {
+		const path = await writeConfig(`extraBinds: [{ path: './shared', mode: 'ro' }]`)
+		const config = await loadUserConfig(path)
+		expect(config.extraBinds?.[0].path).toBe(join(dirname(path), 'shared'))
+	})
+
+	it('rejects a relative destPath, which has nothing to resolve against', async () => {
+		const path = await writeConfig(`extraBinds: [{ path: '/opt/tools', mode: 'ro', destPath: './tools' }]`)
+		await expect(loadUserConfig(path)).rejects.toThrow(/'destPath' must be an absolute path/)
 	})
 
 	it('rejects an unknown bind mode', async () => {
