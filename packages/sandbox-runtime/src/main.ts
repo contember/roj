@@ -22,6 +22,7 @@
 import { resolve, dirname, join } from 'node:path'
 import { symlink, mkdir, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
+import { applySandboxSettings, describeSandboxPosture } from '@roj-ai/sdk/user-config'
 import { startServer } from './server.js'
 import { loadUserConfig } from './user-config-loader.js'
 
@@ -63,7 +64,10 @@ async function main() {
 		process.exit(1)
 	}
 
-	await startServer({ presets: userConfig.presets })
+	const presets = applySandboxSettings(userConfig)
+	console.log(`  Sandbox: ${describeSandboxPosture(presets)}`)
+
+	await startServer({ presets })
 }
 
 main().catch((error) => {
