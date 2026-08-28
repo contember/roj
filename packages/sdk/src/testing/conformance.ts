@@ -450,6 +450,42 @@ const fsChecks: ConformanceCheck[] = [
 	},
 	{
 		port: 'fs',
+		name: 'lstat answers as stat does for a path that is not a link',
+		async run({ platform, path }) {
+			const fs = platform.fs
+			await fs.writeFile(path('a.txt'), 'abcde')
+			await fs.mkdir(path('dir'), { recursive: true })
+
+			const file = await fs.lstat(path('a.txt'))
+			expect(file.size).toBe(5)
+			expect(file.isFile()).toBe(true)
+			expect(file.isSymbolicLink()).toBe(false)
+			expect((await fs.lstat(path('dir'))).isDirectory()).toBe(true)
+
+			await rejection(fs.lstat(path('missing')), 'lstat of a missing path')
+		},
+	},
+	{
+		port: 'fs',
+		needs: ['fs.symlinks'],
+		name: 'lstat reports the link itself, and answers for one whose target is gone',
+		async run({ platform, path, symlink }) {
+			const fs = platform.fs
+			await fs.writeFile(path('target.txt'), 'target')
+			await symlink(path('target.txt'), path('link.txt'))
+			await symlink(path('nowhere.txt'), path('broken.link'))
+
+			expect((await fs.lstat(path('link.txt'))).isSymbolicLink()).toBe(true)
+			expect((await fs.lstat(path('link.txt'))).isFile()).toBe(false)
+			expect((await fs.stat(path('link.txt'))).isFile()).toBe(true)
+
+			// The pair a caller separates "not there" from "there but unresolvable" on.
+			expect((await fs.lstat(path('broken.link'))).isSymbolicLink()).toBe(true)
+			await rejection(fs.realpath(path('broken.link')), 'realpath of a broken link')
+		},
+	},
+	{
+		port: 'fs',
 		name: 'access resolves for a reachable path and rejects for a missing one',
 		async run({ platform, path }) {
 			const fs = platform.fs

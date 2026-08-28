@@ -26,6 +26,7 @@ export function createBunFileSystem(): FileSystem {
 				: fsp.readdir(path)) as FileSystem['readdir'],
 
 		stat: (path) => fsp.stat(path),
+		lstat: (path) => fsp.lstat(path),
 		access: (path, mode) => fsp.access(path, mode),
 
 		unlink: (path) => fsp.unlink(path),

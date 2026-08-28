@@ -34,6 +34,11 @@ export interface FileSystem {
 	readdir(path: string, options: { withFileTypes: true }): Promise<Dirent[]>
 
 	stat(path: string): Promise<Stats>
+	/**
+	 * Like `stat`, but reports the link itself instead of following it. Answers for
+	 * a link whose target is gone, where `realpath` rejects.
+	 */
+	lstat(path: string): Promise<Stats>
 	access(path: string, mode?: number): Promise<void>
 
 	unlink(path: string): Promise<void>
