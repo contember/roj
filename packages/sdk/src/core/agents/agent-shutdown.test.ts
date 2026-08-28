@@ -26,7 +26,8 @@ import { ConsoleLogger } from '../../lib/logger/console.js'
 import { SessionFileStore } from '../file-store/file-store.js'
 import { SessionStore } from '../sessions/session-store.js'
 import { ToolExecutor } from '../tools/executor.js'
-import { Agent, type AgentConfig, type AgentDependencies, parseAgentWakeKey } from './agent.js'
+import { parseAgentWakeKey } from '~/core/wake-key.js'
+import { Agent, type AgentConfig, type AgentDependencies } from './agent.js'
 
 // ============================================================================
 // Test Helpers
