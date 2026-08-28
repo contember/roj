@@ -6,6 +6,10 @@
  * SSRF proxy onto loopback, RFC1918 and the cloud metadata endpoint — and both
  * reflect the status and the extracted content back to the caller. Every fetch
  * on those paths must go through `safeFetch`, redirects included.
+ *
+ * It validates a hostname and then hands that name to `fetch` rather than the
+ * address it checked, so DNS rebinding stays open. Read it as a filter on where
+ * a request may point, not as a guarantee of where the connection lands.
  */
 
 import { lookup } from 'node:dns/promises'

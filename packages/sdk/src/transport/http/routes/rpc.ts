@@ -67,7 +67,8 @@ async function dispatchMethod(
 		const sessionId = sessionIdResult.value
 		const agentId = 'agentId' in input && typeof input.agentId === 'string' ? AgentId(input.agentId) : undefined
 
-		// Extract caller context injected by worker, strip from input
+		// `_caller` is stamped by the transport in front of this route, never accepted
+		// from an end client — see CallerContext. Stripped from the input either way.
 		const caller: CallerContext = '_caller' in input && typeof input._caller === 'object' && input._caller !== null
 			? input._caller as CallerContext
 			: DEFAULT_CALLER

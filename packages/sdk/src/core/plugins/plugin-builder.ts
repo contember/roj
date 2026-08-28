@@ -129,6 +129,10 @@ export type DepsFromPlugins<TPlugins extends readonly PluginDefinition<string, a
  * - 'agent': called via agent tool (ctx.self)
  * - 'client': called via SPA RPC (user-initiated)
  * - 'system': called via backend/webhook (trusted)
+ *
+ * `beforeMethod` gates branch on this, so it is an authority claim, not an input:
+ * a host must stamp it from what it authenticated and must never take it from a
+ * request body an untrusted caller can write.
  */
 export type CallerContext = {
 	source: 'agent' | 'client' | 'system'
