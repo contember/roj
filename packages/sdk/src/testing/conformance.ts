@@ -1564,9 +1564,11 @@ async function probeInstance(target: ConformanceTarget, instance: PlatformInstan
 	add('scheduler', true)
 	add('scheduler.live', isLiveScheduler(platform.scheduler), 'the scheduler does not deliver its own wakes')
 
+	const confinement = platform.shell?.confinement
 	add('shell', platform.shell !== undefined)
-	add('shell.paths', platform.shell?.confinement === 'paths', `confinement is ${platform.shell?.confinement ?? 'absent'}`)
-	add('shell.host', platform.shell?.confinement === 'host', `confinement is ${platform.shell?.confinement ?? 'absent'}`)
+	const confines = await probeConfinement(instance)
+	add('shell.paths', confines.ok, confines.note)
+	add('shell.host', confinement === 'host', `confinement is ${confinement ?? 'absent'}`)
 
 	const buildable = platform.git !== undefined && await canBuildGitRepo(target, platform)
 	add('git', buildable, platform.git === undefined ? undefined : 'no way to build a fixture repository — declare ConformanceTarget.buildGitRepo')
@@ -1598,6 +1600,35 @@ async function canBuildGitRepo(target: ConformanceTarget, platform: Platform): P
 		return true
 	} catch {
 		return false
+	}
+}
+
+/** First line of an error, short enough to carry in a test name. */
+function messageOf(error: unknown): string {
+	const text = (error instanceof Error ? error.message : String(error)).split('\n')[0] ?? ''
+	return text.length > 120 ? `${text.slice(0, 117)}...` : text
+}
+
+/**
+ * Whether the host can run a confined command at all — not whether it confines
+ * correctly, which is what the `shell.paths` checks are for.
+ *
+ * Resolving is the signal, whatever the exit code: a runner that ran and answered
+ * wrongly must fail those checks, and only one that cannot run at all is skipped.
+ */
+async function probeConfinement(instance: PlatformInstance): Promise<{ ok: boolean; note?: string }> {
+	const { platform } = instance
+	const shell = platform.shell
+	if (!shell) return { ok: false, note: 'port absent' }
+	if (shell.confinement !== 'paths') return { ok: false, note: `confinement is ${shell.confinement}` }
+
+	const dir = joinPath(instance.root, ['.conformance-confinement-probe'])
+	try {
+		await platform.fs.mkdir(dir, { recursive: true })
+		await shell.run({ command: 'exit 0', cwd: dir, grants: [{ path: dir, mode: 'rw' }], timeoutMs: 30_000 })
+		return { ok: true }
+	} catch (error) {
+		return { ok: false, note: `declares \`paths\` confinement but cannot run a confined command: ${messageOf(error)}` }
 	}
 }
 
