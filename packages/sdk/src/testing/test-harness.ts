@@ -1,4 +1,5 @@
 import { rm } from 'node:fs/promises'
+import { fullPlugins } from '~/bootstrap.js'
 import type { AgentId } from '~/core/agents/schema.js'
 import type { DomainError } from '~/core/errors.js'
 import { MemoryEventStore } from '~/core/events/memory.js'
@@ -19,43 +20,8 @@ import { ToolExecutor } from '~/core/tools/executor.js'
 import { silentLogger } from '~/lib/logger/logger.js'
 import { createNodePlatform } from './node-platform.js'
 import type { Result } from '~/lib/utils/result.js'
-import { agentStatusPlugin } from '~/plugins/agent-status/plugin.js'
-import { agentsPlugin } from '~/plugins/agents/plugin.js'
-import { filesystemPlugin } from '~/plugins/filesystem/index.js'
-import { gitStatusPlugin } from '~/plugins/git-status/index.js'
-import { llmDebugPlugin } from '~/plugins/llm-debug/plugin.js'
-import { logsPlugin } from '~/plugins/logs/index.js'
-import { mailboxPlugin } from '~/plugins/mailbox/plugin.js'
-import { resourcesPlugin } from '~/plugins/resources/plugin.js'
-import { servicePlugin } from '~/plugins/services/plugin.js'
-import { presetsPlugin, sessionLifecyclePlugin } from '~/plugins/session-lifecycle/index.js'
-import { sessionStatsPlugin } from '~/plugins/session-stats/index.js'
-import { sessionStatePlugin } from '~/plugins/session-state/plugin.js'
-import { uploadsPlugin } from '~/plugins/uploads/plugin.js'
-import { userChatPlugin } from '~/plugins/user-chat/plugin.js'
 import { NotificationCollector } from './notification-collector.js'
 import { waitForAllAgentsIdle } from './wait-helpers.js'
-
-/**
- * Default system plugins for testing — same as builtinPlugins in bootstrap.ts.
- */
-const defaultSystemPlugins: readonly PluginDefinition<string, any, any, any, any>[] = [
-	sessionLifecyclePlugin,
-	presetsPlugin,
-	mailboxPlugin,
-	agentsPlugin,
-	agentStatusPlugin,
-	userChatPlugin,
-	uploadsPlugin,
-	resourcesPlugin,
-	llmDebugPlugin,
-	servicePlugin,
-	filesystemPlugin,
-	logsPlugin,
-	sessionStatsPlugin,
-	sessionStatePlugin,
-	gitStatusPlugin,
-]
 
 const mergeSystemPlugins = <TPlugin extends { name: string }>(plugins: readonly TPlugin[]): TPlugin[] => {
 	const seen = new Set<string>()
@@ -150,7 +116,7 @@ export class TestHarness {
 			llmLogger: options.llmLogger,
 			platform,
 			sessionIdleTimeoutMs: options.sessionIdleTimeoutMs,
-			systemPlugins: mergeSystemPlugins([...defaultSystemPlugins, ...(options.systemPlugins ?? [])]),
+			systemPlugins: mergeSystemPlugins([...fullPlugins, ...(options.systemPlugins ?? [])]),
 		})
 	}
 

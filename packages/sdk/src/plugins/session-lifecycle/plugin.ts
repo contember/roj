@@ -27,6 +27,7 @@ const DEFAULT_EVENT_READ_WINDOW = 1000
 // ============================================================================
 
 export const presetsPlugin = definePlugin('presets')
+	.order(20)
 	.managerMethod('list', {
 		input: z4.object({}),
 		output: z4.object({
@@ -117,6 +118,7 @@ export const presetsPlugin = definePlugin('presets')
 // ============================================================================
 
 export const sessionLifecyclePlugin = definePlugin('sessions')
+	.order(10)
 	.managerMethod('create', {
 		input: z4.object({
 			presetId: z4.string().min(1),

@@ -82,6 +82,7 @@ function formatCurl(httpRequest: { url: string; method: string; headers: Record<
 // ============================================================================
 
 export const llmDebugPlugin = definePlugin('llm')
+	.order(90)
 	.method('getCalls', {
 		input: z4.object({
 			limit: z4.number().int().optional(),

@@ -61,6 +61,7 @@ export interface ServiceAgentConfig {
 }
 
 export const servicePlugin = definePlugin('services')
+	.order(100)
 	.pluginConfig<ServicePluginConfig>()
 	.isSessionEnabled(({ pluginConfig }) => pluginConfig !== undefined && pluginConfig.services.length > 0)
 	.events([serviceEvents, sessionEvents])

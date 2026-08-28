@@ -89,6 +89,7 @@ interface GitStatusCallContext {
 }
 
 export const gitStatusPlugin = definePlugin('git-status')
+	.order(150)
 	.notification('git_status_changed', { schema: gitStatusChangedSchema })
 	.context(async (): Promise<GitStatusPluginContext> => ({ sessions: new Map() }))
 	.method('refresh', {

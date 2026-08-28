@@ -164,6 +164,7 @@ function addPendingUpdates(
 }
 
 export const sessionStatePlugin = definePlugin('sessionState')
+	.order(140)
 	.pluginConfig<SessionStatePluginConfig>()
 	.isSessionEnabled(({ pluginConfig }) => pluginConfig !== undefined)
 	.events([sessionStateEvents])

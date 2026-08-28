@@ -4,6 +4,7 @@ import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { Ok } from '~/lib/utils/result.js'
 
 export const logsPlugin = definePlugin('logs')
+	.order(120)
 	.method('tail', {
 		input: z.object({ since: z.number().int().min(0).optional() }),
 		output: z.object({ lines: z.array(z.string()), offset: z.number() }),

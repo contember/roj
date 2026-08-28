@@ -109,6 +109,7 @@ async function resolveTargetDir(targetDir: ResourcesTargetDir | undefined, args:
 }
 
 export const resourcesPlugin = definePlugin('resources')
+	.order(80)
 	.pluginConfig<ResourcesPluginConfig>()
 	.events([resourceEvents])
 	.state<ResourcesState>({

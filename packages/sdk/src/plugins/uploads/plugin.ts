@@ -658,6 +658,7 @@ async function removeUploadFiles(uploadStore: FileStore, path = ''): Promise<Res
 // ============================================================================
 
 export const uploadsPlugin = definePlugin('uploads')
+	.order(70)
 	.pluginConfig<UploadsPluginConfig>()
 	.events([uploadEvents])
 	.notification('uploadStatusChanged', { schema: statusChangedSchema })
