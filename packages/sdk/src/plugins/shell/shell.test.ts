@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
+import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { createBunShellRunner } from '~/bun-platform/shell.js'
 import type { SessionEnvironment } from '~/core/sessions/session-environment.js'
 import type { ShellConfinement, ShellRunner, ShellRunOptions } from '~/platform/shell.js'
@@ -313,6 +316,127 @@ describe('ShellExecutor', () => {
 			{ path: '/tmp/secret', source: '/tmp/secret', mode: 'ro' },
 			{ path: '/tmp/secret', mode: 'rw' },
 		])
+	})
+
+	describe('sandbox cwd containment', () => {
+		let root = ''
+		let sessionDir = ''
+		let projectDir = ''
+
+		const containedConfig = (): ShellConfig => ({
+			...sandboxedConfig,
+			extraBinds: [{ path: projectDir, mode: 'rw', destPath: '/home/user/project' }],
+		})
+		const environment = (): SessionEnvironment => ({ sessionDir, sandboxed: true })
+
+		beforeAll(async () => {
+			root = await mkdtemp(join(tmpdir(), 'roj-cwd-'))
+			sessionDir = join(root, 'session')
+			projectDir = join(root, 'project')
+			await mkdir(join(sessionDir, 'nested', 'dir'), { recursive: true })
+			await mkdir(join(projectDir, 'sub'), { recursive: true })
+			// Exists on the host, so only the root boundary — not a missing directory — can reject it.
+			await mkdir(`${projectDir}-evil`, { recursive: true })
+			await symlink('/', join(projectDir, 'to-root'))
+		})
+
+		afterAll(async () => {
+			await rm(root, { recursive: true, force: true })
+		})
+
+		it('passes a contained working directory on, normalized', async () => {
+			const { runner, calls } = recordingRunner('paths')
+			const executor = new ShellExecutor(containedConfig(), { fs: testPlatform.fs, shell: runner })
+
+			const result = await executor.execute({ command: 'pwd', cwd: '/home/user/session/nested/./dir' }, environment())
+
+			expect(result.ok).toBe(true)
+			expect(calls[0].cwd).toBe('/home/user/session/nested/dir')
+		})
+
+		it('accepts a working directory the extra binds mount', async () => {
+			const { runner, calls } = recordingRunner('paths')
+			const executor = new ShellExecutor(containedConfig(), { fs: testPlatform.fs, shell: runner })
+
+			const result = await executor.execute({ command: 'git status', cwd: '/home/user/project/sub' }, environment())
+
+			expect(result.ok).toBe(true)
+			expect(calls[0].cwd).toBe('/home/user/project/sub')
+		})
+
+		it('rejects a symlink inside a bind that points out of it', async () => {
+			const { runner, calls } = recordingRunner('paths')
+			const executor = new ShellExecutor(containedConfig(), { fs: testPlatform.fs, shell: runner })
+
+			const result = await executor.execute({ command: 'pwd -P', cwd: '/home/user/project/to-root' }, environment())
+
+			expect(result.ok).toBe(false)
+			if (result.ok) return
+			expect(result.error.message).toContain('via symlink')
+			expect(calls).toEqual([])
+		})
+
+		it('rejects a sibling that only shares a bind root prefix', async () => {
+			const { runner, calls } = recordingRunner('paths')
+			const executor = new ShellExecutor(containedConfig(), { fs: testPlatform.fs, shell: runner })
+
+			const result = await executor.execute({ command: 'ls', cwd: '/home/user/project-evil' }, environment())
+
+			expect(result.ok).toBe(false)
+			if (result.ok) return
+			expect(result.error.message).toContain('not mounted in this sandbox')
+			expect(calls).toEqual([])
+		})
+
+		it('rejects a home path the sandbox does not mount, and says what it does', async () => {
+			const { runner, calls } = recordingRunner('paths')
+			const executor = new ShellExecutor(containedConfig(), { fs: testPlatform.fs, shell: runner })
+
+			const result = await executor.execute({ command: 'ls', cwd: '/home/user/elsewhere' }, environment())
+
+			expect(result.ok).toBe(false)
+			if (result.ok) return
+			expect(result.error.message).toContain('not mounted in this sandbox')
+			expect(result.error.message).toContain('/home/user/session')
+			expect(result.error.message).toContain('/home/user/project')
+			expect(calls).toEqual([])
+		})
+
+		it('keeps the read-only tree and the scratch tmpfs available', async () => {
+			const { runner, calls } = recordingRunner('paths')
+			const executor = new ShellExecutor(containedConfig(), { fs: testPlatform.fs, shell: runner })
+
+			const scratch = await executor.execute({ command: 'ls', cwd: '/tmp' }, environment())
+			const readOnly = await executor.execute({ command: 'ls', cwd: '/usr/share' }, environment())
+
+			expect(scratch.ok).toBe(true)
+			expect(readOnly.ok).toBe(true)
+			expect(calls.map((call) => call.cwd)).toEqual(['/tmp', '/usr/share'])
+		})
+
+		it('rejects a working directory that does not exist, before the host does', async () => {
+			const { runner, calls } = recordingRunner('paths')
+			const executor = new ShellExecutor(containedConfig(), { fs: testPlatform.fs, shell: runner })
+
+			const result = await executor.execute({ command: 'ls', cwd: '/home/user/session/nope' }, environment())
+
+			expect(result.ok).toBe(false)
+			if (result.ok) return
+			expect(result.error.message).toContain('does not exist')
+			expect(calls).toEqual([])
+		})
+
+		it('rejects a workspace working directory when the session has no workspace', async () => {
+			const { runner, calls } = recordingRunner('paths')
+			const executor = new ShellExecutor(containedConfig(), { fs: testPlatform.fs, shell: runner })
+
+			const result = await executor.execute({ command: 'pwd', cwd: '/home/user/workspace/app' }, environment())
+
+			expect(result.ok).toBe(false)
+			if (result.ok) return
+			expect(result.error.message).toContain('No workspace directory')
+			expect(calls).toEqual([])
+		})
 	})
 
 	it('reports a run the host could not start', async () => {
