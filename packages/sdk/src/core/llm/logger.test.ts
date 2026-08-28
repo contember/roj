@@ -288,7 +288,7 @@ for (const sink of SINKS) {
 				const sessionId = SessionId('test-session-9')
 				const agentId = AgentId('test-agent-1')
 
-				const created: string[] = []
+				const created: LLMCallId[] = []
 				for (let i = 0; i < 5; i++) {
 					created.push(await logger.createCall(sessionId, agentId, createTestRequest()))
 				}
