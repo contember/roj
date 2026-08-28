@@ -1,4 +1,6 @@
 export { ConsoleLogger, JsonLogger } from './console.js'
 export type { ConsoleLoggerConfig } from './console.js'
 export { FileLogger } from './file.js'
+export { JsonlLogger } from './jsonl.js'
+export { createSessionLogger, SessionLogStoreLogger } from './session-log.js'
 export { TeeLogger } from './tee.js'
