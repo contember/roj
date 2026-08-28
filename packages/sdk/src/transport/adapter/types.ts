@@ -18,3 +18,13 @@ export interface IAgentTransport {
 	stop(): Promise<void>
 	broadcast(notification: PluginNotification): void
 }
+
+// ============================================================================
+// Liveness probe
+// ============================================================================
+
+/** Wire type of the client's liveness probe. */
+export const HEARTBEAT_TYPE = 'heartbeat'
+
+/** Wire type of the host's answer to a probe — its absence is what marks a link dead. */
+export const HEARTBEAT_ACK_TYPE = 'heartbeat_ack'
