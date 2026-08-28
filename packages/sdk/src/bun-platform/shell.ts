@@ -7,7 +7,7 @@
 
 import type { ChildProcess } from 'node:child_process'
 import { resolve } from 'node:path'
-import type { ProcessRunner, ShellRunner, ShellRunOptions, ShellRunResult } from '../platform/index.js'
+import type { ProcessRunner, ShellGrant, ShellRunner, ShellRunOptions, ShellRunResult } from '../platform/index.js'
 import { createBunProcessRunner } from './process.js'
 
 /** Maximum output size per stream in bytes (1 MB) */
@@ -40,19 +40,13 @@ export interface BwrapOptions {
 	command: string
 	/** Working directory, as the command sees it. */
 	cwd: string
-	/** Paths the command may write, named as the command sees them. */
-	writablePaths?: readonly string[]
-	/** Paths the command may read, named as the command sees them. */
-	readablePaths?: readonly string[]
-	/** Host source of a granted path, keyed by the path the command sees. */
-	pathSources?: Readonly<Record<string, string>>
+	/** What the command may reach; mounted in the order given. */
+	grants?: readonly ShellGrant[]
 	/** Allow network access (default: false) */
 	network?: boolean
 }
 
 export function buildBwrapArgs(opts: BwrapOptions): string[] {
-	const source = (path: string) => resolve(opts.pathSources?.[path] ?? path)
-
 	const args: string[] = [
 		'--ro-bind',
 		'/',
@@ -69,12 +63,8 @@ export function buildBwrapArgs(opts: BwrapOptions): string[] {
 	args.push('--tmpfs', '/home')
 	args.push('--tmpfs', '/root')
 
-	for (const path of opts.writablePaths ?? []) {
-		args.push('--bind', source(path), path)
-	}
-
-	for (const path of opts.readablePaths ?? []) {
-		args.push('--ro-bind', source(path), path)
+	for (const grant of opts.grants ?? []) {
+		args.push(grant.mode === 'ro' ? '--ro-bind' : '--bind', resolve(grant.source ?? grant.path), grant.path)
 	}
 
 	args.push('--unshare-all')
@@ -95,14 +85,13 @@ export function buildBwrapArgs(opts: BwrapOptions): string[] {
 
 /** Host directory the bwrap process itself starts from; the namespace has its own cwd. */
 function hostStartDir(options: ShellRunOptions): string | undefined {
-	const granted = options.writablePaths?.[0] ?? options.readablePaths?.[0]
-	if (!granted) return undefined
-	return options.pathSources?.[granted] ?? granted
+	const first = options.grants?.[0]
+	return first ? first.source ?? first.path : undefined
 }
 
 function runCommand(processRunner: ProcessRunner, options: ShellRunOptions): Promise<ShellRunResult> {
-	// The path lists are the confinement request: without them the command runs unconfined.
-	const confined = options.writablePaths !== undefined || options.readablePaths !== undefined
+	// The grants are the confinement request: without them the command runs unconfined.
+	const confined = options.grants !== undefined
 	const startTime = Date.now()
 
 	return new Promise<ShellRunResult>((settleResult, failResult) => {
@@ -127,9 +116,7 @@ function runCommand(processRunner: ProcessRunner, options: ShellRunOptions): Pro
 			const bwrapArgs = buildBwrapArgs({
 				command: sandboxCommand,
 				cwd: options.cwd,
-				writablePaths: options.writablePaths,
-				readablePaths: options.readablePaths,
-				pathSources: options.pathSources,
+				grants: options.grants,
 				network: options.network,
 			})
 			child = processRunner.spawn('bwrap', bwrapArgs, {

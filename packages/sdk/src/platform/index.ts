@@ -34,7 +34,7 @@ export type { ChildProcess, ExecFileOptions, ExecFileResult, ProcessRunner, Spaw
 export { createTimerScheduler, isLiveScheduler } from './scheduler.js'
 export type { LiveScheduler, Scheduler, WakeHandler } from './scheduler.js'
 export type { SessionLogPage, SessionLogStore } from './session-log.js'
-export type { ShellConfinement, ShellRunner, ShellRunOptions, ShellRunResult } from './shell.js'
+export type { ShellConfinement, ShellGrant, ShellRunner, ShellRunOptions, ShellRunResult } from './shell.js'
 
 /**
  * Aggregate platform capabilities passed through the system at bootstrap.
