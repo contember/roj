@@ -13,6 +13,17 @@ import { createBunProcessRunner } from './process.js'
 /** Maximum output size per stream in bytes (1 MB) */
 const MAX_OUTPUT_BYTES = 1_048_576
 
+/** 512-byte blocks, the unit POSIX `ulimit -f` counts — 200 MB. A shell counting 1024 gives twice that. */
+const LIMIT_FILE_SIZE_BLOCKS = 409_600
+
+/** Processes per user inside the namespace, where the count is not shared with the host */
+const LIMIT_PROCESSES = 64
+
+/** Marks a limit the shell refused, so the host hears about it and the agent's stderr stays clean */
+const LIMIT_NOTICE_PREFIX = 'roj-shell: limit unavailable:'
+
+const reportedLimits = new Set<string>()
+
 /** Grace period before SIGKILL after SIGTERM (ms) */
 const GRACEFUL_KILL_DELAY_MS = 5000
 
@@ -83,13 +94,56 @@ export function buildBwrapArgs(opts: BwrapOptions): string[] {
 	return args
 }
 
+/**
+ * Resource limits for a confined command, one statement at a time: dash fails a single
+ * `ulimit` call carrying several flags, and spells the process cap `-p`, not `-u`.
+ *
+ * Two limits are deliberately absent. `ulimit -v` bounds mapped address space, which a
+ * build reserves far beyond what it touches. `ulimit -t` bounds CPU seconds summed over
+ * threads, so a parallel build dies at timeout/threads of wall time, while sequential
+ * children each get a fresh budget — and the runner already bounds wall time itself.
+ */
+export function buildLimitPrefix(): string {
+	const statements: [string, string][] = [
+		['file size', `ulimit -f ${LIMIT_FILE_SIZE_BLOCKS}`],
+		['process count', `{ ulimit -u ${LIMIT_PROCESSES} 2>/dev/null || ulimit -p ${LIMIT_PROCESSES}; }`],
+	]
+	return statements
+		.map(([name, attempt]) => `${attempt} || echo '${LIMIT_NOTICE_PREFIX} ${name}' >&2`)
+		.join('\n')
+}
+
+/** Split the notices the prefix wrote from the command's own stderr. */
+export function splitLimitNotices(stderr: string): { stderr: string; unavailable: string[] } {
+	const unavailable: string[] = []
+	const lines = stderr.split('\n')
+	let index = 0
+	while (index < lines.length && lines[index].startsWith(LIMIT_NOTICE_PREFIX)) {
+		unavailable.push(lines[index].slice(LIMIT_NOTICE_PREFIX.length).trim())
+		index++
+	}
+	return { stderr: lines.slice(index).join('\n'), unavailable }
+}
+
+function reportUnavailableLimits(names: string[], warn: (message: string) => void): void {
+	for (const name of names) {
+		if (reportedLimits.has(name)) continue
+		reportedLimits.add(name)
+		warn(`shell: this shell applies no ${name} limit; commands run without it`)
+	}
+}
+
 /** Host directory the bwrap process itself starts from; the namespace has its own cwd. */
 function hostStartDir(options: ShellRunOptions): string | undefined {
 	const first = options.grants?.[0]
 	return first ? first.source ?? first.path : undefined
 }
 
-function runCommand(processRunner: ProcessRunner, options: ShellRunOptions): Promise<ShellRunResult> {
+function runCommand(
+	processRunner: ProcessRunner,
+	options: ShellRunOptions,
+	warn: (message: string) => void,
+): Promise<ShellRunResult> {
 	// The grants are the confinement request: without them the command runs unconfined.
 	const confined = options.grants !== undefined
 	const startTime = Date.now()
@@ -110,11 +164,9 @@ function runCommand(processRunner: ProcessRunner, options: ShellRunOptions): Pro
 
 		let child: ChildProcess
 		if (confined) {
-			// Apply resource limits inside the sandbox
-			const timeoutSeconds = Math.ceil(options.timeoutMs / 1000)
-			const sandboxCommand = `ulimit -v 524288 -f 204800 -u 64 -t ${timeoutSeconds} 2>/dev/null; ${options.command}`
+			// The prefix runs in the command's own shell: wrap it in a subshell and it limits nothing.
 			const bwrapArgs = buildBwrapArgs({
-				command: sandboxCommand,
+				command: `${buildLimitPrefix()}\n${options.command}`,
 				cwd: options.cwd,
 				grants: options.grants,
 				network: options.network,
@@ -191,10 +243,13 @@ function runCommand(processRunner: ProcessRunner, options: ShellRunOptions): Pro
 
 			settled = true
 			clearTimers()
+			const notices = splitLimitNotices(stderr)
+			reportUnavailableLimits(notices.unavailable, warn)
+			const commandStderr = notices.stderr.trim()
 			if (stdinError) {
 				failResult(new ShellRunFailure(`Failed to deliver command stdin: ${stdinError.message}`, {
 					stdout: stdout.trim(),
-					stderr: stderr.trim(),
+					stderr: commandStderr,
 					durationMs,
 					exitCode: exitCode ?? -1,
 					signal: exitSignal ?? undefined,
@@ -205,7 +260,7 @@ function runCommand(processRunner: ProcessRunner, options: ShellRunOptions): Pro
 
 			settleResult({
 				stdout: stdout.trim(),
-				stderr: stderr.trim(),
+				stderr: commandStderr,
 				exitCode: exitCode ?? -1,
 				signal: exitSignal ?? undefined,
 				timedOut,
@@ -286,9 +341,13 @@ function runCommand(processRunner: ProcessRunner, options: ShellRunOptions): Pro
 	})
 }
 
-export function createBunShellRunner(processRunner: ProcessRunner = createBunProcessRunner()): ShellRunner {
+export function createBunShellRunner(
+	processRunner: ProcessRunner = createBunProcessRunner(),
+	/** Where a limit this shell refused is reported; the command's own stderr never carries it. */
+	warn: (message: string) => void = (message) => console.warn(message),
+): ShellRunner {
 	return {
 		confinement: 'paths',
-		run: (options) => runCommand(processRunner, options),
+		run: (options) => runCommand(processRunner, options, warn),
 	}
 }

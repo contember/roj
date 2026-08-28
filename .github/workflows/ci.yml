@@ -37,8 +37,20 @@ jobs:
           bunx tsc -p packages/standalone-server/tsconfig.test.json --noEmit
           bunx tsc -p packages/platform-cli/tsconfig.test.json --noEmit
 
+      # The sandbox tests need a usable user namespace, not just the binary. Relaxing the
+      # AppArmor restriction on unprivileged user namespaces is a runner-wide change.
+      - name: Install bubblewrap and allow unprivileged user namespaces
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       - name: Run tests
         run: bun run test
+
+      # Fails rather than skips, so the limits cannot silently stop being exercised.
+      - name: Run sandbox resource-limit tests
+        run: ROJ_REQUIRE_SANDBOX=1 bun test packages/sdk/src/bun-platform/shell-limits.smoke.test.ts
 
       # Replays committed LLM snapshots — no provider key, no network calls.
       # Guards the full client → REST → standalone-server → agent path, which
