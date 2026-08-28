@@ -21,7 +21,8 @@ export { createSystem } from './core/system.js'
 export type { CreateSystemOptions, System } from './core/system.js'
 
 // Lib exports
-export { FileEventStore, MemoryEventStore } from '~/core/events/index.js'
+export { BaseEventStore, EventAppendError, EventStoreError, FileEventStore, MemoryEventStore, SessionNotFoundError } from '~/core/events/index.js'
+export type { EventStore, LoadRangeOptions, LoadRangeResult } from '~/core/events/index.js'
 export { MockLLMProvider, OpenRouterProvider, RequestMatchers } from '~/core/llm/index.js'
 export type { MockInferenceHandler, OpenRouterConfig } from '~/core/llm/index.js'
 export { ConsoleLogger, JsonLogger } from '~/lib/logger/index.js'
