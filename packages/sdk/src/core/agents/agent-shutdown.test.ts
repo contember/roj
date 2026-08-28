@@ -20,12 +20,13 @@ import { ToolCallId } from '~/core/tools/schema.js'
 import { mailboxPlugin } from '~/plugins/mailbox/plugin.js'
 import { generateTestMessageId } from '~/plugins/mailbox/schema.js'
 import { mailboxEvents } from '~/plugins/mailbox/state.js'
+import { isLiveScheduler } from '~/platform/index.js'
 import { createNodePlatform } from '~/testing/node-platform.js'
 import { ConsoleLogger } from '../../lib/logger/console.js'
 import { SessionFileStore } from '../file-store/file-store.js'
 import { SessionStore } from '../sessions/session-store.js'
 import { ToolExecutor } from '../tools/executor.js'
-import { Agent, type AgentConfig, type AgentDependencies } from './agent.js'
+import { Agent, type AgentConfig, type AgentDependencies, parseAgentWakeKey } from './agent.js'
 
 // ============================================================================
 // Test Helpers
@@ -93,6 +94,7 @@ async function createTestAgent(
 	const fileStore = new SessionFileStore('/tmp/test', undefined, false, createNodePlatform().fs)
 
 	const runtimeActivity = new SessionRuntimeActivityController()
+	const platform = createNodePlatform()
 	let nextMailboxMessageSequence = 1
 	const sessionContext: SessionContext = {
 		sessionId: TEST_SESSION_ID,
@@ -103,7 +105,7 @@ async function createTestAgent(
 		llm: llmProvider,
 		files: fileStore,
 		eventStore,
-		platform: createNodePlatform(),
+		platform,
 		logger,
 		runtimeActivity,
 		reserveSequence: (_name, seed) => seed(),
@@ -131,6 +133,15 @@ async function createTestAgent(
 	}
 
 	const agent = new Agent(deps)
+	// Stand-in for SessionManager.dispatchWake: without it a bare Agent arms wakes
+	// that nothing delivers, because the wake carries no closure to run.
+	const scheduler = platform.scheduler
+	if (isLiveScheduler(scheduler)) {
+		scheduler.onWake((key) => {
+			const wake = parseAgentWakeKey(key)
+			if (wake) return agent.deliverWake(wake.kind)
+		})
+	}
 	return { agent, store, eventStore, llmProvider, runtimeActivity }
 }
 

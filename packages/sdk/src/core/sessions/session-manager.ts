@@ -10,8 +10,8 @@
 import { join } from 'node:path'
 import z4 from 'zod/v4'
 import { COMMUNICATOR_ROLE, ORCHESTRATOR_ROLE } from '~/core/agents/agent-roles.js'
-import type { AgentId } from '~/core/agents/schema.js'
-import { generateAgentId } from '~/core/agents/schema.js'
+import { parseAgentWakeKey } from '~/core/agents/agent.js'
+import { AgentId, generateAgentId } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { type DomainError, PresetErrors, SessionErrors, ValidationErrors } from '~/core/errors.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
@@ -20,6 +20,7 @@ import type { FileStore } from '~/core/file-store/types.js'
 import type { LLMLogger } from '~/core/llm/logger.js'
 import type { LLMProvider } from '~/core/llm/provider.js'
 import type { CallerContext, ConfiguredPlugin, ManagerMethodContext, PluginDefinition, SessionCloseReason } from '~/core/plugins/plugin-builder.js'
+import { AGENT_CALLER } from '~/core/plugins/plugin-builder.js'
 import type { Preset } from '~/core/preset/index.js'
 import { knownDefinitionNames, unknownOverrideTargets } from '~/core/preset/overrides.js'
 import type { SessionMetadata } from '~/core/sessions/schema.js'
@@ -32,6 +33,7 @@ import type { ArchiveLimitOverrides } from '~/lib/archive/index.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import { TeeLogger } from '~/lib/logger/tee.js'
 import type { Platform } from '~/platform/index.js'
+import { isLiveScheduler } from '~/platform/index.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { SpawnableAgentInfo } from '~/plugins/agents/index.js'
@@ -116,6 +118,39 @@ export interface AcquiredSessionLease {
 	release: () => void
 }
 
+export interface PluginWake {
+	sessionId: SessionId
+	pluginName: string
+	method: string
+	agentId: AgentId | undefined
+}
+
+/**
+ * Routing key for a plugin wake: `plugin:<sessionId>:<pluginName>:<method>[:<agentId>]`.
+ *
+ * Like an agent wake it carries no closure — the method is re-entered on a
+ * session loaded by id, so a process that never armed it can still deliver it.
+ */
+export function pluginWakeKey(sessionId: SessionId, pluginName: string, method: string, agentId?: AgentId): string {
+	const base = `plugin:${sessionId}:${pluginName}:${method}`
+	return agentId === undefined ? base : `${base}:${agentId}`
+}
+
+/** Read a key back, or null when it is not one `pluginWakeKey` minted. */
+export function parsePluginWakeKey(key: string): PluginWake | null {
+	const parts = key.split(':')
+	if (parts.length !== 4 && parts.length !== 5) return null
+	const [prefix, sessionId, pluginName, method, agentId] = parts
+	if (prefix !== 'plugin' || pluginName === '' || method === '') return null
+	if (agentId === '' || !isValidSessionId(sessionId)) return null
+	return {
+		sessionId: SessionId(sessionId),
+		pluginName,
+		method,
+		agentId: agentId === undefined ? undefined : AgentId(agentId),
+	}
+}
+
 /**
  * SessionManager manages session lifecycle and caching.
  */
@@ -150,6 +185,7 @@ export class SessionManager {
 	private cacheHits = 0
 	private cacheMisses = 0
 	private cacheEvictions = 0
+	/** Set by shutdown(). Also fences wakes: one armed before it must not reload a session after it. */
 	private shuttingDown = false
 
 	constructor(options: SessionManagerOptions) {
@@ -182,11 +218,94 @@ export class SessionManager {
 			}, sweepIntervalMs)
 			this.evictionSweepTimer.unref()
 		}
+
+		// A live scheduler has nowhere else to deliver. Hosts that wake out-of-band
+		// (a Durable Object alarm) call dispatchWake() from their own handler.
+		const scheduler = this.platform.scheduler
+		if (isLiveScheduler(scheduler)) {
+			scheduler.onWake(async (key) => {
+				try {
+					await this.dispatchWake(key)
+				} catch (error) {
+					this.logger.error('Scheduler wake dispatch failed', error instanceof Error ? error : new Error(String(error)), { key })
+				}
+			})
+		}
 	}
 
 	/** Expose platform adapters (used by Session for building contexts). */
 	getPlatform(): Platform {
 		return this.platform
+	}
+
+	/**
+	 * Deliver a scheduler wake that has come due.
+	 *
+	 * The host's entry point back into the SDK — on Cloudflare, called from
+	 * `alarm()` in an isolate that never armed the wake. SessionManager owns it
+	 * because it is the only thing that can turn a session id back into a live
+	 * session, so the key alone is enough input.
+	 *
+	 * Two vocabularies route here: `agent:` wakes re-enter the agent loop,
+	 * `plugin:` wakes call a plugin method. Anything else is a quiet no-op, and so
+	 * is a key naming a session, agent or plugin that is gone — wakes outlive what
+	 * they point at. Only genuinely unexpected failures (event store IO) throw, so
+	 * a host that retries alarms retries those and only those.
+	 */
+	async dispatchWake(key: string): Promise<void> {
+		const agentWake = parseAgentWakeKey(key)
+		if (agentWake) {
+			await this.withWakeTarget(key, agentWake.sessionId, async (session) => {
+				await session.getAgent(agentWake.agentId)?.deliverWake(agentWake.kind)
+			})
+			return
+		}
+
+		const pluginWake = parsePluginWakeKey(key)
+		if (pluginWake) {
+			await this.withWakeTarget(key, pluginWake.sessionId, async (session) => {
+				const result = await session.callPluginMethod(
+					`${pluginWake.pluginName}.${pluginWake.method}`,
+					pluginWake.agentId === undefined ? {} : { agentId: pluginWake.agentId },
+					pluginWake.agentId,
+					AGENT_CALLER,
+				)
+				// A preset that no longer registers the plugin lands here, same as a
+				// missing agent does: the wake points at something that is gone.
+				if (!result.ok) this.logger.debug('Scheduler wake method rejected', { key, error: result.error.type })
+			})
+			return
+		}
+
+		this.logger.debug('Ignoring unrecognized scheduler wake key', { key })
+	}
+
+	/** Run `deliver` against the session a due wake names, under a runtime lease. */
+	private async withWakeTarget(key: string, sessionId: SessionId, deliver: (session: Session) => Promise<void>): Promise<void> {
+		// Nothing armed before shutdown may load a session back in afterwards.
+		if (this.shuttingDown) return
+		// Nor may a wake that lands mid-teardown rebuild what is being torn down —
+		// getSession() would wait out the unload and reload. onSessionReady re-arms.
+		const resident = this.sessions.get(sessionId)
+		if (resident && (resident.state === 'evicting' || resident.activity.getSnapshot().state !== 'ready')) return
+
+		const sessionResult = await this.getSession(sessionId)
+		if (!sessionResult.ok) {
+			this.logger.debug('Scheduler wake for a session that no longer loads', { key, error: sessionResult.error.type })
+			return
+		}
+		const session = sessionResult.value
+		// A closed session's log is sealed; re-entering it would only fail to write.
+		if (session.state.status === 'closed') return
+
+		// Lease the delivery, not the delay before it — an idle session stays evictable while it waits.
+		const release = session.tryAcquireRuntimeLease(`wake:${key}`)
+		if (!release) return
+		try {
+			await deliver(session)
+		} finally {
+			release()
+		}
 	}
 
 	/**
