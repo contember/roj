@@ -3,7 +3,7 @@ import type { SessionEnvironment } from '~/core/sessions/session-environment.js'
 import type { ToolError } from '~/core/tools/executor.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import type { FileSystem } from '~/platform/fs.js'
-import type { ChildProcess, ProcessRunner } from '~/platform/process.js'
+import type { ShellRunner, ShellRunOptions } from '~/platform/shell.js'
 
 // ============================================================================
 // Constants
@@ -11,12 +11,6 @@ import type { ChildProcess, ProcessRunner } from '~/platform/process.js'
 
 const VIRTUAL_SESSION = '/home/user/session'
 const VIRTUAL_WORKSPACE = '/home/user/workspace'
-
-/** Maximum output size per stream in bytes (1 MB) */
-const MAX_OUTPUT_BYTES = 1_048_576
-
-/** Grace period before SIGKILL after SIGTERM (ms) */
-const GRACEFUL_KILL_DELAY_MS = 5000
 
 // ============================================================================
 // Shell escaping
@@ -154,100 +148,6 @@ export interface ShellConfig {
 }
 
 // ============================================================================
-// Environment
-// ============================================================================
-
-/** Safe environment variables that can be passed to child processes */
-const SAFE_ENV_VARS = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL', 'TZ']
-
-function getSafeEnv(): Record<string, string> {
-	return Object.fromEntries(
-		SAFE_ENV_VARS
-			.filter(key => process.env[key])
-			.map(key => [key, process.env[key]!]),
-	)
-}
-
-// ============================================================================
-// Sandbox
-// ============================================================================
-
-export interface BwrapOptions {
-	command: string
-	cwd: string
-	sandbox: SandboxConfig
-	/** Real session directory to map into sandbox */
-	sessionDir?: string
-	/** Real workspace directory to map into sandbox */
-	workspaceDir?: string
-	/** Extra paths to bind-mount inside sandbox */
-	extraBinds?: ExtraBind[]
-}
-
-export function buildBwrapArgs(opts: BwrapOptions): string[] {
-	const { command, cwd, sandbox, extraBinds } = opts
-	const sessionDir = opts.sessionDir ? resolve(opts.sessionDir) : undefined
-	const workspaceDir = opts.workspaceDir ? resolve(opts.workspaceDir) : undefined
-
-	const args: string[] = [
-		'--ro-bind',
-		'/',
-		'/',
-		'--dev',
-		'/dev',
-		'--proc',
-		'/proc',
-		'--tmpfs',
-		'/tmp',
-	]
-
-	// Hide sensitive directories with tmpfs overlays
-	// (overrides --ro-bind / / for these paths, preventing access to user home dirs and root)
-	args.push('--tmpfs', '/home')
-	args.push('--tmpfs', '/root')
-
-	if (sessionDir) {
-		// Map real session dir to /home/user/session (read-write)
-		args.push('--bind', sessionDir, VIRTUAL_SESSION)
-	}
-
-	if (workspaceDir) {
-		// Map real workspace dir to /home/user/workspace (read-write)
-		args.push('--bind', workspaceDir, VIRTUAL_WORKSPACE)
-	}
-
-	// Extra bind mounts (e.g. git project dir for worktree support, .gitconfig)
-	for (const bind of extraBinds ?? []) {
-		args.push(bind.mode === 'ro' ? '--ro-bind' : '--bind', bind.path, bind.destPath ?? bind.path)
-	}
-
-	// Additional writable paths (legacy support)
-	for (const p of sandbox.writablePaths ?? []) {
-		args.push('--bind', p, p)
-	}
-
-	// If no sessionDir/workspaceDir mapping, fall back to making cwd writable
-	if (!sessionDir && !workspaceDir) {
-		args.push('--bind', cwd, cwd)
-	}
-
-	args.push('--unshare-all')
-
-	if (sandbox.network) {
-		args.push('--share-net')
-	}
-
-	args.push('--die-with-parent')
-
-	// Set working directory inside the namespace
-	args.push('--chdir', cwd)
-
-	args.push('/bin/sh', '-c', command)
-
-	return args
-}
-
-// ============================================================================
 // Shell Executor
 // ============================================================================
 
@@ -270,16 +170,24 @@ export interface ShellResult {
 
 export interface ShellExecutorDeps {
 	fs: FileSystem
-	process: ProcessRunner
+	/** Absent on a host with no shell at all — every command then fails with a clear error. */
+	shell?: ShellRunner
+}
+
+/** What the command may reach, named as the command sees it. */
+interface PathGrants {
+	writablePaths: string[]
+	readablePaths: string[]
+	pathSources: Record<string, string>
 }
 
 export class ShellExecutor {
 	private readonly fs: FileSystem
-	private readonly process: ProcessRunner
+	private readonly shell?: ShellRunner
 
 	constructor(private config: ShellConfig, deps: ShellExecutorDeps) {
 		this.fs = deps.fs
-		this.process = deps.process
+		this.shell = deps.shell
 	}
 
 	async execute(
@@ -301,15 +209,27 @@ export class ShellExecutor {
 		// Determine sandbox mode from config
 		const sandboxEnabled = this.config.sandboxed && this.config.sandbox?.enabled !== false
 
-		// Resolve cwd based on sandbox mode:
-		// - bwrap enabled: use virtual path (bwrap handles mapping)
-		// - sandboxed but no bwrap: agent sends virtual paths, resolve to real paths
-		// - not sandboxed: agent sends real paths, use as-is
+		const shell = this.shell
+		if (!shell) {
+			return Err({
+				message: 'This host cannot run shell commands: it has no shell.',
+				recoverable: false,
+			})
+		}
+		if (sandboxEnabled && shell.confinement === 'none') {
+			return Err({
+				message: 'This session runs commands sandboxed, but the host shell cannot confine them.',
+				recoverable: false,
+			})
+		}
+		// A `host` shell needs no grants: its filesystem holds nothing but this session.
+		const confineByPaths = sandboxEnabled && shell.confinement === 'paths'
+
+		// A sandboxed agent sends virtual paths: the shell presents them, or we resolve them here.
 		let cwd: string
 		if (sandboxEnabled) {
 			cwd = input.cwd ?? VIRTUAL_SESSION
 		} else if (this.config.sandboxed && input.cwd) {
-			// Sandboxed env but bwrap disabled — resolve virtual paths to real paths
 			const cwdResult = await resolveAgentPath(this.fs, input.cwd, sessionDir, workspaceDir, this.config.sandboxed)
 			if (!cwdResult.ok) return cwdResult
 			cwd = cwdResult.value
@@ -333,203 +253,75 @@ export class ShellExecutor {
 			}
 		}
 
-		return new Promise<Result<ShellResult, ToolError>>((resolve) => {
-			let stdout = ''
-			let stderr = ''
-			let timedOut = false
-			let processClosed = false
-			let processError: Error | undefined
-			let exitCode: number | null = null
-			let exitSignal: NodeJS.Signals | null = null
-			let stdinSettled = input.stdin === undefined
-			let stdinError: Error | undefined
-			let settled = false
+		const runOptions: ShellRunOptions = {
+			command: fullCommand,
+			cwd,
+			env: this.config.env,
+			stdin: input.stdin,
+			timeoutMs: timeout,
+			shell: this.config.shell,
+		}
+		if (confineByPaths) {
+			const grants = this.grantedPaths(cwd, sessionDir, workspaceDir)
+			runOptions.writablePaths = grants.writablePaths
+			runOptions.readablePaths = grants.readablePaths
+			runOptions.pathSources = grants.pathSources
+			runOptions.network = this.config.sandbox?.network
+		}
 
-			let child: ChildProcess
-			if (sandboxEnabled) {
-				// Apply resource limits inside the sandbox
-				const timeoutSeconds = Math.ceil(timeout / 1000)
-				const sandboxCommand = `ulimit -v 524288 -f 204800 -u 64 -t ${timeoutSeconds} 2>/dev/null; ${fullCommand}`
-				const bwrapArgs = buildBwrapArgs({
-					command: sandboxCommand,
-					cwd,
-					sandbox: this.config.sandbox ?? { enabled: true },
-					sessionDir,
-					workspaceDir,
-					extraBinds: this.config.extraBinds,
-				})
-				child = this.process.spawn('bwrap', bwrapArgs, {
-					cwd: sessionDir ?? this.config.cwd,
-					env: { ...getSafeEnv(), ...this.config.env },
-					detached: true,
-				})
-			} else {
-				const shell = this.config.shell ?? (process.platform === 'win32' ? 'cmd.exe' : '/bin/sh')
-				const shellFlag = process.platform === 'win32' ? '/c' : '-c'
-
-				child = this.process.spawn(shell, [shellFlag, fullCommand], {
-					cwd,
-					env: { ...getSafeEnv(), ...this.config.env },
-					detached: true,
-				})
-			}
-
-			// Collect stdout with size cap
-			let stdoutBytes = 0
-			let stdoutTruncated = false
-			child.stdout?.on('data', (data: Buffer) => {
-				if (stdoutTruncated) return
-				const remaining = MAX_OUTPUT_BYTES - stdoutBytes
-				if (data.length > remaining) {
-					stdout += data.toString('utf-8', 0, remaining)
-					stdoutBytes = MAX_OUTPUT_BYTES
-					stdoutTruncated = true
-					stdout += '\n[stdout truncated at 1 MB]'
-				} else {
-					stdout += data.toString()
-					stdoutBytes += data.length
-				}
+		try {
+			const result = await shell.run(runOptions)
+			return Ok({
+				stdout: result.stdout,
+				stderr: result.stderr,
+				exitCode: result.exitCode,
+				signal: result.signal,
+				timedOut: result.timedOut,
+				durationMs: Date.now() - startTime,
 			})
-
-			// Collect stderr with size cap
-			let stderrBytes = 0
-			let stderrTruncated = false
-			child.stderr?.on('data', (data: Buffer) => {
-				if (stderrTruncated) return
-				const remaining = MAX_OUTPUT_BYTES - stderrBytes
-				if (data.length > remaining) {
-					stderr += data.toString('utf-8', 0, remaining)
-					stderrBytes = MAX_OUTPUT_BYTES
-					stderrTruncated = true
-					stderr += '\n[stderr truncated at 1 MB]'
-				} else {
-					stderr += data.toString()
-					stderrBytes += data.length
-				}
+		} catch (error) {
+			const durationMs = Date.now() - startTime
+			const message = error instanceof Error ? error.message : String(error)
+			return Err({
+				message,
+				recoverable: false,
+				details: error instanceof Error && 'details' in error ? error.details : { durationMs },
 			})
+		}
+	}
 
-			// Timeout handler — SIGTERM first, then SIGKILL after grace period
-			let killTimeoutId: ReturnType<typeof setTimeout> | undefined
-			const clearTimers = () => {
-				clearTimeout(timeoutId)
-				if (killTimeoutId) clearTimeout(killTimeoutId)
-			}
-			const finishExecution = () => {
-				if (settled) return
-				if (!processClosed) return
+	/** Session and workspace keep their agent-visible names; everything else stays where it is. */
+	private grantedPaths(cwd: string, sessionDir: string, workspaceDir: string | undefined): PathGrants {
+		const writablePaths: string[] = []
+		const readablePaths: string[] = []
+		const pathSources: Record<string, string> = {}
 
-				const durationMs = Date.now() - startTime
-				if (processError) {
-					settled = true
-					clearTimers()
-					resolve(Err({
-						message: `Failed to execute command: ${processError.message}`,
-						recoverable: false,
-						details: { durationMs },
-					}))
-					return
-				}
+		if (sessionDir) {
+			writablePaths.push(VIRTUAL_SESSION)
+			pathSources[VIRTUAL_SESSION] = sessionDir
+		}
+		if (workspaceDir) {
+			writablePaths.push(VIRTUAL_WORKSPACE)
+			pathSources[VIRTUAL_WORKSPACE] = workspaceDir
+		}
 
-				if (!stdinSettled) return
+		// Extra binds (e.g. git project dir for worktree support, .gitconfig)
+		for (const bind of this.config.extraBinds ?? []) {
+			const destPath = bind.destPath ?? bind.path
+			if (bind.mode === 'ro') readablePaths.push(destPath)
+			else writablePaths.push(destPath)
+			if (destPath !== bind.path) pathSources[destPath] = bind.path
+		}
 
-				settled = true
-				clearTimers()
-				if (stdinError) {
-					resolve(Err({
-						message: `Failed to deliver command stdin: ${stdinError.message}`,
-						recoverable: false,
-						details: {
-							stdout: stdout.trim(),
-							stderr: stderr.trim(),
-							durationMs,
-							exitCode: exitCode ?? -1,
-							signal: exitSignal ?? undefined,
-							timedOut,
-						},
-					}))
-					return
-				}
+		// Additional writable paths (legacy support)
+		for (const path of this.config.sandbox?.writablePaths ?? []) {
+			writablePaths.push(path)
+		}
 
-				resolve(Ok({
-					stdout: stdout.trim(),
-					stderr: stderr.trim(),
-					exitCode: exitCode ?? -1,
-					signal: exitSignal ?? undefined,
-					timedOut,
-					durationMs,
-				}))
-			}
-			const timeoutId = setTimeout(() => {
-				timedOut = true
-				try {
-					process.kill(-child.pid!, 'SIGTERM')
-				} catch {
-					child.kill('SIGTERM')
-				}
-				killTimeoutId = setTimeout(() => {
-					try {
-						process.kill(-child.pid!, 'SIGKILL')
-					} catch {
-						try {
-							child.kill('SIGKILL')
-						} catch { /* already dead */ }
-					}
-				}, GRACEFUL_KILL_DELAY_MS)
-			}, timeout)
+		if (!sessionDir && !workspaceDir) {
+			writablePaths.push(cwd)
+		}
 
-			// Process exit
-			child.on('close', (code, signal) => {
-				processClosed = true
-				exitCode = code
-				exitSignal = signal
-				if (input.stdin !== undefined && !stdinSettled) {
-					if (child.stdin?.writableFinished) {
-						stdinSettled = true
-					} else {
-						stdinError = new Error('child process closed before accepting all stdin input')
-						stdinSettled = true
-					}
-				}
-				finishExecution()
-			})
-
-			// Process error
-			child.on('error', (error) => {
-				processError = error
-				finishExecution()
-			})
-
-			// A failed stdin write must not be hidden by a successful process exit.
-			if (input.stdin !== undefined) {
-				if (!child.stdin) {
-					stdinError = new Error('child process stdin is unavailable')
-					stdinSettled = true
-				} else {
-					child.stdin.once('finish', () => {
-						if (stdinSettled) return
-						stdinSettled = true
-						finishExecution()
-					})
-					child.stdin.on('error', (error) => {
-						if (stdinSettled) return
-						stdinError = error
-						stdinSettled = true
-						finishExecution()
-					})
-					child.stdin.once('close', () => {
-						if (stdinSettled) return
-						stdinError = new Error('child process stdin closed before accepting all input')
-						stdinSettled = true
-						finishExecution()
-					})
-					child.stdin.end(input.stdin)
-				}
-			} else {
-				// Keep late pipe errors contained when no input delivery was requested.
-				child.stdin?.on('error', () => {})
-				child.stdin?.end()
-			}
-			finishExecution()
-		})
+		return { writablePaths, readablePaths, pathSources }
 	}
 }

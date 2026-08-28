@@ -26,6 +26,16 @@ export interface ShellRunOptions {
 	writablePaths?: readonly string[]
 	/** Paths the command may read but not write. Meaningful only under `paths`. */
 	readablePaths?: readonly string[]
+	/**
+	 * Host source of a granted path, keyed by the path above. A runner that has
+	 * to mount the confinement needs it; a host whose own paths are already the
+	 * ones the command sees has nothing to map.
+	 */
+	pathSources?: Readonly<Record<string, string>>
+	/** Whether a confined command may reach the network. Default: false. */
+	network?: boolean
+	/** Interpreter for `command`. A host with a single interpreter ignores it. */
+	shell?: string
 }
 
 export interface ShellRunResult {

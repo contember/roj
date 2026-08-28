@@ -76,7 +76,7 @@ export const shellPlugin = definePlugin('shell')
 			extraBinds: pluginConfig.extraBinds,
 			sandbox: pluginConfig.sandbox,
 		}
-		const executor = new ShellExecutor(shellConfig, { fs: ctx.platform.fs, process: ctx.platform.process })
+		const executor = new ShellExecutor(shellConfig, { fs: ctx.platform.fs, shell: ctx.platform.shell })
 		return { executor }
 	})
 	.agentConfig<ShellAgentConfig>()

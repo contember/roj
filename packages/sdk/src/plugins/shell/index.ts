@@ -12,8 +12,6 @@ export {
 } from './plugin.js'
 
 export {
-	buildBwrapArgs,
-	type BwrapOptions,
 	type ExtraBind,
 	type RunCommandInput,
 	type SandboxConfig,

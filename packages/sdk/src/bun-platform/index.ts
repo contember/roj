@@ -10,17 +10,20 @@ import { createTimerScheduler } from '../platform/index.js'
 import type { Platform } from '../platform/index.js'
 import { createBunFileSystem } from './fs.js'
 import { createBunProcessRunner } from './process.js'
+import { createBunShellRunner } from './shell.js'
 
 export function createBunPlatform(): Platform {
 	return {
 		fs: createBunFileSystem(),
 		process: createBunProcessRunner(),
 		scheduler: createTimerScheduler(),
+		shell: createBunShellRunner(),
 		tmpDir: tmpdir(),
 	}
 }
 
-export { createBunFileSystem, createBunProcessRunner }
+export { createBunFileSystem, createBunProcessRunner, createBunShellRunner }
+export { buildBwrapArgs, type BwrapOptions } from './shell.js'
 export {
 	createServerLifecycle,
 	runServerStartup,
