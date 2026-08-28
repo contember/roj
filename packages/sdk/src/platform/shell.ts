@@ -4,6 +4,20 @@
  * The shell tool assembles and validates a command line; running it is the
  * host's business. A host with a process table spawns `/bin/sh`; one without
  * answers from an in-process interpreter over its own filesystem.
+ *
+ * Resource limits are the host's business too, and two `ulimit` values are traps.
+ * `ulimit -v` sets RLIMIT_AS, which bounds mapped address space rather than memory
+ * in use: a measured toolchain build maps about 131 GB while touching about 418 MB,
+ * so every value low enough to work as a memory guard is far below what the process
+ * must map, and the build dies. `ulimit -t` sets RLIMIT_CPU, which sums CPU seconds
+ * across threads and starts fresh in each child, so a limit derived from a wall-clock
+ * timeout kills a parallel build after timeout/threads of wall time while bounding
+ * nothing in total — bound wall time in the host, where the answer can say it timed
+ * out, and leave RLIMIT_CPU alone.
+ *
+ * A limit is only worth setting once the host has watched a real build run under it,
+ * and only a check that reads the limits the command actually got — `/proc/self/limits`
+ * on Linux — can tell that from a limit that was merely written down.
  */
 
 /**
