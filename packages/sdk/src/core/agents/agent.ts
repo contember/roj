@@ -9,7 +9,7 @@
 
 import z from 'zod/v4'
 import { DebounceCallback } from '~/core/agents/debounce.js'
-import type { AgentId } from '~/core/agents/schema.js'
+import { AgentId } from '~/core/agents/schema.js'
 import type { AgentState, HandlerResult, ReasoningDetails, ThinkingBlocks } from '~/core/agents/state.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
@@ -43,12 +43,14 @@ import type { ToolDefinition } from '~/core/tools/definition.js'
 import type { ToolCall } from '~/core/tools/schema.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { toolEvents } from '~/core/tools/state.js'
+import type { Scheduler } from '~/platform/scheduler.js'
 import { getAgentUnconsumedMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
 import { AGENT_BASE_BRIEFING } from '~/prompts/base.js'
 import { buildEnvironmentSection } from '~/prompts/builder.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import type { Logger } from '../../lib/logger/logger.js'
 import type { SessionContext } from '../sessions/context.js'
+import { isValidSessionId, SessionId } from '../sessions/schema.js'
 import type { SessionStore } from '../sessions/session-store.js'
 import type { SessionState } from '../sessions/state.js'
 import { resolveAgentOverrides } from '../sessions/state.js'
@@ -126,6 +128,39 @@ export interface AgentDependencies {
 }
 
 // ============================================================================
+// Wake keys
+// ============================================================================
+
+/** Which delayed re-entry a wake stands for. */
+export type AgentWakeKind = 'debounce' | 'retry'
+
+export interface AgentWake {
+	sessionId: SessionId
+	agentId: AgentId
+	kind: AgentWakeKind
+}
+
+/**
+ * Routing key for an agent wake: `agent:<sessionId>:<agentId>:<kind>`.
+ *
+ * A wake must be dispatchable after the process that armed it is gone, so it
+ * carries no closure — the key is the whole routing table.
+ */
+export function agentWakeKey(sessionId: SessionId, agentId: AgentId, kind: AgentWakeKind): string {
+	return `agent:${sessionId}:${agentId}:${kind}`
+}
+
+/** Read a key back, or null when it is not one this module minted. */
+export function parseAgentWakeKey(key: string): AgentWake | null {
+	const parts = key.split(':')
+	if (parts.length !== 4 || parts[0] !== 'agent') return null
+	const [, sessionId, agentId, kind] = parts
+	if (kind !== 'debounce' && kind !== 'retry') return null
+	if (agentId === '' || !isValidSessionId(sessionId)) return null
+	return { sessionId: SessionId(sessionId), agentId: AgentId(agentId), kind }
+}
+
+// ============================================================================
 // Agent
 // ============================================================================
 
@@ -159,10 +194,13 @@ export class Agent {
 	private tools: Map<string, ToolDefinition>
 
 	// Scheduler state (embedded)
-	private debounceTimer?: ReturnType<typeof setTimeout>
-	private errorRetryTimer?: ReturnType<typeof setTimeout>
+	/** Poll timer for the debounceCallback path only — see scheduleProcessing(). */
+	private debounceCheckTimer?: ReturnType<typeof setTimeout>
+	/** Whether a retry wake is armed. In-memory: a fresh process re-arms from replayed state. */
+	private errorRetryArmed = false
 	private releaseScheduledLease?: () => void
-	private releaseErrorRetryLease?: () => void
+	/** Host scheduler, resolved once — the platform never changes for a session. */
+	private scheduler?: Scheduler
 	private processing = false
 	private scheduled = false
 	private pendingReschedule = false
@@ -391,11 +429,12 @@ export class Agent {
 		}
 
 		if (this.config.debounceCallback) {
-			// Callback-based debounce using recursive setTimeout
+			// Stays a plain timer: the poll re-enters with a closure and its own
+			// in-memory `scheduled` guard, neither of which a resumed wake can carry.
 			const checkInterval = this.config.checkIntervalMs ?? 100
 
 			const scheduleCheck = () => {
-				this.debounceTimer = setTimeout(() => {
+				this.debounceCheckTimer = setTimeout(() => {
 					// A throw here (hasPluginPendingMessages, or the preset-supplied
 					// debounceCallback — user code) must not strand the scheduled lease.
 					void this.runDebounceCheck(scheduleCheck)
@@ -404,15 +443,29 @@ export class Agent {
 
 			scheduleCheck()
 		} else {
-			// Timer-based debounce (default: 500ms)
-			const debounceMs = this.config.debounceMs ?? 500
-			this.debounceTimer = setTimeout(() => {
+			// Debounce by wake (default: 500ms) — nothing but the key is needed to resume.
+			this.armWake('debounce', this.config.debounceMs ?? 500)
+		}
+	}
+
+	/**
+	 * Run the continuation a due wake stands for — the one entry point for a host,
+	 * whether this process armed the delay or an alarm held it across an eviction.
+	 */
+	async deliverWake(kind: AgentWakeKind): Promise<void> {
+		if (this.abortController.signal.aborted) return
+
+		switch (kind) {
+			case 'debounce':
+				// Not scheduleProcessing(): that arms a fresh delay and the turn never runs.
 				this.scheduled = false
-				this.debounceTimer = undefined
-				this.continue().catch((err) => {
-					this.logger.error('Unhandled error in continue()', err instanceof Error ? err : undefined, { agentId: this.id })
-				})
-			}, debounceMs)
+				await this.continue()
+				return
+
+			case 'retry':
+				this.errorRetryArmed = false
+				this.scheduleProcessing()
+				return
 		}
 	}
 
@@ -479,12 +532,8 @@ export class Agent {
 			// AbortError may be thrown synchronously by abort signal listeners
 		}
 		this.cancelSchedule()
-		if (this.errorRetryTimer) {
-			clearTimeout(this.errorRetryTimer)
-			this.errorRetryTimer = undefined
-		}
-		this.releaseErrorRetryLease?.()
-		this.releaseErrorRetryLease = undefined
+		this.errorRetryArmed = false
+		this.cancelWake('retry')
 	}
 
 	/**
@@ -610,33 +659,16 @@ export class Agent {
 	 * remaining backoff and re-arms if it hasn't elapsed yet.
 	 */
 	private scheduleErrorRetry(delayMs: number): void {
-		if (this.errorRetryTimer) return
+		if (this.errorRetryArmed) return
 		if (this.store.isClosed()) return
-		// After shutdown() an armed retry keeps this Agent — and through
-		// getSessionContext the whole Session — reachable for the whole backoff.
+		// Nothing cancels a wake armed after shutdown(), and delivering it would
+		// reload a session this host has already torn down.
 		if (this.abortController.signal.aborted) return
-		this.errorRetryTimer = setTimeout(() => {
-			this.errorRetryTimer = undefined
-			// Lease the retry, not the backoff before it: a provider that keeps
-			// failing would otherwise pin the runtime resident forever. The
-			// preserved dequeue token is in the event log, so a rebuilt runtime
-			// still has the work. scheduleProcessing() takes its own lease before
-			// this one drops, so the handover leaves no gap.
-			let release: (() => void) | null = null
-			try {
-				release = this.getSessionContext().runtimeActivity.tryAcquire(`agent:${this.id}:retry`)
-			} catch {
-				return
-			}
-			if (!release) return
-			this.releaseErrorRetryLease = release
-			try {
-				this.scheduleProcessing()
-			} finally {
-				this.releaseErrorRetryLease?.()
-				this.releaseErrorRetryLease = undefined
-			}
-		}, delayMs)
+		this.errorRetryArmed = true
+		// The backoff itself is unleased: a provider that keeps failing would
+		// otherwise pin the runtime resident forever, and the preserved dequeue
+		// token is in the event log, so a rebuilt runtime still has the work.
+		this.armWake('retry', delayMs)
 	}
 
 	private static readonly MAX_INFERENCE_RETRIES = 3
@@ -995,14 +1027,42 @@ export class Agent {
 	 * Cancel any scheduled processing.
 	 */
 	private cancelSchedule(): void {
-		if (this.debounceTimer) {
-			clearTimeout(this.debounceTimer)
-			this.debounceTimer = undefined
+		if (this.debounceCheckTimer) {
+			clearTimeout(this.debounceCheckTimer)
+			this.debounceCheckTimer = undefined
 		}
+		this.cancelWake('debounce')
 		this.scheduled = false
 		this.pendingReschedule = false
 		this.releaseScheduledLease?.()
 		this.releaseScheduledLease = undefined
+	}
+
+	/** The host scheduler, or null once the runtime is gone — a disposed session builds no context. */
+	private tryGetScheduler(): Scheduler | null {
+		if (this.scheduler) return this.scheduler
+		try {
+			this.scheduler = this.getSessionContext().platform.scheduler
+			return this.scheduler
+		} catch {
+			return null
+		}
+	}
+
+	/**
+	 * Arm a wake without awaiting the host: scheduleProcessing() and shutdown() are
+	 * synchronous, while a host may persist the wake asynchronously.
+	 */
+	private armWake(kind: AgentWakeKind, delayMs: number): void {
+		this.tryGetScheduler()?.wake(agentWakeKey(this.store.sessionId, this.id, kind), delayMs).catch((err: unknown) => {
+			this.logger.error('Failed to arm scheduler wake', err instanceof Error ? err : undefined, { agentId: this.id, kind })
+		})
+	}
+
+	private cancelWake(kind: AgentWakeKind): void {
+		this.tryGetScheduler()?.cancel(agentWakeKey(this.store.sessionId, this.id, kind)).catch((err: unknown) => {
+			this.logger.error('Failed to cancel scheduler wake', err instanceof Error ? err : undefined, { agentId: this.id, kind })
+		})
 	}
 
 	/**
