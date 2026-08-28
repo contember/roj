@@ -5,6 +5,7 @@
  * since it performs dynamic imports that require a runtime context.
  */
 
+import type { SessionPluginConfig } from '~/core/plugins/plugin-builder.js'
 import type { Preset } from '~/core/preset/index.js'
 import type { ExtraBind } from '~/plugins/shell/plugin.js'
 
@@ -14,11 +15,11 @@ import type { ExtraBind } from '~/plugins/shell/plugin.js'
 export interface RojConfig {
 	/** Base directory for sessions (default: cwd) */
 	sessionsDir?: string
-	/** Whether sandbox (bwrap) is active (default: true) */
+	/** Sandbox (bwrap) posture for presets that do not set their own `sandboxed` (default: false) */
 	sandboxed?: boolean
 	/** Enable snapshotter for tracking file changes (e.g. 'jj' for Jujutsu VCS) */
 	snapshotter?: 'jj'
-	/** Extra paths to bind-mount inside bwrap sandbox */
+	/** Extra paths to bind-mount inside the bwrap sandbox, for presets whose shell plugin declares none */
 	extraBinds?: ExtraBind[]
 	/** Presets available in this configuration */
 	presets: Preset[]
@@ -64,4 +65,41 @@ export interface LocalResource {
  */
 export function defineConfig(config: RojConfig): RojConfig {
 	return config
+}
+
+const SHELL_PLUGIN_NAME = 'shell'
+
+/**
+ * Fold the top-level sandbox settings into every preset, so a `RojConfig` that
+ * declares them actually takes effect. A preset that sets its own value keeps it.
+ */
+export function applySandboxSettings(config: RojConfig): Preset[] {
+	return config.presets.map(preset => ({
+		...preset,
+		sandboxed: preset.sandboxed ?? config.sandboxed ?? false,
+		plugins: config.extraBinds?.length ? withExtraBinds(preset.plugins, config.extraBinds) : preset.plugins,
+	}))
+}
+
+/** One-line summary of the resolved sandbox posture, for startup logging. */
+export function describeSandboxPosture(presets: Preset[]): string {
+	const on = presets.filter(p => p.sandboxed).map(p => p.id)
+	const off = presets.filter(p => !p.sandboxed).map(p => p.id)
+	if (on.length === 0) return 'off'
+	if (off.length === 0) return 'on'
+	return `on for ${on.join(', ')}; off for ${off.join(', ')}`
+}
+
+// The shell plugin is the only consumer of extraBinds — a preset without it has nothing to bind into.
+function withExtraBinds(
+	plugins: SessionPluginConfig[] | undefined,
+	extraBinds: ExtraBind[],
+): SessionPluginConfig[] | undefined {
+	return plugins?.map(entry => {
+		if (entry.pluginName !== SHELL_PLUGIN_NAME) return entry
+		const current = entry.config
+		if (typeof current !== 'object' || current === null) return entry
+		if ('extraBinds' in current && current.extraBinds !== undefined) return entry
+		return { ...entry, config: { ...current, extraBinds } }
+	})
 }
