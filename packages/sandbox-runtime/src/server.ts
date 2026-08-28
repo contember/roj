@@ -5,7 +5,7 @@
  * HTTP app, Bun.serve, session loading, and shutdown.
  */
 
-import type { Config, LLMMiddleware, Logger, Preset, SessionId } from '@roj-ai/sdk'
+import type { Config, LLMMiddleware, Logger, SessionDefaults, SessionId } from '@roj-ai/sdk'
 import { bootstrap, createSystemFromServices, loadConfig, validateConfig } from '@roj-ai/sdk'
 import { type AppEnv, createApp } from '@roj-ai/sdk/transport/http/app'
 import { createAgentTransport, type IAgentTransport, ServerAdapter } from '@roj-ai/sdk/transport/adapter'
@@ -18,8 +18,7 @@ import { SANDBOX_RUNTIME_NAME, SANDBOX_RUNTIME_VERSION } from './info.js'
 // Public types
 // ============================================================================
 
-export interface StartServerOptions {
-	presets: Preset[]
+export interface StartServerOptions extends SessionDefaults {
 	config?: Partial<Config>
 	/** Global LLM middleware applied to all presets (prepended before preset-level middleware) */
 	llmMiddleware?: LLMMiddleware[]
@@ -56,7 +55,8 @@ export async function startServer(options: StartServerOptions): Promise<ServerHa
 		}))
 		: options.presets
 
-	const services = bootstrap(config, { presets }, createBunPlatform())
+	// Forwarded whole: bootstrap folds the SessionDefaults, so nothing is dropped here.
+	const services = bootstrap(config, { ...options, presets }, createBunPlatform())
 	const { logger } = services
 
 	// Reap service processes left behind by a previous agent, before any session can load
