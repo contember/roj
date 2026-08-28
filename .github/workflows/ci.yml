@@ -35,6 +35,7 @@ jobs:
         run: |
           bunx tsc -p packages/sdk/tsconfig.test.json --noEmit
           bunx tsc -p packages/standalone-server/tsconfig.test.json --noEmit
+          bunx tsc -p packages/platform-cli/tsconfig.test.json --noEmit
 
       - name: Run tests
         run: bun run test

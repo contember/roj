@@ -7,6 +7,23 @@ interface BundleMetadata {
 	lockMinor?: boolean
 }
 
+/**
+ * Entry module the bundle is built from. The self-contained one hands the whole
+ * config to `startServer` — passing `presets` alone would drop everything else
+ * the user declared.
+ */
+export function entrySource(absConfigPath: string, isExternal: boolean): string {
+	if (isExternal) return `import config from '${absConfigPath}'\nexport default config\n`
+	return `
+import config from '${absConfigPath}'
+import { startServer } from '@roj-ai/sandbox-runtime/server'
+startServer(config).catch((err) => {
+	console.error('Fatal:', err)
+	process.exit(1)
+})
+`
+}
+
 export async function build(configPath: string, outPath: string): Promise<void> {
 	const absConfig = resolve(configPath)
 	const absOut = resolve(outPath)
@@ -18,18 +35,7 @@ export async function build(configPath: string, outPath: string): Promise<void> 
 	const lockMinor = userConfig?.runtime?.lockMinor ?? true
 
 	const entryPath = join(configDir, '.roj-entry.ts')
-	const entrySource = isExternal
-		? `import config from '${absConfig}'\nexport default config\n`
-		: `
-import config from '${absConfig}'
-import { startServer } from '@roj-ai/sandbox-runtime/server'
-startServer({ presets: config.presets }).catch((err) => {
-	console.error('Fatal:', err)
-	process.exit(1)
-})
-`
-
-	await writeFile(entryPath, entrySource)
+	await writeFile(entryPath, entrySource(absConfig, isExternal))
 
 	try {
 		await mkdir(dirname(absOut), { recursive: true })

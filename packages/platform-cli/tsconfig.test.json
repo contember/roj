@@ -1,0 +1,13 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"composite": false,
+		"noEmit": true
+	},
+	"include": ["src/**/*"],
+	"exclude": ["node_modules", "dist"],
+	"references": [
+		{ "path": "../client" },
+		{ "path": "../sandbox-runtime" }
+	]
+}
