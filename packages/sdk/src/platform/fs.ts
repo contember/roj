@@ -95,8 +95,13 @@ export interface FileSystem {
 export interface WalkEntry {
 	/** Absolute path. */
 	path: string
-	type: 'file' | 'directory' | 'symlink'
-	/** Bytes for a file, 0 for a directory. */
+	/**
+	 * `other` covers what a walk can find but not classify — a FIFO, a socket.
+	 * A symlink is reported as one whether or not its target resolves, so a
+	 * broken link is still listed rather than silently dropped.
+	 */
+	type: 'file' | 'directory' | 'symlink' | 'other'
+	/** Bytes for a file, 0 for anything else. */
 	size: number
 	mtime: number
 }
