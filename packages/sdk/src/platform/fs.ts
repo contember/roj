@@ -101,7 +101,11 @@ export interface WalkEntry {
 	 * broken link is still listed rather than silently dropped.
 	 */
 	type: 'file' | 'directory' | 'symlink' | 'other'
-	/** Bytes for a file, 0 for anything else. */
+	/**
+	 * Bytes as `stat` reports them, so a symlink carries its target's size: the
+	 * loop this verb replaces follows the link, and a walk that did not would
+	 * disagree with it. 0 for a directory, and for a link whose target is gone.
+	 */
 	size: number
 	mtime: number
 }
