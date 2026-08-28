@@ -8,6 +8,11 @@
  * - Single: { method, input } → { ok: true, value } | { ok: false, error }
  * - Batch:  { batch: [{ method, input }, ...] } → { results: [{ ok: true, value } | { ok: false, error }, ...] }
  *
+ * A batch is all-settled: every item runs and gets its own envelope, so `results`
+ * always has the length of `batch`. A shorter array would leave the caller unable
+ * to tell a completed batch from a truncated one — and because running every item
+ * makes the batch length the work one request buys, the length is capped.
+ *
  * Routing order:
  * 1. Manager methods (session creation, listing, etc.)
  * 2. Session plugin methods (require sessionId in input)
@@ -94,6 +99,9 @@ async function dispatchMethod(
 	return { httpStatus: 400, body: { ok: false, error: { type: 'method_not_found', message: `Unknown method: ${method}` } } }
 }
 
+/** Every item runs, so one request buys this much dispatch and no more. */
+const MAX_BATCH_ITEMS = 100
+
 interface BatchRequest {
 	batch: unknown[]
 }
@@ -137,29 +145,29 @@ export function createRpcRoutes(): Hono<AppEnv> {
 		// `{results}` with no top-level `error`, so a non-2xx here reads as a transport
 		// failure and hides the per-item error the client would otherwise surface.
 		if (isBatchRequest(body)) {
+			if (body.batch.length > MAX_BATCH_ITEMS) {
+				return c.json(
+					{ ok: false, error: { type: 'batch_too_large', message: `Batch holds more than ${MAX_BATCH_ITEMS} calls` } },
+					400,
+				)
+			}
+
 			const results: MethodResult[] = []
 
 			for (const call of body.batch) {
 				if (!isBatchCall(call)) {
 					results.push({ ok: false, error: { type: 'missing_method', message: "Missing 'method' field in batch call" } })
-					break
+					continue
 				}
 
-				let resultBody: MethodResult
 				try {
-					resultBody = (await dispatchMethod(sessionRuntime, call.method, call.input)).body
+					results.push((await dispatchMethod(sessionRuntime, call.method, call.input)).body)
 				} catch (error) {
-					// Earlier items are already committed to the event log — dropping their
-					// envelopes would leave the client unable to tell what to retry.
 					logger.error('Batch RPC call failed', error instanceof Error ? error : new Error(String(error)), {
 						method: call.method,
 					})
 					results.push({ ok: false, error: { type: 'internal_error', message: 'Internal server error' } })
-					break
 				}
-
-				results.push(resultBody)
-				if (!resultBody.ok) break
 			}
 
 			return c.json({ results })
