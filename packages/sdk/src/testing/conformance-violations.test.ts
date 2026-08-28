@@ -351,6 +351,15 @@ const violations: Violation[] = [
 		}),
 	},
 	{
+		name: 'lstat follows the link, as stat does',
+		ports: ['fs', 'fs.symlinks'],
+		caughtBy: 'lstat reports the link itself, and answers for one whose target is gone',
+		break: (platform) => ({
+			...platform,
+			fs: { ...platform.fs, lstat: (path) => platform.fs.stat(path) },
+		}),
+	},
+	{
 		name: 'readFiles throws on a missing path instead of reporting it',
 		ports: ['fs.readFiles'],
 		caughtBy: 'reports a missing path per entry instead of throwing',
