@@ -9,6 +9,7 @@
 import type { IServerWebSocket, ProtocolDef } from '@roj-ai/transport'
 import { ConnectionManager, ServerConnection } from '@roj-ai/transport/server'
 import type { Logger } from '../../lib/logger/logger.js'
+import { encodeAck, isProbeFrame } from './heartbeat.js'
 import type { IAgentTransport, PluginNotification } from './types.js'
 
 export interface ServerAdapterConfig {
@@ -79,6 +80,11 @@ export class ServerAdapter implements IAgentTransport {
 	}
 
 	handleMessage(ws: IServerWebSocket, message: string): void {
+		// Answered here, not in the router: the probe carries no session and has no handler.
+		if (isProbeFrame(message)) {
+			ws.send(encodeAck())
+			return
+		}
 		// Forward message to the connection's onmessage handler
 		ws.onmessage?.(message)
 	}
