@@ -279,6 +279,7 @@ export const coreReducer = createTypedReducer(
 						lastInferenceMetrics: event.metrics,
 						consecutiveInferenceFailures: 0,
 						lastInferenceFailureAt: undefined,
+						turnNumber: (agent.turnNumber ?? 0) + 1,
 					}
 				})
 			}
