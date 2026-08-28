@@ -3,7 +3,7 @@ import type { SessionEnvironment } from '~/core/sessions/session-environment.js'
 import type { ToolError } from '~/core/tools/executor.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import type { FileSystem } from '~/platform/fs.js'
-import type { ShellRunner, ShellRunOptions } from '~/platform/shell.js'
+import type { ShellGrant, ShellRunner, ShellRunOptions } from '~/platform/shell.js'
 
 // ============================================================================
 // Constants
@@ -174,13 +174,6 @@ export interface ShellExecutorDeps {
 	shell?: ShellRunner
 }
 
-/** What the command may reach, named as the command sees it. */
-interface PathGrants {
-	writablePaths: string[]
-	readablePaths: string[]
-	pathSources: Record<string, string>
-}
-
 export class ShellExecutor {
 	private readonly fs: FileSystem
 	private readonly shell?: ShellRunner
@@ -262,10 +255,7 @@ export class ShellExecutor {
 			shell: this.config.shell,
 		}
 		if (confineByPaths) {
-			const grants = this.grantedPaths(cwd, sessionDir, workspaceDir)
-			runOptions.writablePaths = grants.writablePaths
-			runOptions.readablePaths = grants.readablePaths
-			runOptions.pathSources = grants.pathSources
+			runOptions.grants = this.grants(cwd, sessionDir, workspaceDir)
 			runOptions.network = this.config.sandbox?.network
 		}
 
@@ -291,37 +281,30 @@ export class ShellExecutor {
 	}
 
 	/** Session and workspace keep their agent-visible names; everything else stays where it is. */
-	private grantedPaths(cwd: string, sessionDir: string, workspaceDir: string | undefined): PathGrants {
-		const writablePaths: string[] = []
-		const readablePaths: string[] = []
-		const pathSources: Record<string, string> = {}
+	private grants(cwd: string, sessionDir: string, workspaceDir: string | undefined): ShellGrant[] {
+		const grants: ShellGrant[] = []
 
 		if (sessionDir) {
-			writablePaths.push(VIRTUAL_SESSION)
-			pathSources[VIRTUAL_SESSION] = sessionDir
+			grants.push({ path: VIRTUAL_SESSION, source: sessionDir, mode: 'rw' })
 		}
 		if (workspaceDir) {
-			writablePaths.push(VIRTUAL_WORKSPACE)
-			pathSources[VIRTUAL_WORKSPACE] = workspaceDir
+			grants.push({ path: VIRTUAL_WORKSPACE, source: workspaceDir, mode: 'rw' })
 		}
 
 		// Extra binds (e.g. git project dir for worktree support, .gitconfig)
 		for (const bind of this.config.extraBinds ?? []) {
-			const destPath = bind.destPath ?? bind.path
-			if (bind.mode === 'ro') readablePaths.push(destPath)
-			else writablePaths.push(destPath)
-			if (destPath !== bind.path) pathSources[destPath] = bind.path
+			grants.push({ path: bind.destPath ?? bind.path, source: bind.path, mode: bind.mode })
 		}
 
 		// Additional writable paths (legacy support)
 		for (const path of this.config.sandbox?.writablePaths ?? []) {
-			writablePaths.push(path)
+			grants.push({ path, mode: 'rw' })
 		}
 
 		if (!sessionDir && !workspaceDir) {
-			writablePaths.push(cwd)
+			grants.push({ path: cwd, mode: 'rw' })
 		}
 
-		return { writablePaths, readablePaths, pathSources }
+		return grants
 	}
 }

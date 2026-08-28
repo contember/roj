@@ -9,11 +9,23 @@
 /**
  * How a runner confines what a command may touch.
  *
- * `paths` honours the path lists below; `host` is a filesystem that holds
- * nothing but this session, so the lists are redundant; `none` cannot confine
- * at all, and the caller decides whether that is acceptable.
+ * `paths` honours the grants below; `host` is a filesystem that holds nothing
+ * but this session, so the grants are redundant; `none` cannot confine at all,
+ * and the caller decides whether that is acceptable.
  */
 export type ShellConfinement = 'paths' | 'host' | 'none'
+
+/** One path the command may reach, and where the host finds it. */
+export interface ShellGrant {
+	/** Path as the command sees it. */
+	path: string
+	/**
+	 * Where the host reads it from, when that differs. A runner that has to mount
+	 * the confinement needs the pair; absent means the command's path is the host's.
+	 */
+	source?: string
+	mode: 'rw' | 'ro'
+}
 
 export interface ShellRunOptions {
 	/** One command line, already assembled and escaped by the caller. */
@@ -22,16 +34,12 @@ export interface ShellRunOptions {
 	env?: Record<string, string>
 	stdin?: string
 	timeoutMs: number
-	/** Paths the command may write. Meaningful only under `paths` confinement. */
-	writablePaths?: readonly string[]
-	/** Paths the command may read but not write. Meaningful only under `paths`. */
-	readablePaths?: readonly string[]
 	/**
-	 * Host source of a granted path, keyed by the path above. A runner that has
-	 * to mount the confinement needs it; a host whose own paths are already the
-	 * ones the command sees has nothing to map.
+	 * What the command may reach. Meaningful only under `paths` confinement, and
+	 * ordered: a grant is applied after the ones before it, so a later grant may
+	 * narrow an earlier one.
 	 */
-	pathSources?: Readonly<Record<string, string>>
+	grants?: readonly ShellGrant[]
 	/** Whether a confined command may reach the network. Default: false. */
 	network?: boolean
 	/** Interpreter for `command`. A host with a single interpreter ignores it. */

@@ -255,8 +255,7 @@ describe('ShellExecutor', () => {
 		if (!result.ok) return
 		expect(result.value.stdout).toBe('recorded')
 		expect(calls[0].cwd).toBe('/home/user/session')
-		expect(calls[0].writablePaths).toBeUndefined()
-		expect(calls[0].readablePaths).toBeUndefined()
+		expect(calls[0].grants).toBeUndefined()
 	})
 
 	it('grants a path-confined shell the session under its agent-visible name', async () => {
@@ -273,13 +272,31 @@ describe('ShellExecutor', () => {
 		)
 
 		expect(result.ok).toBe(true)
-		expect(calls[0].writablePaths).toEqual(['/home/user/session', '/home/user/workspace', '/tmp/project'])
-		expect(calls[0].readablePaths).toEqual(['/tmp/shared'])
-		expect(calls[0].pathSources).toEqual({
-			'/home/user/session': '/tmp',
-			'/home/user/workspace': '/tmp',
-		})
+		expect(calls[0].grants).toEqual([
+			{ path: '/home/user/session', source: '/tmp', mode: 'rw' },
+			{ path: '/home/user/workspace', source: '/tmp', mode: 'rw' },
+			{ path: '/tmp/project', source: '/tmp/project', mode: 'rw' },
+			{ path: '/tmp/shared', source: '/tmp/shared', mode: 'ro' },
+		])
 		expect(calls[0].network).toBe(true)
+	})
+
+	it('keeps a read-only bind ahead of a legacy writable path that would widen it', async () => {
+		const { runner, calls } = recordingRunner('paths')
+		const executor = new ShellExecutor({
+			...sandboxedConfig,
+			extraBinds: [{ path: '/tmp/secret', mode: 'ro' }],
+			sandbox: { enabled: true, writablePaths: ['/tmp/secret'] },
+		}, { fs: testPlatform.fs, shell: runner })
+
+		const result = await executor.execute({ command: 'echo hi' }, { sessionDir: '/tmp', sandboxed: true })
+
+		expect(result.ok).toBe(true)
+		expect(calls[0].grants).toEqual([
+			{ path: '/home/user/session', source: '/tmp', mode: 'rw' },
+			{ path: '/tmp/secret', source: '/tmp/secret', mode: 'ro' },
+			{ path: '/tmp/secret', mode: 'rw' },
+		])
 	})
 
 	it('reports a run the host could not start', async () => {

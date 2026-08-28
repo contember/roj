@@ -30,8 +30,7 @@ describe('buildBwrapArgs', () => {
 		const args = buildBwrapArgs({
 			command: 'echo hello',
 			cwd: '/home/user/session',
-			writablePaths: ['/home/user/session'],
-			pathSources: { '/home/user/session': '/real/session/path' },
+			grants: [{ path: '/home/user/session', source: '/real/session/path', mode: 'rw' }],
 		})
 
 		expect(args).toContain('--ro-bind')
@@ -58,8 +57,7 @@ describe('buildBwrapArgs', () => {
 		const args = buildBwrapArgs({
 			command: 'curl example.com',
 			cwd: '/home/user/session',
-			writablePaths: ['/home/user/session'],
-			pathSources: { '/home/user/session': '/tmp/session' },
+			grants: [{ path: '/home/user/session', source: '/tmp/session', mode: 'rw' }],
 			network: true,
 		})
 
@@ -70,11 +68,10 @@ describe('buildBwrapArgs', () => {
 		const args = buildBwrapArgs({
 			command: 'ls',
 			cwd: '/home/user/session',
-			writablePaths: ['/home/user/session', '/home/user/workspace'],
-			pathSources: {
-				'/home/user/session': '/real/session',
-				'/home/user/workspace': '/real/workspace',
-			},
+			grants: [
+				{ path: '/home/user/session', source: '/real/session', mode: 'rw' },
+				{ path: '/home/user/workspace', source: '/real/workspace', mode: 'rw' },
+			],
 		})
 
 		const bindIndices: number[] = []
@@ -96,9 +93,11 @@ describe('buildBwrapArgs', () => {
 		const args = buildBwrapArgs({
 			command: 'git status',
 			cwd: '/home/user/session',
-			writablePaths: ['/home/user/session', '/home/user/project'],
-			readablePaths: ['/opt/shared'],
-			pathSources: { '/home/user/session': '/real/session' },
+			grants: [
+				{ path: '/home/user/session', source: '/real/session', mode: 'rw' },
+				{ path: '/home/user/project', mode: 'rw' },
+				{ path: '/opt/shared', mode: 'ro' },
+			],
 		})
 
 		// rw bind: --bind path path
@@ -114,15 +113,30 @@ describe('buildBwrapArgs', () => {
 		expect(args[roIdx + 1]).toBe('/opt/shared')
 	})
 
+	it('mounts grants in the order given', () => {
+		const args = buildBwrapArgs({
+			command: 'ls',
+			cwd: '/w',
+			grants: [
+				{ path: '/w', mode: 'rw' },
+				{ path: '/w/secret', mode: 'ro' },
+			],
+		})
+
+		const bindIdx = args.indexOf('--bind')
+		const roIdx = args.indexOf('--ro-bind', 1)
+		expect(bindIdx).toBeLessThan(roIdx)
+		expect(args.slice(bindIdx, roIdx + 3)).toEqual(['--bind', '/w', '/w', '--ro-bind', '/w/secret', '/w/secret'])
+	})
+
 	it('sets --chdir to workspace cwd', () => {
 		const args = buildBwrapArgs({
 			command: 'git status',
 			cwd: '/home/user/workspace',
-			writablePaths: ['/home/user/session', '/home/user/workspace'],
-			pathSources: {
-				'/home/user/session': '/real/session',
-				'/home/user/workspace': '/real/workspace',
-			},
+			grants: [
+				{ path: '/home/user/session', source: '/real/session', mode: 'rw' },
+				{ path: '/home/user/workspace', source: '/real/workspace', mode: 'rw' },
+			],
 		})
 
 		const chdirIdx = args.indexOf('--chdir')
@@ -130,11 +144,11 @@ describe('buildBwrapArgs', () => {
 		expect(args[chdirIdx + 1]).toBe('/home/user/workspace')
 	})
 
-	it('binds an unmapped path where the host keeps it', () => {
+	it('binds a grant without a source where the host keeps it', () => {
 		const args = buildBwrapArgs({
 			command: 'ls',
 			cwd: '/home/user',
-			writablePaths: ['/home/user'],
+			grants: [{ path: '/home/user', mode: 'rw' }],
 		})
 
 		const bindIndices: number[] = []
@@ -183,8 +197,7 @@ describe('createBunShellRunner', () => {
 		await runner.run(runOptions({
 			command: 'ls',
 			cwd: '/home/user/session',
-			writablePaths: ['/home/user/session'],
-			pathSources: { '/home/user/session': '/real/session' },
+			grants: [{ path: '/home/user/session', source: '/real/session', mode: 'rw' }],
 			timeoutMs: 4000,
 		}))
 
