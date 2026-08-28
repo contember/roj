@@ -52,8 +52,11 @@ export type { Preset } from '~/core/preset/index.js'
 // Domain types (re-exported for external consumers, replacing @roj-ai/shared root exports)
 export { AgentId } from '~/core/agents/schema.js'
 export type { AgentStatus as DomainAgentStatus, ProtocolAgentStatus, ProtocolAgentStatus as AgentStatus } from '~/core/agents/schema.js'
+// Event factories behind BuiltinEvent — a third-party plugin declares these in
+// .events([...]) to react to built-in events without reaching into src/.
 export { agentEvents } from '~/core/agents/state.js'
 export type { AgentPauseReason, AgentState, LLMMessage } from '~/core/agents/state.js'
+export { contextEvents } from '~/core/context/state.js'
 export type { DomainEvent } from '~/core/events/types.js'
 export type { FactoryEventType } from '~/core/events/types.js'
 export { isDomainEvent } from '~/core/events/types.js'
@@ -65,6 +68,7 @@ export type { InferenceNext, LLMMiddleware } from '~/core/llm/middleware.js'
 export type { OpenRouterProviderRouting, OpenRouterReasoningOptions, OpenRouterRequestOptions } from '~/core/llm/provider.js'
 export { ModelId } from '~/core/llm/schema.js'
 export type { LLMCallId } from '~/core/llm/schema.js'
+export { llmEvents } from '~/core/llm/state.js'
 export type { InferenceCompletedEvent, InferenceFailedEvent, InferenceStartedEvent } from '~/core/llm/state.js'
 export { estimateTokens } from '~/core/llm/tokens.js'
 export { applyEvent } from '~/core/sessions/apply-event.js'
@@ -82,13 +86,16 @@ export {
 	createSessionState,
 	reconstructSessionState,
 	resolveAgentOverrides,
+	sessionEvents,
 	sessionOverridesPatchSchema,
 } from '~/core/sessions/state.js'
 export type { SessionState } from '~/core/sessions/state.js'
 export { ToolCallId } from '~/core/tools/schema.js'
+export { toolEvents } from '~/core/tools/state.js'
 export type { ToolStartedEvent } from '~/core/tools/state.js'
-export { getAgentMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
+export { getAgentMailbox, getAgentUnconsumedMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
 export type { MailboxPluginState } from '~/plugins/mailbox/query.js'
+export { mailboxEvents } from '~/plugins/mailbox/state.js'
 export { MessageId } from '~/plugins/mailbox/schema.js'
 export type { MailboxMessage } from '~/plugins/mailbox/schema.js'
 export type { ServiceStatus, ServiceStoppedBy, ServiceStopSource } from '~/plugins/services/schema.js'
@@ -140,7 +147,7 @@ export { RESOURCE_MANIFEST_FILENAME, ResourceManifestSchema } from '~/plugins/re
 export type { ResourceManifest } from '~/plugins/resources/manifest.js'
 export { uploadsPlugin } from '~/plugins/uploads/plugin.js'
 export type { ArchiveLimitOverrides, ArchiveLimits } from '~/lib/archive/index.js'
-export { userChatPlugin } from '~/plugins/user-chat/plugin.js'
+export { userChatEvents, userChatPlugin } from '~/plugins/user-chat/plugin.js'
 export type { UserChatAgentConfig, UserChatPresetConfig, UserCommunicationMode } from '~/plugins/user-chat/plugin.js'
 
 // Workers plugin
