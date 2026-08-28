@@ -10,6 +10,7 @@ import { type ChildProcess, execFile as execFileCb, spawn as nodeSpawn } from 'n
 import * as fsp from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { promisify } from 'node:util'
+import { createBunShellRunner } from '~/bun-platform/shell.js'
 import { createTimerScheduler } from '~/platform/index.js'
 import type { FileSystem, Platform, ProcessRunner } from '~/platform/index.js'
 
@@ -77,6 +78,7 @@ export function createNodePlatform(): Platform {
 		fs: createNodeFileSystem(),
 		process: createNodeProcessRunner(),
 		scheduler: createTimerScheduler(),
+		shell: createBunShellRunner(),
 		tmpDir: tmpdir(),
 	}
 }
