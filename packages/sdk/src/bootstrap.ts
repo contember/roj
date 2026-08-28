@@ -285,8 +285,9 @@ function createLLMProvider(config: Config, logger: Logger, platform: Platform): 
 		return { llmProvider: baseProvider, llmProviders: namedProviders }
 	}
 
-	const llmLogger = new LLMLogger({ basePath: config.dataPath, enabled: true, fs: platform.fs })
-	logger.info('LLM request logging enabled', { path: config.dataPath })
+	// Rows where the host has a table for them, `sessions/<id>/calls/*.json` otherwise.
+	const llmLogger = new LLMLogger({ basePath: config.dataPath, enabled: true, fs: platform.fs, store: platform.llmCallLog })
+	logger.info('LLM request logging enabled', { sink: platform.llmCallLog ? 'store' : config.dataPath })
 
 	return {
 		llmProvider: new LoggingLLMProvider(baseProvider, llmLogger, logger),

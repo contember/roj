@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import * as path from 'node:path'
+import { countFsCalls, withReadFiles } from '~/lib/utils/fs-batch-doubles.test.js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
 import { discoverSkills, loadSkillContent, parseSkillFile, parseSkillFrontmatter } from './discovery.js'
 
@@ -391,5 +392,37 @@ Do something else.`,
 		if (!result.ok) {
 			expect(result.error.message).toContain('not found')
 		}
+	})
+})
+
+// ============================================================================
+// Batch reads
+// ============================================================================
+
+describe('discoverSkills over a platform that takes a set of paths', () => {
+	it('asks once for every candidate instead of probing then reading each', async () => {
+		for (const name of ['alpha', 'beta', 'empty']) {
+			await mkdir(path.join(TEST_DIR, name), { recursive: true })
+		}
+		for (const name of ['alpha', 'beta']) {
+			await writeFile(
+				path.join(TEST_DIR, name, 'SKILL.md'),
+				`---\nname: ${name}\ndescription: ${name} workflow\n---\n# ${name}`,
+			)
+		}
+
+		const loop = countFsCalls(createNodeFileSystem())
+		const batch = countFsCalls(withReadFiles(createNodeFileSystem()))
+
+		const viaLoop = await discoverSkills(loop.fs, [TEST_DIR], '/')
+		const viaBatch = await discoverSkills(batch.fs, [TEST_DIR], '/')
+
+		expect(viaBatch).toEqual(viaLoop)
+		expect(viaBatch.ok && viaBatch.value.map((s) => s.name).sort()).toEqual(['alpha', 'beta'])
+		// One question for the three candidates, and the per-file probe is gone from both.
+		expect(batch.calls.readFiles).toBe(1)
+		expect(batch.calls.readFile).toBeUndefined()
+		expect(loop.calls.readFile).toBe(3)
+		expect(loop.calls.exists).toBe(1)
 	})
 })

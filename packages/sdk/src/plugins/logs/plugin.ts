@@ -9,6 +9,14 @@ export const logsPlugin = definePlugin('logs')
 		output: z.object({ lines: z.array(z.string()), offset: z.number() }),
 		handler: async (ctx, input) => {
 			const since = input.since ?? 0
+
+			// Where the host keeps the log in rows, the cursor counts entries instead of
+			// bytes. Both are opaque to the caller — it only ever hands `offset` back.
+			const store = ctx.platform.sessionLog
+			if (store !== undefined) {
+				return Ok(await store.read(String(ctx.sessionId), since))
+			}
+
 			const logPath = resolve(ctx.environment.sessionDir, 'session.log')
 
 			let fileSize: number
