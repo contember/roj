@@ -4,24 +4,9 @@
 
 import { describe, expect, it } from 'bun:test'
 import { z } from 'zod'
-import { defineProtocol, method, notification } from './protocol.js'
+import { defineProtocol, notification } from './protocol.js'
 
 describe('Protocol Definition', () => {
-	describe('method()', () => {
-		it('should create a method definition', () => {
-			const def = method({
-				input: z.object({ id: z.string() }),
-				output: z.object({ success: z.boolean() }),
-				error: z.object({ code: z.string() }),
-			})
-
-			expect(def._type).toBe('method')
-			expect(def.input).toBeDefined()
-			expect(def.output).toBeDefined()
-			expect(def.error).toBeDefined()
-		})
-	})
-
 	describe('notification()', () => {
 		it('should create a notification definition', () => {
 			const def = notification({
@@ -35,15 +20,8 @@ describe('Protocol Definition', () => {
 
 	describe('defineProtocol()', () => {
 		const testProtocol = defineProtocol({
-			subscribe: method({
+			subscribe: notification({
 				input: z.object({ sessionId: z.string() }),
-				output: z.void(),
-				error: z.object({ code: z.enum(['SESSION_NOT_FOUND']), message: z.string() }),
-			}),
-			unsubscribe: method({
-				input: z.object({ sessionId: z.string() }),
-				output: z.void(),
-				error: z.never(),
 			}),
 			agentMessage: notification({
 				input: z.object({
@@ -57,52 +35,14 @@ describe('Protocol Definition', () => {
 		it('should expose the definition', () => {
 			expect(testProtocol._def).toBeDefined()
 			expect(testProtocol._def.subscribe).toBeDefined()
-			expect(testProtocol._def.unsubscribe).toBeDefined()
 			expect(testProtocol._def.agentMessage).toBeDefined()
-		})
-
-		describe('getEndpoint()', () => {
-			it('should return endpoint definition by name', () => {
-				const endpoint = testProtocol.getEndpoint('subscribe')
-				expect(endpoint._type).toBe('method')
-			})
-		})
-
-		describe('isMethod()', () => {
-			it('should return true for methods', () => {
-				expect(testProtocol.isMethod('subscribe')).toBe(true)
-				expect(testProtocol.isMethod('unsubscribe')).toBe(true)
-			})
-
-			it('should return false for notifications', () => {
-				expect(testProtocol.isMethod('agentMessage')).toBe(false)
-			})
-		})
-
-		describe('isNotification()', () => {
-			it('should return true for notifications', () => {
-				expect(testProtocol.isNotification('agentMessage')).toBe(true)
-			})
-
-			it('should return false for methods', () => {
-				expect(testProtocol.isNotification('subscribe')).toBe(false)
-			})
-		})
-
-		describe('getMethodNames()', () => {
-			it('should return all method names', () => {
-				const names = testProtocol.getMethodNames()
-				expect(names).toContain('subscribe')
-				expect(names).toContain('unsubscribe')
-				expect(names).not.toContain('agentMessage')
-			})
 		})
 
 		describe('getNotificationNames()', () => {
 			it('should return all notification names', () => {
 				const names = testProtocol.getNotificationNames()
+				expect(names).toContain('subscribe')
 				expect(names).toContain('agentMessage')
-				expect(names).not.toContain('subscribe')
 			})
 		})
 
@@ -128,16 +68,7 @@ describe('Protocol Definition', () => {
 				expect(result.success).toBe(false)
 			})
 
-			it('should validate notification input', () => {
-				const result = testProtocol.validateInput('agentMessage', {
-					sessionId: 'test',
-					content: 'Hello',
-					format: 'text',
-				})
-				expect(result.success).toBe(true)
-			})
-
-			it('should reject invalid notification input', () => {
+			it('should reject an invalid enum value', () => {
 				const result = testProtocol.validateInput('agentMessage', {
 					sessionId: 'test',
 					content: 'Hello',
@@ -146,25 +77,12 @@ describe('Protocol Definition', () => {
 				expect(result.success).toBe(false)
 			})
 		})
-
-		describe('validateOutput()', () => {
-			it('should validate method output', () => {
-				const result = testProtocol.validateOutput('subscribe', undefined)
-				expect(result.success).toBe(true)
-			})
-
-			it('should throw for notification output validation', () => {
-				expect(() => testProtocol.validateOutput('agentMessage', {})).toThrow(
-					'Endpoint agentMessage is not a method',
-				)
-			})
-		})
 	})
 
 	describe('complex schemas', () => {
 		it('should handle nested objects', () => {
 			const protocol = defineProtocol({
-				createUser: method({
+				userCreated: notification({
 					input: z.object({
 						name: z.string(),
 						address: z.object({
@@ -172,18 +90,16 @@ describe('Protocol Definition', () => {
 							city: z.string(),
 						}),
 					}),
-					output: z.object({ id: z.string() }),
-					error: z.object({ code: z.string() }),
 				}),
 			})
 
-			const valid = protocol.validateInput('createUser', {
+			const valid = protocol.validateInput('userCreated', {
 				name: 'John',
 				address: { street: '123 Main St', city: 'NYC' },
 			})
 			expect(valid.success).toBe(true)
 
-			const invalid = protocol.validateInput('createUser', {
+			const invalid = protocol.validateInput('userCreated', {
 				name: 'John',
 				address: { street: '123 Main St' }, // Missing city
 			})
@@ -192,19 +108,17 @@ describe('Protocol Definition', () => {
 
 		it('should handle arrays', () => {
 			const protocol = defineProtocol({
-				sendBatch: method({
+				batchSent: notification({
 					input: z.object({
 						messages: z.array(z.object({
 							id: z.string(),
 							content: z.string(),
 						})),
 					}),
-					output: z.object({ processed: z.number() }),
-					error: z.object({ code: z.string() }),
 				}),
 			})
 
-			const valid = protocol.validateInput('sendBatch', {
+			const valid = protocol.validateInput('batchSent', {
 				messages: [
 					{ id: '1', content: 'Hello' },
 					{ id: '2', content: 'World' },
@@ -215,20 +129,18 @@ describe('Protocol Definition', () => {
 
 		it('should handle optional fields', () => {
 			const protocol = defineProtocol({
-				search: method({
+				searched: notification({
 					input: z.object({
 						query: z.string(),
 						limit: z.number().optional(),
 					}),
-					output: z.array(z.string()),
-					error: z.object({ code: z.string() }),
 				}),
 			})
 
-			const withOptional = protocol.validateInput('search', { query: 'test', limit: 10 })
+			const withOptional = protocol.validateInput('searched', { query: 'test', limit: 10 })
 			expect(withOptional.success).toBe(true)
 
-			const withoutOptional = protocol.validateInput('search', { query: 'test' })
+			const withoutOptional = protocol.validateInput('searched', { query: 'test' })
 			expect(withoutOptional.success).toBe(true)
 		})
 	})
