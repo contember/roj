@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { ModelId } from '@roj-ai/sdk'
+import { ModelId, type Preset } from '@roj-ai/sdk'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -8,6 +8,7 @@ import {
 	isLoopbackHost,
 	resolveStandaloneHost,
 	startStandaloneServer,
+	type StartStandaloneOptions,
 	warnIfStandaloneExposed,
 } from '../src/server.js'
 
@@ -113,5 +114,70 @@ describe('standalone network boundary', () => {
 			await handle?.shutdown()
 			await rm(dataPath, { recursive: true, force: true })
 		}
+	}, 15_000)
+})
+
+// =========================================================================
+// Sandbox settings reaching a running host
+// =========================================================================
+
+/** Minimal preset; `sandboxed` left absent unless a case declares it. */
+function probePreset(sandboxed?: boolean): Preset {
+	return {
+		id: 'probe',
+		name: 'Probe',
+		sandboxed,
+		orchestrator: { system: 'Test orchestrator', model: ModelId('mock'), tools: [], agents: [] },
+		agents: [],
+	}
+}
+
+/** Start a real host from the given config and report the posture its sessions get. */
+async function sessionSandboxedUnder(options: Omit<StartStandaloneOptions, 'config'>): Promise<boolean> {
+	const dataPath = await mkdtemp(join(tmpdir(), 'roj-standalone-sandbox-'))
+	let handle: Awaited<ReturnType<typeof startStandaloneServer>> | undefined
+	try {
+		handle = await startStandaloneServer({
+			...options,
+			config: {
+				port: 0,
+				host: '127.0.0.1',
+				dataPath,
+				persistence: 'memory',
+				logLevel: 'error',
+				logFormat: 'console',
+				llmMock: () => ({
+					content: 'unused',
+					toolCalls: [],
+					finishReason: 'stop',
+					metrics: { promptTokens: 0, completionTokens: 0, totalTokens: 0, latencyMs: 0, model: 'mock' },
+				}),
+			},
+		})
+
+		const created = await handle.sessionManager.createSession('probe')
+		if (!created.ok) throw new Error(`createSession failed: ${JSON.stringify(created.error)}`)
+		return created.value.environment.sandboxed
+	} finally {
+		await handle?.shutdown()
+		await rm(dataPath, { recursive: true, force: true })
+	}
+}
+
+describe('sandbox settings reach the session', () => {
+	it('applies the top-level sandboxed flag to a preset that is silent', async () => {
+		expect(await sessionSandboxedUnder({ presets: [probePreset()], sandboxed: true })).toBe(true)
+	}, 15_000)
+
+	it('leaves sessions unsandboxed when nothing declares it', async () => {
+		expect(await sessionSandboxedUnder({ presets: [probePreset()] })).toBe(false)
+	}, 15_000)
+
+	it('lets a preset opt out of an enabled top-level flag', async () => {
+		expect(await sessionSandboxedUnder({ presets: [probePreset(false)], sandboxed: true })).toBe(false)
+	}, 15_000)
+
+	it('lets a preset opt in when the top-level flag is off', async () => {
+		expect(await sessionSandboxedUnder({ presets: [probePreset(true)], sandboxed: false })).toBe(true)
 	}, 15_000)
 })
