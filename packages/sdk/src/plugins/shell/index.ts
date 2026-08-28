@@ -3,8 +3,7 @@
  */
 
 export {
-	createRestrictedShellConfig,
-	createSafeShellConfig,
+	createSandboxedShellConfig,
 	type ExtraBind as ShellExtraBind,
 	type ShellAgentConfig,
 	shellPlugin,
@@ -15,6 +14,7 @@ export {
 	buildBwrapArgs,
 	type BwrapOptions,
 	type ExtraBind,
+	type ResourceLimitsConfig,
 	type RunCommandInput,
 	type SandboxConfig,
 	type ShellConfig,

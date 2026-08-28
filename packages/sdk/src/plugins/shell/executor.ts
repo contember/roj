@@ -18,6 +18,13 @@ const MAX_OUTPUT_BYTES = 1_048_576
 /** Grace period before SIGKILL after SIGTERM (ms) */
 const GRACEFUL_KILL_DELAY_MS = 5000
 
+/** Exit code reported when the shell cannot apply the configured resource limits */
+const LIMIT_FAILURE_EXIT_CODE = 126
+
+const DEFAULT_VIRTUAL_MEMORY_KB = 524_288
+const DEFAULT_FILE_SIZE_KB = 204_800
+const DEFAULT_PROCESSES = 64
+
 // ============================================================================
 // Shell escaping
 // ============================================================================
@@ -26,6 +33,29 @@ function shellEscape(arg: string): string {
 	if (arg.length === 0) return "''"
 	if (/^[a-zA-Z0-9_./:=@%^,+-]+$/.test(arg)) return arg
 	return "'" + arg.replace(/'/g, "'\\''") + "'"
+}
+
+// ============================================================================
+// Resource limits
+// ============================================================================
+
+/** Wrap a command in a `ulimit` prelude that aborts the command when a limit cannot be applied. */
+function buildLimitedCommand(command: string, timeoutMs: number, limits: ResourceLimitsConfig, capProcesses: boolean): string {
+	if (limits.enabled === false) return command
+
+	const statements = [
+		`ulimit -v ${limits.virtualMemoryKb ?? DEFAULT_VIRTUAL_MEMORY_KB}`,
+		`ulimit -f ${limits.fileSizeKb ?? DEFAULT_FILE_SIZE_KB}`,
+		`ulimit -t ${Math.ceil(timeoutMs / 1000)}`,
+	]
+	if (capProcesses) {
+		// `-u` is the bash spelling of the process cap, `-p` the dash one.
+		const processes = limits.processes ?? DEFAULT_PROCESSES
+		statements.push(`{ ulimit -u ${processes} 2>/dev/null || ulimit -p ${processes}; }`)
+	}
+	const prelude = `{ ${statements.join(' && ')}; } || `
+		+ `{ echo 'shell: cannot apply resource limits' >&2; exit ${LIMIT_FAILURE_EXIT_CODE}; }`
+	return `${prelude}\n${command}`
 }
 
 // ============================================================================
@@ -112,6 +142,18 @@ async function resolveAgentPath(
 	return Ok(absolutePath)
 }
 
+/** Validate an agent-supplied sandbox cwd and return the virtual path bwrap may chdir into. */
+async function resolveSandboxCwd(
+	fs: FileSystem,
+	agentCwd: string,
+	sessionDir: string,
+	workspaceDir: string | undefined,
+): Promise<Result<string, ToolError>> {
+	const contained = await resolveAgentPath(fs, agentCwd, sessionDir, workspaceDir, true)
+	if (!contained.ok) return contained
+	return Ok(resolve(agentCwd))
+}
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -134,6 +176,20 @@ export interface SandboxConfig {
 	network?: boolean
 	/** Paths with read-write access (default: [cwd]) */
 	writablePaths?: string[]
+	/** Run unconfined when bwrap is disabled or unavailable (default: false — the session refuses instead) */
+	allowUnconfined?: boolean
+}
+
+/** Per-command resource limits applied through the shell's `ulimit` builtin. */
+export interface ResourceLimitsConfig {
+	/** Apply limits at all (default: true) */
+	enabled?: boolean
+	/** Address space in KB (default: 524288) */
+	virtualMemoryKb?: number
+	/** Maximum file size in KB (default: 204800) */
+	fileSizeKb?: number
+	/** Process count, sandbox only (default: 64) */
+	processes?: number
 }
 
 export interface ShellConfig {
@@ -151,6 +207,8 @@ export interface ShellConfig {
 	extraBinds?: ExtraBind[]
 	/** Bubblewrap sandbox config (default: enabled) */
 	sandbox?: SandboxConfig
+	/** Per-command resource limits (default: applied) */
+	resourceLimits?: ResourceLimitsConfig
 }
 
 // ============================================================================
@@ -276,10 +334,35 @@ export interface ShellExecutorDeps {
 export class ShellExecutor {
 	private readonly fs: FileSystem
 	private readonly process: ProcessRunner
+	private bwrapProbe: Promise<boolean> | undefined
 
 	constructor(private config: ShellConfig, deps: ShellExecutorDeps) {
 		this.fs = deps.fs
 		this.process = deps.process
+	}
+
+	/** Whether commands run under bwrap. A sandboxed session refuses to run unconfined unless it opted out. */
+	private async resolveSandboxMode(): Promise<Result<boolean, ToolError>> {
+		if (!this.config.sandboxed) return Ok(false)
+
+		const allowUnconfined = this.config.sandbox?.allowUnconfined === true
+		const refuse = (reason: string): Result<boolean, ToolError> => {
+			if (allowUnconfined) return Ok(false)
+			return Err({
+				message: `This session requires a sandbox, but ${reason}. `
+					+ 'Set sandbox.allowUnconfined in the shell config to run commands unconfined.',
+				recoverable: false,
+			})
+		}
+
+		if (this.config.sandbox?.enabled === false) return refuse('it is disabled in the shell config')
+		if (await this.isBwrapAvailable()) return Ok(true)
+		return refuse('bubblewrap (bwrap) is not available')
+	}
+
+	private async isBwrapAvailable(): Promise<boolean> {
+		this.bwrapProbe ??= this.process.execFile('bwrap', ['--version']).then(() => true, () => false)
+		return this.bwrapProbe
 	}
 
 	async execute(
@@ -298,16 +381,19 @@ export class ShellExecutor {
 		const sessionDir = environment.sessionDir
 		const workspaceDir = environment.workspaceDir
 
-		// Determine sandbox mode from config
-		const sandboxEnabled = this.config.sandboxed && this.config.sandbox?.enabled !== false
+		const sandboxMode = await this.resolveSandboxMode()
+		if (!sandboxMode.ok) return sandboxMode
+		const sandboxEnabled = sandboxMode.value
 
 		// Resolve cwd based on sandbox mode:
-		// - bwrap enabled: use virtual path (bwrap handles mapping)
+		// - bwrap enabled: validate the virtual path, bwrap handles the mapping
 		// - sandboxed but no bwrap: agent sends virtual paths, resolve to real paths
 		// - not sandboxed: agent sends real paths, use as-is
 		let cwd: string
 		if (sandboxEnabled) {
-			cwd = input.cwd ?? VIRTUAL_SESSION
+			const cwdResult = await resolveSandboxCwd(this.fs, input.cwd ?? VIRTUAL_SESSION, sessionDir, workspaceDir)
+			if (!cwdResult.ok) return cwdResult
+			cwd = cwdResult.value
 		} else if (this.config.sandboxed && input.cwd) {
 			// Sandboxed env but bwrap disabled — resolve virtual paths to real paths
 			const cwdResult = await resolveAgentPath(this.fs, input.cwd, sessionDir, workspaceDir, this.config.sandboxed)
@@ -345,13 +431,11 @@ export class ShellExecutor {
 			let stdinError: Error | undefined
 			let settled = false
 
+			const limits = this.config.resourceLimits ?? {}
 			let child: ChildProcess
 			if (sandboxEnabled) {
-				// Apply resource limits inside the sandbox
-				const timeoutSeconds = Math.ceil(timeout / 1000)
-				const sandboxCommand = `ulimit -v 524288 -f 204800 -u 64 -t ${timeoutSeconds} 2>/dev/null; ${fullCommand}`
 				const bwrapArgs = buildBwrapArgs({
-					command: sandboxCommand,
+					command: buildLimitedCommand(fullCommand, timeout, limits, true),
 					cwd,
 					sandbox: this.config.sandbox ?? { enabled: true },
 					sessionDir,
@@ -364,10 +448,13 @@ export class ShellExecutor {
 					detached: true,
 				})
 			} else {
-				const shell = this.config.shell ?? (process.platform === 'win32' ? 'cmd.exe' : '/bin/sh')
-				const shellFlag = process.platform === 'win32' ? '/c' : '-c'
+				const isWindows = process.platform === 'win32'
+				const shell = this.config.shell ?? (isWindows ? 'cmd.exe' : '/bin/sh')
+				const shellFlag = isWindows ? '/c' : '-c'
+				// cmd.exe has no `ulimit`; the process cap would count the host user's processes.
+				const command = isWindows ? fullCommand : buildLimitedCommand(fullCommand, timeout, limits, false)
 
-				child = this.process.spawn(shell, [shellFlag, fullCommand], {
+				child = this.process.spawn(shell, [shellFlag, command], {
 					cwd,
 					env: { ...getSafeEnv(), ...this.config.env },
 					detached: true,

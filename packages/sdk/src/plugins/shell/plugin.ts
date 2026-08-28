@@ -2,7 +2,7 @@ import z from 'zod/v4'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { createTool } from '~/core/tools/definition.js'
 import { Err, Ok } from '~/lib/utils/result.js'
-import { type RunCommandInput, type ShellConfig, ShellExecutor } from './executor.js'
+import { type ResourceLimitsConfig, type RunCommandInput, type ShellConfig, ShellExecutor } from './executor.js'
 
 /**
  * Extra path to bind-mount inside bwrap sandbox.
@@ -39,7 +39,11 @@ export interface ShellPresetConfig {
 		network?: boolean
 		/** Paths with read-write access (default: [cwd]) */
 		writablePaths?: string[]
+		/** Run unconfined when bwrap is disabled or unavailable (default: false — the session refuses instead) */
+		allowUnconfined?: boolean
 	}
+	/** Per-command resource limits (default: applied) */
+	resourceLimits?: ResourceLimitsConfig
 	/** Default enabled state for agents (default: true). Agents can override via ShellAgentConfig.enabled. */
 	defaultEnabled?: boolean
 }
@@ -75,6 +79,7 @@ export const shellPlugin = definePlugin('shell')
 			sandboxed: pluginConfig.sandboxed ?? ctx.environment.sandboxed,
 			extraBinds: pluginConfig.extraBinds,
 			sandbox: pluginConfig.sandbox,
+			resourceLimits: pluginConfig.resourceLimits,
 		}
 		const executor = new ShellExecutor(shellConfig, { fs: ctx.platform.fs, process: ctx.platform.process })
 		return { executor }
@@ -107,12 +112,7 @@ export const shellPlugin = definePlugin('shell')
 	})
 	.build()
 
-/** Safe shell config for typical development tasks */
-export function createSafeShellConfig(cwd: string): ShellPresetConfig {
-	return { cwd, timeout: 60000, sandbox: { enabled: true } }
-}
-
-/** Restrictive shell config for untrusted agents */
-export function createRestrictedShellConfig(cwd: string): ShellPresetConfig {
-	return { cwd, timeout: 30000, sandbox: { enabled: true } }
+/** Sandboxed shell config; the command timeout is the only knob it sets. */
+export function createSandboxedShellConfig(cwd: string, timeout = 60000): ShellPresetConfig {
+	return { cwd, timeout, sandbox: { enabled: true } }
 }

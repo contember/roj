@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'bun:test'
 import { ChildProcess } from 'node:child_process'
+import { rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { PassThrough, Writable } from 'node:stream'
 import type { SessionEnvironment } from '~/core/sessions/session-environment.js'
-import type { ExecFileResult, ProcessRunner } from '~/platform/process.js'
+import type { ExecFileResult, ProcessRunner, SpawnOptions } from '~/platform/process.js'
 import { createNodePlatform } from '~/testing/node-platform.js'
 import { buildBwrapArgs, type ShellConfig, ShellExecutor } from './executor.js'
 
@@ -381,6 +384,7 @@ describe('ShellExecutor', () => {
 		resultPromise.then(() => {
 			completed = true
 		})
+		await Bun.sleep(0)
 
 		child.emit('error', new Error('runtime process error'))
 		await Bun.sleep(30)
@@ -422,6 +426,7 @@ describe('ShellExecutor', () => {
 			{ command: 'closes-early', stdin: 'pending input' },
 			createTestEnvironment(),
 		)
+		await Bun.sleep(0)
 
 		child.emit('close', 0, null)
 		const result = await resultPromise
@@ -555,5 +560,245 @@ describe('ShellExecutor', () => {
 		if (!result.ok) return
 
 		expect(result.value.exitCode).toBe(42)
+	})
+})
+
+// ============================================================================
+// Sandbox containment and resource limits
+// ============================================================================
+
+interface SpawnCall {
+	command: string
+	args: string[]
+	options?: SpawnOptions
+}
+
+function createCapturingRunner(bwrapAvailable = true): { runner: ProcessRunner; calls: SpawnCall[] } {
+	const calls: SpawnCall[] = []
+	const runner: ProcessRunner = {
+		spawn: (command, args, options) => {
+			calls.push({ command, args, options })
+			const child = new ChildProcess()
+			Object.defineProperties(child, {
+				pid: { value: 424_250 + calls.length },
+				stdin: { value: null },
+				stdout: { value: null },
+				stderr: { value: null },
+			})
+			setTimeout(() => child.emit('close', 0, null), 0)
+			return child
+		},
+		execFile: async (file): Promise<ExecFileResult> => {
+			if (file === 'bwrap' && bwrapAvailable) return { stdout: 'bubblewrap 0.8.0', stderr: '' }
+			throw new Error(`spawn ${file} ENOENT`)
+		},
+	}
+	return { runner, calls }
+}
+
+const sandboxedConfig: ShellConfig = {
+	cwd: process.cwd(),
+	timeout: 5000,
+	sandboxed: true,
+	sandbox: { enabled: true },
+}
+
+const createSandboxedEnvironment = (): SessionEnvironment => ({
+	sessionDir: process.cwd(),
+	sandboxed: true,
+})
+
+describe('sandbox cwd containment', () => {
+	it('rejects a working directory outside the virtual roots', async () => {
+		const { runner, calls } = createCapturingRunner()
+		const executor = new ShellExecutor(sandboxedConfig, { fs: testPlatform.fs, process: runner })
+
+		const result = await executor.execute({ command: 'pwd', cwd: '/etc' }, createSandboxedEnvironment())
+
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.message).toContain('/home/user/session/')
+		expect(calls).toEqual([])
+	})
+
+	it('rejects a working directory that traverses out of the session root', async () => {
+		const { runner, calls } = createCapturingRunner()
+		const executor = new ShellExecutor(sandboxedConfig, { fs: testPlatform.fs, process: runner })
+
+		const result = await executor.execute(
+			{ command: 'pwd', cwd: '/home/user/session/../../../etc' },
+			createSandboxedEnvironment(),
+		)
+
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.message).toContain('outside allowed directories')
+		expect(calls).toEqual([])
+	})
+
+	it('rejects a workspace working directory when the session has no workspace', async () => {
+		const { runner } = createCapturingRunner()
+		const executor = new ShellExecutor(sandboxedConfig, { fs: testPlatform.fs, process: runner })
+
+		const result = await executor.execute(
+			{ command: 'pwd', cwd: '/home/user/workspace/app' },
+			createSandboxedEnvironment(),
+		)
+
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.message).toContain('No workspace directory')
+	})
+
+	it('passes a contained working directory to --chdir', async () => {
+		const { runner, calls } = createCapturingRunner()
+		const executor = new ShellExecutor(sandboxedConfig, { fs: testPlatform.fs, process: runner })
+
+		const result = await executor.execute(
+			{ command: 'pwd', cwd: '/home/user/session/packages/./sdk' },
+			createSandboxedEnvironment(),
+		)
+
+		expect(result.ok).toBe(true)
+		expect(calls[0].command).toBe('bwrap')
+		const chdirIdx = calls[0].args.indexOf('--chdir')
+		expect(calls[0].args[chdirIdx + 1]).toBe('/home/user/session/packages/sdk')
+	})
+})
+
+describe('resource limits', () => {
+	it('caps memory, file size, cpu time and processes inside the sandbox', async () => {
+		const { runner, calls } = createCapturingRunner()
+		const executor = new ShellExecutor(sandboxedConfig, { fs: testPlatform.fs, process: runner })
+
+		await executor.execute({ command: 'echo hi' }, createSandboxedEnvironment())
+
+		const command = calls[0].args[calls[0].args.length - 1]
+		expect(command).toContain('ulimit -v 524288')
+		expect(command).toContain('ulimit -f 204800')
+		expect(command).toContain('ulimit -t 5')
+		expect(command).toContain('ulimit -u 64')
+		expect(command).toContain('echo hi')
+	})
+
+	it('fails the command when a limit cannot be applied', async () => {
+		const { runner, calls } = createCapturingRunner()
+		const executor = new ShellExecutor(sandboxedConfig, { fs: testPlatform.fs, process: runner })
+
+		await executor.execute({ command: 'echo hi' }, createSandboxedEnvironment())
+
+		const command = calls[0].args[calls[0].args.length - 1]
+		expect(command).not.toContain('ulimit -v 524288 2>/dev/null')
+		expect(command).toContain('exit 126')
+	})
+
+	it('applies limits on the direct spawn path, without the host-wide process cap', async () => {
+		const { runner, calls } = createCapturingRunner()
+		const executor = new ShellExecutor(defaultConfig, { fs: testPlatform.fs, process: runner })
+
+		await executor.execute({ command: 'echo hi' }, createTestEnvironment())
+
+		const command = calls[0].args[1]
+		expect(command).toContain('ulimit -v 524288')
+		expect(command).toContain('ulimit -f 204800')
+		expect(command).toContain('exit 126')
+		expect(command).not.toContain('ulimit -u')
+	})
+
+	it('honours configured limits and lets a session opt out', async () => {
+		const { runner, calls } = createCapturingRunner()
+		const configured = new ShellExecutor(
+			{ ...defaultConfig, resourceLimits: { virtualMemoryKb: 1024, fileSizeKb: 2048 } },
+			{ fs: testPlatform.fs, process: runner },
+		)
+		await configured.execute({ command: 'echo hi' }, createTestEnvironment())
+		expect(calls[0].args[1]).toContain('ulimit -v 1024')
+		expect(calls[0].args[1]).toContain('ulimit -f 2048')
+
+		const disabled = new ShellExecutor(
+			{ ...defaultConfig, resourceLimits: { enabled: false } },
+			{ fs: testPlatform.fs, process: runner },
+		)
+		await disabled.execute({ command: 'echo hi' }, createTestEnvironment())
+		expect(calls[1].args[1]).toBe('echo hi')
+	})
+
+	it('enforces the file size limit on a real command', async () => {
+		const target = join(tmpdir(), `roj-shell-limit-${process.pid}.bin`)
+		const executor = new ShellExecutor(
+			{ ...defaultConfig, resourceLimits: { fileSizeKb: 1 } },
+			testExecutorDeps,
+		)
+
+		const result = await executor.execute(
+			{ command: `head -c 200000 /dev/zero > ${target}` },
+			createTestEnvironment(),
+		)
+		await rm(target, { force: true })
+
+		expect(result.ok).toBe(true)
+		if (!result.ok) return
+		expect(result.value.exitCode).not.toBe(0)
+	})
+})
+
+describe('sandbox availability', () => {
+	it('refuses to run when the sandbox is requested but unavailable', async () => {
+		const { runner, calls } = createCapturingRunner(false)
+		const executor = new ShellExecutor(sandboxedConfig, { fs: testPlatform.fs, process: runner })
+
+		const result = await executor.execute({ command: 'echo hi' }, createSandboxedEnvironment())
+
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.message).toContain('requires a sandbox')
+		expect(result.error.message).toContain('bwrap')
+		expect(calls).toEqual([])
+	})
+
+	it('refuses to run when the sandbox is requested but disabled in config', async () => {
+		const { runner, calls } = createCapturingRunner()
+		const executor = new ShellExecutor(
+			{ ...sandboxedConfig, sandbox: { enabled: false } },
+			{ fs: testPlatform.fs, process: runner },
+		)
+
+		const result = await executor.execute({ command: 'echo hi' }, createSandboxedEnvironment())
+
+		expect(result.ok).toBe(false)
+		if (result.ok) return
+		expect(result.error.message).toContain('allowUnconfined')
+		expect(calls).toEqual([])
+	})
+
+	it('runs unconfined only when the session opts out explicitly', async () => {
+		const { runner, calls } = createCapturingRunner(false)
+		const executor = new ShellExecutor(
+			{ ...sandboxedConfig, sandbox: { enabled: true, allowUnconfined: true } },
+			{ fs: testPlatform.fs, process: runner },
+		)
+
+		const result = await executor.execute({ command: 'echo hi' }, createSandboxedEnvironment())
+
+		expect(result.ok).toBe(true)
+		expect(calls[0].command).not.toBe('bwrap')
+	})
+
+	it('probes the sandbox once per executor', async () => {
+		let probes = 0
+		const { runner } = createCapturingRunner()
+		const countingRunner: ProcessRunner = {
+			spawn: runner.spawn,
+			execFile: (file, args, options) => {
+				probes++
+				return runner.execFile(file, args, options)
+			},
+		}
+		const executor = new ShellExecutor(sandboxedConfig, { fs: testPlatform.fs, process: countingRunner })
+
+		await executor.execute({ command: 'echo hi' }, createSandboxedEnvironment())
+		await executor.execute({ command: 'echo hi' }, createSandboxedEnvironment())
+
+		expect(probes).toBe(1)
 	})
 })
