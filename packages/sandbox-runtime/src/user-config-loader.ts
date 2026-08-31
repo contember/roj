@@ -81,4 +81,3 @@ export async function loadUserConfig(configPath: string): Promise<RojConfig> {
 		extraBinds: parseExtraBinds(typedConfig.extraBinds, dirname(absolutePath), absolutePath),
 	}
 }
-

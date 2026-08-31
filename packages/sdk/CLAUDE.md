@@ -89,5 +89,5 @@ await harness.shutdown()
 ## Config Levels
 
 1. **System config** (`config.ts`): env vars — port, API keys, persistence mode, log format
-2. **User config** (`roj.config.ts`): `defineConfig({ presets, sandboxed, snapshotter })`
+2. **User config** (`roj.config.ts`): `defineConfig({ presets, sandboxed, extraBinds, snapshotter })` — `sandboxed` and `extraBinds` fold into every preset
 3. **Plugin config**: per-preset (`pluginConfig`) and per-agent (`agentConfig`) overrides
