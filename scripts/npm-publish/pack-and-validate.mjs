@@ -72,19 +72,29 @@ const packedByName = new Map(packed.map((entry) => [entry.name, entry]))
 const packedManifests = new Map(packed.map((entry) => [entry.name, readPackedManifest(entry)]))
 const packedDependencyGraph = buildPackedDependencyGraph(packed, packedManifests)
 for (const entry of packed) {
-	const consumerDir = await mkdtemp(path.join(tmpdir(), `roj-npm-consumer-${entry.dir}-`))
-	const installPlan = createIsolatedInstallPlan(entry, packedByName, packedDependencyGraph)
-	const consumerPackage = {
-		name: `roj-published-artifact-smoke-${entry.dir}`,
+	const harnessDir = await mkdtemp(path.join(tmpdir(), `roj-npm-consumer-${entry.dir}-`))
+	const consumerDir = path.join(harnessDir, 'consumer')
+	await mkdir(consumerDir)
+	// The type toolchain hoists in the parent so its own transitive @types stay resolvable.
+	await writeFile(path.join(harnessDir, 'package.json'), `${JSON.stringify({
+		name: `roj-published-artifact-harness-${entry.dir}`,
 		private: true,
 		type: 'module',
-		...installPlan,
 		devDependencies: {
 			typescript: rootPackage.devDependencies.typescript,
 			'@types/bun': rootPackage.workspaces.catalog['@types/bun'],
 			'@types/react': clientReact?.devDependencies?.['@types/react'],
 			'@types/react-dom': clientReact?.devDependencies?.['@types/react-dom'],
 		},
+	}, null, '\t')}\n`)
+	run('npm', ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--package-lock=false'], { cwd: harnessDir })
+
+	const installPlan = createIsolatedInstallPlan(entry, packedByName, packedDependencyGraph)
+	const consumerPackage = {
+		name: `roj-published-artifact-smoke-${entry.dir}`,
+		private: true,
+		type: 'module',
+		...installPlan,
 	}
 	await writeFile(path.join(consumerDir, 'package.json'), `${JSON.stringify(consumerPackage, null, '\t')}\n`)
 	// Nested layout preserves package-local visibility for the declared graph.
@@ -177,8 +187,8 @@ for (const specifier of specifiers) await import(specifier)
 		},
 		include: ['smoke.ts'],
 	}, null, '\t')}\n`)
-	run(path.join(consumerDir, 'node_modules', '.bin', 'tsc'), ['--project', 'tsconfig.json'], { cwd: consumerDir })
-	await rm(consumerDir, { recursive: true, force: true })
+	run(path.join(harnessDir, 'node_modules', '.bin', 'tsc'), ['--project', 'tsconfig.json'], { cwd: consumerDir })
+	await rm(harnessDir, { recursive: true, force: true })
 }
 
 const manifestPath = path.join(packRoot, 'manifest.json')
