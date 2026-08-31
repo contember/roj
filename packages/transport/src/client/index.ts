@@ -15,6 +15,7 @@ export type {
 	ProtocolDef,
 	ProtocolHandlers,
 	ProtocolNotifier,
+	SafeParseResult,
 	ReconnectOptions,
 	TransportEvent,
 	TransportEventListener,

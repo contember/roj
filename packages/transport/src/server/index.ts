@@ -18,6 +18,7 @@ export type {
 	ProtocolDef,
 	ProtocolHandlers,
 	ProtocolNotifier,
+	SafeParseResult,
 	TransportEvent,
 	TransportEventListener,
 } from '../core/index.js'

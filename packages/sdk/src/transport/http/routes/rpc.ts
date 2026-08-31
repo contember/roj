@@ -67,8 +67,8 @@ async function dispatchMethod(
 		const sessionId = sessionIdResult.value
 		const agentId = 'agentId' in input && typeof input.agentId === 'string' ? AgentId(input.agentId) : undefined
 
-		// `_caller` is stamped by the transport in front of this route, never accepted
-		// from an end client — see CallerContext. Stripped from the input either way.
+		// Stripped from the input before dispatch. Unvalidated: anything holding the bearer
+		// token can set it, so it is a hint about the caller, not proof of one.
 		const caller: CallerContext = '_caller' in input && typeof input._caller === 'object' && input._caller !== null
 			? input._caller as CallerContext
 			: DEFAULT_CALLER
