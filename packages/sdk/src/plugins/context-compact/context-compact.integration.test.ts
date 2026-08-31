@@ -169,9 +169,6 @@ describe('context-compact plugin', () => {
 
 	describe('turn numbering', () => {
 		it('an attempt that commits nothing does not consume a turn number', async () => {
-			// Deliberate change from the pre-persistence counter, which incremented
-			// per attempt: a paused attempt runs again on the same pending messages,
-			// so it is the same turn, and only a committed turn can be persisted.
 			const turnNumbers: number[] = []
 			let paused = false
 			const pauseOnce = definePlugin('pause-once')
