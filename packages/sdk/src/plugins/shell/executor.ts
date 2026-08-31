@@ -1,4 +1,4 @@
-import { resolve } from 'node:path'
+import { isAbsolute, resolve } from 'node:path'
 import type { SessionEnvironment } from '~/core/sessions/session-environment.js'
 import type { ToolError } from '~/core/tools/executor.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
@@ -302,10 +302,13 @@ export class ShellExecutor {
 		sessionDir: string,
 		workspaceDir: string | undefined,
 	): Promise<Result<string, ToolError>> {
+		if (!isAbsolute(agentCwd)) {
+			return Err({ message: `Working directory '${agentCwd}' must be an absolute path`, recoverable: false })
+		}
 		const normalized = resolve(agentCwd)
 
 		if (isWithin(normalized, VIRTUAL_SESSION) || isWithin(normalized, VIRTUAL_WORKSPACE)) {
-			const contained = await resolveAgentPath(this.fs, agentCwd, sessionDir, workspaceDir, true)
+			const contained = await resolveAgentPath(this.fs, normalized, sessionDir, workspaceDir, true)
 			if (!contained.ok) return contained
 			return this.requireExists(contained.value, agentCwd, normalized)
 		}

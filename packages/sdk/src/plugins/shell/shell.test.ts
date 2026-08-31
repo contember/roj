@@ -354,6 +354,29 @@ describe('ShellExecutor', () => {
 			expect(calls[0].cwd).toBe('/home/user/session/nested/dir')
 		})
 
+		it('refuses a relative working directory instead of resolving it against the host process', async () => {
+			const { runner, calls } = recordingRunner('paths')
+			const executor = new ShellExecutor(containedConfig(), { fs: testPlatform.fs, shell: runner })
+
+			for (const cwd of ['build', '.', '', '~']) {
+				const result = await executor.execute({ command: 'pwd', cwd }, environment())
+
+				expect(result.ok).toBe(false)
+				if (!result.ok) expect(result.error.message).toContain('must be an absolute path')
+			}
+			expect(calls).toHaveLength(0)
+		})
+
+		it('accepts a working directory that only normalization places in the session', async () => {
+			const { runner, calls } = recordingRunner('paths')
+			const executor = new ShellExecutor(containedConfig(), { fs: testPlatform.fs, shell: runner })
+
+			const result = await executor.execute({ command: 'pwd', cwd: '/home/user/./session/nested' }, environment())
+
+			expect(result.ok).toBe(true)
+			expect(calls[0].cwd).toBe('/home/user/session/nested')
+		})
+
 		it('accepts a working directory the extra binds mount', async () => {
 			const { runner, calls } = recordingRunner('paths')
 			const executor = new ShellExecutor(containedConfig(), { fs: testPlatform.fs, shell: runner })
