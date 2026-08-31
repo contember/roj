@@ -7,17 +7,20 @@
 
 import type { ChildProcess } from 'node:child_process'
 import { resolve } from 'node:path'
-import type { ProcessRunner, ShellGrant, ShellRunner, ShellRunOptions, ShellRunResult } from '../platform/index.js'
+import type { ProcessRunner, ShellGrant, ShellLimits, ShellRunner, ShellRunOptions, ShellRunResult } from '../platform/index.js'
 import { createBunProcessRunner } from './process.js'
 
 /** Maximum output size per stream in bytes (1 MB) */
 const MAX_OUTPUT_BYTES = 1_048_576
 
-/** 512-byte blocks, the unit POSIX `ulimit -f` counts — 200 MB. A shell counting 1024 gives twice that. */
-const LIMIT_FILE_SIZE_BLOCKS = 409_600
+/** Default cap on what a confined command may write (200 MB). */
+const DEFAULT_FILE_SIZE_BYTES = 209_715_200
 
-/** Processes per user. Namespace-local only on Linux 5.14+; older kernels count per host uid. */
-const LIMIT_PROCESSES = 64
+/** Default process cap. Namespace-local only on Linux 5.14+; older kernels count per host uid. */
+const DEFAULT_PROCESSES = 64
+
+/** POSIX counts `ulimit -f` in 512-byte blocks; a shell counting 1024 caps at twice the request. */
+const FILE_SIZE_BLOCK_BYTES = 512
 
 /** Marks a limit the shell refused, so the host hears about it and the agent's stderr stays clean */
 const LIMIT_NOTICE_PREFIX = 'roj-shell: limit unavailable:'
@@ -99,14 +102,24 @@ export function buildBwrapArgs(opts: BwrapOptions): string[] {
  * `ulimit` call carrying several flags, and spells the process cap `-p`, not `-u`.
  * `-v` and `-t` stay unset; the shell port documents why.
  */
-export function buildLimitPrefix(): string {
-	const statements: [string, string][] = [
-		['file size', `ulimit -f ${LIMIT_FILE_SIZE_BLOCKS}`],
-		['process count', `{ ulimit -u ${LIMIT_PROCESSES} 2>/dev/null || ulimit -p ${LIMIT_PROCESSES} 2>/dev/null; }`],
-	]
+export function buildLimitPrefix(limits: ShellLimits = {}): string {
+	const fileSizeBytes = limits.fileSizeBytes === undefined ? DEFAULT_FILE_SIZE_BYTES : limits.fileSizeBytes
+	const processes = limits.processes === undefined ? DEFAULT_PROCESSES : limits.processes
+	const statements: [string, string][] = []
+	if (fileSizeBytes !== null) {
+		statements.push(['file size', `ulimit -f ${Math.ceil(fileSizeBytes / FILE_SIZE_BLOCK_BYTES)}`])
+	}
+	if (processes !== null) {
+		statements.push(['process count', `{ ulimit -u ${processes} 2>/dev/null || ulimit -p ${processes} 2>/dev/null; }`])
+	}
 	return statements
 		.map(([name, attempt]) => `${attempt} || echo '${LIMIT_NOTICE_PREFIX} ${name}' >&2`)
 		.join('\n')
+}
+
+/** Every limit turned off leaves no prefix, and the command must not gain a blank first line. */
+function prefixCommand(prefix: string, command: string): string {
+	return prefix === '' ? command : `${prefix}\n${command}`
 }
 
 /** Split the notices the prefix wrote from the command's own stderr. */
@@ -162,7 +175,7 @@ function runCommand(
 		if (confined) {
 			// The prefix runs in the command's own shell: wrap it in a subshell and it limits nothing.
 			const bwrapArgs = buildBwrapArgs({
-				command: `${buildLimitPrefix()}\n${options.command}`,
+				command: prefixCommand(buildLimitPrefix(options.limits), options.command),
 				cwd: options.cwd,
 				grants: options.grants,
 				network: options.network,

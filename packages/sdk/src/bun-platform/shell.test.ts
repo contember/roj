@@ -207,6 +207,37 @@ describe('createBunShellRunner', () => {
 		expect(spawned?.args[spawned.args.length - 1]).toBe(`${buildLimitPrefix()}\nls`)
 	})
 
+	it('applies the caps the run options carry, and prefixes nothing when they are all off', async () => {
+		for (const [limits, expected] of [
+			[{ processes: 256 }, `${buildLimitPrefix({ processes: 256 })}\nls`],
+			[{ fileSizeBytes: null, processes: null }, 'ls'],
+		] as const) {
+			let spawned: { command: string; args: string[] } | undefined
+			const child = new ChildProcess()
+			Object.defineProperties(child, {
+				pid: { value: 424_252 },
+				stdin: { value: null },
+				stdout: { value: null },
+				stderr: { value: null },
+			})
+			const runner = createBunShellRunner(stubProcessRunner((command, args) => {
+				spawned = { command, args }
+				setTimeout(() => child.emit('close', 0, null), 0)
+				return child
+			}))
+
+			await runner.run(runOptions({
+				command: 'ls',
+				cwd: '/home/user/session',
+				grants: [{ path: '/home/user/session', source: '/real/session', mode: 'rw' }],
+				timeoutMs: 4000,
+				limits,
+			}))
+
+			expect(spawned?.args[spawned.args.length - 1]).toBe(expected)
+		}
+	})
+
 	it('keeps a limit notice out of the command stderr and tells the host once', async () => {
 		const warnings: string[] = []
 		const stderr = new PassThrough()
@@ -452,5 +483,25 @@ describe('buildLimitPrefix', () => {
 
 	it('suppresses the shell error from both process-cap attempts', () => {
 		expect(buildLimitPrefix()).toContain('{ ulimit -u 64 2>/dev/null || ulimit -p 64 2>/dev/null; }')
+	})
+
+	it('takes the caps the caller asks for, in bytes', () => {
+		const prefix = buildLimitPrefix({ fileSizeBytes: 1_048_576, processes: 256 })
+
+		expect(prefix).toContain('ulimit -f 2048')
+		expect(prefix).toContain('ulimit -u 256')
+		expect(prefix).not.toContain('409600')
+	})
+
+	it('leaves a cap unset when the caller passes null, and keeps the others', () => {
+		const prefix = buildLimitPrefix({ processes: null })
+
+		expect(prefix).toContain('ulimit -f 409600')
+		expect(prefix).not.toContain('ulimit -u')
+		expect(prefix).not.toContain('ulimit -p')
+	})
+
+	it('produces nothing when every cap is off', () => {
+		expect(buildLimitPrefix({ fileSizeBytes: null, processes: null })).toBe('')
 	})
 })

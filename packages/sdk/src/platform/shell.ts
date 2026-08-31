@@ -44,6 +44,20 @@ export interface ShellRunOptions {
 	network?: boolean
 	/** Interpreter for `command`. A host with a single interpreter ignores it. */
 	shell?: string
+	/** Caps for a confined command; ignored when the command runs unconfined. */
+	limits?: ShellLimits
+}
+
+/**
+ * Caps a host applies to a confined command. An omitted field takes the host's
+ * default; `null` asks for no cap at all, for a host where one does more harm
+ * than good — an old kernel that counts processes per uid rather than per namespace.
+ */
+export interface ShellLimits {
+	/** Largest file the command may write, in bytes. */
+	fileSizeBytes?: number | null
+	/** Concurrent processes. On Linux this is per-uid, not per-process. */
+	processes?: number | null
 }
 
 export interface ShellRunResult {

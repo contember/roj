@@ -2,6 +2,7 @@ import z from 'zod/v4'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { createTool } from '~/core/tools/definition.js'
 import { Err, Ok } from '~/lib/utils/result.js'
+import type { ShellLimits } from '~/platform/shell.js'
 import { type RunCommandInput, type ShellConfig, ShellExecutor } from './executor.js'
 
 /**
@@ -39,6 +40,8 @@ export interface ShellPresetConfig {
 		network?: boolean
 		/** Paths with read-write access (default: [cwd]) */
 		writablePaths?: string[]
+		/** Resource caps for the confined command; a `null` field asks for no cap. */
+		limits?: ShellLimits
 	}
 	/** Default enabled state for agents (default: true). Agents can override via ShellAgentConfig.enabled. */
 	defaultEnabled?: boolean
