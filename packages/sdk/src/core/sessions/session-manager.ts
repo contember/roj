@@ -974,10 +974,9 @@ export class SessionManager {
 	 * 3. If no config at all → call .create() with no args (void config)
 	 * 4. Check isSessionEnabled — skip plugin if not enabled
 	 *
-	 * The result is sorted by each plugin's declared `.order()`. Agent, session
-	 * and dequeue hooks all run in this order, and most agent hooks stop at the
-	 * first non-null result — so this is the precedence between plugins that
-	 * both want to act on the same hook.
+	 * The result is sorted by each plugin's declared `.order()` — the precedence
+	 * between plugins that both want the same hook, since most agent hooks stop
+	 * at the first non-null result.
 	 */
 	private buildPlugins(preset: Preset): ConfiguredPlugin[] {
 		// Build a lookup from preset Sessionplugins

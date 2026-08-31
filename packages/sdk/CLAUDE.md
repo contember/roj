@@ -54,6 +54,7 @@ Plugins use a fluent builder DSL:
 
 ```typescript
 definePlugin('name')
+  .order(100)                 // Hook precedence; lower first, default DEFAULT_PLUGIN_ORDER
   .pluginConfig<T>()          // Session-wide config
   .agentConfig<T>()           // Per-agent config
   .events([eventDefs])        // Domain events (Zod-typed)

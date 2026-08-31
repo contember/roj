@@ -537,10 +537,9 @@ export class PluginBuilder<
 	// --- Setup ---
 
 	/**
-	 * Declare where this plugin sits in hook order. Lower runs first, which for
-	 * the agent hooks — first non-null result wins — decides who gets to act.
-	 * Built-ins occupy 10…150 (see `plugins/builtin.ts`); anything that declares
-	 * no order runs after them, in registration order.
+	 * Declare where this plugin sits in hook order. Lower runs first, which for the
+	 * agent hooks — first non-null result wins — decides who gets to act. Built-ins
+	 * occupy 10…150; anything without an order runs after them, in registration order.
 	 */
 	order(value: number): this {
 		this._cfg.order = value

@@ -159,7 +159,7 @@ export type { WorkerContext } from '~/plugins/workers/index.js'
 export type { WorkerError, WorkerResult } from '~/plugins/workers/index.js'
 
 // Plugin builder
-export { definePlugin } from '~/core/plugins/plugin-builder.js'
+export { DEFAULT_PLUGIN_ORDER, definePlugin } from '~/core/plugins/plugin-builder.js'
 export type { CallerContext, ConfiguredPlugin, PluginDefinition, SessionCloseReason } from '~/core/plugins/plugin-builder.js'
 
 // Zod (re-export for presets that need schemas)
