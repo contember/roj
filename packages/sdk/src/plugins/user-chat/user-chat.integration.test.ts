@@ -890,6 +890,40 @@ describe('user-chat plugin', () => {
 			await harness.shutdown()
 		})
 
+		it('answerQuestion → a resubmitted answer is dropped, not delivered twice', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withSequence([
+					{
+						toolCalls: [{
+							id: ToolCallId('tc1'),
+							name: 'ask_user',
+							input: { question: 'Color?', inputType: 'text' },
+						}],
+					},
+					{ content: 'Waiting', toolCalls: [] },
+					{ content: 'Got it', toolCalls: [] },
+				]),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Hi')
+
+			const questionEvents = await session.getEventsByType(userChatEvents, 'user_question_asked')
+			const questionId = questionEvents[0].messageId
+			const entryAgentId = session.getEntryAgentId()!
+
+			await session.answerQuestion(entryAgentId, questionId, 'Blue')
+			await session.waitForIdle()
+			await session.answerQuestion(entryAgentId, questionId, 'Blue')
+			await session.waitForIdle()
+
+			const answerEvents = await session.getEventsByType('user_chat_answer_received')
+			expect(answerEvents).toHaveLength(1)
+
+			await harness.shutdown()
+		})
+
 		it('answerQuestion → question marked as answered in getMessages', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
