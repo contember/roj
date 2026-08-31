@@ -12,7 +12,9 @@
 	},
 	"files": [
 		"src",
-		"dist"
+		"dist",
+		"!src/**/*.test.ts",
+		"!src/__tests__"
 	],
 	"publishConfig": {
 		"access": "public"
