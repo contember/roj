@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test'
 import { ChildProcess } from 'node:child_process'
 import { PassThrough, Writable } from 'node:stream'
 import type { ExecFileResult, ProcessRunner, ShellRunOptions } from '../platform/index.js'
-import { buildBwrapArgs, createBunShellRunner, splitLimitNotices } from './shell.js'
+import { buildBwrapArgs, buildLimitPrefix, createBunShellRunner, splitLimitNotices } from './shell.js'
 
 // ============================================================================
 // Test Helpers
@@ -204,7 +204,7 @@ describe('createBunShellRunner', () => {
 		expect(spawned?.command).toBe('bwrap')
 		expect(spawned?.args.slice(-2, -1)).toEqual(['-c'])
 		// What the limits do is asserted against /proc/self/limits in shell-limits.smoke.test.ts.
-		expect(spawned?.args[spawned.args.length - 1].endsWith('\nls')).toBe(true)
+		expect(spawned?.args[spawned.args.length - 1]).toBe(`${buildLimitPrefix()}\nls`)
 	})
 
 	it('keeps a limit notice out of the command stderr and tells the host once', async () => {
@@ -438,4 +438,19 @@ describe('createBunShellRunner', () => {
 		expect(result.timedOut).toBe(true)
 		expect(result.signal).toBeDefined()
 	}, 10_000)
+})
+
+describe('buildLimitPrefix', () => {
+	it('caps file size and process count, and leaves address space and CPU alone', () => {
+		const prefix = buildLimitPrefix()
+		expect(prefix).toContain('ulimit -f 409600')
+		expect(prefix).toContain('ulimit -u 64')
+		expect(prefix).toContain('ulimit -p 64')
+		expect(prefix).not.toContain('ulimit -v')
+		expect(prefix).not.toContain('ulimit -t')
+	})
+
+	it('suppresses the shell error from both process-cap attempts', () => {
+		expect(buildLimitPrefix()).toContain('{ ulimit -u 64 2>/dev/null || ulimit -p 64 2>/dev/null; }')
+	})
 })

@@ -16,7 +16,7 @@ const MAX_OUTPUT_BYTES = 1_048_576
 /** 512-byte blocks, the unit POSIX `ulimit -f` counts — 200 MB. A shell counting 1024 gives twice that. */
 const LIMIT_FILE_SIZE_BLOCKS = 409_600
 
-/** Processes per user inside the namespace, where the count is not shared with the host */
+/** Processes per user. Namespace-local only on Linux 5.14+; older kernels count per host uid. */
 const LIMIT_PROCESSES = 64
 
 /** Marks a limit the shell refused, so the host hears about it and the agent's stderr stays clean */
@@ -97,16 +97,12 @@ export function buildBwrapArgs(opts: BwrapOptions): string[] {
 /**
  * Resource limits for a confined command, one statement at a time: dash fails a single
  * `ulimit` call carrying several flags, and spells the process cap `-p`, not `-u`.
- *
- * Two limits are deliberately absent. `ulimit -v` bounds mapped address space, which a
- * build reserves far beyond what it touches. `ulimit -t` bounds CPU seconds summed over
- * threads, so a parallel build dies at timeout/threads of wall time, while sequential
- * children each get a fresh budget — and the runner already bounds wall time itself.
+ * `-v` and `-t` stay unset; the shell port documents why.
  */
 export function buildLimitPrefix(): string {
 	const statements: [string, string][] = [
 		['file size', `ulimit -f ${LIMIT_FILE_SIZE_BLOCKS}`],
-		['process count', `{ ulimit -u ${LIMIT_PROCESSES} 2>/dev/null || ulimit -p ${LIMIT_PROCESSES}; }`],
+		['process count', `{ ulimit -u ${LIMIT_PROCESSES} 2>/dev/null || ulimit -p ${LIMIT_PROCESSES} 2>/dev/null; }`],
 	]
 	return statements
 		.map(([name, attempt]) => `${attempt} || echo '${LIMIT_NOTICE_PREFIX} ${name}' >&2`)
