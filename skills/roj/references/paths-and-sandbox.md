@@ -97,6 +97,8 @@ shellPlugin.configure(shell)
 | `env` | Extra env vars merged into the command's environment. |
 | `defaultEnabled` | Default `true`. **Every agent in the preset gets `run_command` unless explicitly disabled** with `shellPlugin.configureAgent({ enabled: false })`. `tools: []` on the agent definition does not opt the agent out. |
 
+`extraBinds` can also be declared top-level in `roj.config.ts`, where it reaches every preset's shell plugin. A preset that declares its own keeps them — the two lists replace, they do not merge.
+
 ### When you need extraBinds
 
 | Use case | Bind |
