@@ -185,7 +185,8 @@ describe('DefaultImageProcessor', () => {
 		const processor = createProcessor()
 		const resolve = async (name: string): Promise<ChatMessageContentItem> => {
 			const out = await processor.resolveContent([{ type: 'image_url', imageUrl: { url: `file://${name}` } }], fileStore)
-			return (out as ChatMessageContentItem[])[0]
+			if (typeof out === 'string') throw new Error('resolveContent collapsed the array form')
+			return out[0]
 		}
 
 		const own = await resolve('own.png')
