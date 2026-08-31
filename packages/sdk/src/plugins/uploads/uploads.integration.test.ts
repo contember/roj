@@ -119,6 +119,41 @@ describe('uploads plugin', () => {
 			await harness.shutdown()
 		})
 
+		// macOS sends the decomposed spelling; a model repeating that name back writes the composed
+		// one, and the two are different byte strings. Whatever the agent is told the file is called
+		// has to be what `open`/`cp` will find, so both the event and the state carry the stored form.
+		it('a decomposed filename is stored and reported composed', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			const fileContent = Buffer.from('Ahoj')
+			const decomposed = 'Veronika Paulova\u0301.txt'.normalize('NFD')
+			const composed = decomposed.normalize('NFC')
+			expect(decomposed).not.toBe(composed)
+
+			const result = await session.callPluginMethod('uploads.upload', {
+				sessionId: String(session.sessionId),
+				filename: decomposed,
+				mimeType: 'text/plain',
+				size: fileContent.length,
+				fileBuffer: fileContent,
+			})
+
+			okValue(result, uploadResultSchema)
+
+			const events = await session.getEventsByType(uploadEvents, 'attachment_uploaded')
+			expect(events[0].filename).toBe(composed)
+
+			const uploads = selectPluginState<UploadsState>(session.state, 'uploads')
+			if (!uploads) throw new Error('Expected uploads state')
+			expect(uploads.pending[0].filename).toBe(composed)
+
+			await harness.shutdown()
+		})
+
 		it('upload file exceeding 10MB → error', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
