@@ -114,6 +114,8 @@ interface PreparedUpload {
 	uploadId: ReturnType<typeof generateUploadId>
 	uploadIdStr: string
 	uploadStore: FileStore
+	/** The name as written. Callers report THIS, never their own input — see toStoredFilename. */
+	filename: string
 	filePath: string
 	createdAt: number
 	lifecycle: UploadLifecycle
@@ -162,6 +164,19 @@ function withoutKeys<T>(
 function isBasename(value: string): boolean {
 	if (value === '' || value === '.' || value === '..') return false
 	return !/[/\\\0]/.test(value)
+}
+
+/**
+ * The single spelling of a filename this plugin stores and reports.
+ *
+ * Unicode lets the same name be two different byte strings: macOS hands over the decomposed form
+ * (`á` as `a` + U+0301), while a model asked to repeat that name writes the composed one. The two
+ * do not compare equal, so every `cp`, `read_file` and shell redirect the agent builds from the
+ * name it was given misses the file that is actually on disk. Composing on the way in makes the
+ * name the agent produces the name that is there.
+ */
+function toStoredFilename(filename: string): string {
+	return filename.normalize('NFC')
 }
 
 function validateUploadInput(input: Pick<UploadInput, 'size' | 'mimeType' | 'filename'>): string | undefined {
@@ -276,7 +291,8 @@ async function prepareUpload(args: {
 	logger: Logger
 	input: UploadInput
 }): Promise<Result<PreparedUpload, DomainError>> {
-	const validationError = validateUploadInput(args.input)
+	const filename = toStoredFilename(args.input.filename)
+	const validationError = validateUploadInput({ ...args.input, filename })
 	if (validationError) return Err(ValidationErrors.invalid(validationError))
 
 	const uploadId = generateUploadId()
@@ -286,19 +302,20 @@ async function prepareUpload(args: {
 	try {
 		if (lifecycle.controller.signal.aborted) return Err(ValidationErrors.invalid('Session is closing'))
 		const uploadStore = args.dataFileStore.scoped(`sessions/${args.input.sessionId}/uploads/${uploadId}`)
-		const writeResult = await uploadStore.write(args.input.filename, args.input.fileBuffer)
+		const writeResult = await uploadStore.write(filename, args.input.fileBuffer)
 		if (!writeResult.ok) {
-			args.logger.error('Could not write upload file', undefined, { uploadId: uploadIdStr, filename: args.input.filename, error: writeResult.error })
+			args.logger.error('Could not write upload file', undefined, { uploadId: uploadIdStr, filename, error: writeResult.error })
 			return Err(uploadStorageError())
 		}
 		if (args.pluginContext.closing) {
-			await uploadStore.remove(args.input.filename)
+			await uploadStore.remove(filename)
 			return Err(ValidationErrors.invalid('Session is closing'))
 		}
 		prepared = {
 			uploadId,
 			uploadIdStr,
 			uploadStore,
+			filename,
 			filePath: writeResult.value.path,
 			createdAt: Date.now(),
 			lifecycle,
@@ -306,7 +323,7 @@ async function prepareUpload(args: {
 		return Ok(prepared)
 	} catch (error) {
 		// An embedder-supplied store throws its own driver text (bucket, endpoint, request id) — log it, never echo it.
-		args.logger.error('Could not write upload file', error instanceof Error ? error : undefined, { uploadId: uploadIdStr, filename: args.input.filename })
+		args.logger.error('Could not write upload file', error instanceof Error ? error : undefined, { uploadId: uploadIdStr, filename })
 		return Err(uploadStorageError())
 	} finally {
 		// The lifecycle is registered before any fs work, so every failure path must settle it —
@@ -990,11 +1007,6 @@ export const uploadsPlugin = definePlugin('uploads')
 			extractedContent: z.string().optional(),
 		}),
 		handler: async (ctx, input) => {
-			const upload: UploadDescriptor = {
-				filename: input.filename,
-				mimeType: input.mimeType,
-				size: input.size,
-			}
 			const preparedResult = await prepareUpload({
 				pluginContext: ctx.pluginContext,
 				dataFileStore: ctx.pluginConfig.dataFileStore,
@@ -1003,6 +1015,13 @@ export const uploadsPlugin = definePlugin('uploads')
 			})
 			if (!preparedResult.ok) return Err(preparedResult.error)
 			const prepared = preparedResult.value
+			// Built from the stored name, not from `input`: the metadata and the event tell the agent
+			// where the file is, and a spelling that differs from the directory entry is unusable.
+			const upload: UploadDescriptor = {
+				filename: prepared.filename,
+				mimeType: input.mimeType,
+				size: input.size,
+			}
 			const entryAgentId = getEntryAgentId(ctx.sessionState)
 			try {
 				const result = await prepared.lifecycle.start(() =>
@@ -1051,11 +1070,6 @@ export const uploadsPlugin = definePlugin('uploads')
 			status: z.enum(['processing']),
 		}),
 		handler: async (ctx, input) => {
-			const upload: UploadDescriptor = {
-				filename: input.filename,
-				mimeType: input.mimeType,
-				size: input.size,
-			}
 			const preparedResult = await prepareUpload({
 				pluginContext: ctx.pluginContext,
 				dataFileStore: ctx.pluginConfig.dataFileStore,
@@ -1064,6 +1078,13 @@ export const uploadsPlugin = definePlugin('uploads')
 			})
 			if (!preparedResult.ok) return Err(preparedResult.error)
 			const prepared = preparedResult.value
+			// Built from the stored name, not from `input`: the metadata and the event tell the agent
+			// where the file is, and a spelling that differs from the directory entry is unusable.
+			const upload: UploadDescriptor = {
+				filename: prepared.filename,
+				mimeType: input.mimeType,
+				size: input.size,
+			}
 			const processingMeta: UploadMetadata = {
 				uploadId: prepared.uploadId,
 				sessionId: ctx.sessionId,
