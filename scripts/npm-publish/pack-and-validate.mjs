@@ -138,13 +138,22 @@ for (const entry of packed) {
 		if (!firstLine.startsWith('#!')) throw new Error(`${entry.name} bin ${binName} has no shebang`)
 	}
 
+	// Bun-only exports still type-check; only the Node loader cannot take them.
+	const bunOnlyExports = new Set(manifest.roj?.bunOnlyExports ?? [])
+	for (const subpath of bunOnlyExports) {
+		if (!(manifest.exports ?? {})[subpath]) throw new Error(`${entry.name} declares bun-only export ${subpath} that it does not export`)
+	}
+
 	const importSpecifiers = []
+	const nodeImportSpecifiers = []
 	for (const [subpath, definition] of Object.entries(manifest.exports ?? {})) {
 		const importTarget = typeof definition === 'string'
 			? definition
 			: definition?.import ?? definition?.default
 		if (typeof importTarget !== 'string' || !/\.[cm]?js$/.test(importTarget)) continue
-		importSpecifiers.push(subpath === '.' ? entry.name : `${entry.name}${subpath.slice(1)}`)
+		const specifier = subpath === '.' ? entry.name : `${entry.name}${subpath.slice(1)}`
+		importSpecifiers.push(specifier)
+		if (!bunOnlyExports.has(subpath)) nodeImportSpecifiers.push(specifier)
 	}
 
 	if (entry.name === '@roj-ai/cli') {
@@ -159,7 +168,7 @@ for (const entry of packed) {
 	const uniqueImportSpecifiers = [...new Set(importSpecifiers)]
 	const esmSmokePath = path.join(consumerDir, 'esm-smoke.mjs')
 	await writeFile(esmSmokePath, `
-const specifiers = ${JSON.stringify(uniqueImportSpecifiers)}
+const specifiers = ${JSON.stringify([...new Set(nodeImportSpecifiers)])}
 for (const specifier of specifiers) await import(specifier)
 `)
 	run('node', [esmSmokePath], { cwd: consumerDir })
