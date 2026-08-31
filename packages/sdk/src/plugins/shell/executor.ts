@@ -3,7 +3,7 @@ import type { SessionEnvironment } from '~/core/sessions/session-environment.js'
 import type { ToolError } from '~/core/tools/executor.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import type { FileSystem } from '~/platform/fs.js'
-import type { ShellGrant, ShellRunner, ShellRunOptions } from '~/platform/shell.js'
+import type { ShellGrant, ShellLimits, ShellRunner, ShellRunOptions } from '~/platform/shell.js'
 
 // ============================================================================
 // Constants
@@ -128,6 +128,8 @@ export interface SandboxConfig {
 	network?: boolean
 	/** Paths with read-write access (default: [cwd]) */
 	writablePaths?: string[]
+	/** Resource caps for the confined command; a `null` field asks for no cap. */
+	limits?: ShellLimits
 }
 
 export interface ShellConfig {
@@ -257,6 +259,7 @@ export class ShellExecutor {
 		if (confineByPaths) {
 			runOptions.grants = this.grants(cwd, sessionDir, workspaceDir)
 			runOptions.network = this.config.sandbox?.network
+			runOptions.limits = this.config.sandbox?.limits
 		}
 
 		try {

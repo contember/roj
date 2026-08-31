@@ -258,6 +258,22 @@ describe('ShellExecutor', () => {
 		expect(calls[0].grants).toBeUndefined()
 	})
 
+	it('hands the caps the preset declares to the runner', async () => {
+		const { runner, calls } = recordingRunner('paths')
+		const executor = new ShellExecutor({
+			...sandboxedConfig,
+			sandbox: { enabled: true, limits: { processes: 256, fileSizeBytes: null } },
+		}, { fs: testPlatform.fs, shell: runner })
+
+		const result = await executor.execute(
+			{ command: 'echo hi' },
+			{ sessionDir: '/tmp', sandboxed: true },
+		)
+
+		expect(result.ok).toBe(true)
+		expect(calls[0].limits).toEqual({ processes: 256, fileSizeBytes: null })
+	})
+
 	it('grants a path-confined shell the session under its agent-visible name', async () => {
 		const { runner, calls } = recordingRunner('paths')
 		const executor = new ShellExecutor({
