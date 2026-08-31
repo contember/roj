@@ -92,6 +92,7 @@ shellPlugin.configure(shell)
 | `cwd` | **Mostly inert in sandboxed mode.** When bwrap is enabled, the default cwd inside the sandbox is `/home/user/session`; per-call `input.cwd` (or virtual `/home/user/workspace`) overrides. `config.cwd` is only consulted as the *outer* spawn cwd for the bwrap process itself, with `sessionDir` taking precedence (`executor.ts:355`). |
 | `sandbox.enabled` | Default `true`. When `false` (or `sandbox` is unset and `environment.sandboxed` is also false), commands run without bwrap. |
 | `sandbox.network` | Default `false`. **Turn on for any preset that runs `bun install`, `npm`, fetches, etc.** |
+| `sandbox.limits` | Caps for the confined command: `fileSizeBytes` (default 200 MB) and `processes` (default 64). Omit a field for the default, `null` to set no cap. `processes` is `RLIMIT_NPROC`, which is per-uid and namespace-local only on Linux 5.14+ — on an older kernel a busy host account can fail every `fork` inside the sandbox. |
 | `extraBinds` | bind extra paths into the bwrap namespace. `mode: 'rw'` for project trees, `'ro'` for credentials and configs. `destPath` defaults to `path`. |
 | `timeout` | Default 30000ms. Override per-call via `input.timeout`. |
 | `env` | Extra env vars merged into the command's environment. |
