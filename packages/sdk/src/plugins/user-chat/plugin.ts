@@ -742,6 +742,12 @@ export const userChatPlugin = definePlugin("user-chat")
 		}),
 		output: z.object({}),
 		handler: async (ctx, input) => {
+			// A retried batch resubmits answers that already landed; the agent must see one.
+			const asked = ctx.pluginState.messages.find(
+				(msg) => msg.type === "ask_user" && msg.questionId === input.questionId,
+			);
+			if (asked?.type === "ask_user" && asked.answered) return Ok({});
+
 			const messageId = generateChatMessageId(
 				reserveMessageSequence(ctx.pluginContext),
 			);
