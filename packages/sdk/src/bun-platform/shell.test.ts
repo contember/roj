@@ -168,6 +168,7 @@ describe('buildBwrapArgs', () => {
 describe('createBunShellRunner', () => {
 	it('reports paths confinement', () => {
 		expect(createBunShellRunner().confinement).toBe('paths')
+		expect(createBunShellRunner().supportsTimeout).toBe(true)
 	})
 
 	it('runs a command line through the shell', async () => {

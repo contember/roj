@@ -357,6 +357,7 @@ export function createBunShellRunner(
 ): ShellRunner {
 	return {
 		confinement: 'paths',
+		supportsTimeout: true,
 		run: (options) => runCommand(processRunner, options, warn),
 	}
 }

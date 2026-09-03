@@ -93,7 +93,8 @@ export const GIT_FIXTURE: {
 /**
  * What the suite reports on. Most are ports; the dotted ones are facets a port
  * either has or does not — a scheduler that delivers its own wakes, a shell that
- * confines by paths — and they are named so that not exercising one is visible.
+ * terminates on timeout or confines by paths — and they are named so that not
+ * exercising one is visible.
  */
 export type ConformancePort =
 	| 'fs'
@@ -106,6 +107,7 @@ export type ConformancePort =
 	| 'scheduler'
 	| 'scheduler.live'
 	| 'shell'
+	| 'shell.timeout'
 	| 'shell.paths'
 	| 'shell.host'
 	| 'git'
@@ -126,6 +128,7 @@ export const CONFORMANCE_PORTS: readonly ConformancePort[] = [
 	'scheduler',
 	'scheduler.live',
 	'shell',
+	'shell.timeout',
 	'shell.paths',
 	'shell.host',
 	'git',
@@ -1071,6 +1074,13 @@ const shellChecks: ConformanceCheck[] = [
 	},
 	{
 		port: 'shell',
+		name: 'declares whether it supports wall-clock termination',
+		async run({ platform }) {
+			expect(typeof platform.shell?.supportsTimeout).toBe('boolean')
+		},
+	},
+	{
+		port: 'shell',
 		name: 'a non-zero exit resolves rather than rejects',
 		async run({ platform, root }) {
 			const result = await shellRun(platform, { command: 'exit 3', cwd: root, timeoutMs: 10_000 })
@@ -1129,7 +1139,7 @@ const shellChecks: ConformanceCheck[] = [
 		},
 	},
 	{
-		port: 'shell',
+		port: 'shell.timeout',
 		name: 'a timeout terminates the command and reports timedOut',
 		async run({ platform, root }) {
 			const started = Date.now()
@@ -1137,6 +1147,21 @@ const shellChecks: ConformanceCheck[] = [
 			expect(result.timedOut).toBe(true)
 			expect(Date.now() - started).toBeLessThan(20_000)
 			expect(result.exitCode).not.toBe(0)
+		},
+	},
+	{
+		port: 'shell.timeout',
+		name: 'a timed-out run cannot keep mutating after it resolves',
+		async run({ platform, path, root }) {
+			const marker = path('late-after-timeout.txt')
+			const result = await shellRun(platform, {
+				command: 'sleep 1; printf late > late-after-timeout.txt',
+				cwd: root,
+				timeoutMs: 100,
+			})
+			expect(result.timedOut).toBe(true)
+			await sleep(1_200)
+			expect(await platform.fs.exists(marker)).toBe(false)
 		},
 	},
 	{
@@ -1605,6 +1630,11 @@ async function probeInstance(target: ConformanceTarget, instance: PlatformInstan
 
 	const confinement = platform.shell?.confinement
 	add('shell', platform.shell !== undefined)
+	add(
+		'shell.timeout',
+		platform.shell?.supportsTimeout === true,
+		platform.shell === undefined ? 'port absent' : 'the runner declares no wall-clock timeout support',
+	)
 	const confines = await probeConfinement(instance)
 	add('shell.paths', confines.ok, confines.note)
 	add('shell.host', confinement === 'host', `confinement is ${confinement ?? 'absent'}`)

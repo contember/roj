@@ -41,6 +41,7 @@ function recordingRunner(confinement: ShellConfinement): { runner: ShellRunner; 
 		calls,
 		runner: {
 			confinement,
+			supportsTimeout: true,
 			run: async (options) => {
 				calls.push(options)
 				return { stdout: 'recorded', stderr: '', exitCode: 0, timedOut: false }
@@ -465,6 +466,7 @@ describe('ShellExecutor', () => {
 	it('reports a run the host could not start', async () => {
 		const runner: ShellRunner = {
 			confinement: 'paths',
+			supportsTimeout: true,
 			run: async () => {
 				throw new Error('Failed to execute command: bwrap missing')
 			},
