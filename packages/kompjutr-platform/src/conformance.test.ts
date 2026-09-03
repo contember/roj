@@ -35,7 +35,7 @@ runPlatformConformance({
 		})
 		workspace.filesystem.mkdir(ROOT, { recursive: true })
 
-		const platform = createKompjutrPlatform(workspace)
+		const platform = createKompjutrPlatform(workspace, { shellConfinement: 'host' })
 		workspaces.set(platform, workspace)
 
 		return { platform, root: ROOT }

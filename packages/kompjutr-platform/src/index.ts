@@ -16,6 +16,7 @@ import { KompjutrLLMCallLog } from './llm-call-log.js'
 import type { KompjutrLLMCallLogOptions } from './llm-call-log.js'
 import { createUnsupportedProcessRunner } from './process.js'
 import { KompjutrSessionLog } from './session-log.js'
+import { createKompjutrShellRunner } from './shell.js'
 
 export interface KompjutrPlatformOptions {
 	/** Scratch directory, created if it is not there. Defaults to `/tmp`. */
@@ -28,6 +29,8 @@ export interface KompjutrPlatformOptions {
 	scheduler?: Scheduler
 	/** Retention and column ceiling for the LLM call log. */
 	llmCallLog?: KompjutrLLMCallLogOptions
+	/** How the workspace itself is isolated. Defaults to `none`. */
+	shellConfinement?: 'host' | 'none'
 }
 
 export function createKompjutrPlatform(workspace: Workspace, options: KompjutrPlatformOptions = {}): Platform {
@@ -40,6 +43,11 @@ export function createKompjutrPlatform(workspace: Workspace, options: KompjutrPl
 	return {
 		fs: createKompjutrFileSystem({ compat: workspace.fs, filesystem: workspace.filesystem }),
 		process: createUnsupportedProcessRunner(),
+		shell: createKompjutrShellRunner({
+			filesystem: workspace.filesystem,
+			git,
+			confinement: options.shellConfinement,
+		}),
 		git: git && createKompjutrGitClient(git),
 		// One counter for the whole workspace, bumped once per mutating call. It is
 		// a gate against an unnecessary read, never a scope: a write in one session
@@ -72,3 +80,5 @@ export { KompjutrLLMCallLog } from './llm-call-log.js'
 export type { KompjutrLLMCallLogOptions } from './llm-call-log.js'
 export { createUnsupportedProcessRunner } from './process.js'
 export { KompjutrSessionLog } from './session-log.js'
+export { createKompjutrShellRunner } from './shell.js'
+export type { KompjutrShellRunnerOptions } from './shell.js'

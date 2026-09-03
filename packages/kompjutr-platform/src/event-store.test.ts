@@ -46,7 +46,8 @@ test('a batch wider than one statement can bind lands whole', async () => {
 
 	const loaded = await store.load(SESSION)
 	expect(loaded).toHaveLength(100)
-	expect(loaded.map((entry) => entry.index)).toEqual(events.map((entry) => entry.index))
+	expect(loaded.map((entry) => 'index' in entry && typeof entry.index === 'number' ? entry.index : undefined))
+		.toEqual(Array.from({ length: 100 }, (_, index) => index))
 })
 
 test('a batch that fails part way through leaves nothing behind', async () => {

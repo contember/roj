@@ -36,11 +36,11 @@ test('git commits and reports a dirty worktree', async () => {
 	expect(JSON.stringify(await ws.git.status({ dir: '/' }))).toContain('scratch.txt')
 })
 
-test('the shell runs a pipeline over the same database', () => {
+test('the shell runs a pipeline over the same database', async () => {
 	const ws = workspace()
 	ws.filesystem.writeFile('/a.txt', utf8.encode('b\na\nc\n'))
 
-	const run = createShell({ fs: ws.filesystem }).run('cat /a.txt | sort | head -2')
+	const run = await createShell({ fs: ws.filesystem }).run('cat /a.txt | sort | head -2')
 
 	expect(run.exitCode).toBe(0)
 	expect(run.stdout).toBe('a\nb\n')

@@ -94,6 +94,7 @@ export function createKompjutrFileSystem(options: KompjutrFileSystemOptions): Fi
 			readdirOptions?.withFileTypes ? compat.readdirSync(path, { withFileTypes: true }) : compat.readdirSync(path)) as FileSystem['readdir'],
 
 		stat: async (path) => compat.statSync(path),
+		lstat: async (path) => compat.lstatSync(path),
 		access: async (path, mode) => {
 			compat.accessSync(path, mode)
 		},
@@ -172,5 +173,7 @@ export function createKompjutrFileSystem(options: KompjutrFileSystemOptions): Fi
 		rmFiles: async (paths: readonly string[], rmOptions?: { recursive?: boolean; force?: boolean }) => {
 			filesystem.removeFiles(paths, { recursive: rmOptions?.recursive ?? false, force: rmOptions?.force ?? false })
 		},
+
+		scopeReads: (fn) => filesystem.withReadScope(fn),
 	}
 }
