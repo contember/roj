@@ -91,6 +91,7 @@ async function walkTree(fs: FileSystem, dir: string, options?: WalkOptions): Pro
 
 /** node:fs plus the five optional verbs, each answering what its loop would. */
 function equippedFileSystem(base: FileSystem, onWrite: () => void): FileSystem {
+	const rename = base.rename?.bind(base)
 	const written = <T>(result: Promise<T>): Promise<T> => result.then((value) => {
 		onWrite()
 		return value
@@ -101,6 +102,7 @@ function equippedFileSystem(base: FileSystem, onWrite: () => void): FileSystem {
 
 		writeFile: (path, data) => written(base.writeFile(path, data)),
 		appendFile: (path, data) => written(base.appendFile(path, data)),
+		rename: rename ? (source, dest) => written(rename(source, dest)) : undefined,
 		mkdir: (path, options) => written(base.mkdir(path, options)),
 		unlink: (path) => written(base.unlink(path)),
 		rm: (path, options) => written(base.rm(path, options)),
@@ -322,6 +324,27 @@ interface Violation {
 }
 
 const violations: Violation[] = [
+	{
+		name: 'fsRevision does not count rename as a write',
+		ports: ['fsRevision.numbered', 'fs.rename'],
+		caughtBy: 'the number moves after a rename',
+		break: (platform) => ({ ...platform, fs: { ...platform.fs, rename: createNodePlatform().fs.rename } }),
+	},
+	{
+		name: 'rename copies over the destination inode then unlinks the source',
+		ports: ['fs.rename'],
+		caughtBy: 'same-directory rename moves exact bytes and replaces without modifying the old inode',
+		break: (platform) => ({
+			...platform,
+			fs: {
+				...platform.fs,
+				rename: async (source, dest) => {
+					await platform.fs.writeFile(dest, await platform.fs.readFile(source))
+					await platform.fs.unlink(source)
+				},
+			},
+		}),
+	},
 	{
 		name: 'walk ignores excludeHidden',
 		ports: ['fs.walk'],

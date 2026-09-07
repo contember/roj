@@ -23,6 +23,7 @@ export function createNodeFileSystem(): FileSystem {
 
 		writeFile: (path, data) => fsp.writeFile(path, data),
 		appendFile: (path, data) => fsp.appendFile(path, data),
+		rename: (source, dest) => fsp.rename(source, dest),
 
 		mkdir: async (path, options) => {
 			await fsp.mkdir(path, options)
