@@ -35,6 +35,7 @@ export function isDomainError(value: unknown): value is DomainError {
 // ============================================================================
 
 export const SessionErrors = {
+	runtimeUnavailable: (id: string, state: string) => createDomainError('session_runtime_unavailable', `Session runtime '${id}' is ${state}`, 409),
 	notFound: (id: string) => createDomainError('session_not_found', `Session not found: ${id}`, 404),
 	closed: (id: string) => createDomainError('session_closed', `Session is closed: ${id}`, 409),
 	alreadyExists: (id: string) => createDomainError('session_already_exists', `Session already exists: ${id}`, 409),

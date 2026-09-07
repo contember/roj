@@ -3,6 +3,7 @@ import { z } from 'zod/v4'
 import { SessionErrors, ValidationErrors } from '~/core/errors.js'
 import { ModelId } from '~/core/llm/schema.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
+import { SessionRuntimeUnavailableError } from '~/core/sessions/runtime-activity.js'
 import type { SessionState } from '~/core/sessions/state.js'
 import { getEntryAgentId } from '~/core/sessions/state.js'
 import { Err, Ok } from '~/lib/utils/result.js'
@@ -24,12 +25,14 @@ describe('session context live seams', () => {
 			snapshot?: SessionState
 			getSessionState?: () => SessionState
 			reserveMailboxMessageSequence?: () => number
+			reservations?: number[]
 		} = {}
 		const plugin = definePlugin('session-context-probe')
 			.sessionHook('onSessionReady', async (ctx) => {
 				observed.snapshot = ctx.sessionState
 				observed.getSessionState = ctx.getSessionState
 				observed.reserveMailboxMessageSequence = ctx.reserveMailboxMessageSequence
+				observed.reservations = [ctx.reserveMailboxMessageSequence(), ctx.reserveMailboxMessageSequence()]
 			})
 			.build()
 		const harness = new TestHarness({ presets: [createTestPreset()], systemPlugins: [plugin] })
@@ -40,10 +43,8 @@ describe('session context live seams', () => {
 			const reserveMailboxMessageSequence = observed.reserveMailboxMessageSequence
 			if (!snapshot || !getSessionState || !reserveMailboxMessageSequence) throw new Error('Session context was not observed')
 
-			const first = reserveMailboxMessageSequence()
-			const second = reserveMailboxMessageSequence()
-			expect(first).toBe(1)
-			expect(second).toBe(first + 1)
+			expect(observed.reservations).toEqual([1, 2])
+			expect(() => reserveMailboxMessageSequence()).toThrow(SessionRuntimeUnavailableError)
 
 			const model = ModelId('live-model')
 			await session.setOverrides({ defaults: { model } })
@@ -56,33 +57,42 @@ describe('session context live seams', () => {
 	})
 
 	it('keeps named sequences independent and seeds each one once per runtime', async () => {
-		const observed: { reserve?: (name: string, seed: () => number) => number } = {}
+		const observed: { reserve?: (name: string, seed: () => number) => number; reservations?: number[] } = {}
 		const seedCalls = { a: 0, b: 0 }
+		const seedA = () => {
+			seedCalls.a++
+			return 10
+		}
+		const seedB = () => {
+			seedCalls.b++
+			return 100
+		}
 		const plugin = definePlugin('sequence-probe')
 			.sessionHook('onSessionReady', async (ctx) => {
 				observed.reserve = ctx.reserveSequence
+				observed.reservations = [ctx.reserveSequence('a', seedA), ctx.reserveSequence('b', seedB)]
+			})
+			.method('reserve', {
+				input: z.object({}),
+				output: z.array(z.number()),
+				handler: async (ctx) => Ok([
+					ctx.reserveSequence('a', seedA),
+					ctx.reserveSequence('a', seedA),
+					ctx.reserveSequence('b', seedB),
+				]),
 			})
 			.build()
 		const harness = new TestHarness({ presets: [createTestPreset()], systemPlugins: [plugin] })
 		try {
-			await harness.createSession('test')
+			const session = await harness.createSession('test')
 			const reserve = observed.reserve
 			if (!reserve) throw new Error('Session context was not observed')
 
-			const seedA = () => {
-				seedCalls.a++
-				return 10
-			}
-			const seedB = () => {
-				seedCalls.b++
-				return 100
-			}
-
-			expect(reserve('a', seedA)).toBe(10)
-			expect(reserve('a', seedA)).toBe(11)
-			expect(reserve('b', seedB)).toBe(100)
-			expect(reserve('a', seedA)).toBe(12)
-			expect(reserve('b', seedB)).toBe(101)
+			expect(observed.reservations).toEqual([10, 100])
+			const result = await session.callPluginMethod('sequence-probe.reserve', {})
+			expect(result.ok).toBe(true)
+			if (result.ok) expect(result.value).toEqual([11, 12, 101])
+			expect(() => reserve('escaped', seedA)).toThrow(SessionRuntimeUnavailableError)
 			// The seed only hands a rebuilt runtime its starting point; after that the counter owns it.
 			expect(seedCalls).toEqual({ a: 1, b: 1 })
 		} finally {
@@ -151,13 +161,27 @@ describe('session context live seams', () => {
 			await session.close()
 			if (!reserveMailboxMessageSequence) throw new Error('Reservation function was not observed')
 			const reserveAfterClose = reserveMailboxMessageSequence
-			expect(() => reserveAfterClose()).toThrow('closed or disposed')
+			expect(() => reserveAfterClose()).toThrow(SessionRuntimeUnavailableError)
+			try {
+				reserveAfterClose()
+			} catch (error) {
+				if (!(error instanceof SessionRuntimeUnavailableError)) throw error
+				expect(error.sessionId).toBe(session.sessionId)
+				expect(error.state).toBe('disposed')
+			}
 			const result = await session.callPluginMethod('closed-writer.write', {})
 			expect(result.ok).toBe(false)
-			if (!result.ok) expect(result.error.type).toBe('session_closed')
+			if (!result.ok) expect(result.error.type).toBe('session_runtime_unavailable')
 			expect(handlerCalls).toBe(0)
 			const messages = await session.getEventsByType(mailboxEvents, 'mailbox_message')
 			expect(messages).toHaveLength(0)
+			const acquired = await harness.sessionManager.getSession(session.sessionId)
+			if (!acquired.ok) throw new Error(acquired.error.message)
+			const closedResult = await acquired.value.callPluginMethod('closed-writer.write', {})
+			expect(closedResult.ok).toBe(false)
+			if (!closedResult.ok) expect(closedResult.error.type).toBe('session_closed')
+			expect(handlerCalls).toBe(0)
+			expect(await session.getEventsByType(mailboxEvents, 'mailbox_message')).toHaveLength(0)
 		} finally {
 			await harness.shutdown()
 		}

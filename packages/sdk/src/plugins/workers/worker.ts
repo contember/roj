@@ -60,6 +60,8 @@ export interface WorkerEntry {
 	workerType: string
 	/** Common status */
 	status: WorkerStatus
+	/** A durable request whose body has not been entered yet. */
+	pendingStart?: boolean
 	/** Worker-specific state, retained only while resumable. */
 	state?: unknown
 	/** Configuration passed when starting the worker, retained only while resumable. */

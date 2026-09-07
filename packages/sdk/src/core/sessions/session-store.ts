@@ -8,6 +8,7 @@
 import type { AgentId } from '~/core/agents/schema.js'
 import type { AgentState } from '~/core/agents/state.js'
 import type { EventStore } from '~/core/events/event-store.js'
+import { EventAppendError } from '~/core/events/event-store.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import { applyEvent as coreApplyEvent } from '~/core/sessions/apply-event.js'
 import type { SessionReducer } from '~/core/sessions/reducer.js'
@@ -39,6 +40,10 @@ export class SessionStore {
 	private readonly eventListeners: Array<(event: DomainEvent) => void> = []
 	private readonly applyEvent: SessionReducer
 	private detached = false
+	private tail: Promise<void> = Promise.resolve()
+	private fence: { error: unknown } | undefined
+	private failure: { error: unknown } | undefined
+	private pendingWrites = 0
 
 	constructor(
 		readonly sessionId: SessionId,
@@ -85,6 +90,15 @@ export class SessionStore {
 		return this.detached
 	}
 
+	hasPendingWrites(): boolean {
+		return this.pendingWrites > 0
+	}
+
+	async waitForIdle(): Promise<void> {
+		while (this.pendingWrites > 0) await this.tail
+		if (this.failure) throw this.failure.error
+	}
+
 	/**
 	 * Create a new SessionStore by loading events from EventStore.
 	 * Also validates and reconciles metadata if out of sync (e.g., after crash).
@@ -120,10 +134,7 @@ export class SessionStore {
 	 * Emit a single event - writes to EventStore and applies to state.
 	 */
 	async emit(event: DomainEvent): Promise<void> {
-		if (this.detached) throw new SessionRuntimeDetachedError(this.sessionId, [event])
-		await this.eventStore.append(this.sessionId, event)
-		this._state = this.applyEvent(this._state, event)
-		this.notifyListeners(event)
+		await this.enqueue([event], () => this.eventStore.append(this.sessionId, event))
 	}
 
 	/**
@@ -132,14 +143,45 @@ export class SessionStore {
 	 * state application for subsequent events in the batch.
 	 */
 	async emitBatch(events: DomainEvent[]): Promise<void> {
-		if (events.length === 0) return
-		if (this.detached) throw new SessionRuntimeDetachedError(this.sessionId, events)
+		await this.enqueue(events, () => this.eventStore.appendBatch(this.sessionId, events))
+	}
 
-		await this.eventStore.appendBatch(this.sessionId, events)
-		for (const event of events) {
-			this._state = this.applyEvent(this._state, event)
-			this.notifyListeners(event)
-		}
+	private enqueue(events: DomainEvent[], append: () => Promise<void>): Promise<void> {
+		if (this.detached) return Promise.reject(new SessionRuntimeDetachedError(this.sessionId, events))
+		if (this.fence) return Promise.reject(this.fence.error)
+		if (events.length === 0) return Promise.resolve()
+		this.pendingWrites++
+		const operation = this.tail.then(async () => {
+			if (this.detached) throw new SessionRuntimeDetachedError(this.sessionId, events)
+			if (this.fence) throw this.fence.error
+			try {
+				await append()
+			} catch (error) {
+				if (!(error instanceof EventAppendError)) this.fence = { error }
+				throw error
+			}
+			if (this.detached) throw new SessionRuntimeDetachedError(this.sessionId, events)
+			try {
+				let next = this._state
+				for (const event of events) next = this.applyEvent(next, event)
+				this._state = next
+			} catch (error) {
+				this.fence = { error }
+				throw error
+			}
+			for (const event of events) {
+				if (this.detached) break
+				this.notifyListeners(event)
+			}
+		})
+		this.tail = operation.then(
+			() => { this.pendingWrites-- },
+			(error: unknown) => {
+				this.failure ??= { error }
+				this.pendingWrites--
+			},
+		)
+		return operation
 	}
 
 	/**
@@ -148,6 +190,7 @@ export class SessionStore {
 	 */
 	private notifyListeners(event: DomainEvent): void {
 		for (const listener of this.eventListeners) {
+			if (this.detached) return
 			try {
 				listener(event)
 			} catch (err) {

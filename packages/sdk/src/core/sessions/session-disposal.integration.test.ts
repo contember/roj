@@ -4,7 +4,7 @@ import { Agent } from '~/core/agents/agent.js'
 import { createEventsFactory } from '~/core/events/types.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
-import { SessionRuntimeDetachedError } from '~/core/sessions/session-store.js'
+import { SessionRuntimeUnavailableError } from '~/core/sessions/runtime-activity.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 
 const createDeferred = () => {
@@ -188,7 +188,7 @@ describe('session disposal', () => {
 
 		// The manager rebuilds this session from the log on the next access, so a
 		// write from the disposed runtime would be invisible to the live one.
-		await expect(lateEmit()).rejects.toBeInstanceOf(SessionRuntimeDetachedError)
+		await expect(lateEmit()).rejects.toBeInstanceOf(SessionRuntimeUnavailableError)
 		expect(await session.getEventsByType('late_write')).toHaveLength(0)
 
 		await harness.shutdown()
