@@ -10,6 +10,7 @@
 import { rm } from 'node:fs/promises'
 import { afterEach, describe, expect, it } from 'bun:test'
 import { AgentId } from '~/core/agents/schema.js'
+import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { MemoryEventStore } from '~/core/events/memory.js'
 import { SessionFileStore } from '~/core/file-store/file-store.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
@@ -17,6 +18,7 @@ import type { MockInferenceHandler } from '~/core/llm/mock.js'
 import type { InferenceResponse } from '~/core/llm/provider.js'
 import { SessionId } from '~/core/sessions/schema.js'
 import { SessionManager } from '~/core/sessions/session-manager.js'
+import { SessionRuntimeUnavailableError } from '~/core/sessions/runtime-activity.js'
 import { agentWakeKey, pluginWakeKey } from '~/core/wake-key.js'
 import type { Session } from '~/core/sessions/session.js'
 import { ToolExecutor } from '~/core/tools/executor.js'
@@ -90,12 +92,110 @@ interface Host {
 
 const hosts: Host[] = []
 
+describe('scheduler handoff', () => {
+	for (const cause of ['close', 'shutdown']) {
+		it(`rejects a wake during ${cause} teardown instead of acknowledging it`, async () => {
+			const entered = Promise.withResolvers<void>()
+			const release = Promise.withResolvers<void>()
+			const plugin = definePlugin('wake-teardown').sessionHook('onSessionClose', async () => {
+				entered.resolve()
+				await release.promise
+			}).build()
+			const host = createHost({ scheduler: new RecordingScheduler(), preset: createTestPreset({ plugins: [plugin.configure({})] }) })
+			const session = await createSession(host)
+			const key = agentWakeKey(session.id, entryAgentId(session), 'debounce')
+			const closing = cause === 'close' ? session.close() : host.manager.shutdown()
+			await entered.promise
+			try {
+				await expect(host.manager.dispatchWake(key)).rejects.toBeInstanceOf(SessionRuntimeUnavailableError)
+			} finally {
+				release.resolve()
+				await closing
+			}
+		})
+	}
+
+	it('preserves an actual retry wake armed after exhausted inference retries', async () => {
+		const scheduler = new RecordingScheduler()
+		const host = createHost({ scheduler, mockHandler: () => { throw { type: 'rate_limit', message: 'retry later', retryAfterMs: 0 } } })
+		const session = await createSession(host)
+		const agentId = entryAgentId(session)
+		await sendMessage(session, agentId, 'trigger retry')
+		await host.manager.dispatchWake(agentWakeKey(session.id, agentId, 'debounce'))
+		const key = agentWakeKey(session.id, agentId, 'retry')
+		const delay = scheduler.armed.get(key)
+		const operations = scheduler.opsFor(key)
+		expect(delay).toBeDefined()
+		const activation = host.manager.activateSession(session.id)
+		if (!activation.ok) throw new Error(activation.error.message)
+		await host.manager.parkSession(activation.value)
+		expect(scheduler.armed.get(key)).toBe(delay)
+		expect(scheduler.opsFor(key)).toEqual(operations)
+		await expect(host.manager.dispatchWake(key)).rejects.toBeInstanceOf(SessionRuntimeUnavailableError)
+	})
+
+	it('preserves the actual supervision wake armed by child creation', async () => {
+		const scheduler = new RecordingScheduler()
+		const host = createHost({ scheduler, preset: createTestPreset({
+			agents: [{ name: 'child', system: 'Work', tools: [], agents: [] }],
+			plugins: [agentsPlugin.configure({ agentDefinitions: new Map([['child', { name: 'child' }]]), superviseChildrenIntervalMs: 60_000 })],
+		}) })
+		const session = await createSession(host)
+		const agentId = entryAgentId(session)
+		expect((await session.callPluginMethod('agents.spawn', { definitionName: 'child', parentId: agentId, message: 'work' })).ok).toBe(true)
+		const key = pluginWakeKey(session.id, 'agents', '_supervisionTick', agentId)
+		const delay = scheduler.armed.get(key)
+		const operations = scheduler.opsFor(key)
+		expect(delay).toBe(60_000)
+		const activation = host.manager.activateSession(session.id)
+		if (!activation.ok) throw new Error(activation.error.message)
+		await host.manager.parkSession(activation.value)
+		expect(scheduler.armed.get(key)).toBe(delay)
+		expect(scheduler.opsFor(key)).toEqual(operations)
+		await expect(host.manager.dispatchWake(key)).rejects.toBeInstanceOf(SessionRuntimeUnavailableError)
+	})
+
+	it('preserves the host debounce record and refuses delivery while explicitly released', async () => {
+		const scheduler = new RecordingScheduler()
+		const host = createHost({ scheduler })
+		const session = await createSession(host)
+		const agentId = entryAgentId(session)
+		await sendMessage(session, agentId, 'park before inference')
+		const key = agentWakeKey(session.id, agentId, 'debounce')
+		const operations = scheduler.opsFor(key)
+		const delay = scheduler.armed.get(key)
+		expect(delay).toBeDefined()
+		const activation = host.manager.activateSession(session.id)
+		if (!activation.ok) throw new Error(activation.error.message)
+		await host.manager.parkSession(activation.value)
+		expect(scheduler.opsFor(key)).toEqual(operations)
+		expect(scheduler.armed.get(key)).toBe(delay)
+		await expect(host.manager.dispatchWake(key)).rejects.toBeInstanceOf(SessionRuntimeUnavailableError)
+		expect(host.llmProvider.getCallCount()).toBe(0)
+	})
+
+	it('rejects park when an admitted scheduler operation failed', async () => {
+		class FailingScheduler extends RecordingScheduler {
+			override async wake(): Promise<void> { throw new Error('Scheduler unavailable') }
+		}
+		const host = createHost({ scheduler: new FailingScheduler() })
+		const session = await createSession(host)
+		await sendMessage(session, entryAgentId(session), 'arm a failing wake')
+		const activation = host.manager.activateSession(session.id)
+		if (!activation.ok) throw new Error(activation.error.message)
+		await expect(host.manager.parkSession(activation.value)).rejects.toBeInstanceOf(AggregateError)
+		expect(host.manager.activateSession(session.id).ok).toBe(false)
+		host.manager.revokeSession(activation.value)
+	})
+})
+
 /**
  * A SessionManager on an injectable scheduler. TestHarness always builds its own
  * platform, and the whole point here is to swap the scheduler out.
  */
 function createHost(options: {
 	scheduler: Scheduler
+	preset?: ReturnType<typeof createTestPreset>
 	eventStore?: MemoryEventStore
 	mockHandler?: MockInferenceHandler
 }): Host {
@@ -106,7 +206,7 @@ function createHost(options: {
 		eventStore: options.eventStore ?? new MemoryEventStore(),
 		llmProvider,
 		toolExecutor: new ToolExecutor(silentLogger),
-		presets: new Map([['test', createTestPreset()]]),
+		presets: new Map([['test', options.preset ?? createTestPreset()]]),
 		logger: silentLogger,
 		basePath,
 		dataFileStore: new SessionFileStore(basePath, undefined, false, platform.fs, 'session'),

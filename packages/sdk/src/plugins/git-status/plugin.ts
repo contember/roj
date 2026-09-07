@@ -73,6 +73,8 @@ interface SessionGitStatus {
 
 interface GitStatusPluginContext {
 	sessions: Map<SessionId, SessionGitStatus>
+	runtimeActivity: import('~/core/sessions/runtime-activity.js').SessionRuntimeActivity
+	notify: import('~/core/sessions/context.js').SessionContext['notify']
 }
 
 export interface GitStatusPluginConfig {
@@ -100,7 +102,7 @@ export const gitStatusPlugin = definePlugin('git-status')
 	.order(150)
 	.pluginConfig<GitStatusPluginConfig>()
 	.notification('git_status_changed', { schema: gitStatusChangedSchema })
-	.context(async (): Promise<GitStatusPluginContext> => ({ sessions: new Map() }))
+	.context(async (ctx): Promise<GitStatusPluginContext> => ({ sessions: new Map(), runtimeActivity: ctx.runtimeActivity, notify: ctx.notify }))
 	.method('refresh', {
 		input: z.object({}),
 		output: z.object({ snapshot: gitStatusSnapshotSchema.nullable() }),
@@ -116,8 +118,13 @@ export const gitStatusPlugin = definePlugin('git-status')
 		ctx.pluginContext.sessions.set(ctx.sessionId, entry)
 		if (!polls) return
 
-		void refresh(ctx)
-		entry.interval = setInterval(() => void refresh(ctx), POLL_INTERVAL_MS)
+		const poll = () => {
+			const operation = ctx.pluginContext.runtimeActivity.tryOperation('git-status:poll')
+			if (!operation) return
+			void refresh({ ...ctx, notify: (type, payload) => ctx.pluginContext.notify(type, payload, operation.activity) }).finally(() => operation.release())
+		}
+		poll()
+		entry.interval = setInterval(poll, POLL_INTERVAL_MS)
 	})
 	.hook('afterToolCall', async (ctx) => {
 		// Only a mark: the read itself waits for the turn to end, and is skipped if no tool ran.

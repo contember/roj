@@ -5,6 +5,8 @@ import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MemoryEventStore } from '~/core/events/memory.js'
+import { EventAppendError } from '~/core/events/event-store.js'
+import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
@@ -75,6 +77,36 @@ const neverReadyService: ServiceConfig = {
 // ============================================================================
 
 let currentHarness: TestHarness | undefined
+
+describe('service handoff cleanup', () => {
+	for (const reason of ['parked', 'revoked']) {
+		it(`${reason} stops only the old process with the appropriate grace`, async () => {
+			const child = new ChildProcess()
+			Object.defineProperties(child, {
+				pid: { value: 429_000 }, stdin: { value: null },
+				stdout: { value: new EventEmitter() }, stderr: { value: new EventEmitter() },
+			})
+			const signals: NodeJS.Signals[] = []
+			let alive = true
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), {
+				fs: createNodePlatform().fs,
+				process: { spawn: () => child, execFile: async () => { throw new Error('Unexpected exec') } },
+				kill: (_pid, signal) => {
+					if (signal === 0) throw Object.assign(new Error('Process probe'), { code: alive ? 'EPERM' : 'ESRCH' })
+					if (typeof signal !== 'string') throw new Error('Unexpected signal')
+					signals.push(signal)
+					if ((reason === 'parked' && signal === 'SIGTERM') || signal === 'SIGKILL') alive = false
+					return true
+				},
+			})
+			const id = SessionId(`service-${reason}`)
+			expect((await executor.start({ type: 'handoff', description: 'Handoff', command: 'unused', gracefulStopMs: 60_000 }, id)).ok).toBe(true)
+			await executor.close(id, reason === 'parked' ? 'parked' : 'revoked')
+			expect(signals).toEqual(reason === 'parked' ? ['SIGTERM'] : ['SIGTERM', 'SIGKILL'])
+			expect(executor.getStatus('handoff')).toBeNull()
+		})
+	}
+})
 
 afterEach(async () => {
 	if (currentHarness) {
@@ -271,6 +303,58 @@ async function waitForAsync(condition: () => Promise<boolean>, describeState: ()
 // ============================================================================
 
 describe('services plugin', () => {
+	for (const failPublication of [false, true]) {
+		it(`persists an admitted stop during parking${failPublication ? ' or rejects park when publication fails' : ' without restarting on B'}`, async () => {
+			const entered = Promise.withResolvers<void>()
+			const release = Promise.withResolvers<void>()
+			class StopStore extends MemoryEventStore {
+				override async append(id: SessionId, event: DomainEvent): Promise<void> {
+					if (failPublication && event.type === 'service_status_changed' && 'toStatus' in event && event.toStatus === 'stopped') {
+						throw new EventAppendError(id, new Error('Injected stop publication failure'))
+					}
+					await super.append(id, event)
+				}
+			}
+			const gate = definePlugin('service-stop-gate').sessionHook('beforeMethod', async (ctx) => {
+				if (ctx.method !== 'services.stop') return null
+				entered.resolve()
+				await release.promise
+				return null
+			}).build()
+			const harness = createServicesHarness({
+				presets: [createServicesPreset([autoStartService], ['auto-start'], new PortPool(), { plugins: [gate.configure({})] })],
+				eventStore: new StopStore(),
+			})
+			const session = await harness.createSession('test')
+			expect((await session.callPluginMethod('services.start', { serviceType: 'auto-start', waitForReady: true })).ok).toBe(true)
+			await harness.notifications.waitFor((notification) => notification.type === 'serviceStatus'
+				&& typeof notification.payload === 'object' && notification.payload !== null
+				&& 'status' in notification.payload && notification.payload.status === 'ready')
+			expect(harness.sessionManager.getRuntimeCacheStats().sessions[0]?.leaseReasons['service:auto-start']).toBeUndefined()
+			const activation = harness.sessionManager.activateSession(session.sessionId)
+			if (!activation.ok) throw new Error(activation.error.message)
+			const stop = session.callPluginMethod('services.stop', { serviceType: 'auto-start' }).catch((error: unknown) => error)
+			await entered.promise
+			const parking = harness.sessionManager.parkSession(activation.value).then(() => ({ ok: true }), (error: unknown) => ({ ok: false, error }))
+			release.resolve()
+			if (failPublication) {
+				expect(await stop).toBeInstanceOf(AggregateError)
+				expect((await parking).ok).toBe(false)
+				return
+			}
+			expect(await stop).toMatchObject({ ok: true })
+			expect((await parking).ok).toBe(true)
+			const events = (await session.getEventsByType(serviceEvents, 'service_status_changed')).filter((event) => event.serviceType === 'auto-start')
+			expect(events.slice(-2).map((event) => event.toStatus)).toEqual(['stopping', 'stopped'])
+			expect(events.at(-1)?.stoppedBy).toBe('agent')
+			expect(harness.sessionManager.activateSession(session.sessionId).ok).toBe(true)
+			const loaded = await harness.sessionManager.getSession(session.sessionId)
+			if (!loaded.ok) throw new Error(loaded.error.message)
+			expect(selectPluginState<Map<string, ServiceEntry>>(loaded.value.state, 'services')?.get('auto-start')).toMatchObject({ status: 'stopped', stoppedBy: 'agent' })
+			expect((await session.getEventsByType(serviceEvents, 'service_status_changed')).filter((event) => event.toStatus === 'starting')).toHaveLength(1)
+		})
+	}
+
 	it('keeps a runtime resident while a service is still starting, and evicts it once stopped', async () => {
 		const slowService: ServiceConfig = {
 			type: 'slow-start',
