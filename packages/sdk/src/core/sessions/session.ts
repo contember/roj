@@ -26,6 +26,7 @@ import type { SessionOverridesPatch, SessionState } from '~/core/sessions/state.
 import { agentSequenceKey, getEntryAgentId, getNextAgentSeq, sessionEvents } from '~/core/sessions/state.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import type { Platform } from '~/platform/index.js'
+import { isLiveScheduler } from '~/platform/index.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import { getNextMessageSeq, selectMailboxState } from '~/plugins/mailbox/query.js'
@@ -37,10 +38,11 @@ import type { EventStore } from '../events/event-store.js'
 import type { BaseEvent } from '../events/types.js'
 import { SessionFileStore } from '../file-store/file-store.js'
 import type { SessionContext } from '../sessions/context.js'
+import { RuntimeFileStore } from '../sessions/context.js'
 import type { SessionEnvironment } from '../sessions/session-environment.js'
 import type { ToolExecutor } from '../tools/executor.js'
 import { SessionStore } from './session-store.js'
-import { type RuntimeLeaseRelease, SessionRuntimeActivityController } from './runtime-activity.js'
+import { type RuntimeLeaseRelease, type SessionRuntimeActivity, SessionRuntimeActivityController, SessionRuntimeUnavailableError } from './runtime-activity.js'
 
 // ============================================================================
 // Types
@@ -127,6 +129,15 @@ export class Session {
 	private readonly pluginContexts = new Map<string, unknown>()
 	private disposalPromise?: Promise<void>
 	private reopenPromise?: Promise<Result<void, DomainError>>
+	private parkPromise?: Promise<void>
+	private localCleanup: Promise<void> | undefined
+	private cleanupFailed = false
+	private revoked = false
+	private disposalReason: SessionCloseReason = 'evicted'
+	private readonly closeHooks = new Map<ConfiguredPlugin, Promise<void>>()
+	private schedulerTail: Promise<void> = Promise.resolve()
+	private pendingScheduler = 0
+	private readonly schedulerErrors: unknown[] = []
 
 	constructor(deps: SessionDependencies) {
 		this.id = deps.store.sessionId
@@ -177,11 +188,16 @@ export class Session {
 	 * Must be called before session hooks or plugin methods that need pluginContext.
 	 */
 	async initPluginContexts(): Promise<void> {
-		const sessionContext = this.buildSessionContext()
 		for (const plugin of this.plugins) {
+			this.runtimeActivity.assertAvailable()
 			if (plugin.createContext) {
-				const ctx = await plugin.createContext(sessionContext)
+				const ctx = await plugin.createContext(this.buildSessionContext(plugin.name))
 				this.pluginContexts.set(plugin.name, ctx)
+				const state = this.runtimeActivity.getSnapshot().state
+				if (state !== 'ready') {
+					if (state !== 'parking') await this.runCloseHooks(state === 'revoked' ? 'revoked' : this.disposalReason)
+					throw new SessionRuntimeUnavailableError(this.id, state)
+				}
 			}
 		}
 	}
@@ -196,11 +212,14 @@ export class Session {
 		for (const plugin of this.plugins) {
 			if (plugin.sessionHooks?.onSessionReady) {
 				const startTime = Date.now()
+				const operation = this.runtimeActivity.tryOperation(`ready:${plugin.name}`)
+				if (!operation) throw new SessionRuntimeUnavailableError(this.id, this.runtimeActivity.getSnapshot().state)
 
 				try {
-					const ctx = this.buildSessionHookContext(plugin)
+					const ctx = this.buildSessionHookContext(plugin, operation.activity)
 					await plugin.sessionHooks.onSessionReady(ctx)
 				} catch (err) {
+					if (this.runtimeActivity.getSnapshot().state === 'revoked') throw err
 					await this.store.emit(withSessionId(
 						this.id,
 						sessionEvents.create('session_handler_completed', {
@@ -211,6 +230,8 @@ export class Session {
 						}),
 					))
 					throw err
+				} finally {
+					operation.release()
 				}
 			}
 		}
@@ -221,6 +242,10 @@ export class Session {
 	 * Emits session_closed, then awaits the shared runtime disposal path.
 	 */
 	async close(): Promise<Result<void, DomainError>> {
+		return this.mutate('close', () => this.performClose())
+	}
+
+	private async performClose(): Promise<Result<void, DomainError>> {
 		if (this.store.isClosed()) {
 			return Err(SessionErrors.closed(String(this.id)))
 		}
@@ -232,13 +257,17 @@ export class Session {
 	}
 
 	/**
-	 * Reopen a closed session.
+	 * Reopen a freshly acquired closed session; a runtime disposed by close cannot be reused.
 	 */
 	async reopen(): Promise<Result<void, DomainError>> {
+		return this.mutate('reopen', (activity) => this.performReopenRequest(activity))
+	}
+
+	private async performReopenRequest(activity: SessionRuntimeActivity): Promise<Result<void, DomainError>> {
 		if (!this.store.isClosed()) {
 			return Err(ValidationErrors.invalid('Session is not closed'))
 		}
-		return this.reopenWithEvent(sessionEvents.create('session_reopened', {}))
+		return this.reopenWithEvent(sessionEvents.create('session_reopened', {}), activity)
 	}
 
 	/**
@@ -250,6 +279,10 @@ export class Session {
 	 * preset; see `unknownOverrideTargets`.
 	 */
 	async setOverrides(patch: SessionOverridesPatch): Promise<Result<void, DomainError>> {
+		return this.mutate('overrides', () => this.performSetOverrides(patch))
+	}
+
+	private async performSetOverrides(patch: SessionOverridesPatch): Promise<Result<void, DomainError>> {
 		if (this.store.isClosed()) {
 			return Err(SessionErrors.closed(String(this.id)))
 		}
@@ -279,6 +312,7 @@ export class Session {
 	 * Schedule agent processing (with debounce).
 	 */
 	scheduleAgent(agentId: AgentId): void {
+		if (this.runtimeActivity.getSnapshot().state !== 'ready') return
 		const agentState = this.store.getAgentState(agentId)
 		if (!agentState || agentState.status === 'paused') return
 
@@ -302,6 +336,10 @@ export class Session {
 	 * Resume a paused agent so it can continue processing.
 	 */
 	async resumeAgent(agentId: AgentId): Promise<Result<void, DomainError>> {
+		return this.mutate('resume', () => this.performResumeAgent(agentId))
+	}
+
+	private async performResumeAgent(agentId: AgentId): Promise<Result<void, DomainError>> {
 		if (this.store.isClosed()) {
 			return Err(SessionErrors.closed(String(this.id)))
 		}
@@ -335,6 +373,10 @@ export class Session {
 	 * Pause an agent manually via API.
 	 */
 	async pauseAgent(agentId: AgentId, message?: string): Promise<Result<void, DomainError>> {
+		return this.mutate('pause', (activity) => this.performPauseAgent(agentId, message, activity))
+	}
+
+	private async performPauseAgent(agentId: AgentId, message: string | undefined, activity: SessionRuntimeActivity): Promise<Result<void, DomainError>> {
 		if (this.store.isClosed()) {
 			return Err(SessionErrors.closed(String(this.id)))
 		}
@@ -358,7 +400,7 @@ export class Session {
 			}),
 		))
 
-		await agent.notifyPaused(message)
+		await agent.notifyPaused(message, activity)
 
 		this.logger.info('Agent paused', { sessionId: this.id, agentId })
 		return Ok(undefined)
@@ -372,6 +414,16 @@ export class Session {
 		parentId: AgentId,
 		message?: string,
 		typedInput?: unknown,
+	): Promise<Result<AgentId, DomainError>> {
+		return this.mutate('spawn', (activity) => this.performSpawnAgentManually(definitionName, parentId, message, typedInput, activity))
+	}
+
+	private async performSpawnAgentManually(
+		definitionName: string,
+		parentId: AgentId,
+		message: string | undefined,
+		typedInput: unknown,
+		activity: SessionRuntimeActivity,
 	): Promise<Result<AgentId, DomainError>> {
 		if (this.store.isClosed()) {
 			return Err(SessionErrors.closed(String(this.id)))
@@ -406,7 +458,7 @@ export class Session {
 			}
 		}
 
-		const seq = this.reserveSequence(agentSequenceKey(definitionName), () => getNextAgentSeq(this.state, definitionName))
+		const seq = this.reserveSequence(agentSequenceKey(definitionName), () => getNextAgentSeq(this.state, definitionName), activity)
 		const agentId = generateAgentId(definitionName, seq)
 		const now = Date.now()
 
@@ -423,7 +475,7 @@ export class Session {
 		]
 
 		if (message) {
-			const sequence = this.reserveMailboxMessageSequence()
+			const sequence = this.reserveMailboxMessageSequence(activity)
 			const messageId = generateMessageId(sequence)
 			events.push(withSessionId(
 				this.id,
@@ -462,9 +514,102 @@ export class Session {
 	 * next access rebuilds it. The paths that really end a session pass `closed`.
 	 */
 	dispose(reason: SessionCloseReason = 'evicted'): Promise<void> {
+		if (!this.disposalPromise) this.disposalReason = reason
 		this.runtimeActivity.beginForcedUnload()
 		this.disposalPromise ??= Promise.resolve().then(() => this.performDisposal(reason))
 		return this.disposalPromise
+	}
+
+	private async mutate<T>(reason: string, run: (activity: SessionRuntimeActivity) => Promise<Result<T, DomainError>>): Promise<Result<T, DomainError>> {
+		const operation = this.runtimeActivity.tryOperation(reason)
+		if (!operation) return Err(SessionErrors.runtimeUnavailable(String(this.id), this.runtimeActivity.getSnapshot().state))
+		try {
+			return await run(operation.activity)
+		} finally { operation.release() }
+	}
+
+	park(): Promise<void> {
+		if (this.parkPromise) return this.parkPromise
+		if (this.runtimeActivity.getSnapshot().state === 'ready') this.runtimeActivity.beginParking()
+		for (const agent of this.agents.values()) agent.stopLocalScheduling()
+		this.parkPromise = this.runtimeActivity.untilRevoked(this.performPark())
+		return this.parkPromise
+	}
+
+	revoke(): void {
+		if (this.revoked) return
+		this.revoked = true
+		this.runtimeActivity.revoke()
+		this.store.detach()
+		for (const agent of this.agents.values()) agent.revoke()
+		this.localCleanup ??= this.runCloseHooks('revoked').finally(() => {
+			this.agents.clear()
+			this.pluginContexts.clear()
+			this.store.clearListeners()
+			this.localCleanup = undefined
+		})
+		void this.localCleanup.catch((error: unknown) => this.logger.error('Revoked runtime cleanup failed', error instanceof Error ? error : new Error(String(error))))
+	}
+
+	hasUnsafeResources(): boolean {
+		return this.store.hasPendingWrites() || this.localCleanup !== undefined || this.cleanupFailed || this.pendingScheduler > 0 || this.runtimeActivity.hasPendingResources()
+	}
+
+	async waitForLocalCleanup(): Promise<void> {
+		await this.localCleanup
+		await Promise.all(this.closeHooks.values())
+	}
+
+	private async performPark(): Promise<void> {
+		await this.runtimeActivity.waitForIdle()
+		await Promise.all([...this.agents.values()].map((agent) => agent.waitForIdle()))
+		await this.store.waitForIdle()
+		const teardown = this.runtimeActivity.beginTeardown()
+		try {
+			this.localCleanup = this.runCloseHooks('parked', teardown.activity)
+			await this.localCleanup
+		} finally {
+			this.localCleanup = undefined
+			teardown.release()
+		}
+		await this.runtimeActivity.waitForIdle()
+		await Promise.all([...this.agents.values()].map((agent) => agent.waitForScheduler()))
+		await this.schedulerTail
+		if (this.schedulerErrors.length) throw new AggregateError(this.schedulerErrors, 'Session scheduler operations failed')
+		await this.store.waitForIdle()
+		if (this.runtimeActivity.getSnapshot().state !== 'parking') throw new SessionRuntimeUnavailableError(this.id, this.runtimeActivity.getSnapshot().state)
+		this.store.detach()
+		this.store.clearListeners()
+		this.agents.clear()
+		this.pluginContexts.clear()
+		this.runtimeActivity.markDisposed()
+	}
+
+	private async runCloseHooks(reason: SessionCloseReason, activity: SessionRuntimeActivity = this.runtimeActivity): Promise<void> {
+		const errors: unknown[] = []
+		for (const plugin of [...this.plugins].reverse()) {
+			if (!plugin.sessionHooks?.onSessionClose) continue
+			if (plugin.createContext && !this.pluginContexts.has(plugin.name) && !this.closeHooks.has(plugin)) continue
+			try {
+				let pending = this.closeHooks.get(plugin)
+				if (!pending) {
+					const context = this.pluginContexts.get(plugin.name)
+					const hook = plugin.sessionHooks.onSessionClose
+					pending = Promise.resolve().then(() => {
+						const state = this.runtimeActivity.getSnapshot().state
+						return hook({
+							...this.buildSessionHookContext(plugin, state === 'revoked' ? this.runtimeActivity : activity),
+							pluginContext: context,
+							reason: state === 'revoked' ? 'revoked' : state === 'unloading' ? this.disposalReason : reason,
+						})
+					})
+					this.closeHooks.set(plugin, pending)
+				}
+				await pending
+			} catch (error) { errors.push(error) }
+		}
+		if (reason === 'parked' || reason === 'revoked') this.cleanupFailed ||= errors.length > 0
+		if (errors.length > 0) throw new AggregateError(errors, 'Session close hooks failed')
 	}
 
 	/**
@@ -481,6 +626,7 @@ export class Session {
 	 * Check if a session has any agents that need processing.
 	 */
 	checkPendingAgents(): void {
+		if (this.runtimeActivity.getSnapshot().state !== 'ready') return
 		for (const agent of this.agents.values()) {
 			agent.continue().catch((err) => {
 				this.logger.error('Unhandled error in agent.continue()', err instanceof Error ? err : undefined, { sessionId: this.id, agentId: agent.id })
@@ -514,14 +660,19 @@ export class Session {
 		input: unknown,
 		agentId?: AgentId,
 		caller?: CallerContext,
+		activity: SessionRuntimeActivity = this.runtimeActivity,
 	): Promise<Result<unknown, DomainError>> {
-		if (this.store.isClosed()) return this.executePluginMethod(method, input, agentId, caller)
-		const release = this.runtimeActivity.tryAcquire(`plugin:${method}`)
-		if (!release) return Err(SessionErrors.notFound(String(this.id)))
+		try { this.runtimeActivity.assertOwnScope(activity) } catch {
+			return Err(SessionErrors.runtimeUnavailable(String(this.id), this.runtimeActivity.getSnapshot().state))
+		}
+		const operation = activity.tryOperation(`plugin:${method}`)
+		if (!operation) return Err(SessionErrors.runtimeUnavailable(String(this.id), activity.getSnapshot().state))
 		try {
-			return await this.executePluginMethod(method, input, agentId, caller)
+			const result = await this.executePluginMethod(method, input, agentId, caller, operation.activity)
+			await this.waitForScheduler()
+			return result
 		} finally {
-			release()
+			operation.release()
 		}
 	}
 
@@ -530,6 +681,7 @@ export class Session {
 		input: unknown,
 		agentId?: AgentId,
 		caller?: CallerContext,
+		activity: SessionRuntimeActivity = this.runtimeActivity,
 	): Promise<Result<unknown, DomainError>> {
 		// Find the plugin and method by parsing "pluginName.methodName"
 		const dotIndex = method.indexOf('.')
@@ -563,7 +715,7 @@ export class Session {
 			if (!gatePlugin.sessionHooks?.beforeMethod) continue
 			try {
 				const gateCtx = {
-					...this.buildSessionHookContext(gatePlugin),
+					...this.buildSessionHookContext(gatePlugin, activity),
 					caller: caller ?? DEFAULT_CALLER,
 					method,
 					input: parsed.data,
@@ -579,10 +731,10 @@ export class Session {
 		}
 
 		// Build MethodHandlerContext with plugin state, context, scheduleAgent, notify, and deps
-		const sessionContext = this.buildSessionContext()
+		const sessionContext = this.buildSessionContext('_session', activity)
 		const pluginState = plugin.slice ? plugin.slice.select(this.store.getState()) : undefined
 		const pluginContext = this.pluginContexts.get(pluginName)
-		const deps = this.buildPluginDeps(plugin)
+		const deps = this.buildPluginDeps(plugin, activity)
 		const ctx = {
 			...sessionContext,
 			caller: caller ?? DEFAULT_CALLER,
@@ -591,11 +743,12 @@ export class Session {
 			pluginContext,
 			pluginState,
 			scheduleAgent: (targetAgentId: AgentId) => this.scheduleAgent(targetAgentId),
-			notify: this.createNotify(pluginName),
+			notify: this.createNotify(pluginName, activity),
 			deps,
 		}
 
 		try {
+			activity.assertAvailable()
 			return await methodDef.handler(ctx, parsed.data)
 		} catch (error) {
 			if (error instanceof SessionReopenError) return Err(error.domainError)
@@ -646,7 +799,7 @@ export class Session {
 
 		return new Agent({
 			id: agentState.id,
-			getSessionContext: () => this.buildSessionContext('_agent'),
+			getSessionContext: (activity) => this.buildSessionContext('_agent', activity),
 			store: this.store,
 			llmProvider,
 			llmProviders: this.llmProviders,
@@ -658,8 +811,8 @@ export class Session {
 			fileStore,
 			pluginContexts: this.pluginContexts,
 			sendNotification: (n) => this.onUserOutput?.(n),
-			pluginMethodCaller: async (depPluginName, methodName, input) => {
-				return await this.callPluginMethod(`${depPluginName}.${methodName}`, input, agentState.id, AGENT_CALLER)
+			pluginMethodCaller: async (depPluginName, methodName, input, activity) => {
+				return await this.callPluginMethod(`${depPluginName}.${methodName}`, input, agentState.id, AGENT_CALLER, activity)
 			},
 			schedule: () => this.scheduleAgent(agentState.id),
 		})
@@ -692,26 +845,17 @@ export class Session {
 	 * and agents are always shut down, even if one plugin's close hook fails.
 	 */
 	private async performDisposal(reason: SessionCloseReason): Promise<void> {
-		// Call onSessionClose for all plugins in REVERSE order (per-plugin isolation)
-		const reversedPlugins = [...this.plugins].reverse()
-		for (const plugin of reversedPlugins) {
-			if (plugin.sessionHooks?.onSessionClose) {
-				try {
-					const ctx = this.buildSessionHookContext(plugin)
-					await plugin.sessionHooks.onSessionClose({ ...ctx, reason })
-				} catch (err) {
-					this.logger.error(`Session plugin '${plugin.name}' onSessionClose failed`, err instanceof Error ? err : new Error(String(err)), {
-						sessionId: this.id,
-						pluginName: plugin.name,
-					})
-				}
-			}
+		const teardown = this.runtimeActivity.beginLegacyTeardown()
+		try {
+			await this.runCloseHooks(reason, teardown.activity)
+		} catch (error) {
+			this.logger.error('Session close hooks failed', error instanceof Error ? error : new Error(String(error)))
 		}
 
 		// Shutdown all agents
 		for (const agent of this.agents.values()) {
 			try {
-				agent.shutdown()
+				agent.shutdown(teardown.activity)
 			} catch {
 				// Suppress errors during shutdown (e.g. AbortError from abort signal listeners)
 			}
@@ -720,6 +864,7 @@ export class Session {
 		// The shutdown above only aborts; a turn still inside a tool call keeps
 		// running against the agents and plugin contexts cleared below.
 		await this.drainAgents()
+		await this.schedulerTail
 
 		// Clean up references to prevent memory leaks
 		this.agents.clear()
@@ -729,6 +874,7 @@ export class Session {
 		// whatever outlives disposal now fails instead of writing behind the
 		// replacement runtime the manager builds from the same log.
 		this.store.detach()
+		teardown.release()
 		this.runtimeActivity.markDisposed()
 
 		this.logger.info('Session runtime disposed', { sessionId: this.id, reason })
@@ -760,6 +906,7 @@ export class Session {
 	 * Handle newly spawned agent.
 	 */
 	private handleAgentSpawned(agentId: AgentId): void {
+		if (this.runtimeActivity.getSnapshot().state !== 'ready') return
 		// Guard: skip if agent already initialized (e.g., from initializeAgents)
 		if (this.agents.has(agentId)) return
 
@@ -787,8 +934,9 @@ export class Session {
 	/**
 	 * Create a notify function bound to a specific plugin name.
 	 */
-	private createNotify(pluginName: string): (type: string, payload: unknown) => void {
-		return (type, payload) => {
+	private createNotify(pluginName: string, activity: SessionRuntimeActivity = this.runtimeActivity): SessionContext['notify'] {
+		return (type, payload, continuation = activity) => {
+			this.runtimeActivity.assertOwnScope(continuation)
 			this.onUserOutput?.({ pluginName, type, payload })
 		}
 	}
@@ -796,12 +944,12 @@ export class Session {
 	/**
 	 * Build deps object for a plugin — delegates method calls to callPluginMethod.
 	 */
-	private buildPluginDeps(plugin: ConfiguredPlugin) {
+	private buildPluginDeps(plugin: ConfiguredPlugin, activity: SessionRuntimeActivity = this.runtimeActivity) {
 		return buildPluginDeps(
 			plugin.dependencyNames,
 			this.plugins,
 			async (depPluginName, methodName, input) => {
-				return await this.callPluginMethod(`${depPluginName}.${methodName}`, input)
+				return await this.callPluginMethod(`${depPluginName}.${methodName}`, input, undefined, undefined, activity)
 			},
 		)
 	}
@@ -809,7 +957,8 @@ export class Session {
 	/**
 	 * Build a SessionContext from current session state.
 	 */
-	private buildSessionContext(notificationPluginName = '_session'): SessionContext {
+	private buildSessionContext(notificationPluginName = '_session', activity: SessionRuntimeActivity = this.runtimeActivity): SessionContext {
+		if (activity !== this.runtimeActivity) this.runtimeActivity.assertOwnScope(activity)
 		const env = this.getSessionEnvironment()
 		const fileStore = new SessionFileStore(env.sessionDir, env.workspaceDir, env.sandboxed, this.platform.fs)
 		return {
@@ -819,34 +968,71 @@ export class Session {
 			sessionInput: undefined,
 			environment: env,
 			llm: this.llmProvider,
-			files: fileStore,
+			files: new RuntimeFileStore(fileStore, activity),
 			eventStore: this.eventStore,
 			llmLogger: this.llmLogger,
-			platform: this.platform,
+			platform: {
+				...this.platform,
+				scheduler: {
+					...(isLiveScheduler(this.platform.scheduler) ? { onWake: this.platform.scheduler.onWake.bind(this.platform.scheduler) } : {}),
+					wake: (key, delayMs) => this.runScheduler(activity, () => this.platform.scheduler.wake(key, delayMs)),
+					cancel: (key) => this.runScheduler(activity, () => this.platform.scheduler.cancel(key)),
+				},
+			},
 			logger: this.logger,
-			runtimeActivity: this.runtimeActivity,
-			reserveSequence: (name, seed) => this.reserveSequence(name, seed),
-			reserveMailboxMessageSequence: () => this.reserveMailboxMessageSequence(),
-			emitEvent: async (event) => {
-				if (event.type === 'session_reopened') {
-					const reopened = await this.reopenWithEvent(event)
-					if (!reopened.ok) throw new SessionReopenError(reopened.error)
-					return
-				}
-				await this.store.emit(withSessionId(this.id, event))
+			runtimeActivity: activity,
+			reserveSequence: (name, seed, continuation = activity) => this.reserveSequence(name, seed, continuation),
+			reserveMailboxMessageSequence: (continuation = activity) => this.reserveMailboxMessageSequence(continuation),
+			emitEvent: async (event, continuation = activity) => {
+				this.runtimeActivity.assertOwnScope(continuation)
+				const operation = continuation.tryOperation('event')
+				if (!operation) throw new SessionRuntimeUnavailableError(this.id, activity.getSnapshot().state)
+				try {
+					if (event.type === 'session_reopened') {
+						const reopened = await this.reopenWithEvent(event, operation.activity)
+						if (!reopened.ok) throw new SessionReopenError(reopened.error)
+						return
+					}
+					await this.store.emit(withSessionId(this.id, event))
+				} finally { operation.release() }
 			},
-			emitEvents: async (events) => {
-				await this.store.emitBatch(events.map((event) => withSessionId(this.id, event)))
+			emitEvents: async (events, continuation = activity) => {
+				this.runtimeActivity.assertOwnScope(continuation)
+				const operation = continuation.tryOperation('events')
+				if (!operation) throw new SessionRuntimeUnavailableError(this.id, activity.getSnapshot().state)
+				try {
+					await this.store.emitBatch(events.map((event) => withSessionId(this.id, event)))
+				} finally { operation.release() }
 			},
-			notify: (type, payload) => {
+			notify: (type, payload, continuation = activity) => {
+				this.runtimeActivity.assertOwnScope(continuation)
 				this.onUserOutput?.({ pluginName: notificationPluginName, type, payload })
 			},
 		}
 	}
 
-	private reserveSequence(name: string, seed: () => number): number {
-		const activity = this.runtimeActivity.getSnapshot()
-		if (this.store.isClosed() || activity.state !== 'ready') {
+	private runScheduler(activity: SessionRuntimeActivity, run: () => Promise<void>): Promise<void> {
+		const operation = activity.tryOperation('scheduler')
+		if (!operation) return Promise.reject(new SessionRuntimeUnavailableError(this.id, activity.getSnapshot().state))
+		this.pendingScheduler++
+		const pending = this.schedulerTail.then(async () => {
+			operation.activity.assertAvailable()
+			await run()
+		})
+		this.schedulerTail = pending.then(
+			() => { operation.release(); this.pendingScheduler-- },
+			(error: unknown) => { operation.release(); this.pendingScheduler--; this.schedulerErrors.push(error) },
+		)
+		return pending
+	}
+
+	async waitForScheduler(): Promise<void> {
+		await this.schedulerTail
+	}
+
+	private reserveSequence(name: string, seed: () => number, activity: SessionRuntimeActivity = this.runtimeActivity): number {
+		this.runtimeActivity.assertOwnScope(activity)
+		if (this.store.isClosed()) {
 			throw new Error(`Cannot reserve sequence "${name}" on a closed or disposed session runtime`)
 		}
 		const sequence = this.sequences.get(name) ?? seed()
@@ -854,13 +1040,13 @@ export class Session {
 		return sequence
 	}
 
-	private reserveMailboxMessageSequence(): number {
-		return this.reserveSequence(MAILBOX_MESSAGE_SEQUENCE, () => getNextMessageSeq(selectMailboxState(this.store.getState())))
+	private reserveMailboxMessageSequence(activity: SessionRuntimeActivity = this.runtimeActivity): number {
+		return this.reserveSequence(MAILBOX_MESSAGE_SEQUENCE, () => getNextMessageSeq(selectMailboxState(this.store.getState())), activity)
 	}
 
-	private reopenWithEvent(event: Omit<BaseEvent<string>, 'sessionId'>): Promise<Result<void, DomainError>> {
+	private reopenWithEvent(event: Omit<BaseEvent<string>, 'sessionId'>, activity: SessionRuntimeActivity): Promise<Result<void, DomainError>> {
 		if (this.reopenPromise) return this.reopenPromise
-		const operation = this.performReopen(event)
+		const operation = this.performReopen(event, activity)
 		this.reopenPromise = operation
 		void operation.then(
 			() => {
@@ -873,15 +1059,17 @@ export class Session {
 		return operation
 	}
 
-	private async performReopen(event: Omit<BaseEvent<string>, 'sessionId'>): Promise<Result<void, DomainError>> {
-		if (!this.store.isClosed()) return Err(ValidationErrors.invalid('Session is not closed'))
-		// A disposed runtime cannot host the reopened session — the manager refuses to
-		// re-register it — so reopen through a freshly loaded one instead of writing
-		// the event from a handle that is already dead.
-		if (this.store.isDetached()) {
-			return Err(ValidationErrors.invalid('Session runtime is disposed; load the session again to reopen it'))
+	private async performReopen(event: Omit<BaseEvent<string>, 'sessionId'>, activity: SessionRuntimeActivity): Promise<Result<void, DomainError>> {
+		this.runtimeActivity.assertOwnScope(activity)
+		const runtimeState = this.runtimeActivity.getSnapshot().state
+		if (runtimeState !== 'ready' && runtimeState !== 'parking') {
+			return Err(SessionErrors.runtimeUnavailable(String(this.id), runtimeState))
 		}
-		const registrationResult = this.registerReopenedSession?.(this) ?? Ok(undefined)
+		if (!this.store.isClosed()) return Err(ValidationErrors.invalid('Session is not closed'))
+		if (this.store.isDetached()) {
+			return Err(SessionErrors.runtimeUnavailable(String(this.id), runtimeState))
+		}
+		const registrationResult = this.runtimeActivity.getSnapshot().state === 'parking' ? Ok(undefined) : this.registerReopenedSession?.(this) ?? Ok(undefined)
 		if (!registrationResult.ok) return registrationResult
 		const registration = registrationResult.value
 		try {
@@ -898,8 +1086,8 @@ export class Session {
 	 * Build context for a session-level hook (onSessionReady / onSessionClose).
 	 * Provides pluginConfig (via closure), pluginContext, pluginState, self, and session fields.
 	 */
-	private buildSessionHookContext(plugin: ConfiguredPlugin): BaseSessionHookContext {
-		const sessionContext = this.buildSessionContext()
+	private buildSessionHookContext(plugin: ConfiguredPlugin, activity: SessionRuntimeActivity = this.runtimeActivity): BaseSessionHookContext {
+		const sessionContext = this.buildSessionContext('_session', activity)
 		const pluginState = plugin.slice ? plugin.slice.select(this.store.getState()) : undefined
 		const pluginContext = this.pluginContexts.get(plugin.name)
 
@@ -907,7 +1095,7 @@ export class Session {
 		const self: Record<string, (input: unknown) => Promise<unknown>> = {}
 		for (const [methodName] of Object.entries(plugin.methods)) {
 			self[methodName] = async (input: unknown) => {
-				const result = await this.callPluginMethod(`${plugin.name}.${methodName}`, input, undefined, AGENT_CALLER)
+				const result = await this.callPluginMethod(`${plugin.name}.${methodName}`, input, undefined, AGENT_CALLER, activity)
 				if (!result.ok) {
 					throw new Error(`Plugin method failed: ${plugin.name}.${methodName}: ${result.error.type}`)
 				}
@@ -915,7 +1103,7 @@ export class Session {
 			}
 		}
 
-		const deps = this.buildPluginDeps(plugin)
+		const deps = this.buildPluginDeps(plugin, activity)
 
 		return {
 			...sessionContext,
@@ -925,7 +1113,7 @@ export class Session {
 			pluginState,
 			self,
 			scheduleAgent: (agentId: AgentId) => this.scheduleAgent(agentId),
-			notify: this.createNotify(plugin.name),
+			notify: this.createNotify(plugin.name, activity),
 			deps,
 		}
 	}

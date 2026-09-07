@@ -205,7 +205,7 @@ describe('session overrides', () => {
 				await Bun.sleep(35)
 				const duringAppend = harness.sessionManager.getRuntimeCacheStats()
 				expect(duringAppend.loadedSessionCount).toBe(1)
-				expect(duringAppend.sessions[0]?.leaseReasons).toEqual({ 'manager:sessions.setOverrides': 1 })
+				expect(duringAppend.sessions[0]?.leaseReasons).toEqual({ 'manager:sessions.setOverrides': 1, overrides: 1 })
 
 				if (!releaseAppend) throw new Error('Append release was not initialized')
 				releaseAppend()

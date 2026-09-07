@@ -4,6 +4,7 @@ import { ValidationErrors } from '~/core/errors.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import type { SessionRuntimeActivity } from '~/core/sessions/runtime-activity.js'
+import { RuntimeFileStore } from '~/core/sessions/context.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import type { SessionState } from '~/core/sessions/state.js'
 import { createTool, type ToolDefinition } from '~/core/tools/definition.js'
@@ -80,9 +81,12 @@ async function executeWorker(
 	logger: Logger,
 	releaseLease: () => void,
 	executionControl: WorkerExecutionControl,
-	effectDrainTimeoutMs: number,
 ): Promise<void> {
 	try {
+		if (!context.resumed) {
+			if (!await context.persistTerminal(workerEvents.create('worker_execution_started', { workerId }))) return
+		}
+		if (!context.shouldContinue()) return
 		const result = await definition.execute(config, context)
 		if (executionControl.suppressTerminalEvent) return
 
@@ -110,9 +114,7 @@ async function executeWorker(
 		}))
 		if (persisted) logger.error('Worker threw exception', error instanceof Error ? error : undefined, { workerId })
 	} finally {
-		// Bounded like the stop path: a stalled append must not hold the runtime lease forever.
-		const drained = await awaitWithin(context.waitForEffects(), effectDrainTimeoutMs)
-		if (!drained) context.releaseEffectLeases()
+		await context.waitForEffects()
 		// A stop may already have replaced this entry with a relaunch; only drop our own.
 		if (runningWorkers.get(workerId)?.context === context) runningWorkers.delete(workerId)
 		releaseLease()
@@ -219,12 +221,10 @@ interface LaunchWorkerParams {
 	files: FileStore
 	emitEvent: EmitEvent
 	getSessionState: () => SessionState
-	reserveMailboxMessageSequence: () => number
+	reserveMailboxMessageSequence: (activity?: SessionRuntimeActivity) => number
 	scheduleAgent: (agentId: AgentId) => void
 	runtimeActivity: SessionRuntimeActivity
 	runningWorkers: Map<WorkerIdType, RunningWorker>
-	/** Bound on draining the effects this run leaves in flight when it returns. */
-	effectDrainTimeoutMs: number
 	logger: Logger
 }
 
@@ -249,14 +249,16 @@ function launchWorker({
 	scheduleAgent,
 	runtimeActivity,
 	runningWorkers,
-	effectDrainTimeoutMs,
 	logger,
 }: LaunchWorkerParams): Result<void, string> {
+	if (runtimeActivity.getSnapshot().state === 'parking') return Ok(undefined)
+	if (runtimeActivity.getSnapshot().state !== 'ready') return Err('Session runtime is no longer accepting workers')
 	if (runningWorkers.size >= MAX_CONCURRENT_WORKERS) {
 		return Err(`Max concurrent workers reached (${MAX_CONCURRENT_WORKERS})`)
 	}
-	const releaseLease = runtimeActivity.tryAcquire(`worker:${workerId}`)
-	if (!releaseLease) return Err('Session runtime is no longer accepting workers')
+	const operation = runtimeActivity.tryOperation(`worker:${workerId}`)
+	if (!operation) return Err('Session runtime is no longer accepting workers')
+	const releaseLease = () => operation.release()
 
 	const workerLogger = logger.child({ workerId, workerType: definition.type })
 	const workerContext = new WorkerContextImpl({
@@ -264,11 +266,14 @@ function launchWorker({
 		workerId,
 		agentId,
 		workerType: definition.type,
-		files,
-		emitEvent,
+		files: new RuntimeFileStore(files, operation.activity),
+		emitEvent: (event) => emitEvent(event, operation.activity),
 		getSessionState,
-		reserveMailboxMessageSequence,
-		acquireEffectLease: () => runtimeActivity.tryAcquire(`worker:${workerId}:effect`),
+		reserveMailboxMessageSequence: () => reserveMailboxMessageSequence(operation.activity),
+		acquireEffectLease: () => operation.activity.tryAcquire(`worker:${workerId}:effect`),
+		isRuntimeAvailable: () => {
+			try { operation.activity.assertAvailable(); return true } catch { return false }
+		},
 		reducer: definition.reduce,
 		initialState,
 		resumed,
@@ -286,7 +291,6 @@ function launchWorker({
 		logger,
 		releaseLease,
 		executionControl,
-		effectDrainTimeoutMs,
 	).catch((error) => {
 		logger.error('Unhandled error in worker execution', error instanceof Error ? error : undefined, {
 			workerId,
@@ -340,6 +344,7 @@ export const workerPlugin = definePlugin('workers')
 						agentId: event.agentId,
 						workerType: event.workerType,
 						status: 'running',
+						pendingStart: event.pendingStart ?? false,
 						state: initialState,
 						config: event.config,
 						createdAt: event.timestamp,
@@ -349,6 +354,14 @@ export const workerPlugin = definePlugin('workers')
 					const newWorkers = new Map(workers)
 					newWorkers.set(event.workerId, workerEntry)
 					return newWorkers
+				}
+
+				case 'worker_execution_started': {
+					const worker = workers.get(event.workerId)
+					if (!worker) return workers
+					const next = new Map(workers)
+					next.set(worker.id, { ...worker, pendingStart: false })
+					return next
 				}
 
 				case 'worker_sub_event': {
@@ -483,6 +496,7 @@ export const workerPlugin = definePlugin('workers')
 				agentId: input.agentId,
 				workerType: definition.type,
 				config: validConfig,
+				pendingStart: true,
 			}))
 
 			const sessionId = ctx.sessionId
@@ -508,7 +522,6 @@ export const workerPlugin = definePlugin('workers')
 				scheduleAgent,
 				runtimeActivity,
 				runningWorkers,
-				effectDrainTimeoutMs: resolveStopTimeouts(ctx.pluginConfig).effectDrainTimeoutMs,
 				logger,
 			})
 			if (!launched.ok) {
@@ -539,7 +552,6 @@ export const workerPlugin = definePlugin('workers')
 		const reserveMailboxMessageSequence = ctx.reserveMailboxMessageSequence
 		const scheduleAgent = ctx.scheduleAgent
 		const runtimeActivity = ctx.runtimeActivity
-		const { effectDrainTimeoutMs } = resolveStopTimeouts(ctx.pluginConfig)
 		// A relaunch that does not happen must not leave the projection claiming `running`
 		// — park the worker instead, which keeps its state and lets `resume` pick it up.
 		const parkStoppedWorker = async (workerId: WorkerIdType): Promise<void> => {
@@ -567,7 +579,7 @@ export const workerPlugin = definePlugin('workers')
 				definition,
 				config: worker.config,
 				initialState: worker.state,
-				resumed: true,
+				resumed: !worker.pendingStart,
 				files,
 				emitEvent,
 				getSessionState,
@@ -575,7 +587,6 @@ export const workerPlugin = definePlugin('workers')
 				scheduleAgent,
 				runtimeActivity,
 				runningWorkers,
-				effectDrainTimeoutMs,
 				logger,
 			})
 			if (!launched.ok) {
@@ -770,7 +781,7 @@ export const workerPlugin = definePlugin('workers')
 					definition,
 					config: workerEntry.config,
 					initialState: workerEntry.state,
-					resumed: true,
+					resumed: !workerEntry.pendingStart,
 					files: ctx.files.session,
 					emitEvent: ctx.emitEvent,
 					getSessionState: ctx.getSessionState,
@@ -778,7 +789,6 @@ export const workerPlugin = definePlugin('workers')
 					scheduleAgent: ctx.scheduleAgent,
 					runtimeActivity: ctx.runtimeActivity,
 					runningWorkers,
-					effectDrainTimeoutMs: resolveStopTimeouts(ctx.pluginConfig).effectDrainTimeoutMs,
 					logger,
 				})
 				if (!launched.ok) {
@@ -803,6 +813,10 @@ export const workerPlugin = definePlugin('workers')
 		const { runningWorkers, abandonedWorkers, logger } = ctx.pluginContext
 		if (runningWorkers.size === 0) return
 		const closingWorkers = [...runningWorkers.values()]
+		if (ctx.reason === 'parked') {
+			await Promise.all(closingWorkers.map((worker) => worker.promise))
+			return
+		}
 
 		logger.info('Cancelling running workers on session close', { count: closingWorkers.length })
 
