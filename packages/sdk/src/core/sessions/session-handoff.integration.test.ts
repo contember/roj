@@ -62,6 +62,34 @@ describe('session park after a recovered failure', () => {
 	})
 })
 
+describe('notifications from an expired scope', () => {
+	it('drops a late notify instead of raising into the callback that fired it', async () => {
+		let notify: ((type: string, payload: unknown) => void) | undefined
+		const ticker = definePlugin('ticker')
+			.notification('tick', { schema: z.object({}) })
+			.sessionHook('onSessionReady', async (ctx) => { notify = ctx.notify })
+			.build()
+		const host = new TestHarness({
+			presets: [createTestPreset({ plugins: [ticker.configure({})] })],
+			llmProvider: MockLLMProvider.withFixedResponse({ content: 'ok', toolCalls: [] }),
+			systemPlugins: [ticker],
+		})
+		try {
+			const session = await host.createSession('test')
+			const activation = host.sessionManager.activateSession(session.sessionId)
+			if (!activation.ok) throw new Error(activation.error.message)
+			await host.sessionManager.parkSession(activation.value)
+			if (!notify) throw new Error('Session ready hook did not run')
+
+			// A notification is ephemeral, and this one arrives from a timer nobody is
+			// guarding — dropping it is the only safe outcome.
+			const before = host.notifications.getAll().length
+			expect(() => notify?.('tick', {})).not.toThrow()
+			expect(host.notifications.getAll()).toHaveLength(before)
+		} finally { await host.shutdown() }
+	})
+})
+
 describe('tenure retention', () => {
 	it('stops guarding a runtime once the cache drops it', async () => {
 		const host = new TestHarness({
