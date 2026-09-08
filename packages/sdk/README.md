@@ -149,17 +149,47 @@ Each version-1 envelope contains `version`, `batch`, `byteLength`, `sha256`, and
 the sequence, UTF-8, payload length/checksum, event shape, and session identity.
 
 The writer writes `.pending-*` in the destination directory and atomically renames
-it into the committed batch name. An append batch has all-or-none logical
-visibility, not a partially replayable prefix. Recovery ignores pending files and
-attempts their cleanup after validating committed history. Metadata is derived
+it into the committed batch name, and drops its own pending file when that rename
+fails. An append batch has all-or-none logical visibility, not a partially
+replayable prefix. Recovery ignores pending files and attempts their cleanup
+after validating committed history. Metadata is derived
 from events and refreshed separately; metadata-write failure does not undo a
 confirmed event commit. This protocol does **not** call fsync or guarantee survival
 of power loss. It requires a single writer instance per session, not merely a
 filesystem shared by several independently cached stores.
 
+Nothing here enforces that. `rename` replaces its destination, so two stores over
+one directory overwrite each other's batches with no error and nothing a later
+recovery can detect. A host that runs more than one instance must fence
+externally and surface the loss through `SessionOwnershipLostError` — see
+**Ownership** below.
+
 **Downgrade is unsupported after the first new batch commit.** An older SDK may
 see only legacy history. Safe rollback requires a suitable pre-write backup or a
 deployment that understands batches; never point an old SDK at newly written data.
+
+## Ownership
+
+The SDK does not decide who owns a session; a host does, and tells the SDK by
+supplying an `EventStore` bound to whatever lease it holds. That store throws
+`SessionOwnershipLostError` from an append once the lease has moved on.
+
+Nobody can revoke a host that is merely unreachable, so this is the only signal
+such a host can still get. It is a definite noncommit that also stops the
+runtime: the store fences, the session revokes itself rather than parking, and
+the manager drops the residency so the next access asks the store again. Close
+hooks run with reason `revoked`.
+
+A host that wants a graceful handoff instead uses `parkSession`, which drains
+and releases residency without ending the session. `parkSession(handle,
+{ timeoutMs })` bounds the wait; `SessionManagerOptions.writeQueueTimeoutMs`
+bounds how long a write may wait for its turn. Both should sit inside the host's
+own shutdown budget. See `SESSION-LIFECYCLE.md`.
+
+**Known gap.** A service that exits while the runtime is already parking cannot
+publish its terminal `service_status_changed`: the runtime stopped accepting
+writes, which is the point. A replaying host therefore sees it as `running`, and
+reconciling that on load is not implemented.
 
 ## Recovery checklist
 
