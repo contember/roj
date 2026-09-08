@@ -260,11 +260,12 @@ export class SessionManager {
 		if (!tenure) throw new SessionRuntimeUnavailableError(handle.sessionId, 'revoked')
 		if (this.tenures.get(handle.sessionId) !== tenure || tenure.state === 'released' || tenure.state === 'revoked') return
 		tenure.state = 'revoked'
-		for (const entry of tenure.entries) {
+		for (const entry of [...tenure.entries]) {
 			entry.activity.revoke()
 			entry.runtime?.revoke()
 			entry.listenerCleanup?.()
 			if (this.sessions.get(handle.sessionId) === entry) this.sessions.delete(handle.sessionId)
+			if (entry.runtime) this.forgetEntry(entry, entry.runtime)
 		}
 	}
 
@@ -1128,6 +1129,8 @@ export class SessionManager {
 		misses: number
 		evictions: number
 		loadedSessionCount: number
+		/** Tenures still guarding a runtime the cache already dropped. Should settle to zero. */
+		retainedRuntimeCount: number
 		sessions: Array<{
 			id: SessionId
 			state: SessionCacheEntry['state']
@@ -1141,6 +1144,8 @@ export class SessionManager {
 			misses: this.cacheMisses,
 			evictions: this.cacheEvictions,
 			loadedSessionCount: this.sessions.size,
+			retainedRuntimeCount: [...this.tenures.values()]
+				.filter((tenure) => tenure.entry !== undefined || tenure.entries.size > 0).length,
 			sessions: [...this.sessions].map(([id, entry]) => {
 				const activity = entry.activity.getSnapshot()
 				return {
@@ -1352,11 +1357,10 @@ export class SessionManager {
 			// Drop the residency so the next access reloads and re-checks ownership;
 			// the runtime already stopped itself.
 			onOwnershipLost: () => {
-				entry.tenure.entries.delete(entry)
-				if (entry.tenure.entry === entry) entry.tenure.entry = undefined
 				if (this.sessions.get(store.sessionId) === entry) this.sessions.delete(store.sessionId)
 				entry.listenerCleanup?.()
 				entry.listenerCleanup = undefined
+				if (entry.runtime) this.forgetEntry(entry, entry.runtime)
 			},
 		})
 		entry.runtime = session
@@ -1551,7 +1555,7 @@ export class SessionManager {
 				)
 			})
 			.finally(() => {
-				if (!session.hasUnsafeResources()) entry.tenure.entries.delete(entry)
+				this.forgetEntry(entry, session)
 				if (this.sessions.get(sessionId) === entry) this.sessions.delete(sessionId)
 				entry.listenerCleanup?.()
 				entry.listenerCleanup = undefined
@@ -1559,6 +1563,25 @@ export class SessionManager {
 				this.logger.debug('Session runtime evicted', { sessionId, reason })
 			})
 		return entry.unloadPromise
+	}
+
+	/**
+	 * Drop a tenure's references to a runtime that no longer needs guarding.
+	 *
+	 * `tenure.entry` only exists to refuse re-admission while a disposed runtime
+	 * still holds resources; once it does not, keeping it pins the whole runtime
+	 * graph — store, agents, plugin contexts — for the life of the process. A
+	 * tenure whose cleanup is still outstanding is retried when it settles.
+	 */
+	private forgetEntry(entry: SessionCacheEntry, session: Session): void {
+		if (session.hasUnsafeResources()) {
+			void session.waitForLocalCleanup().catch(() => {}).then(() => {
+				if (!session.hasUnsafeResources()) this.forgetEntry(entry, session)
+			})
+			return
+		}
+		entry.tenure.entries.delete(entry)
+		if (entry.tenure.entry === entry) entry.tenure.entry = undefined
 	}
 
 	private getSessionDir(sessionId: SessionId): string {
