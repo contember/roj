@@ -22,6 +22,46 @@ function harness(plugins: ConstructorParameters<typeof TestHarness>[0]['systemPl
 	})
 }
 
+describe('session park after a recovered failure', () => {
+	it('reports a transient wake failure once, then parks on the next attempt', async () => {
+		let failNextWake = true
+		const waker = definePlugin('waker').method('arm', {
+			input: z.object({}), output: z.object({}),
+			handler: async (ctx) => {
+				// Fire-and-forget, the way a plugin arms a wake it does not wait on.
+				void ctx.platform.scheduler.wake(pluginWakeKey(ctx.sessionId, 'waker', 'tick'), 60_000).catch(() => {})
+				return Ok({})
+			},
+		}).build()
+		const host = new TestHarness({
+			presets: [createTestPreset({ plugins: [waker.configure({})] })],
+			llmProvider: MockLLMProvider.withFixedResponse({ content: 'ok', toolCalls: [] }),
+			systemPlugins: [waker],
+			scheduler: {
+				wake: async () => {
+					if (!failNextWake) return
+					failNextWake = false
+					throw new Error('durable scheduler blip')
+				},
+				cancel: async () => {},
+			},
+		})
+		try {
+			const session = await host.createSession('test')
+			const activation = host.sessionManager.activateSession(session.sessionId)
+			if (!activation.ok) throw new Error(activation.error.message)
+			await session.callPluginMethod('waker.arm', {})
+
+			// The wake never armed, so the first park must say so.
+			await expect(host.sessionManager.parkSession(activation.value)).rejects.toBeInstanceOf(AggregateError)
+			// The blip is settled history: retaining it would refuse every later park and
+			// leave the host no way to hand the session off gracefully.
+			await host.sessionManager.parkSession(activation.value)
+			expect(host.sessionManager.activateSession(session.sessionId).ok).toBe(true)
+		} finally { await host.shutdown() }
+	})
+})
+
 describe('session activation handoff', () => {
 	function heldFileWrite() {
 		const writeEntered = Promise.withResolvers<void>()

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import z from 'zod/v4'
+import { EventAppendError } from '~/core/events/event-store.js'
 import { MemoryEventStore } from '~/core/events/memory.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { DomainEvent } from '~/core/events/types.js'
@@ -410,8 +411,10 @@ function createInFlightEffectsWorker() {
 				return event.type === 'in_flight' ? { emitted: state.emitted + 1 } : state
 			},
 			execute: async (_config, ctx) => {
-				void ctx.emit({ type: 'in_flight' })
-				void ctx.notifyAgent('in-flight notification')
+				// Fire-and-forget, like worker code that does not await its own effects:
+				// a rejected append surfaces through waitForEffects, not as a crash.
+				void ctx.emit({ type: 'in_flight' }).catch(() => {})
+				void ctx.notifyAgent('in-flight notification').catch(() => {})
 				markStarted()
 				await bodyGate
 				return Ok({ status: 'done', summary: 'Body released' })
@@ -1517,6 +1520,46 @@ describe('workers plugin', () => {
 			expect(await session.getEventsByType(workerEvents, 'worker_completed')).toHaveLength(0)
 			expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
 			await harness.shutdown()
+		})
+
+		it('bounds the effect drain so a stalled event store cannot hang close', async () => {
+			const inFlight = createInFlightEffectsWorker()
+			const eventStore = new GatedWorkerEffectEventStore()
+			const harness = createWorkersHarness({
+				presets: [createTestPreset({
+					plugins: [workerPlugin.configure({
+						workers: [inFlight.worker, immediateWorker],
+						stopTimeoutMs: 50,
+						effectDrainTimeoutMs: 50,
+					})],
+				})],
+				eventStore,
+				// session_closed queues behind the stalled effect append; close must fail on
+				// this bound rather than wait out a writer that never returns.
+				writeQueueTimeoutMs: 100,
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+			try {
+				const session = await harness.createSession('test')
+				const agentId = session.getEntryAgentId()
+				if (!agentId) throw new Error('Expected entry agent')
+				const spawned = await session.callPluginMethod('workers.spawn', {
+					sessionId: String(session.sessionId),
+					agentId: String(agentId),
+					workerType: 'in-flight-effects',
+					config: {},
+				})
+				expect(spawned.ok).toBe(true)
+				await inFlight.started
+
+				// The event store never releases. session_closed queues behind the stalled
+				// effect append, so close must fail on its own bound instead of hanging.
+				await expect(session.close()).rejects.toBeInstanceOf(EventAppendError)
+			} finally {
+				eventStore.release()
+				inFlight.finishBody()
+				await harness.shutdown()
+			}
 		})
 
 		it('bounds runtime shutdown without overtaking a stalled event append', async () => {

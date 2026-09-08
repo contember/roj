@@ -27,13 +27,13 @@ class DeferredStore extends MemoryEventStore {
 	}
 }
 
-function setup(storage: DeferredStore) {
+function setup(storage: DeferredStore, options?: { queueTimeoutMs?: number }) {
 	const applied: number[] = []
 	const notified: number[] = []
 	const store = new SessionStore(id, storage, createSessionState(id, 'test', 0), (state, value) => {
 		applied.push(value.timestamp)
 		return state
-	})
+	}, options)
 	store.onEvent((value) => notified.push(value.timestamp))
 	return { store, applied, notified }
 }
@@ -83,6 +83,37 @@ describe('SessionStore write lifetime', () => {
 		await second
 		expect(applied).toEqual([2])
 		await expect(store.waitForIdle()).rejects.toBe(storage.failure)
+	})
+
+	it('reports a definite drain failure once, so a later drain can succeed', async () => {
+		const storage = new DeferredStore()
+		storage.failure = new EventAppendError(id)
+		const { store } = setup(storage)
+		const first = store.emit(event(1)).catch((error: unknown) => error)
+		await storage.entered.promise
+		storage.gate.resolve()
+		expect(await first).toBe(storage.failure)
+
+		// A definite noncommit is settled history: retaining it would refuse every
+		// later park for the life of the runtime.
+		await expect(store.waitForIdle()).rejects.toBe(storage.failure)
+		await store.waitForIdle()
+		await store.emit(event(2))
+		await store.waitForIdle()
+	})
+
+	it('fails a write that never gets its turn and fences what would follow it', async () => {
+		const storage = new DeferredStore()
+		const { store } = setup(storage, { queueTimeoutMs: 20 })
+		const stalled = store.emit(event(1)).catch((error: unknown) => error)
+		await storage.entered.promise
+		// The head never returns, so the queued write definitely did not commit — and
+		// nothing may be ordered behind a head whose outcome is still open.
+		await expect(store.emit(event(2))).rejects.toBeInstanceOf(EventAppendError)
+		await expect(store.emit(event(3))).rejects.toBeInstanceOf(EventAppendOutcomeUnknownError)
+		expect(store.hasPendingWrites()).toBe(true)
+		storage.gate.resolve()
+		await stalled
 	})
 
 	it('suppresses late projection and notification after detach', async () => {

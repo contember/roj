@@ -32,6 +32,7 @@ import type { ToolExecutor } from '~/core/tools'
 import type { ArchiveLimitOverrides } from '~/lib/archive/index.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import { createSessionLogger } from '~/lib/logger/session-log.js'
+import { withDeadline } from '~/lib/utils/concurrency.js'
 import { TeeLogger } from '~/lib/logger/tee.js'
 import type { Platform } from '~/platform/index.js'
 import { isLiveScheduler } from '~/platform/index.js'
@@ -48,6 +49,7 @@ import { EventStore } from '../events/event-store.js'
 import { createApplyEvent } from './apply-event.js'
 import { rewriteEventsForFork } from './fork-utils.js'
 import { SessionStore } from './session-store.js'
+import type { SessionStoreOptions } from './session-store.js'
 import { Session, type SessionReopenRegistration, type UserOutputCallback } from './session.js'
 import { SessionRuntimeActivityController, SessionRuntimeUnavailableError } from './runtime-activity.js'
 
@@ -92,6 +94,13 @@ export interface SessionManagerOptions {
 	systemPlugins?: readonly PluginDefinition<string, any, any, any, any>[]
 	/** Evict resident runtimes after this idle period. Absent or zero disables eviction. */
 	sessionIdleTimeoutMs?: number
+	/**
+	 * Bound on waiting for a turn in a session's ordered write queue.
+	 *
+	 * A host that drains on a deadline (a pod on SIGTERM) should keep this under
+	 * its own budget, so a stalled store fails the close instead of outliving it.
+	 */
+	writeQueueTimeoutMs?: number
 }
 
 interface SessionCacheEntry {
@@ -109,6 +118,19 @@ interface SessionCacheEntry {
 
 export interface SessionActivation {
 	readonly sessionId: SessionId
+}
+
+export interface ParkOptions {
+	/** Bound on waiting for the drain. The park itself keeps running past it. */
+	timeoutMs?: number
+}
+
+/** The park outlived the caller's budget; it is still draining in the background. */
+export class SessionParkTimeoutError extends Error {
+	constructor(readonly sessionId: SessionId, readonly timeoutMs: number) {
+		super(`Session '${sessionId}' did not park within ${timeoutMs}ms`)
+		this.name = 'SessionParkTimeoutError'
+	}
 }
 
 interface SessionTenure {
@@ -139,6 +161,7 @@ export interface AcquiredSessionLease {
  * SessionManager manages session lifecycle and caching.
  */
 export class SessionManager {
+	private readonly storeOptions: SessionStoreOptions
 	private readonly sessions = new Map<SessionId, SessionCacheEntry>()
 	private readonly tenures = new Map<SessionId, SessionTenure>()
 	private readonly activations = new WeakMap<SessionActivation, SessionTenure>()
@@ -159,7 +182,21 @@ export class SessionManager {
 		return Ok(handle)
 	}
 
-	parkSession(handle: SessionActivation): Promise<void> {
+	/**
+	 * Drain the session and release residency, so another host can reopen it.
+	 *
+	 * `timeoutMs` bounds the wait, not the drain: the park keeps running and a
+	 * later call races the same one. A host that runs out of budget should revoke
+	 * and fall back to whatever fencing it uses to admit the replacement.
+	 */
+	parkSession(handle: SessionActivation, options: ParkOptions = {}): Promise<void> {
+		const park = this.beginPark(handle)
+		const { timeoutMs } = options
+		if (timeoutMs === undefined) return park
+		return withDeadline(park, timeoutMs, () => new SessionParkTimeoutError(handle.sessionId, timeoutMs))
+	}
+
+	private beginPark(handle: SessionActivation): Promise<void> {
 		const tenure = this.activations.get(handle)
 		if (!tenure) return Promise.reject(new SessionRuntimeUnavailableError(handle.sessionId, 'revoked'))
 		if (tenure.parkPromise) return tenure.parkPromise
@@ -178,14 +215,21 @@ export class SessionManager {
 		for (const entry of entries) {
 			if (entry.activity.getSnapshot().state === 'ready') entry.activity.beginParking()
 		}
-		tenure.parkPromise = Promise.all(entries.map((entry) => this.parkEntry(entry))).then(() => {
+		const parking: Promise<void> = Promise.all(entries.map((entry) => this.parkEntry(entry))).then(() => {
 			if (tenure.state === 'revoked') throw new SessionRuntimeUnavailableError(handle.sessionId, 'revoked')
 			if ([...tenure.entries].some((entry) => entry.runtime?.hasUnsafeResources())) throw new SessionRuntimeUnavailableError(handle.sessionId, 'unloading')
 			tenure.state = 'released'
 			tenure.entries.clear()
 			tenure.entry = undefined
+		}).catch((error: unknown) => {
+			// A drain that reported a failure stays retryable; one that found the runtime
+			// gone is terminal, and the host has to revoke instead.
+			const terminal = error instanceof SessionRuntimeUnavailableError
+			if (tenure.parkPromise === parking && tenure.state === 'parking' && !terminal) tenure.parkPromise = undefined
+			throw error
 		})
-		return tenure.parkPromise
+		tenure.parkPromise = parking
+		return parking
 	}
 
 	private parkEntry(entry: SessionCacheEntry): Promise<void> {
@@ -295,6 +339,7 @@ export class SessionManager {
 		this.platform = options.platform
 		this.systemPlugins = options.systemPlugins ?? []
 		this.sessionIdleTimeoutMs = options.sessionIdleTimeoutMs ?? 0
+		this.storeOptions = { queueTimeoutMs: options.writeQueueTimeoutMs }
 		this.managerMethods = this.collectManagerMethods()
 		if (this.sessionIdleTimeoutMs > 0) {
 			const sweepIntervalMs = Math.min(this.sessionIdleTimeoutMs, 60_000)
@@ -505,7 +550,7 @@ export class SessionManager {
 			const composedReducer = createApplyEvent(plugins)
 			const state = reconstructSessionState(events, composedReducer)
 			if (!state) throw new SessionLoadError(ValidationErrors.invalid('Failed to reconstruct session'))
-			const store = new SessionStore(sessionId, this.eventStore, state, composedReducer)
+			const store = new SessionStore(sessionId, this.eventStore, state, composedReducer, this.storeOptions)
 			return this.createSessionInstance(store, preset, plugins, entry)
 		})
 		entry = {
@@ -619,7 +664,7 @@ export class SessionManager {
 			const composedReducer = createApplyEvent(plugins)
 			const state = reconstructSessionState(forkedEvents, composedReducer)
 			if (!state) throw new SessionLoadError(ValidationErrors.invalid('Failed to reconstruct forked session'))
-			const store = new SessionStore(newSessionId, this.eventStore, state, composedReducer)
+			const store = new SessionStore(newSessionId, this.eventStore, state, composedReducer, this.storeOptions)
 			const recoveryData = checkRecoveryNeeded(state)
 			if (recoveryData) {
 				await store.emit(withSessionId(
@@ -766,7 +811,7 @@ export class SessionManager {
 		const composedReducer = createApplyEvent(plugins)
 
 		// Load store with composed reducer
-		const store = await SessionStore.fromEvents(sessionId, this.eventStore, events, composedReducer)
+		const store = await SessionStore.fromEvents(sessionId, this.eventStore, events, composedReducer, this.storeOptions)
 		this.assertAdmission(entry.tenure)
 		if (!store) {
 			throw new SessionLoadError(SessionErrors.notFound(String(sessionId)))

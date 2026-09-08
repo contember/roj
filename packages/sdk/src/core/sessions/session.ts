@@ -532,8 +532,17 @@ export class Session {
 		if (this.parkPromise) return this.parkPromise
 		if (this.runtimeActivity.getSnapshot().state === 'ready') this.runtimeActivity.beginParking()
 		for (const agent of this.agents.values()) agent.stopLocalScheduling()
-		this.parkPromise = this.runtimeActivity.untilRevoked(this.performPark())
-		return this.parkPromise
+		const parking = this.runtimeActivity.untilRevoked(this.performPark())
+		// A park that reports a failure stays retryable. The runtime never returns to
+		// `ready`, so it still admits no new work, but a host draining on a deadline
+		// can try again before falling back to revoke.
+		const guarded: Promise<void> = parking.catch((error: unknown) => {
+			const terminal = this.revoked || error instanceof SessionRuntimeUnavailableError
+			if (this.parkPromise === guarded && !terminal) this.parkPromise = undefined
+			throw error
+		})
+		this.parkPromise = guarded
+		return guarded
 	}
 
 	revoke(): void {
@@ -575,7 +584,10 @@ export class Session {
 		await this.runtimeActivity.waitForIdle()
 		await Promise.all([...this.agents.values()].map((agent) => agent.waitForScheduler()))
 		await this.schedulerTail
-		if (this.schedulerErrors.length) throw new AggregateError(this.schedulerErrors, 'Session scheduler operations failed')
+		// Report the failures once and drop them: a scheduler call that definitely
+		// failed is settled, and retaining it would refuse every later park.
+		const schedulerErrors = this.schedulerErrors.splice(0)
+		if (schedulerErrors.length) throw new AggregateError(schedulerErrors, 'Session scheduler operations failed')
 		await this.store.waitForIdle()
 		if (this.runtimeActivity.getSnapshot().state !== 'parking') throw new SessionRuntimeUnavailableError(this.id, this.runtimeActivity.getSnapshot().state)
 		this.store.detach()

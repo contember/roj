@@ -272,7 +272,8 @@ export const servicePlugin = definePlugin('services')
 			while (statusEffects.size > 0) {
 				await Promise.allSettled([...statusEffects])
 			}
-			if (publicationFailures.length > 0) throw new AggregateError(publicationFailures, 'Service status publication failed')
+			const failures = publicationFailures.splice(0)
+			if (failures.length > 0) throw new AggregateError(failures, 'Service status publication failed')
 		}
 		const stopService = async (serviceType: string, sessionId: Parameters<ServiceExecutor['stop']>[1], activity: SessionRuntimeActivity) => {
 			const lease = beginLifecycle(serviceType, activity)
