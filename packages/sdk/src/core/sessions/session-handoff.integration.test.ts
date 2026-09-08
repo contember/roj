@@ -62,6 +62,30 @@ describe('session park after a recovered failure', () => {
 	})
 })
 
+describe('tenure retention', () => {
+	it('stops guarding a runtime once the cache drops it', async () => {
+		const host = new TestHarness({
+			presets: [createTestPreset()],
+			llmProvider: MockLLMProvider.withFixedResponse({ content: 'ok', toolCalls: [] }),
+		})
+		try {
+			for (let i = 0; i < 3; i++) {
+				const session = await host.createSession('test')
+				// Touching a session activates its tenure implicitly, which is how a host
+				// that never calls activateSession still accumulates them.
+				const loaded = await host.sessionManager.getSession(session.sessionId)
+				if (!loaded.ok) throw new Error(loaded.error.message)
+				await loaded.value.close()
+				await loaded.value.waitForLocalCleanup()
+			}
+			expect(host.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
+			// A tenure outlives its runtime as a tombstone, but must not keep the store,
+			// agents and plugin contexts reachable with it.
+			expect(host.sessionManager.getRuntimeCacheStats().retainedRuntimeCount).toBe(0)
+		} finally { await host.shutdown() }
+	})
+})
+
 describe('session activation handoff', () => {
 	function heldFileWrite() {
 		const writeEntered = Promise.withResolvers<void>()
