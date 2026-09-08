@@ -174,6 +174,26 @@ describe('scheduler handoff', () => {
 		expect(host.llmProvider.getCallCount()).toBe(0)
 	})
 
+	it('reports every scheduler failure a park drains, not only the first', async () => {
+		class FailingScheduler extends RecordingScheduler {
+			override async wake(): Promise<void> { throw new Error('Scheduler unavailable') }
+		}
+		const plugin = definePlugin('session-wake').sessionHook('onSessionPark', async (ctx) => {
+			await ctx.platform.scheduler.wake(pluginWakeKey(ctx.sessionId, 'session-wake', 'late'), 1_000).catch(() => {})
+		}).build()
+		const host = createHost({ scheduler: new FailingScheduler(), preset: createTestPreset({ plugins: [plugin.configure()] }) })
+		const session = await createSession(host)
+		await sendMessage(session, entryAgentId(session), 'arm a failing wake')
+		const activation = host.manager.activateSession(session.id)
+		if (!activation.ok) throw new Error(activation.error.message)
+		// One agent failure and one session failure: awaiting them with Promise.all
+		// throws on the first and drops the rest, which have already been spliced.
+		const failure = await host.manager.parkSession(activation.value).catch((error: unknown) => error)
+		expect(failure).toBeInstanceOf(AggregateError)
+		expect((failure as AggregateError).errors.length).toBeGreaterThan(1)
+		host.manager.revokeSession(activation.value)
+	})
+
 	it('rejects park when an admitted scheduler operation failed', async () => {
 		class FailingScheduler extends RecordingScheduler {
 			override async wake(): Promise<void> { throw new Error('Scheduler unavailable') }
