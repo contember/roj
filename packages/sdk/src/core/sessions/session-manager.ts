@@ -1349,6 +1349,15 @@ export class SessionManager {
 			platform: this.platform,
 			runtimeActivity: entry.activity,
 			registerReopenedSession: (reopenedSession) => this.registerReopenedSession(reopenedSession, entry.activity, entry.tenure),
+			// Drop the residency so the next access reloads and re-checks ownership;
+			// the runtime already stopped itself.
+			onOwnershipLost: () => {
+				entry.tenure.entries.delete(entry)
+				if (entry.tenure.entry === entry) entry.tenure.entry = undefined
+				if (this.sessions.get(store.sessionId) === entry) this.sessions.delete(store.sessionId)
+				entry.listenerCleanup?.()
+				entry.listenerCleanup = undefined
+			},
 		})
 		entry.runtime = session
 		this.assertAdmission(entry.tenure)
