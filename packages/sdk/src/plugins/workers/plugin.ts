@@ -820,21 +820,20 @@ export const workerPlugin = definePlugin('workers')
 			}
 		},
 	})
+	.sessionHook('onSessionPark', async (ctx) => {
+		const { runningWorkers, abandonedWorkers, logger } = ctx.pluginContext
+		const workers = [...runningWorkers.values()]
+		const timeouts = resolveStopTimeouts(ctx.pluginConfig)
+		const exited = await awaitWithin(Promise.allSettled(workers.map((worker) => worker.promise)), timeouts.stopTimeoutMs)
+		if (exited) return
+		const stragglers = workers.filter((worker) => runningWorkers.get(worker.workerId) === worker)
+		logger.warn('Stopping workers that outlived the park drain', { count: stragglers.length })
+		await stopWorkers(stragglers, runningWorkers, abandonedWorkers, timeouts)
+	})
 	.sessionHook('onSessionClose', async (ctx) => {
 		const { runningWorkers, abandonedWorkers, logger } = ctx.pluginContext
 		if (runningWorkers.size === 0) return
 		const closingWorkers = [...runningWorkers.values()]
-		if (ctx.reason === 'parked') {
-			const timeouts = resolveStopTimeouts(ctx.pluginConfig)
-			// A park may finish the work in flight, but never past the host's drain budget:
-			// stragglers are stopped so their state parks and the next host resumes them.
-			const exited = await awaitWithin(Promise.allSettled(closingWorkers.map((worker) => worker.promise)), timeouts.stopTimeoutMs)
-			if (exited) return
-			const stragglers = closingWorkers.filter((worker) => runningWorkers.get(worker.workerId) === worker)
-			logger.warn('Stopping workers that outlived the park drain', { count: stragglers.length })
-			await stopWorkers(stragglers, runningWorkers, abandonedWorkers, timeouts)
-			return
-		}
 
 		logger.info('Cancelling running workers on session close', { count: closingWorkers.length })
 

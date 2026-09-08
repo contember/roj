@@ -101,7 +101,7 @@ describe('scheduler handoff', () => {
 				entered.resolve()
 				await release.promise
 			}).build()
-			const host = createHost({ scheduler: new RecordingScheduler(), preset: createTestPreset({ plugins: [plugin.configure({})] }) })
+			const host = createHost({ scheduler: new RecordingScheduler(), preset: createTestPreset({ plugins: [plugin.configure()] }) })
 			const session = await createSession(host)
 			const key = agentWakeKey(session.id, entryAgentId(session), 'debounce')
 			const closing = cause === 'close' ? session.close() : host.manager.shutdown()

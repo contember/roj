@@ -257,6 +257,8 @@ type SessionHookMap<TCtx> = {
 	 * runtime is rebuilt from its event log and runs this hook again.
 	 */
 	onSessionReady: (ctx: TCtx) => Promise<void>
+	/** Quiesce background work before the runtime waits for admitted operations to drain. */
+	onSessionPark: (ctx: TCtx) => Promise<void>
 	/**
 	 * Runs once per resident runtime lifetime, not once per session — an idle
 	 * eviction runs it too, and the next access runs `onSessionReady` again.
@@ -340,6 +342,7 @@ type ErasedAgentHookMap = {
 type ErasedSessionHookMap = {
 	/** Fires once per resident runtime lifetime — a rebuilt runtime runs it again. */
 	onSessionReady: (ctx: BaseSessionHookContext) => Promise<void>
+	onSessionPark: (ctx: BaseSessionHookContext) => Promise<void>
 	/** Fires once per resident runtime lifetime — `reason` says whether the session ends or is only parked. */
 	onSessionClose: (ctx: BaseSessionHookContext & { reason: SessionCloseReason }) => Promise<void>
 	beforeMethod: (ctx: BaseSessionHookContext & { method: string; input: unknown; agentId?: AgentId }) => Promise<BeforeMethodResult>

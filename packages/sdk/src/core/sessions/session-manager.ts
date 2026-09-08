@@ -577,6 +577,7 @@ export class SessionManager {
 		} catch (error) {
 			if (this.sessions.get(sessionId) === entry) this.sessions.delete(sessionId)
 			entry.listenerCleanup?.()
+			this.forgetEntry(entry, entry.runtime)
 			if (tenure.state !== 'active') return Err(SessionErrors.runtimeUnavailable(String(sessionId), tenure.state))
 			if (error instanceof SessionLoadError) return Err(error.domainError)
 			throw error
@@ -698,6 +699,7 @@ export class SessionManager {
 		} catch (error) {
 			if (this.sessions.get(newSessionId) === entry) this.sessions.delete(newSessionId)
 			entry.listenerCleanup?.()
+			this.forgetEntry(entry, entry.runtime)
 			if (tenure.state !== 'active') return Err(SessionErrors.runtimeUnavailable(String(newSessionId), tenure.state))
 			if (error instanceof SessionLoadError) return Err(error.domainError)
 			throw error
@@ -765,18 +767,15 @@ export class SessionManager {
 			try {
 				const session = await entry.promise
 				this.assertAdmission(tenure)
-				if (session.state.status !== 'closed' && (this.sessions.get(sessionId) !== entry || entry.activity.getSnapshot().state !== 'ready')) continue
+				if (this.sessions.get(sessionId) !== entry || entry.activity.getSnapshot().state !== 'ready') continue
 				if (this.sessions.get(sessionId) === entry && entry.state === 'loading') {
-					if (session.state.status === 'closed') this.sessions.delete(sessionId)
-					else {
-						entry.state = 'ready'
-						entry.lastAccessAt = performance.now()
-					}
+					entry.state = 'ready'
+					entry.lastAccessAt = performance.now()
 				}
 				return Ok(session)
 			} catch (error) {
 				if (this.sessions.get(sessionId) === entry) this.sessions.delete(sessionId)
-				if (!entry.runtime && error instanceof SessionLoadError) entry.activity.markDisposed()
+				this.forgetEntry(entry, entry.runtime)
 				if (tenure.state !== 'active') return Err(SessionErrors.runtimeUnavailable(String(sessionId), tenure.state))
 				if (error instanceof SessionLoadError) return Err(error.domainError)
 				throw error
@@ -820,7 +819,6 @@ export class SessionManager {
 
 		const state = store.getState()
 
-		// Don't cache closed sessions
 		if (state.status === 'closed') {
 			// Skip onSessionReady hooks — closed sessions are immutable, firing hooks
 			// would emit events to a sealed event log on every read / restart.
@@ -1364,21 +1362,16 @@ export class SessionManager {
 			},
 		})
 		entry.runtime = session
-		this.assertAdmission(entry.tenure)
-
-		// Only register cache eviction listener for active sessions (not closed)
-		if (store.getState().status !== 'closed') {
-			this.registerSessionEventListener(store.sessionId, store, session, entry)
-		}
-
-		// Ensure session and workspace directories exist before plugins run
-		await this.platform.fs.mkdir(sessionDir, { recursive: true })
-		const workspaceDir = store.getState().workspaceDir
-		if (workspaceDir) {
-			await this.platform.fs.mkdir(workspaceDir, { recursive: true })
-		}
-
 		try {
+			this.assertAdmission(entry.tenure)
+			if (store.getState().status !== 'closed') {
+				this.registerSessionEventListener(store.sessionId, store, session, entry)
+			}
+			await this.platform.fs.mkdir(sessionDir, { recursive: true })
+			const workspaceDir = store.getState().workspaceDir
+			if (workspaceDir) {
+				await this.platform.fs.mkdir(workspaceDir, { recursive: true })
+			}
 			this.assertAdmission(entry.tenure)
 			// Safe for closed sessions — createContext is pure local setup, no event emit.
 			await session.initPluginContexts()
@@ -1452,7 +1445,12 @@ export class SessionManager {
 		if (tenure.state !== 'active' || this.tenures.get(session.id) !== tenure) return Err(SessionErrors.runtimeUnavailable(String(session.id), tenure.state))
 		if (this.shuttingDown) return Err(ValidationErrors.invalid('Session manager is shutting down'))
 		if (activity.getSnapshot().state !== 'ready') return Ok(undefined)
-		if (this.sessions.has(session.id)) return Err(SessionErrors.alreadyExists(String(session.id)))
+		const current = this.sessions.get(session.id)
+		if (current && current.runtime !== session) return Err(SessionErrors.alreadyExists(String(session.id)))
+		if (current) {
+			current.listenerCleanup?.()
+			tenure.entries.delete(current)
+		}
 
 		const deferred = Promise.withResolvers<Session>()
 		void deferred.promise.catch(() => {})
@@ -1565,21 +1563,21 @@ export class SessionManager {
 		return entry.unloadPromise
 	}
 
-	/**
-	 * Drop a tenure's references to a runtime that no longer needs guarding.
-	 *
-	 * `tenure.entry` only exists to refuse re-admission while a disposed runtime
-	 * still holds resources; once it does not, keeping it pins the whole runtime
-	 * graph — store, agents, plugin contexts — for the life of the process. A
-	 * tenure whose cleanup is still outstanding is retried when it settles.
-	 */
-	private forgetEntry(entry: SessionCacheEntry, session: Session): void {
-		if (session.hasUnsafeResources()) {
+	private forgetEntry(entry: SessionCacheEntry, session: Session | undefined): void {
+		// Late contexts must finish initialization and cleanup before replacement admission.
+		if (!entry.settled) {
+			void entry.promise.catch(() => {}).then(() => this.forgetEntry(entry, entry.runtime))
+			return
+		}
+		const state = entry.activity.getSnapshot().state
+		if (session && state !== 'disposed' && state !== 'revoked') return
+		if (session?.hasUnsafeResources()) {
 			void session.waitForLocalCleanup().catch(() => {}).then(() => {
 				if (!session.hasUnsafeResources()) this.forgetEntry(entry, session)
 			})
 			return
 		}
+		if (!session) entry.activity.markDisposed()
 		entry.tenure.entries.delete(entry)
 		if (entry.tenure.entry === entry) entry.tenure.entry = undefined
 	}

@@ -23,6 +23,86 @@ function harness(plugins: ConstructorParameters<typeof TestHarness>[0]['systemPl
 }
 
 describe('session park after a recovered failure', () => {
+	it('retries park hooks before final cleanup after a quiescence failure', async () => {
+		let attempts = 0
+		let closes = 0
+		const plugin = definePlugin('retry-park')
+			.sessionHook('onSessionPark', async (ctx) => {
+				if (++attempts === 1) throw new Error('Quiescence failed')
+				await ctx.emitEvent(sessionEvents.create('session_overrides_set', {}))
+			})
+			.sessionHook('onSessionClose', async () => { closes++ }).build()
+		const host = harness([plugin])
+		try {
+			const created = await host.createSession('test')
+			const activation = host.sessionManager.activateSession(created.sessionId)
+			if (!activation.ok) throw new Error(activation.error.message)
+			await expect(host.sessionManager.parkSession(activation.value)).rejects.toBeInstanceOf(AggregateError)
+			expect(closes).toBe(0)
+			expect((await host.sessionManager.getSession(created.sessionId)).ok).toBe(false)
+			await host.sessionManager.parkSession(activation.value)
+			expect(attempts).toBe(2)
+			expect(closes).toBe(1)
+		} finally { await host.shutdown() }
+	})
+
+	it('retains a revoked runtime until an in-flight park hook settles', async () => {
+		const entered = Promise.withResolvers<void>()
+		const finish = Promise.withResolvers<void>()
+		const plugin = definePlugin('held-park').sessionHook('onSessionPark', async () => {
+			entered.resolve()
+			await finish.promise
+		}).build()
+		const host = harness([plugin])
+		try {
+			const created = await host.createSession('test')
+			const loaded = await host.sessionManager.getSession(created.sessionId)
+			const activation = host.sessionManager.activateSession(created.sessionId)
+			if (!loaded.ok || !activation.ok) throw new Error('Session unavailable')
+			const parking = host.sessionManager.parkSession(activation.value).catch((error: unknown) => error)
+			await entered.promise
+			host.sessionManager.revokeSession(activation.value)
+			expect(await parking).toBeInstanceOf(SessionRuntimeUnavailableError)
+			await new Promise<void>((resolve) => setTimeout(resolve, 0))
+			expect(host.sessionManager.activateSession(created.sessionId).ok).toBe(false)
+			finish.resolve()
+			await loaded.value.waitForLocalCleanup()
+			expect(host.sessionManager.activateSession(created.sessionId).ok).toBe(true)
+		} finally { finish.resolve(); await host.shutdown() }
+	})
+
+	it.each(['load', 'create'])('parks after a failed %s acquisition and a successful retry', async (failure) => {
+		class FailingLoadStore extends MemoryEventStore {
+			failNextLoad = false
+			override async load(id: SessionId) {
+				if (this.failNextLoad) {
+					this.failNextLoad = false
+					throw new Error('Transient load failure')
+				}
+				return super.load(id)
+			}
+		}
+		const store = new FailingLoadStore()
+		const host = new TestHarness({ presets: [createTestPreset()], eventStore: store })
+		try {
+			const created = await host.createSession('test')
+			const activation = host.sessionManager.activateSession(created.sessionId)
+			if (!activation.ok) throw new Error(activation.error.message)
+			await host.sessionManager.parkSession(activation.value)
+			const next = host.sessionManager.activateSession(created.sessionId)
+			if (!next.ok) throw new Error(next.error.message)
+			if (failure === 'load') {
+				store.failNextLoad = true
+				await expect(host.sessionManager.getSession(created.sessionId)).rejects.toThrow('Transient load failure')
+			} else {
+				expect((await host.sessionManager.createSession('test', { sessionId: created.sessionId })).ok).toBe(false)
+			}
+			expect((await host.sessionManager.getSession(created.sessionId)).ok).toBe(true)
+			await host.sessionManager.parkSession(next.value)
+			expect(host.sessionManager.getRuntimeCacheStats().retainedRuntimeCount).toBe(0)
+		} finally { await host.shutdown() }
+	})
+
 	it('reports a transient wake failure once, then parks on the next attempt', async () => {
 		let failNextWake = true
 		const waker = definePlugin('waker').method('arm', {
@@ -34,7 +114,7 @@ describe('session park after a recovered failure', () => {
 			},
 		}).build()
 		const host = new TestHarness({
-			presets: [createTestPreset({ plugins: [waker.configure({})] })],
+			presets: [createTestPreset({ plugins: [waker.configure()] })],
 			llmProvider: MockLLMProvider.withFixedResponse({ content: 'ok', toolCalls: [] }),
 			systemPlugins: [waker],
 			scheduler: {
@@ -70,7 +150,7 @@ describe('notifications from an expired scope', () => {
 			.sessionHook('onSessionReady', async (ctx) => { notify = ctx.notify })
 			.build()
 		const host = new TestHarness({
-			presets: [createTestPreset({ plugins: [ticker.configure({})] })],
+			presets: [createTestPreset({ plugins: [ticker.configure()] })],
 			llmProvider: MockLLMProvider.withFixedResponse({ content: 'ok', toolCalls: [] }),
 			systemPlugins: [ticker],
 		})
@@ -91,6 +171,25 @@ describe('notifications from an expired scope', () => {
 })
 
 describe('tenure retention', () => {
+	it('reuses one closed runtime and releases it after reopen and close', async () => {
+		const host = harness()
+		try {
+			const created = await host.createSession('test')
+			await created.close()
+			const first = await host.sessionManager.getSession(created.sessionId)
+			if (!first.ok) throw new Error(first.error.message)
+			for (let i = 0; i < 10; i++) {
+				const next = await host.sessionManager.getSession(created.sessionId)
+				if (!next.ok) throw new Error(next.error.message)
+				expect(next.value).toBe(first.value)
+			}
+			expect(host.sessionManager.getRuntimeCacheStats().retainedRuntimeCount).toBe(1)
+			expect((await first.value.reopen()).ok).toBe(true)
+			await first.value.close()
+			expect(host.sessionManager.getRuntimeCacheStats().retainedRuntimeCount).toBe(0)
+		} finally { await host.shutdown() }
+	})
+
 	it('stops guarding a runtime once the cache drops it', async () => {
 		const host = new TestHarness({
 			presets: [createTestPreset()],
@@ -122,7 +221,7 @@ describe('session activation handoff', () => {
 		const releaseClose = Promise.withResolvers<void>()
 		let contexts = 0
 		let closes = 0
-		const plugin = definePlugin('held-file').context(() => { contexts++; return {} })
+		const plugin = definePlugin('held-file').context(async () => { contexts++; return {} })
 			.method('write', {
 				input: z.object({}), output: z.object({}),
 				handler: async (ctx) => {
@@ -439,6 +538,9 @@ describe('session activation handoff', () => {
 		const creating = host.sessionManager.createSession('test', { sessionId: id })
 		await entered.promise
 		host.sessionManager.revokeSession(activation.value)
+		expect(host.sessionManager.activateSession(id).ok).toBe(false)
+		await new Promise<void>((resolve) => setTimeout(resolve, 0))
+		expect(closed).toEqual([])
 		expect(host.sessionManager.activateSession(id).ok).toBe(false)
 		finishInit.resolve()
 		await cleanupEntered.promise

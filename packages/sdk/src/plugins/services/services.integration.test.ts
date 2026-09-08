@@ -93,7 +93,7 @@ describe('service handoff cleanup', () => {
 				process: { spawn: () => child, execFile: async () => { throw new Error('Unexpected exec') } },
 				kill: (_pid, signal) => {
 					if (signal === 0) throw Object.assign(new Error('Process probe'), { code: alive ? 'EPERM' : 'ESRCH' })
-					if (typeof signal !== 'string') throw new Error('Unexpected signal')
+					if (signal !== 'SIGTERM' && signal !== 'SIGKILL') throw new Error('Unexpected signal')
 					signals.push(signal)
 					if ((reason === 'parked' && signal === 'SIGTERM') || signal === 'SIGKILL') alive = false
 					return true
@@ -322,7 +322,7 @@ describe('services plugin', () => {
 				return null
 			}).build()
 			const harness = createServicesHarness({
-				presets: [createServicesPreset([autoStartService], ['auto-start'], new PortPool(), { plugins: [gate.configure({})] })],
+				presets: [createServicesPreset([autoStartService], ['auto-start'], new PortPool(), { plugins: [gate.configure()] })],
 				eventStore: new StopStore(),
 			})
 			const session = await harness.createSession('test')

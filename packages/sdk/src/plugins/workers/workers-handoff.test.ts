@@ -10,6 +10,42 @@ import { selectPluginState } from '~/core/sessions/reducer.js'
 import type { WorkerEntry, WorkerId } from './worker.js'
 
 describe('worker handoff', () => {
+	it('stops an abort-dependent worker on the park deadline and resumes it on replacement', async () => {
+		const entered = Promise.withResolvers<void>()
+		const resumed = Promise.withResolvers<void>()
+		let aborts = 0
+		const worker = createWorkerDefinition('until-abort', 'Run until stopped', z.object({}), {
+			initialState: () => ({}), reduce: (state: {}) => state,
+			execute: async (_config, ctx) => {
+				if (ctx.resumed) resumed.resolve()
+				entered.resolve()
+				await new Promise<void>((resolve) => ctx.getAbortSignal().addEventListener('abort', () => {
+					aborts++
+					resolve()
+				}, { once: true }))
+				return Ok({ status: 'done', summary: 'stopped' })
+			},
+		})
+		const host = new TestHarness({ presets: [createTestPreset({
+			plugins: [workerPlugin.configure({ workers: [worker], stopTimeoutMs: 10, effectDrainTimeoutMs: 10 })],
+		})] })
+		try {
+			const created = await host.createSession('test')
+			const activation = host.sessionManager.activateSession(created.sessionId)
+			if (!activation.ok) throw new Error(activation.error.message)
+			expect((await created.callPluginMethod('workers.spawn', {
+				sessionId: created.sessionId, agentId: created.getEntryAgentId(), workerType: 'until-abort', config: {},
+			})).ok).toBe(true)
+			await entered.promise
+			await host.sessionManager.parkSession(activation.value, { timeoutMs: 1000 })
+			expect(aborts).toBe(1)
+			expect((await host.eventStore.load(created.sessionId)).filter((event) => event.type === 'worker_completed')).toHaveLength(0)
+			expect(host.sessionManager.activateSession(created.sessionId).ok).toBe(true)
+			expect((await host.sessionManager.getSession(created.sessionId)).ok).toBe(true)
+			await resumed.promise
+		} finally { await host.shutdown() }
+	})
+
 	it('manually starts a restored overflow worker for the first time, then resumes its interrupted execution', async () => {
 		const entered = Promise.withResolvers<void>()
 		const release = Promise.withResolvers<void>()
