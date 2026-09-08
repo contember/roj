@@ -80,6 +80,7 @@ export type { SessionRuntimeState } from '~/core/sessions/runtime-activity.js'
 export type { ParkOptions, SessionActivation } from '~/core/sessions/session-manager.js'
 export { SessionParkTimeoutError } from '~/core/sessions/session-manager.js'
 export { EventAppendError, EventAppendOutcomeUnknownError, EventLogCorruptionError, FileEventStoreCapabilityError, SessionOwnershipLostError } from '~/core/events/event-store.js'
+export type { EventStore, LoadRangeOptions, LoadRangeResult } from '~/core/events/event-store.js'
 export type { SessionMetadata } from '~/core/sessions/schema.js'
 // Exported so a consumer can validate a callManagerMethod('sessions.list')
 // result — that call is typed Result<unknown>, so the plugin's output schema

@@ -97,6 +97,7 @@ async function executeWorker(
 				result: result.value,
 			}))
 			if (persisted) logger.info('Worker completed', { workerId, result: result.value.summary })
+			else logger.warn('Worker terminal event not persisted', { workerId, type: 'worker_completed' })
 		} else {
 			const persisted = await context.persistTerminal(workerEvents.create('worker_failed', {
 				workerId,
@@ -104,6 +105,7 @@ async function executeWorker(
 				resumable: result.error.resumable,
 			}))
 			if (persisted) logger.warn('Worker failed', { workerId, error: result.error.message, resumable: result.error.resumable })
+			else logger.warn('Worker terminal event not persisted', { workerId, type: 'worker_failed' })
 		}
 	} catch (error) {
 		if (executionControl.suppressTerminalEvent) return
@@ -114,6 +116,7 @@ async function executeWorker(
 			resumable: false,
 		}))
 		if (persisted) logger.error('Worker threw exception', error instanceof Error ? error : undefined, { workerId })
+		else logger.warn('Worker terminal event not persisted', { workerId, type: 'worker_failed' })
 	} finally {
 		// Bounded like the stop path: a stalled append must not hold the runtime lease forever.
 		const drained = await awaitWithin(context.waitForEffects(), effectDrainTimeoutMs)

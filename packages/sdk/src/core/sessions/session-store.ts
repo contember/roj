@@ -210,8 +210,7 @@ export class SessionStore {
 			} catch (error) {
 				// Fence unless the store said the append definitely did not commit: an
 				// unclassified failure may still have landed, and nothing may be ordered
-				// behind an outcome nobody knows. Losing ownership is a definite
-				// noncommit that must still stop the runtime — a replacement owns the log.
+				// behind an outcome nobody knows.
 				if (error instanceof SessionOwnershipLostError) this.loseOwnership(error)
 				else if (!(error instanceof EventAppendError)) this.fence ??= { error }
 				throw error

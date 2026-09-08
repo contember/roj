@@ -269,7 +269,7 @@ describe('uploads runtime retention', () => {
 	it('does not invoke preprocessing after revoke while its execution-marker write is pending', async () => {
 		const entered = deferred()
 		const release = deferred()
-		const basePath = `/tmp/opencode/uploads-revoke-marker-${crypto.randomUUID()}`
+		const basePath = `/tmp/roj-upload-revoke-marker-${crypto.randomUUID()}`
 		const dataFileStore = new SelectiveFailureStore(new SessionFileStore(basePath, undefined, false, createNodePlatform().fs, 'session'))
 		dataFileStore.faults.beforeWrite = async (path, content) => {
 			if (path !== 'meta.json') return
@@ -337,7 +337,7 @@ describe('uploads runtime retention', () => {
 			await release.promise
 			return null
 		}).build()
-		const basePath = `/tmp/opencode/uploads-handoff-${crypto.randomUUID()}`
+		const basePath = `/tmp/roj-upload-handoff-${crypto.randomUUID()}`
 		const dataFileStore = new SessionFileStore(basePath, undefined, false, createNodePlatform().fs, 'session')
 		const preprocessor: Preprocessor = {
 			name: 'handoff', supportedMimeTypes: ['text/plain'],
