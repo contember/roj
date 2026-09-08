@@ -262,16 +262,17 @@ describe('immutable event batches', () => {
 			() => store.getMetadata(id),
 			() => store.load(id),
 			() => store.exists(id),
-			() => store.listSessions(),
-			() => store.listSessionsWithMetadata(),
-			() => store.listSessionsWithMetadata({ status: 'active' }),
-			() => store.listSessionsWithMetadata({ status: 'closed' }),
 			() => store.reconcileMetadata(id, events),
 			() => store.updateMetadata(id, { name: 'must not write' }),
 			() => store.append(id, events[1]),
 			() => store.appendBatch(id, events),
 		]
 		for (const attempt of attempts) await expect(attempt()).rejects.toBeInstanceOf(EventAppendOutcomeUnknownError)
+		// A fenced session is skipped by the listing rather than taking it down for every other one.
+		expect(await store.listSessions()).toEqual([id])
+		expect((await store.listSessionsWithMetadata()).sessions).toEqual([])
+		expect((await store.listSessionsWithMetadata({ status: 'active' })).total).toBe(0)
+		expect((await store.listSessionsWithMetadata({ status: 'closed' })).total).toBe(0)
 		expect(reads).toBe(readsBefore)
 		expect(writes).toBe(writesBefore)
 		expect(await readFile(join(directory, 'meta.json'), 'utf8')).toBe(metadataBefore)
@@ -658,6 +659,25 @@ describe('immutable event batches', () => {
 		expect(() => decodeBatch('{"version":2}', 0, id, path)).toThrow(EventLogCorruptionError)
 		expect(() => batchName(Number.MAX_SAFE_INTEGER + 1)).toThrow()
 		expect(batchName(Number.MAX_SAFE_INTEGER)).toBe('001fffffffffffff.json')
+	})
+
+	test('a foreign file in the batch directory is not a missing batch', async () => {
+		const store = fresh()
+		await store.appendBatch(id, events)
+		// The shapes a pod pool over shared storage produces on its own.
+		for (const name of ['.DS_Store', '.nfs00000000004a1c2200000003', 'events.json.swp'])
+			await writeFile(join(batches, name), 'not a batch')
+		const recovered = fresh()
+		expect(await recovered.load(id)).toEqual(events)
+		expect(await recovered.listSessions()).toEqual([id])
+		expect(await store.append(id, events[1])).toBeUndefined()
+	})
+
+	test('a since below -1 reads from the start instead of slicing from the end', async () => {
+		const store = fresh()
+		await store.appendBatch(id, events)
+		expect(await store.loadRange(id, { since: -5 })).toEqual({ events, fromIndex: 0, toIndex: 1 })
+		expect(await store.loadRange(id, { since: -5, limit: 1 })).toEqual({ events: [events[0]], fromIndex: 0, toIndex: 0 })
 	})
 
 	test('concurrent appends and metadata updates preserve all counters and custom fields', async () => {
