@@ -286,7 +286,7 @@ describe('uploads runtime retention', () => {
 				})
 			},
 		}
-		const basePath = `/tmp/opencode/uploads-revoke-open-${crypto.randomUUID()}`
+		const basePath = `/tmp/roj-upload-revoke-open-${crypto.randomUUID()}`
 		const dataFileStore = new SelectiveFailureStore(new SessionFileStore(basePath, undefined, false, createNodePlatform().fs, 'session'))
 		let bodies = 0
 		const preprocessor: Preprocessor = {
@@ -347,7 +347,7 @@ describe('uploads runtime retention', () => {
 			await release.promise
 			return null
 		}).build()
-		const basePath = `/tmp/opencode/uploads-handoff-${crypto.randomUUID()}`
+		const basePath = `/tmp/roj-upload-handoff-${crypto.randomUUID()}`
 		const dataFileStore = new SessionFileStore(basePath, undefined, false, createNodePlatform().fs, 'session')
 		const preprocessor: Preprocessor = {
 			name: 'handoff', supportedMimeTypes: ['text/plain'],

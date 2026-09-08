@@ -149,7 +149,7 @@ interface SessionTenure {
 /** Why the manager is dropping a resident runtime — finer-grained than what plugins see. */
 type RuntimeDisposalCause = 'idle' | 'closed' | 'disposed' | 'shutdown'
 
-// Both parking causes map to `evicted`: the session survives and the next access rebuilds its runtime.
+// `idle` and `disposed` both map to `evicted`: the session survives and the next access rebuilds its runtime.
 const RUNTIME_DISPOSAL_CLOSE_REASON: Record<RuntimeDisposalCause, SessionCloseReason> = {
 	idle: 'evicted',
 	disposed: 'evicted',
@@ -215,6 +215,8 @@ export class SessionManager {
 		const entries = [...tenure.entries].filter((entry) => entry.activity.getSnapshot().state !== 'disposed')
 		if (entries.length === 0) {
 			tenure.state = 'released'
+			tenure.entries.clear()
+			tenure.entry = undefined
 			return Promise.resolve()
 		}
 		for (const entry of entries) {
