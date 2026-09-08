@@ -8,7 +8,7 @@
 import type { AgentId } from '~/core/agents/schema.js'
 import type { AgentState } from '~/core/agents/state.js'
 import type { EventStore } from '~/core/events/event-store.js'
-import { EventAppendError, EventAppendOutcomeUnknownError } from '~/core/events/event-store.js'
+import { EventAppendError, EventAppendOutcomeUnknownError, SessionOwnershipLostError } from '~/core/events/event-store.js'
 import { withDeadline } from '~/lib/utils/concurrency.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import { applyEvent as coreApplyEvent } from '~/core/sessions/apply-event.js'
@@ -60,6 +60,7 @@ export class SessionStore {
 	private fence: { error: unknown } | undefined
 	private failure: { error: unknown } | undefined
 	private readonly pending = new Set<Promise<void>>()
+	private ownershipLost: ((error: SessionOwnershipLostError) => void) | undefined
 
 	private readonly queueTimeoutMs: number
 
@@ -103,6 +104,22 @@ export class SessionStore {
 	 */
 	detach(): void {
 		this.detached = true
+	}
+
+	/**
+	 * Observe the moment a write is refused because ownership moved to another host.
+	 *
+	 * Fires once, after the store is fenced, so the owner can stop instead of retry.
+	 */
+	onOwnershipLost(listener: (error: SessionOwnershipLostError) => void): void {
+		this.ownershipLost = listener
+	}
+
+	private loseOwnership(error: SessionOwnershipLostError): void {
+		this.fence ??= { error }
+		const listener = this.ownershipLost
+		this.ownershipLost = undefined
+		listener?.(error)
 	}
 
 	/** True once the owning runtime was disposed and the store stopped accepting writes. */
@@ -193,8 +210,10 @@ export class SessionStore {
 			} catch (error) {
 				// Fence unless the store said the append definitely did not commit: an
 				// unclassified failure may still have landed, and nothing may be ordered
-				// behind an outcome nobody knows.
-				if (!(error instanceof EventAppendError)) this.fence ??= { error }
+				// behind an outcome nobody knows. Losing ownership is a definite
+				// noncommit that must still stop the runtime — a replacement owns the log.
+				if (error instanceof SessionOwnershipLostError) this.loseOwnership(error)
+				else if (!(error instanceof EventAppendError)) this.fence ??= { error }
 				throw error
 			}
 			if (this.detached) throw new SessionRuntimeDetachedError(this.sessionId, events)

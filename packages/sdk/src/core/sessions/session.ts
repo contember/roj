@@ -34,7 +34,7 @@ import type { MessageId } from '~/plugins/mailbox/schema.js'
 import { generateMessageId } from '~/plugins/mailbox/schema.js'
 import { mailboxEvents } from '~/plugins/mailbox/state.js'
 import { Agent, type AgentConfig } from '../agents/agent.js'
-import type { EventStore } from '../events/event-store.js'
+import type { EventStore, SessionOwnershipLostError } from '../events/event-store.js'
 import type { BaseEvent } from '../events/types.js'
 import { SessionFileStore } from '../file-store/file-store.js'
 import type { SessionContext } from '../sessions/context.js'
@@ -96,6 +96,8 @@ export interface SessionDependencies {
 	/** Lifecycle guard shared by the manager, agents, and plugins. */
 	runtimeActivity: SessionRuntimeActivityController
 	registerReopenedSession?: (session: Session) => Result<SessionReopenRegistration | undefined, DomainError>
+	/** Called after the runtime stops itself because another host took the log. */
+	onOwnershipLost?: (error: SessionOwnershipLostError) => void
 }
 
 // ============================================================================
@@ -155,6 +157,13 @@ export class Session {
 		this.platform = deps.platform
 		this.runtimeActivity = deps.runtimeActivity
 		this.registerReopenedSession = deps.registerReopenedSession
+		// Losing the log is not a drain: a replacement is already writing it, so stop
+		// rather than park — nothing this runtime still holds may reach the log again.
+		this.store.onOwnershipLost((error) => {
+			this.logger.warn('Session ownership lost, abandoning the runtime', { sessionId: this.id })
+			this.revoke()
+			deps.onOwnershipLost?.(error)
+		})
 		// Initialize agents from state
 		this.initializeAgents()
 
