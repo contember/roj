@@ -49,7 +49,7 @@ export class MemoryEventStore extends BaseEventStore {
 
 			const storeLastIndex = allEvents.length - 1
 
-			const fromIndex = since + 1
+			const fromIndex = Math.max(0, since + 1)
 			if (fromIndex >= allEvents.length) {
 				return { events: [], fromIndex: -1, toIndex: storeLastIndex }
 			}

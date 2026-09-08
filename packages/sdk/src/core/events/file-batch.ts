@@ -20,6 +20,11 @@ export function batchName(batch: number): string {
 	return `${batch.toString(16).padStart(16, '0')}.json`
 }
 
+/** Recovery selects batches positively: a foreign file is not a missing batch. */
+export function isBatchName(name: string): boolean {
+	return /^[0-9a-f]{16}\.json$/.test(name)
+}
+
 function checksum(payload: string): string {
 	return createHash('sha256').update(payload, 'utf8').digest('hex')
 }
