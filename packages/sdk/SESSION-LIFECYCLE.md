@@ -14,6 +14,10 @@ new object. The new object becomes active; the old object's state stays closed.
 A freshly acquired closed runtime still exposes domain errors such as
 `session_closed` when asked to close again.
 
+Closed runtimes use the normal residency cache. Repeated reads return the same
+handle until eviction, park, or revoke. Reopening promotes that cached runtime;
+it does not retain an additional historical runtime.
+
 This intentionally replaces compatibility with reopening the original object.
 Callers that retain `Session` references must update their acquisition boundary.
 
@@ -33,6 +37,17 @@ in the middle of idle unload. Unknown keys and genuinely missing targets may
 be ignored. Delivery after ordinary idle unload can load a new runtime.
 
 ## Draining on a deadline
+
+After stopping admission, the runtime calls `onSessionPark` hooks before waiting
+for admitted operations. Plugins use this phase to quiesce background work;
+`onSessionClose('parked')` performs final cleanup after those operations drain.
+Park hooks may run again after a failed park and must be retryable. They receive
+a teardown activity so their cleanup effects can complete during parking.
+
+Workers first have `stopTimeoutMs` to finish naturally. Remaining workers are
+cancelled, with another `stopTimeoutMs` for cancellation and
+`effectDrainTimeoutMs` for effects. These plugin bounds are separate from the
+host's overall deadline; an issued store or file write can still delay handoff.
 
 `parkSession(handle, { timeoutMs })` bounds the caller's wait, not the drain.
 The park keeps running past the timeout and a later call races the same one, so

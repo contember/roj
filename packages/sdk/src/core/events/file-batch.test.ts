@@ -120,7 +120,7 @@ describe('immutable event batches', () => {
 		expect(await fresh().load(id)).toEqual([...events, events[1]])
 	})
 
-	test('partial pending write is a definite failure and restart ignores it', async () => {
+	test('partial pending writes are removed on every warm-store retry', async () => {
 		await fresh().append(id, events[0])
 		const store = fresh(
 			instrument(native, {
@@ -131,8 +131,10 @@ describe('immutable event batches', () => {
 				},
 			}),
 		)
-		await expect(store.appendBatch(id, [events[1], events[1]])).rejects.toBeInstanceOf(EventAppendError)
-		expect((await readdir(batches)).filter((name) => !name.startsWith('.pending-'))).toEqual([batchName(0)])
+		for (let attempt = 0; attempt < 3; attempt++) {
+			await expect(store.appendBatch(id, [events[1], events[1]])).rejects.toBeInstanceOf(EventAppendError)
+			expect(await readdir(batches)).toEqual([batchName(0)])
+		}
 		expect(await fresh().load(id)).toEqual([events[0]])
 		const recovered = fresh()
 		await recovered.append(id, events[1])

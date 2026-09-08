@@ -272,7 +272,7 @@ describe('core: error recovery', () => {
 			expect(bRuns.count).toBe(1)
 			const completed = await session.getEventsByType(toolEvents, 'tool_completed')
 			expect(completed).toHaveLength(1)
-			expect(completed[0]!.toolCallId).toBe('ta')
+			expect(completed[0]!.toolCallId).toBe(ToolCallId('ta'))
 			const agentId = session.getEntryAgentId()!
 			expect(session.state.agents.get(agentId)!.pendingToolCalls).toHaveLength(0)
 
