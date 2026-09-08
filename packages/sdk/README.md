@@ -185,9 +185,12 @@ hooks run with reason `revoked`.
 
 A host that wants a graceful handoff instead uses `parkSession`, which drains
 and releases residency without ending the session. `parkSession(handle,
-{ timeoutMs })` bounds the wait; `SessionManagerOptions.writeQueueTimeoutMs`
-bounds how long a write may wait for its turn. Both should sit inside the host's
-own shutdown budget. See `SESSION-LIFECYCLE.md`.
+{ timeoutMs })` bounds the caller's wait, not the drain;
+`SessionManagerOptions.writeQueueTimeoutMs` bounds how long a write may wait for
+its turn. Neither caps the drain as a whole, and four of its waits are unbounded
+— so size `timeoutMs` to the host's shutdown budget and treat revoke as the
+fallback when it fires. `SESSION-LIFECYCLE.md` lists every wait a drain spends,
+with its bound and default.
 
 **Known gap.** A service that exits while the runtime is already parking cannot
 publish its terminal `service_status_changed`: the runtime stopped accepting
