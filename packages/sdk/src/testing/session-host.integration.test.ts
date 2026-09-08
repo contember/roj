@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import z from 'zod/v4'
 import { FileEventStore } from '~/core/events/file.js'
-import { EventAppendError, EventAppendOutcomeUnknownError, type EventStore } from '~/core/events/event-store.js'
+import { EventAppendError, SessionOwnershipLostError, EventAppendOutcomeUnknownError, type EventStore } from '~/core/events/event-store.js'
 import { MemoryEventStore } from '~/core/events/memory.js'
 import { createEventsFactory, type DomainEvent } from '~/core/events/types.js'
 import { SessionFileStore } from '~/core/file-store/file-store.js'
@@ -63,7 +63,7 @@ class EpochBacking extends MemoryEventStore {
 	}
 	commit(id: SessionId, epoch: number, events: DomainEvent[]): Promise<void> {
 		return this.serialize(id, async () => {
-			if (epoch !== this.epoch) throw new EventAppendError(id, new Error('Stale host epoch'))
+			if (epoch !== this.epoch) throw new SessionOwnershipLostError(id, new Error('Stale host epoch'))
 			await super.doAppendBatch(id, events)
 		})
 	}
@@ -339,6 +339,29 @@ describe('cross-host file-backed handoff', () => {
 		expect((await reopened.callPluginMethod('host-test.mark', { value: 'new' })).ok).toBe(true)
 		held.release.resolve()
 		expect(await oldAppend).toBeInstanceOf(EventAppendError)
+		const events = await backing.load(session.id)
+		expect(z.array(z.object({ value: z.string() })).parse(events.filter((event) => event.type === 'host_marker'))).toEqual([{ value: 'new' }])
+	})
+
+	it('stops a runtime whose write is refused because another host took the log', async () => {
+		const f = await fixture()
+		const backing = new EpochBacking()
+		const a = host(f, { eventStore: backing.adapter(1) })
+		const session = await create(a)
+		activate(a, session.id)
+
+		// B takes the log. A has no way to be told: nobody can revoke a host that is
+		// merely unreachable, so it has to learn from its own refused write.
+		await backing.transfer(session.id)
+		await expect(session.callPluginMethod('host-test.mark', { value: 'late' }))
+			.rejects.toBeInstanceOf(SessionOwnershipLostError)
+
+		// The runtime stopped itself rather than retrying, and residency is gone, so a
+		// later access reloads and asks the store who owns the log now.
+		expect(a.manager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
+		const b = host(f, { eventStore: backing.adapter(2) })
+		const reopened = await load(b, session.id)
+		expect((await reopened.callPluginMethod('host-test.mark', { value: 'new' })).ok).toBe(true)
 		const events = await backing.load(session.id)
 		expect(z.array(z.object({ value: z.string() })).parse(events.filter((event) => event.type === 'host_marker'))).toEqual([{ value: 'new' }])
 	})
