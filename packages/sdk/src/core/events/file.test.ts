@@ -707,7 +707,7 @@ describe('FileEventStore', () => {
 			expect(await cold.loadRange(repairedId)).toEqual({ events: [], fromIndex: -1, toIndex: -1 })
 		})
 
-		test('rejects reads while metadata is inaccessible rather than erasing unread decorations', async () => {
+		test('skips an inaccessible session in the listing rather than erasing unread decorations', async () => {
 			await createSession(store, testSessionId)
 			await store.updateMetadata(testSessionId, { name: 'must survive', tags: ['kept'] })
 			const before = await readPersistedMetadata(testSessionId)
@@ -715,7 +715,10 @@ describe('FileEventStore', () => {
 			const recorded = recordingLogger()
 			const cold = new FileEventStore(TEST_BASE_PATH, denyingFileSystem(createNodeFileSystem()), recorded.logger)
 
-			await expect(cold.listSessionsWithMetadata()).rejects.toThrow('EACCES')
+			// One unreadable session must not take the listing down for every other one.
+			expect((await cold.listSessionsWithMetadata()).total).toBe(0)
+			expect(recorded.warns).toContain('Skipping unreadable session in listing')
+			// A direct read still surfaces the failure, and nothing overwrote the record.
 			await expect(cold.getMetadata(testSessionId)).rejects.toThrow('EACCES')
 			expect(await readPersistedMetadata(testSessionId)).toEqual(before)
 		})
