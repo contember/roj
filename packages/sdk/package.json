@@ -129,6 +129,7 @@
 	"files": [
 		"src",
 		"dist",
+		"SESSION-LIFECYCLE.md",
 		"!src/**/*.test.ts",
 		"!src/__tests__"
 	],
