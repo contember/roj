@@ -8,7 +8,8 @@
 import type { AgentId } from '~/core/agents/schema.js'
 import type { AgentState } from '~/core/agents/state.js'
 import type { EventStore } from '~/core/events/event-store.js'
-import { EventAppendError } from '~/core/events/event-store.js'
+import { EventAppendError, EventAppendOutcomeUnknownError } from '~/core/events/event-store.js'
+import { withDeadline } from '~/lib/utils/concurrency.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import { applyEvent as coreApplyEvent } from '~/core/sessions/apply-event.js'
 import type { SessionReducer } from '~/core/sessions/reducer.js'
@@ -19,6 +20,21 @@ import { getAgentState, reconstructSessionState } from '~/core/sessions/state.js
 // ============================================================================
 // SessionStore
 // ============================================================================
+
+/**
+ * Bound on waiting for a turn in the ordered write queue.
+ *
+ * Appends are serialised so state follows the log, which makes one stalled write
+ * block every later one. Waiting forever would wedge close and park, so a turn
+ * that never comes fails definitively and fences the store: the stalled head may
+ * still land, and nothing may be ordered behind an outcome nobody knows.
+ */
+export const SESSION_WRITE_QUEUE_TIMEOUT_MS = 30_000
+
+export interface SessionStoreOptions {
+	/** Bound on waiting for a turn in the write queue. Defaults to {@link SESSION_WRITE_QUEUE_TIMEOUT_MS}. */
+	queueTimeoutMs?: number
+}
 
 /** Thrown when a disposed runtime tries to append — see {@link SessionStore.detach}. */
 export class SessionRuntimeDetachedError extends Error {
@@ -43,16 +59,20 @@ export class SessionStore {
 	private tail: Promise<void> = Promise.resolve()
 	private fence: { error: unknown } | undefined
 	private failure: { error: unknown } | undefined
-	private pendingWrites = 0
+	private readonly pending = new Set<Promise<void>>()
+
+	private readonly queueTimeoutMs: number
 
 	constructor(
 		readonly sessionId: SessionId,
 		private readonly eventStore: EventStore,
 		initialState: SessionState,
 		applyEvent: SessionReducer = coreApplyEvent,
+		options: SessionStoreOptions = {},
 	) {
 		this._state = initialState
 		this.applyEvent = applyEvent
+		this.queueTimeoutMs = options.queueTimeoutMs ?? SESSION_WRITE_QUEUE_TIMEOUT_MS
 	}
 
 	/**
@@ -91,12 +111,21 @@ export class SessionStore {
 	}
 
 	hasPendingWrites(): boolean {
-		return this.pendingWrites > 0
+		return this.pending.size > 0
 	}
 
+	/**
+	 * Wait for the queue to drain, then report the first write that failed.
+	 *
+	 * The failure is reported once and cleared: a definite append failure is
+	 * settled history, so retaining it would refuse every later park for the life
+	 * of the runtime. A {@link fence} is not clearable — it survives here.
+	 */
 	async waitForIdle(): Promise<void> {
-		while (this.pendingWrites > 0) await this.tail
-		if (this.failure) throw this.failure.error
+		while (this.pending.size > 0) await Promise.allSettled([...this.pending])
+		const failure = this.failure
+		this.failure = undefined
+		if (failure) throw failure.error
 	}
 
 	/**
@@ -107,9 +136,10 @@ export class SessionStore {
 		sessionId: SessionId,
 		eventStore: EventStore,
 		applyEvent?: SessionReducer,
+		options?: SessionStoreOptions,
 	): Promise<SessionStore | null> {
 		const events = await eventStore.load(sessionId)
-		return SessionStore.fromEvents(sessionId, eventStore, events, applyEvent)
+		return SessionStore.fromEvents(sessionId, eventStore, events, applyEvent, options)
 	}
 
 	/** Build a store from an event log that the caller already loaded. */
@@ -118,6 +148,7 @@ export class SessionStore {
 		eventStore: EventStore,
 		events: DomainEvent[],
 		applyEvent?: SessionReducer,
+		options?: SessionStoreOptions,
 	): Promise<SessionStore | null> {
 		if (events.length === 0) return null
 
@@ -127,7 +158,7 @@ export class SessionStore {
 		// Validate and reconcile metadata if needed (handles crash recovery)
 		await eventStore.reconcileMetadata(sessionId, events)
 
-		return new SessionStore(sessionId, eventStore, state, applyEvent)
+		return new SessionStore(sessionId, eventStore, state, applyEvent, options)
 	}
 
 	/**
@@ -150,14 +181,20 @@ export class SessionStore {
 		if (this.detached) return Promise.reject(new SessionRuntimeDetachedError(this.sessionId, events))
 		if (this.fence) return Promise.reject(this.fence.error)
 		if (events.length === 0) return Promise.resolve()
-		this.pendingWrites++
-		const operation = this.tail.then(async () => {
+		const turn = withDeadline(this.tail, this.queueTimeoutMs, () => {
+			this.fence ??= { error: new EventAppendOutcomeUnknownError(this.sessionId, new Error('Session write queue stalled')) }
+			return new EventAppendError(this.sessionId, new Error('Timed out waiting for the session write queue'))
+		})
+		const operation = turn.then(async () => {
 			if (this.detached) throw new SessionRuntimeDetachedError(this.sessionId, events)
 			if (this.fence) throw this.fence.error
 			try {
 				await append()
 			} catch (error) {
-				if (!(error instanceof EventAppendError)) this.fence = { error }
+				// Fence unless the store said the append definitely did not commit: an
+				// unclassified failure may still have landed, and nothing may be ordered
+				// behind an outcome nobody knows.
+				if (!(error instanceof EventAppendError)) this.fence ??= { error }
 				throw error
 			}
 			if (this.detached) throw new SessionRuntimeDetachedError(this.sessionId, events)
@@ -174,11 +211,12 @@ export class SessionStore {
 				this.notifyListeners(event)
 			}
 		})
+		this.pending.add(operation)
 		this.tail = operation.then(
-			() => { this.pendingWrites-- },
+			() => { this.pending.delete(operation) },
 			(error: unknown) => {
 				this.failure ??= { error }
-				this.pendingWrites--
+				this.pending.delete(operation)
 			},
 		)
 		return operation

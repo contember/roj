@@ -99,3 +99,17 @@ export class Semaphore {
 		}
 	}
 }
+
+/**
+ * Bound the wait on `work` without cancelling it.
+ *
+ * The work keeps running and a later wait races the same promise. Use it where
+ * giving up on the wait is safe but abandoning the operation is not.
+ */
+export function withDeadline<T>(work: Promise<T>, timeoutMs: number, onTimeout: () => Error): Promise<T> {
+	const expiry = Promise.withResolvers<never>()
+	void expiry.promise.catch(() => {})
+	void work.catch(() => {})
+	const timer = setTimeout(() => expiry.reject(onTimeout()), timeoutMs)
+	return Promise.race([work, expiry.promise]).finally(() => clearTimeout(timer))
+}
