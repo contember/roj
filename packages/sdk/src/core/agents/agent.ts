@@ -319,6 +319,15 @@ export class Agent {
 							const currentState = this.state
 							if (!currentState || currentState.status === 'paused') return
 							if (this.abortController.signal.aborted) return
+							// Re-entering on an unchanged head would hand decide() the same call forever.
+							if (currentState.pendingToolCalls[0]?.id === toolCall.id) {
+								this.logger.error('Tool call stayed pending after execution, ending turn', undefined, {
+									agentId: this.id,
+									toolCallId: toolCall.id,
+									toolName: toolCall.name,
+								})
+								return
+							}
 						}
 						if (this.state?.pendingToolCalls.length) continue
 						// Schedule re-entry via debounce after tool execution
@@ -1115,8 +1124,10 @@ export class Agent {
 				))
 				return
 			} else if (beforeResult.action === 'replace') {
+				// The id pairs the result with the LLM's tool_use, so a hook may swap
+				// name and input but never identity.
 				effectiveToolCall = {
-					id: ToolCallId(beforeResult.toolCall.id),
+					id: toolCall.id,
 					name: beforeResult.toolCall.name,
 					input: beforeResult.toolCall.input,
 				}
