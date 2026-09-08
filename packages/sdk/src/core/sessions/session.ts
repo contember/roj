@@ -602,11 +602,11 @@ export class Session {
 			teardown.release()
 		}
 		await this.runtimeActivity.waitForIdle()
-		await Promise.all([...this.agents.values()].map((agent) => agent.waitForScheduler()))
+		const drained = await Promise.allSettled([...this.agents.values()].map((agent) => agent.waitForScheduler()))
 		await this.schedulerTail
 		// Report the failures once and drop them: a scheduler call that definitely
 		// failed is settled, and retaining it would refuse every later park.
-		const schedulerErrors = this.schedulerErrors.splice(0)
+		const schedulerErrors = [...drained.flatMap((result) => (result.status === 'rejected' ? [result.reason] : [])), ...this.schedulerErrors.splice(0)]
 		if (schedulerErrors.length) throw new AggregateError(schedulerErrors, 'Session scheduler operations failed')
 		await this.store.waitForIdle()
 		if (this.runtimeActivity.getSnapshot().state !== 'parking') throw new SessionRuntimeUnavailableError(this.id, this.runtimeActivity.getSnapshot().state)
@@ -646,11 +646,16 @@ export class Session {
 						})
 					})
 					this.closeHooks.set(plugin, pending)
+					// Park stays retryable, so a rejection must not be cached: the next
+					// attempt has to run the hook again, not re-await its failure.
+					void pending.catch(() => {
+						if (this.closeHooks.get(plugin) === pending) this.closeHooks.delete(plugin)
+					})
 				}
 				await pending
 			} catch (error) { errors.push(error) }
 		}
-		if (reason === 'parked' || reason === 'revoked') this.cleanupFailed ||= errors.length > 0
+		if (reason === 'parked' || reason === 'revoked') this.cleanupFailed = errors.length > 0
 		if (errors.length > 0) throw new AggregateError(errors, 'Session close hooks failed')
 	}
 
