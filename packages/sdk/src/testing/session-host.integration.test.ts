@@ -425,7 +425,9 @@ describe('cross-host file-backed handoff', () => {
 			expect(failed).toBeInstanceOf(committed ? EventAppendOutcomeUnknownError : EventAppendError)
 			expect(pendingPath).toBeDefined()
 			if (!pendingPath) throw new Error('Fault did not hit an event batch')
-			expect(await fs.exists(pendingPath)).toBe(!committed)
+			// Recovery never reads pending files, so a failed commit drops its own rather
+			// than leaving one behind for every retry.
+			expect(await fs.exists(pendingPath)).toBe(false)
 			if (committed) {
 				await expect(session.callPluginMethod('host-test.mark', { value: 'uncertain' })).rejects.toBeInstanceOf(EventAppendOutcomeUnknownError)
 			}

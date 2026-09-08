@@ -204,6 +204,9 @@ export class FileEventStore extends BaseEventStore {
 		try {
 			await this.rename(pending, final)
 		} catch (cause) {
+			// The rename did not consume it, and a retry mints a new name: without this
+			// a persistently failing commit fills the directory with orphans.
+			await this.fs.unlink(pending).catch(() => {})
 			let actual: Buffer
 			try {
 				actual = await this.fs.readFile(final)
@@ -314,6 +317,16 @@ export class FileEventStore extends BaseEventStore {
 		return this.serialize(sessionId, () => this.readMetadata(sessionId))
 	}
 
+	/** One unreadable session must not take the listing down for every other one. */
+	private async readMetadataOrSkip(sessionId: SessionId): Promise<SessionMetadata | null> {
+		try {
+			return await this.getMetadata(sessionId)
+		} catch (error) {
+			this.logger.warn('Skipping unreadable session in listing', { sessionId, reason: String(error) })
+			return null
+		}
+	}
+
 	private assertUnfenced(sessionId: SessionId): void {
 		const fence = this.fenced.get(sessionId)
 		if (fence) throw fence
@@ -365,7 +378,9 @@ export class FileEventStore extends BaseEventStore {
 	async reconcileMetadata(sessionId: SessionId, _events: DomainEvent[]): Promise<boolean> {
 		return this.serialize(sessionId, async () => {
 			const before = JSON.stringify(this.metadata.get(sessionId))
-			await this.recover(sessionId)
+			// The caller loaded this log, which verified and cached it; recovering again
+			// would re-read and re-digest every batch on the session load path.
+			await this.verified(sessionId)
 			return before !== JSON.stringify(this.metadata.get(sessionId))
 		})
 	}
@@ -387,7 +402,7 @@ export class FileEventStore extends BaseEventStore {
 				})
 			}
 		}
-		const results = await Promise.all(ids.map((id) => this.getMetadata(id)))
+		const results = await Promise.all(ids.map((id) => this.readMetadataOrSkip(id)))
 		return results.filter((value): value is SessionMetadata => value !== null)
 	}
 }
