@@ -206,7 +206,7 @@ describe('RPC integration', () => {
 			const input = { sessionId: session.sessionId, deliveryId: 'rpc-delivery', content: 'Hello via RPC' }
 			const first = await rpcCall(app, 'user-chat.sendMessage', input)
 			expect(first.status).toBe(200)
-			const result: RpcResponse<{ messageId: string }> = await first.json()
+			const result = await first.json()
 			expect(result).toEqual({ ok: true, value: { messageId: 'm1' } })
 			const replay = await rpcCall(app, 'user-chat.sendMessage', input)
 			expect(replay.status).toBe(200)
@@ -402,9 +402,7 @@ describe('RPC session leases', () => {
 		const res = await rpcCall(app, 'user-chat.sendMessage', { sessionId: session.sessionId, content: 'Must not reload' })
 
 		expect(res.status).toBe(200)
-		const json: RpcResponse = await res.json()
-		expect(json.ok).toBe(false)
-		expect(json.error?.type).toBe('session_runtime_unavailable')
+		expect(await res.json()).toMatchObject({ ok: false, error: { type: 'session_runtime_unavailable' } })
 		expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
 		expect(await session.getEventsByType('user_chat_message_received')).toHaveLength(0)
 		expect(httpLeaseReasons()).toEqual([])
@@ -414,9 +412,7 @@ describe('RPC session leases', () => {
 		const res = await rpcCall(app, 'user-chat.sendMessage', { sessionId: 'nonexistent-session-id', content: 'Missing' })
 
 		expect(res.status).toBe(200)
-		const json: RpcResponse = await res.json()
-		expect(json.ok).toBe(false)
-		expect(json.error?.type).toBe('session_not_found')
+		expect(await res.json()).toMatchObject({ ok: false, error: { type: 'session_not_found' } })
 		expect(httpLeaseReasons()).toEqual([])
 	})
 

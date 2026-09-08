@@ -40,7 +40,8 @@ manager's object is invalid. Repeated activation during the same active tenure
 returns the same handle. After release, explicit activation returns a new handle.
 Calls with an authentic stale handle do not park or revoke its replacement.
 
-Park does not close the persisted session. It runs `onSessionClose` hooks with
+Park does not close the persisted session. It first runs `onSessionPark` hooks
+to quiesce background work, then drains admitted operations and runs `onSessionClose` hooks with
 reason `parked`; later activation reloads persisted state. Keep external ownership
 until park resolves successfully, then release it. A failed or hung park is not a
 successful handoff. Revocation rejects a pending park without waiting for hung
@@ -120,6 +121,8 @@ opaque string scoped to the session. Without it, calls do not deduplicate.
   different requests. Preserve that distinction on retries.
 - The fingerprint is computed before truncation; receipts persist with the
   accepted message event, not only in process memory.
+- Receipts are retained for the session lifetime, including in the replayed
+  projection. Memory usage grows with the number of distinct delivery IDs.
 
 For HTTP, send `POST /rpc` with
 `{ "method": "user-chat.sendMessage", "input": { "sessionId": "…", "deliveryId": "request-42", "content": "Hello" } }`.

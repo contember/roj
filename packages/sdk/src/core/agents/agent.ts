@@ -52,6 +52,7 @@ import { buildEnvironmentSection } from '~/prompts/builder.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import type { Logger } from '../../lib/logger/logger.js'
 import type { SessionContext } from '../sessions/context.js'
+import { RuntimeFileStore } from '../sessions/context.js'
 import { isValidSessionId, SessionId } from '../sessions/schema.js'
 import type { SessionStore } from '../sessions/session-store.js'
 import type { SessionState } from '../sessions/state.js'
@@ -593,7 +594,7 @@ export class Agent {
 			sessionId: this.store.sessionId,
 			agentId: this.id,
 			signal: this.abortController.signal,
-			fileStore: this.fileStore,
+			fileStore: new RuntimeFileStore(this.fileStore, operation.activity),
 			providers: this.llmProviders,
 		})
 
@@ -800,7 +801,7 @@ export class Agent {
 							llmCallId = LLMCallId(callId)
 						},
 						signal: this.abortController.signal,
-						fileStore: this.fileStore,
+						fileStore: new RuntimeFileStore(this.fileStore, this.getSessionContext(this.stepOperation?.activity).runtimeActivity),
 						providers: this.llmProviders,
 					}),
 				{ logger: this.logger, signal: this.abortController.signal },
@@ -1318,8 +1319,13 @@ export class Agent {
 			pluginState,
 			self,
 			schedule,
-			notify: (type: string, payload: unknown) => {
-				agentContext.runtimeActivity.assertAvailable()
+			notify: (type: string, payload: unknown, continuation: SessionRuntimeActivity = agentContext.runtimeActivity) => {
+				try {
+					this.getSessionContext(continuation)
+				} catch (error) {
+					if (error instanceof SessionRuntimeUnavailableError) return
+					throw error
+				}
 				sendNotification?.({ pluginName, type, payload })
 			},
 			deps,

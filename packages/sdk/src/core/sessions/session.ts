@@ -132,6 +132,7 @@ export class Session {
 	private disposalPromise?: Promise<void>
 	private reopenPromise?: Promise<Result<void, DomainError>>
 	private parkPromise?: Promise<void>
+	private parkHooksPromise?: Promise<void>
 	private localCleanup: Promise<void> | undefined
 	private cleanupFailed = false
 	private revoked = false
@@ -571,15 +572,24 @@ export class Session {
 	}
 
 	hasUnsafeResources(): boolean {
-		return this.store.hasPendingWrites() || this.localCleanup !== undefined || this.cleanupFailed || this.pendingScheduler > 0 || this.runtimeActivity.hasPendingResources()
+		return this.store.hasPendingWrites() || this.localCleanup !== undefined || this.parkHooksPromise !== undefined || this.cleanupFailed || this.pendingScheduler > 0 || this.runtimeActivity.hasPendingResources()
 	}
 
 	async waitForLocalCleanup(): Promise<void> {
+		await this.parkHooksPromise
 		await this.localCleanup
 		await Promise.all(this.closeHooks.values())
 	}
 
 	private async performPark(): Promise<void> {
+		const quiescence = this.runtimeActivity.beginTeardown()
+		try {
+			this.parkHooksPromise = this.runParkHooks(quiescence.activity)
+			await this.parkHooksPromise
+		} finally {
+			this.parkHooksPromise = undefined
+			quiescence.release()
+		}
 		await this.runtimeActivity.waitForIdle()
 		await Promise.all([...this.agents.values()].map((agent) => agent.waitForIdle()))
 		await this.store.waitForIdle()
@@ -605,6 +615,16 @@ export class Session {
 		this.agents.clear()
 		this.pluginContexts.clear()
 		this.runtimeActivity.markDisposed()
+	}
+
+	private async runParkHooks(activity: SessionRuntimeActivity): Promise<void> {
+		const results = await Promise.allSettled(this.plugins.map(async (plugin) => {
+			if (plugin.sessionHooks?.onSessionPark) {
+				await plugin.sessionHooks.onSessionPark(this.buildSessionHookContext(plugin, activity))
+			}
+		}))
+		const errors = results.flatMap((result) => result.status === 'rejected' ? [result.reason] : [])
+		if (errors.length) throw new AggregateError(errors, 'Session park hooks failed')
 	}
 
 	private async runCloseHooks(reason: SessionCloseReason, activity: SessionRuntimeActivity = this.runtimeActivity): Promise<void> {

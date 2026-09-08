@@ -115,6 +115,29 @@ describe('user-chat delivery receipts', () => {
 		}
 	})
 
+	it('retains the oldest receipt after 1,000 later deliveries and replay', async () => {
+		const owner = harness()
+		const { session, agentId } = await paused(owner)
+		const input = { deliveryId: 'oldest', content: 'Original' }
+		const first = await session.callPluginMethod('user-chat.sendMessage', input)
+		expect(first.ok).toBe(true)
+		for (let i = 0; i < 1000; i++) {
+			expect((await session.callPluginMethod('user-chat.sendMessage', {
+				deliveryId: `later-${i}`, content: 'Later', ...(i % 2 ? { agentId } : {}),
+			})).ok).toBe(true)
+		}
+		const verify = async (current: typeof session) => {
+			expect(await current.callPluginMethod('user-chat.sendMessage', input)).toEqual(first)
+			expect(await current.callPluginMethod('user-chat.sendMessage', { ...input, content: 'Changed' })).toMatchObject({
+				ok: false, error: { type: 'user_chat_delivery_conflict' },
+			})
+			expect(await current.getEventsByType('user_chat_message_received')).toHaveLength(1001)
+		}
+		await verify(session)
+		await owner.shutdown()
+		await verify(await harness(owner.eventStore).openSession(session.sessionId))
+	})
+
 	it.each([
 		['hello', ' hello'],
 		['hello', 'hello\n'],

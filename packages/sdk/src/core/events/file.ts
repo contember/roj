@@ -183,7 +183,7 @@ export class FileEventStore extends BaseEventStore {
 		let state: VerifiedSession
 		let content: string
 		let final: string
-		let pending: string
+		let pending: string | undefined
 		let committedEvents: DomainEvent[]
 		let computed: SessionMetadata | null
 		try {
@@ -198,6 +198,7 @@ export class FileEventStore extends BaseEventStore {
 			await this.fs.mkdir(directory, { recursive: true })
 			await this.fs.writeFile(pending, content)
 		} catch (cause) {
+			if (pending !== undefined) await this.fs.unlink(pending).catch(() => {})
 			if (this.fenced.has(sessionId)) throw cause
 			throw new EventAppendError(sessionId, cause)
 		}
