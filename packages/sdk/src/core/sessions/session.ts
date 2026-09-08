@@ -138,6 +138,7 @@ export class Session {
 	private disposalReason: SessionCloseReason = 'evicted'
 	private readonly closeHooks = new Map<ConfiguredPlugin, Promise<void>>()
 	private schedulerTail: Promise<void> = Promise.resolve()
+	private readonly scopedScheduler = new WeakMap<SessionRuntimeActivity, Promise<void>>()
 	private pendingScheduler = 0
 	private readonly schedulerErrors: unknown[] = []
 
@@ -690,7 +691,7 @@ export class Session {
 		if (!operation) return Err(SessionErrors.runtimeUnavailable(String(this.id), activity.getSnapshot().state))
 		try {
 			const result = await this.executePluginMethod(method, input, agentId, caller, operation.activity)
-			await this.waitForScheduler()
+			await this.waitForScopedScheduler(operation.activity)
 			return result
 		} finally {
 			operation.release()
@@ -882,21 +883,25 @@ export class Session {
 			}
 		}
 
-		// The shutdown above only aborts; a turn still inside a tool call keeps
-		// running against the agents and plugin contexts cleared below.
-		await this.drainAgents()
-		await this.schedulerTail
-
-		// Clean up references to prevent memory leaks
-		this.agents.clear()
-		this.pluginContexts.clear()
-		this.store.clearListeners()
-		// Fence the log last: everything above may still emit legitimately, but
-		// whatever outlives disposal now fails instead of writing behind the
-		// replacement runtime the manager builds from the same log.
-		this.store.detach()
-		teardown.release()
-		this.runtimeActivity.markDisposed()
+		try {
+			// The shutdown above only aborts; a turn still inside a tool call keeps
+			// running against the agents and plugin contexts cleared below.
+			await this.drainAgents()
+			await this.schedulerTail
+		} finally {
+			// Clean up references to prevent memory leaks
+			this.agents.clear()
+			this.pluginContexts.clear()
+			this.store.clearListeners()
+			// Fence the log last: everything above may still emit legitimately, but
+			// whatever outlives disposal now fails instead of writing behind the
+			// replacement runtime the manager builds from the same log.
+			this.store.detach()
+			// An unreleased teardown lease would leave activeCount above zero, so every
+			// later waitForIdle hangs and the activity never reaches `disposed`.
+			teardown.release()
+			this.runtimeActivity.markDisposed()
+		}
 
 		this.logger.info('Session runtime disposed', { sessionId: this.id, reason })
 	}
@@ -1057,11 +1062,24 @@ export class Session {
 			() => { operation.release(); this.pendingScheduler-- },
 			(error: unknown) => { operation.release(); this.pendingScheduler--; this.schedulerErrors.push(error) },
 		)
+		const settled = pending.then(() => undefined, () => undefined)
+		const scope = this.scopedScheduler.get(activity)
+		this.scopedScheduler.set(activity, scope ? Promise.all([scope, settled]).then(() => undefined) : settled)
 		return pending
 	}
 
 	async waitForScheduler(): Promise<void> {
 		await this.schedulerTail
+	}
+
+	/**
+	 * Await only the scheduler work this scope armed.
+	 *
+	 * The session tail orders every wake and cancel, so waiting on it would couple
+	 * one call's latency to unrelated ones already queued behind it.
+	 */
+	private async waitForScopedScheduler(activity: SessionRuntimeActivity): Promise<void> {
+		await this.scopedScheduler.get(activity)
 	}
 
 	private reserveSequence(name: string, seed: () => number, activity: SessionRuntimeActivity = this.runtimeActivity): number {

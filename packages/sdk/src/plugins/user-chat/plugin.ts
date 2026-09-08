@@ -470,6 +470,25 @@ function decodeAskUserDisplayStrings(input: AskUserInputType): AskUserInputType 
 // Plugin
 // ============================================================================
 
+/**
+ * Receipts only have to outlive the sender's retry window.
+ *
+ * Keeping every receipt a session ever wrote copied the whole map per message —
+ * quadratic over a replay — and never gave any of it back.
+ */
+const MAX_ACCEPTED_DELIVERIES = 1000;
+
+function capAcceptedDeliveries(
+	deliveries: Map<string, { fingerprint: string; messageId: ChatMessageId }>,
+): Map<string, { fingerprint: string; messageId: ChatMessageId }> {
+	while (deliveries.size > MAX_ACCEPTED_DELIVERIES) {
+		const oldest = deliveries.keys().next();
+		if (oldest.done) break;
+		deliveries.delete(oldest.value);
+	}
+	return deliveries;
+}
+
 export const userChatPlugin = definePlugin("user-chat")
 	.order(60)
 	.pluginConfig<UserChatPresetConfig>()
@@ -505,13 +524,14 @@ export const userChatPlugin = definePlugin("user-chat")
 						agentId: event.agentId,
 						messageIndex: state.messages.length,
 					};
-					const acceptedDeliveries = new Map(state.acceptedDeliveries ?? []);
-					if (event.delivery) {
-						acceptedDeliveries.set(event.delivery.id, {
-							fingerprint: event.delivery.fingerprint,
-							messageId: event.messageId,
-						});
-					}
+					const acceptedDeliveries = event.delivery
+						? capAcceptedDeliveries(
+							new Map(state.acceptedDeliveries ?? []).set(event.delivery.id, {
+								fingerprint: event.delivery.fingerprint,
+								messageId: event.messageId,
+							}),
+						)
+						: state.acceptedDeliveries;
 					return {
 						acceptedDeliveries,
 						messages: [...state.messages, userMessage],
