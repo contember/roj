@@ -957,9 +957,22 @@ export class Session {
 	 */
 	private createNotify(pluginName: string, activity: SessionRuntimeActivity = this.runtimeActivity): SessionContext['notify'] {
 		return (type, payload, continuation = activity) => {
-			this.runtimeActivity.assertOwnScope(continuation)
+			if (!this.canNotify(continuation)) return
 			this.onUserOutput?.({ pluginName, type, payload })
 		}
+	}
+
+	/**
+	 * A notification is ephemeral and never persisted, so an expired scope drops it.
+	 *
+	 * Throwing here would raise into whatever fired it — an interval, a detached
+	 * promise, a callback that outlived its method — where nothing is guarding.
+	 */
+	private canNotify(continuation: SessionRuntimeActivity): boolean {
+		try {
+			this.runtimeActivity.assertOwnScope(continuation)
+			return true
+		} catch { return false }
 	}
 
 	/**
@@ -1026,7 +1039,7 @@ export class Session {
 				} finally { operation.release() }
 			},
 			notify: (type, payload, continuation = activity) => {
-				this.runtimeActivity.assertOwnScope(continuation)
+				if (!this.canNotify(continuation)) return
 				this.onUserOutput?.({ pluginName: notificationPluginName, type, payload })
 			},
 		}
