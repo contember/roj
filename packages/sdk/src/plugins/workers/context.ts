@@ -196,7 +196,9 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 				workerType: this.workerType,
 				subEvent: event,
 			}))
-			if (this.shouldContinue()) this.localState = this.reducer(this.localState, event)
+			// The append committed, so the state follows it — skipping the reduce here
+			// left emit() resolving on a state one event behind the durable log.
+			this.localState = this.reducer(this.localState, event)
 		})
 	}
 
