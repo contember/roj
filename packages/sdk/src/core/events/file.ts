@@ -9,7 +9,7 @@ import { silentLogger, type Logger } from '~/lib/logger/logger.js'
 import { BaseEventStore } from './base-event-store.js'
 import { EventAppendError, EventAppendOutcomeUnknownError, EventLogCorruptionError, FileEventStoreCapabilityError } from './event-store.js'
 import type { LoadRangeOptions, LoadRangeResult } from './event-store.js'
-import { batchName, decodeBatch, encodeBatch, parseEvent } from './file-batch.js'
+import { batchName, decodeBatch, encodeBatch, isBatchName, parseEvent } from './file-batch.js'
 import { computeMetadataFromEvents, computeMetricsFromEvents } from './metadata-utils.js'
 
 function isNotFound(error: unknown): boolean {
@@ -114,7 +114,7 @@ export class FileEventStore extends BaseEventStore {
 			const state: VerifiedSession = { totalEvents: 0, legacyCount: events.length, batches: [], computed: null }
 			const batches = join(directory, 'batches')
 			const names = await this.names(batches)
-			const committed = names.filter((name) => !name.startsWith('.pending-')).sort()
+			const committed = names.filter(isBatchName).sort()
 			for (const [index, name] of committed.entries()) {
 				const path = join(batches, name)
 				if (name !== batchName(index)) throw new EventLogCorruptionError(sessionId, path, new Error('Non-contiguous batch sequence'))
@@ -240,7 +240,7 @@ export class FileEventStore extends BaseEventStore {
 	async loadRange(sessionId: SessionId, options?: LoadRangeOptions): Promise<LoadRangeResult> {
 		return this.serialize(sessionId, async () => {
 			const state = await this.verified(sessionId)
-			const start = (options?.since ?? -1) + 1
+			const start = Math.max(0, (options?.since ?? -1) + 1)
 			const end = Math.min(state.totalEvents, options?.limit === undefined ? state.totalEvents : start + options.limit)
 			const events: DomainEvent[] = []
 			try {
@@ -270,7 +270,6 @@ export class FileEventStore extends BaseEventStore {
 			const ids = (await this.fs.readdir(join(this.basePath, 'sessions'), { withFileTypes: true }))
 				.filter((entry) => entry.isDirectory() && isValidSessionId(entry.name))
 				.map((entry) => SessionId(entry.name))
-			await Promise.all(ids.map((id) => this.serialize(id, async () => this.assertUnfenced(id))))
 			return ids
 		} catch (error) {
 			if (isNotFound(error)) return []
@@ -312,10 +311,6 @@ export class FileEventStore extends BaseEventStore {
 				this.logger.warn('Session metadata remains dirty', { sessionId, reason: String(error) })
 			}
 		}
-	}
-
-	async getMetadata(sessionId: SessionId): Promise<SessionMetadata | null> {
-		return this.serialize(sessionId, () => this.readMetadata(sessionId))
 	}
 
 	/** One unreadable session must not take the listing down for every other one. */
@@ -368,7 +363,13 @@ export class FileEventStore extends BaseEventStore {
 			} catch (error) {
 				// An unconfirmed explicit replacement must be re-read before decorations can be used again.
 				if (explicit) this.metadata.delete(sessionId)
-				const actual = await this.fs.readFile(final)
+				let actual: Buffer
+				try {
+					actual = await this.fs.readFile(final)
+				} catch (readError) {
+					if (isNotFound(readError)) throw error
+					throw readError
+				}
 				if (!actual.equals(Buffer.from(content, 'utf8'))) throw error
 			}
 		} finally {
@@ -389,7 +390,7 @@ export class FileEventStore extends BaseEventStore {
 	protected async getAllSessionMetadata(): Promise<SessionMetadata[]> {
 		const ids = await this.listSessions()
 		const present = new Set(ids)
-		for (const id of new Set([...this.metadata.keys(), ...this.verifiedSessions.keys()])) {
+		for (const id of new Set([...this.metadata.keys(), ...this.verifiedSessions.keys(), ...this.fenced.keys()])) {
 			if (!present.has(id)) {
 				await this.serialize(id, async () => {
 					try {
@@ -399,6 +400,7 @@ export class FileEventStore extends BaseEventStore {
 						this.metadata.delete(id)
 						this.verifiedSessions.delete(id)
 						this.dirty.delete(id)
+						this.fenced.delete(id)
 					}
 				})
 			}

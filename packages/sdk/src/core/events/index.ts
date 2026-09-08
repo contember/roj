@@ -7,6 +7,7 @@ export {
 	EventStoreError,
 	FileEventStoreCapabilityError,
 	SessionNotFoundError,
+	SessionOwnershipLostError,
 } from './event-store.js'
 export { FileEventStore } from './file.js'
 export { MemoryEventStore } from './memory.js'
