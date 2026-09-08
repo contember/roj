@@ -21,23 +21,24 @@ export class RuntimeFileStore implements FileStore {
 		return this.activity.trackResource(() => this.source.write(path, content))
 	}
 
+	// Reads pass through. Only a write can land behind the runtime that replaces
+	// this one, and these return Result — throwing a lease error out of them breaks
+	// the FileStore contract for callers that never mutate anything.
 	read(path: string): Promise<Result<string, string>>
 	read(path: string, opts: { type: 'buffer' }): Promise<Result<Buffer, string>>
 	read(path: string, opts?: { type: 'buffer' }): Promise<Result<string | Buffer, string>> {
-		this.activity.assertAvailable()
 		return opts ? this.source.read(path, opts) : this.source.read(path)
 	}
 
-	exists(path: string) { this.activity.assertAvailable(); return this.source.exists(path) }
-	stat(path: string) { this.activity.assertAvailable(); return this.source.stat(path) }
+	exists(path: string) { return this.source.exists(path) }
+	stat(path: string) { return this.source.stat(path) }
 	list(path: string, options?: { maxDepth?: number; gitIgnore?: boolean }) {
-		this.activity.assertAvailable()
 		return this.source.list(path, options)
 	}
 	remove(path: string) { return this.activity.trackResource(() => this.source.remove(path)) }
-	realPath(path: string) { this.activity.assertAvailable(); return this.source.realPath(path) }
-	containedPath(path: string) { this.activity.assertAvailable(); return this.source.containedPath(path) }
-	getRoots() { this.activity.assertAvailable(); return this.source.getRoots() }
+	realPath(path: string) { return this.source.realPath(path) }
+	containedPath(path: string) { return this.source.containedPath(path) }
+	getRoots() { return this.source.getRoots() }
 	scoped(path: string): FileStore { return new RuntimeFileStore(this.source.scoped(path), this.activity) }
 	get session(): FileStore { return new RuntimeFileStore(this.source.session, this.activity) }
 	get workspace(): FileStore | undefined {
