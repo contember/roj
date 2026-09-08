@@ -77,7 +77,8 @@ export { isValidSessionId, parseSessionId, SessionId } from '~/core/sessions/sch
 export type { RuntimeLeaseRelease, SessionRuntimeActivity, SessionRuntimeActivitySnapshot } from '~/core/sessions/runtime-activity.js'
 export { SessionRuntimeUnavailableError } from '~/core/sessions/runtime-activity.js'
 export type { SessionRuntimeState } from '~/core/sessions/runtime-activity.js'
-export type { SessionActivation } from '~/core/sessions/session-manager.js'
+export type { ParkOptions, SessionActivation } from '~/core/sessions/session-manager.js'
+export { SessionParkTimeoutError } from '~/core/sessions/session-manager.js'
 export { EventAppendError, EventAppendOutcomeUnknownError, EventLogCorruptionError } from '~/core/events/event-store.js'
 export type { SessionMetadata } from '~/core/sessions/schema.js'
 // Exported so a consumer can validate a callManagerMethod('sessions.list')

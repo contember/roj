@@ -1063,7 +1063,8 @@ export class Agent {
 
 	async waitForScheduler(): Promise<void> {
 		await this.schedulerTail
-		if (this.schedulerFailure.length) throw new AggregateError(this.schedulerFailure, 'Agent scheduler operations failed')
+		const failures = this.schedulerFailure.splice(0)
+		if (failures.length) throw new AggregateError(failures, 'Agent scheduler operations failed')
 	}
 
 	private enqueueScheduler(operation: (scheduler: Scheduler) => Promise<void>): void {
