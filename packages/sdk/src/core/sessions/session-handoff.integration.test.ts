@@ -46,6 +46,24 @@ describe('session park after a recovered failure', () => {
 		} finally { await host.shutdown() }
 	})
 
+	it('retries close hooks after a failed park and releases the session id', async () => {
+		let closes = 0
+		const plugin = definePlugin('retry-close')
+			.sessionHook('onSessionClose', async () => { if (++closes === 1) throw new Error('Cleanup failed') })
+			.build()
+		const host = harness([plugin])
+		try {
+			const created = await host.createSession('test')
+			const activation = host.sessionManager.activateSession(created.sessionId)
+			if (!activation.ok) throw new Error(activation.error.message)
+			await expect(host.sessionManager.parkSession(activation.value)).rejects.toBeInstanceOf(AggregateError)
+			await host.sessionManager.parkSession(activation.value)
+			// A memoized rejection would resolve the retry without ever re-running the hook.
+			expect(closes).toBe(2)
+			expect(host.sessionManager.activateSession(created.sessionId).ok).toBe(true)
+		} finally { await host.shutdown() }
+	})
+
 	it('retains a revoked runtime until an in-flight park hook settles', async () => {
 		const entered = Promise.withResolvers<void>()
 		const finish = Promise.withResolvers<void>()
