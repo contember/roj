@@ -75,6 +75,11 @@ interface GitStatusPluginContext {
 	sessions: Map<SessionId, SessionGitStatus>
 }
 
+export interface GitStatusPluginConfig {
+	/** Compare against this ref instead of the detected local default branch, e.g. origin/main. */
+	baseBranch?: string
+}
+
 /**
  * The slice of a context a read needs. Session hooks, agent hooks and the method
  * handler all satisfy it, so all three share one code path.
@@ -86,10 +91,12 @@ interface GitStatusCallContext {
 	logger: Logger
 	notify: (type: 'git_status_changed', payload: GitStatusChanged) => void
 	pluginContext: GitStatusPluginContext
+	pluginConfig?: GitStatusPluginConfig
 }
 
 export const gitStatusPlugin = definePlugin('git-status')
 	.order(150)
+	.pluginConfig<GitStatusPluginConfig>()
 	.notification('git_status_changed', { schema: gitStatusChangedSchema })
 	.context(async (): Promise<GitStatusPluginContext> => ({ sessions: new Map() }))
 	.method('refresh', {
@@ -150,7 +157,7 @@ async function refresh(ctx: GitStatusCallContext): Promise<GitStatusSnapshot | n
 		const git = ctx.platform.git
 		const processRunner = ctx.platform.process
 
-		let baseBranch = entry.defaultBranch
+		let baseBranch = ctx.pluginConfig?.baseBranch ?? entry.defaultBranch
 		if (!baseBranch) {
 			const detected = git
 				? await detectDefaultBranchOverPort(git, workdir)
