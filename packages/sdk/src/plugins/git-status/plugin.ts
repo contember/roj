@@ -78,6 +78,8 @@ interface GitStatusPluginContext {
 export interface GitStatusPluginConfig {
 	/** Compare against this ref instead of the detected local default branch, e.g. origin/main. */
 	baseBranch?: string
+	/** Treat a missing baseline as an unpublished branch; by default no snapshot is emitted. */
+	missingBase?: 'all'
 }
 
 /**
@@ -167,8 +169,8 @@ async function refresh(ctx: GitStatusCallContext): Promise<GitStatusSnapshot | n
 		}
 
 		const snapshot = git
-			? await computeGitStatusOverPort(git, workdir, baseBranch)
-			: await computeGitStatus(processRunner, workdir, baseBranch)
+			? await computeGitStatusOverPort(git, workdir, baseBranch, ctx.pluginConfig?.missingBase)
+			: await computeGitStatus(processRunner, workdir, baseBranch, ctx.pluginConfig?.missingBase)
 		if (!snapshot) {
 			ctx.logger.warn('git-status: snapshot failed', { sessionId, workdir, baseBranch })
 			return null
@@ -214,10 +216,10 @@ function snapshotsEqual(a: GitStatusSnapshot, b: GitStatusSnapshot): boolean {
 		&& a.lastCommitMessage === b.lastCommitMessage
 }
 
-async function computeGitStatusOverPort(git: GitClient, workdir: string, baseBranch: string): Promise<GitStatusSnapshot | null> {
+async function computeGitStatusOverPort(git: GitClient, workdir: string, baseBranch: string, missingBase?: 'all'): Promise<GitStatusSnapshot | null> {
 	try {
 		const [committedAhead, commits, status] = await Promise.all([
-			git.countAhead({ dir: workdir, base: baseBranch }),
+			git.countAhead({ dir: workdir, base: baseBranch, missingBase }),
 			git.log({ dir: workdir, depth: 1 }),
 			git.status({ dir: workdir }),
 		])
@@ -243,8 +245,11 @@ async function detectDefaultBranchOverPort(git: GitClient, workdir: string): Pro
 	}
 }
 
-async function computeGitStatus(process: ProcessRunner, workdir: string, baseBranch: string): Promise<GitStatusSnapshot | null> {
-	const countOutput = await runGit(process, workdir, ['rev-list', '--count', `${baseBranch}..HEAD`])
+async function computeGitStatus(process: ProcessRunner, workdir: string, baseBranch: string, missingBase?: 'all'): Promise<GitStatusSnapshot | null> {
+	let countOutput = await runGit(process, workdir, ['rev-list', '--count', `${baseBranch}..HEAD`])
+	if (countOutput === null && missingBase === 'all' && await isMissingRef(process, workdir, baseBranch)) {
+		countOutput = await runGit(process, workdir, ['rev-list', '--count', 'HEAD'])
+	}
 	if (countOutput === null) return null
 	const committedAhead = Number.parseInt(countOutput.trim(), 10)
 	if (!Number.isFinite(committedAhead)) return null
@@ -267,6 +272,16 @@ async function computeGitStatus(process: ProcessRunner, workdir: string, baseBra
 	}
 
 	return { committedAhead, uncommittedFiles, lastCommitAt, lastCommitMessage }
+}
+
+async function isMissingRef(process: ProcessRunner, workdir: string, ref: string): Promise<boolean> {
+	try {
+		await process.execFile('git', ['rev-parse', '--verify', '--quiet', ref], { cwd: workdir, timeout: GIT_TIMEOUT_MS })
+		return false
+	} catch (error) {
+		if (error instanceof Error && 'code' in error && error.code === 1) return true
+		throw error
+	}
 }
 
 async function detectDefaultBranch(process: ProcessRunner, workdir: string): Promise<string | null> {

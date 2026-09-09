@@ -220,8 +220,17 @@ function processGitClient(platform: Platform): GitClient {
 				})
 		},
 
-		async countAhead({ dir, base, ref }) {
-			return Number.parseInt((await run(dir, ['rev-list', '--count', `${base}..${ref ?? 'HEAD'}`])).trim(), 10)
+		async countAhead({ dir, base, ref, missingBase }) {
+			let revision = `${base}..${ref ?? 'HEAD'}`
+			if (missingBase === 'all') {
+				try {
+					await run(dir, ['rev-parse', '--verify', '--quiet', base])
+				} catch (error) {
+					if (!(error instanceof Error && 'code' in error && error.code === 1)) throw error
+					revision = ref ?? 'HEAD'
+				}
+			}
+			return Number.parseInt((await run(dir, ['rev-list', '--count', revision])).trim(), 10)
 		},
 
 		async defaultBranch({ dir }) {

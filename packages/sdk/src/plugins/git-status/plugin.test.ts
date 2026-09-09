@@ -248,8 +248,17 @@ function realGitClient(runner: ProcessRunner): GitClient {
 				})
 		},
 
-		async countAhead({ dir, base, ref }) {
-			return Number.parseInt((await run(dir, ['rev-list', '--count', `${base}..${ref ?? 'HEAD'}`])).trim(), 10)
+		async countAhead({ dir, base, ref, missingBase }) {
+			let revision = `${base}..${ref ?? 'HEAD'}`
+			if (missingBase === 'all') {
+				try {
+					await run(dir, ['rev-parse', '--verify', '--quiet', base])
+				} catch (error) {
+					if (!(error instanceof Error && 'code' in error && error.code === 1)) throw error
+					revision = ref ?? 'HEAD'
+				}
+			}
+			return Number.parseInt((await run(dir, ['rev-list', '--count', revision])).trim(), 10)
 		},
 
 		async defaultBranch({ dir }) {
@@ -295,6 +304,34 @@ async function makeRepo(): Promise<{ dir: string; lastCommitAt: number }> {
 }
 
 describe('git-status reads a repository through the port or the binary', () => {
+	test('an explicitly unpublished baseline counts all commits until the remote ref appears', async () => {
+		const repo = await makeRepo()
+		await gitRunner.execFile('git', ['update-ref', 'refs/heads/main', 'HEAD'], { cwd: repo.dir })
+		const base: Platform = { ...createNodePlatform(), scheduler: new RecordingScheduler() }
+		const gitStatus: GitStatusPluginConfig = { baseBranch: 'origin/main', missingBase: 'all' }
+		const overPort = await bootSession({ platform: { ...base, git: realGitClient(gitRunner) }, workspaceDir: repo.dir, gitStatus })
+		const overBinary = await bootSession({ platform: base, workspaceDir: repo.dir, gitStatus })
+		for (const host of [overPort, overBinary]) {
+			expect((await pull(host.session)).snapshot?.committedAhead).toBe(2)
+		}
+		await gitRunner.execFile('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo.dir })
+		for (const host of [overPort, overBinary]) {
+			expect((await pull(host.session)).snapshot?.committedAhead).toBe(0)
+		}
+	})
+
+	test('a damaged baseline is unknown even when missing baselines count as unpublished', async () => {
+		const repo = await makeRepo()
+		await mkdir(join(repo.dir, '.git', 'refs', 'remotes', 'origin'), { recursive: true })
+		await writeFile(join(repo.dir, '.git', 'refs', 'remotes', 'origin', 'main'), 'a'.repeat(40) + '\n')
+		const base: Platform = { ...createNodePlatform(), scheduler: new RecordingScheduler() }
+		for (const platform of [base, { ...base, git: realGitClient(gitRunner) }]) {
+			const host = await bootSession({ platform, workspaceDir: repo.dir, gitStatus: { baseBranch: 'origin/main', missingBase: 'all' } })
+			expect((await pull(host.session)).snapshot).toBeNull()
+			expect(seen(host.notifications)).toEqual([])
+		}
+	})
+
 	test('a published baseline stays ahead after local main advances, then clears when publication catches up', async () => {
 		const repo = await makeRepo()
 		await gitRunner.execFile('git', ['update-ref', 'refs/remotes/origin/main', 'main'], { cwd: repo.dir })
