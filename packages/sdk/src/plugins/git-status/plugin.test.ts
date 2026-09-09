@@ -20,7 +20,7 @@ import { createNodePlatform, createNodeProcessRunner } from '~/testing/node-plat
 import { createTestPreset } from '~/testing/preset-helpers.js'
 import { waitForAllAgentsIdle } from '~/testing/wait-helpers.js'
 import z from 'zod/v4'
-import { gitStatusPlugin } from './plugin.js'
+import { type GitStatusPluginConfig, gitStatusPlugin } from './plugin.js'
 
 /** Mirrors the plugin's own poll interval — the suite cannot import it. */
 const POLL_INTERVAL_MS = 2000
@@ -129,12 +129,17 @@ async function bootSession(options: {
 	workspaceDir?: string
 	logger?: Logger
 	systemPlugins?: SessionManagerOptions['systemPlugins']
+	gitStatus?: GitStatusPluginConfig
 	llmProvider?: MockLLMProvider
 }): Promise<Booted> {
 	const notifications: PluginNotification[] = []
 	const basePath = scratch('base')
 	const logger = options.logger ?? silentLogger
-	const preset = createTestPreset({ id: 'git-status-test', workspaceDir: options.workspaceDir ?? scratch('workspace') })
+	const preset = createTestPreset({
+		id: 'git-status-test',
+		workspaceDir: options.workspaceDir ?? scratch('workspace'),
+		plugins: options.gitStatus ? [gitStatusPlugin.configure(options.gitStatus)] : [],
+	})
 
 	const manager = new SessionManager({
 		eventStore: new MemoryEventStore(),
@@ -290,6 +295,35 @@ async function makeRepo(): Promise<{ dir: string; lastCommitAt: number }> {
 }
 
 describe('git-status reads a repository through the port or the binary', () => {
+	test('a published baseline stays ahead after local main advances, then clears when publication catches up', async () => {
+		const repo = await makeRepo()
+		await gitRunner.execFile('git', ['update-ref', 'refs/remotes/origin/main', 'main'], { cwd: repo.dir })
+		await gitRunner.execFile('git', ['update-ref', 'refs/heads/main', 'HEAD'], { cwd: repo.dir })
+		const base: Platform = { ...createNodePlatform(), scheduler: new RecordingScheduler() }
+		const options = { workspaceDir: repo.dir, gitStatus: { baseBranch: 'origin/main' } }
+		const overPort = await bootSession({ ...options, platform: { ...base, git: realGitClient(gitRunner) } })
+		const overBinary = await bootSession({ ...options, platform: base })
+
+		for (const host of [overPort, overBinary]) {
+			expect((await pull(host.session)).snapshot?.committedAhead).toBe(1)
+		}
+		await gitRunner.execFile('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo.dir })
+		for (const host of [overPort, overBinary]) {
+			expect((await pull(host.session)).snapshot?.committedAhead).toBe(0)
+			expect(seen(host.notifications).map(snapshot => snapshot.committedAhead)).toEqual([1, 0])
+		}
+	})
+
+	test('an unavailable configured baseline does not fall back to local main or report zero', async () => {
+		const repo = await makeRepo()
+		const base: Platform = { ...createNodePlatform(), scheduler: new RecordingScheduler() }
+		for (const platform of [base, { ...base, git: realGitClient(gitRunner) }]) {
+			const host = await bootSession({ platform, workspaceDir: repo.dir, gitStatus: { baseBranch: 'origin/main' } })
+			expect((await pull(host.session)).snapshot).toBeNull()
+			expect(seen(host.notifications)).toEqual([])
+		}
+	})
+
 	test('both paths answer the same for the same repo', async () => {
 		const repo = await makeRepo()
 		const base: Platform = { ...createNodePlatform(), scheduler: new RecordingScheduler() }

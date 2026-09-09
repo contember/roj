@@ -32,6 +32,22 @@ Roj is also the OSS core of a hosted platform. The same client packages talk to
 either the standalone server or the Cloudflare-hosted platform — only the URL
 and auth differ.
 
+## Git status baseline
+
+The built-in `git-status` plugin normally compares the session's HEAD with the
+detected local default branch. To display unpublished work, configure the
+remote-tracking ref in the preset's `plugins`:
+
+```ts
+import { gitStatusPlugin } from '@roj-ai/sdk'
+
+gitStatusPlugin.configure({ baseBranch: 'origin/main' })
+```
+
+This works with both native Git and `platform.git`. The host owns fetching the
+remote ref. If the configured ref is missing or unreadable, refresh returns no
+snapshot and sends no notification; it does not substitute local `main` or zero.
+
 ## Requirements
 
 - [Bun](https://bun.sh) (the monorepo, the server runtime and the test runner)

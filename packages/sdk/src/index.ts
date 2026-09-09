@@ -199,3 +199,5 @@ export type {
 	SpawnOptions,
 	Stats,
 } from '~/platform/index.js'
+export { gitStatusPlugin } from './plugins/git-status/index.js'
+export type { GitStatusPluginConfig } from './plugins/git-status/index.js'
