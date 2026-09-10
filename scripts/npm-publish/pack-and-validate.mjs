@@ -83,6 +83,8 @@ for (const entry of packed) {
 		devDependencies: {
 			typescript: rootPackage.devDependencies.typescript,
 			'@types/bun': rootPackage.workspaces.catalog['@types/bun'],
+			// bun-types asks for @types/node '*'; npm reads that as the stale latest tag, bun as the newest.
+			'@types/node': rootPackage.workspaces.catalog['@types/node'],
 			'@types/react': clientReact?.devDependencies?.['@types/react'],
 			'@types/react-dom': clientReact?.devDependencies?.['@types/react-dom'],
 		},
