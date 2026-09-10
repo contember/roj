@@ -32,6 +32,7 @@ import type { ToolExecutor } from '~/core/tools'
 import type { ArchiveLimitOverrides } from '~/lib/archive/index.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import { createSessionLogger } from '~/lib/logger/session-log.js'
+import { withDeadline } from '~/lib/utils/concurrency.js'
 import { TeeLogger } from '~/lib/logger/tee.js'
 import type { Platform } from '~/platform/index.js'
 import { isLiveScheduler } from '~/platform/index.js'
@@ -48,8 +49,9 @@ import { EventStore } from '../events/event-store.js'
 import { createApplyEvent } from './apply-event.js'
 import { rewriteEventsForFork } from './fork-utils.js'
 import { SessionStore } from './session-store.js'
+import type { SessionStoreOptions } from './session-store.js'
 import { Session, type SessionReopenRegistration, type UserOutputCallback } from './session.js'
-import { SessionRuntimeActivityController } from './runtime-activity.js'
+import { SessionRuntimeActivityController, SessionRuntimeUnavailableError } from './runtime-activity.js'
 
 // ============================================================================
 // Errors
@@ -92,9 +94,20 @@ export interface SessionManagerOptions {
 	systemPlugins?: readonly PluginDefinition<string, any, any, any, any>[]
 	/** Evict resident runtimes after this idle period. Absent or zero disables eviction. */
 	sessionIdleTimeoutMs?: number
+	/**
+	 * Bound on waiting for a turn in a session's ordered write queue.
+	 *
+	 * A host that drains on a deadline (a pod on SIGTERM) should keep this under
+	 * its own budget, so a stalled store fails the close instead of outliving it.
+	 */
+	writeQueueTimeoutMs?: number
 }
 
 interface SessionCacheEntry {
+	tenure: SessionTenure
+	runtime?: Session
+	settled?: boolean
+	disposalCause?: RuntimeDisposalCause
 	state: 'loading' | 'ready' | 'evicting'
 	promise: Promise<Session>
 	activity: SessionRuntimeActivityController
@@ -103,10 +116,35 @@ interface SessionCacheEntry {
 	listenerCleanup?: () => void
 }
 
+export interface SessionActivation {
+	readonly sessionId: SessionId
+}
+
+export interface ParkOptions {
+	/** Bound on waiting for the drain. The park itself keeps running past it. */
+	timeoutMs?: number
+}
+
+/** The park outlived the caller's budget; it is still draining in the background. */
+export class SessionParkTimeoutError extends Error {
+	constructor(readonly sessionId: SessionId, readonly timeoutMs: number) {
+		super(`Session '${sessionId}' did not park within ${timeoutMs}ms`)
+		this.name = 'SessionParkTimeoutError'
+	}
+}
+
+interface SessionTenure {
+	readonly handle: SessionActivation
+	state: 'active' | 'parking' | 'released' | 'revoked'
+	parkPromise?: Promise<void>
+	entry?: SessionCacheEntry
+	readonly entries: Set<SessionCacheEntry>
+}
+
 /** Why the manager is dropping a resident runtime — finer-grained than what plugins see. */
 type RuntimeDisposalCause = 'idle' | 'closed' | 'disposed' | 'shutdown'
 
-// Both parking causes map to `evicted`: the session survives and the next access rebuilds its runtime.
+// `idle` and `disposed` both map to `evicted`: the session survives and the next access rebuilds its runtime.
 const RUNTIME_DISPOSAL_CLOSE_REASON: Record<RuntimeDisposalCause, SessionCloseReason> = {
 	idle: 'evicted',
 	disposed: 'evicted',
@@ -123,7 +161,133 @@ export interface AcquiredSessionLease {
  * SessionManager manages session lifecycle and caching.
  */
 export class SessionManager {
+	private readonly storeOptions: SessionStoreOptions
 	private readonly sessions = new Map<SessionId, SessionCacheEntry>()
+	private readonly tenures = new Map<SessionId, SessionTenure>()
+	private readonly activations = new WeakMap<SessionActivation, SessionTenure>()
+
+	activateSession(sessionId: SessionId): Result<SessionActivation, DomainError> {
+		if (!isValidSessionId(sessionId)) return Err(ValidationErrors.invalid(`Invalid session id: ${sessionId}`))
+		if (this.shuttingDown) return Err(SessionErrors.runtimeUnavailable(String(sessionId), 'shutdown'))
+		const old = this.tenures.get(sessionId)
+		if (old?.state === 'active') return Ok(old.handle)
+		if (old?.state === 'parking' || (old && [...old.entries].some((entry) => !entry.settled || entry.runtime?.hasUnsafeResources()))) {
+			return Err(SessionErrors.runtimeUnavailable(String(sessionId), old.state))
+		}
+		if (old) { old.entries.clear(); old.entry = undefined }
+		const handle: SessionActivation = Object.freeze({ sessionId })
+		const tenure: SessionTenure = { handle, state: 'active', entries: new Set() }
+		this.tenures.set(sessionId, tenure)
+		this.activations.set(handle, tenure)
+		return Ok(handle)
+	}
+
+	/**
+	 * Drain the session and release residency, so another host can reopen it.
+	 *
+	 * `timeoutMs` bounds the wait, not the drain: the park keeps running and a
+	 * later call races the same one. A host that runs out of budget should revoke
+	 * and fall back to whatever fencing it uses to admit the replacement.
+	 */
+	parkSession(handle: SessionActivation, options: ParkOptions = {}): Promise<void> {
+		const park = this.beginPark(handle)
+		const { timeoutMs } = options
+		if (timeoutMs === undefined) return park
+		return withDeadline(park, timeoutMs, () => new SessionParkTimeoutError(handle.sessionId, timeoutMs))
+	}
+
+	private beginPark(handle: SessionActivation): Promise<void> {
+		const tenure = this.activations.get(handle)
+		if (!tenure) return Promise.reject(new SessionRuntimeUnavailableError(handle.sessionId, 'revoked'))
+		if (tenure.parkPromise) return tenure.parkPromise
+		if ([...tenure.entries].some((entry) => (entry.activity.getSnapshot().state === 'disposed' || tenure.state === 'revoked') && entry.runtime?.hasUnsafeResources())) {
+			if (tenure.state === 'active') tenure.state = 'parking'
+			tenure.parkPromise = Promise.reject(new SessionRuntimeUnavailableError(handle.sessionId, 'unloading'))
+			return tenure.parkPromise
+		}
+		if (this.tenures.get(handle.sessionId) !== tenure || tenure.state === 'released' || tenure.state === 'revoked') return Promise.resolve()
+		tenure.state = 'parking'
+		const entries = [...tenure.entries].filter((entry) => entry.activity.getSnapshot().state !== 'disposed')
+		if (entries.length === 0) {
+			tenure.state = 'released'
+			tenure.entries.clear()
+			tenure.entry = undefined
+			return Promise.resolve()
+		}
+		for (const entry of entries) {
+			if (entry.activity.getSnapshot().state === 'ready') entry.activity.beginParking()
+		}
+		const parking: Promise<void> = Promise.all(entries.map((entry) => this.parkEntry(entry))).then(() => {
+			if (tenure.state === 'revoked') throw new SessionRuntimeUnavailableError(handle.sessionId, 'revoked')
+			if ([...tenure.entries].some((entry) => entry.runtime?.hasUnsafeResources())) throw new SessionRuntimeUnavailableError(handle.sessionId, 'unloading')
+			tenure.state = 'released'
+			tenure.entries.clear()
+			tenure.entry = undefined
+		}).catch((error: unknown) => {
+			// A drain that reported a failure stays retryable; one that found the runtime
+			// gone is terminal, and the host has to revoke instead.
+			const terminal = error instanceof SessionRuntimeUnavailableError
+			if (tenure.parkPromise === parking && tenure.state === 'parking' && !terminal) tenure.parkPromise = undefined
+			throw error
+		})
+		tenure.parkPromise = parking
+		return parking
+	}
+
+	private parkEntry(entry: SessionCacheEntry): Promise<void> {
+		return entry.activity.untilRevoked((async () => {
+			if (entry.state === 'evicting') {
+				if (entry.disposalCause !== 'idle') throw new SessionRuntimeUnavailableError(entry.tenure.handle.sessionId, 'unloading')
+				await entry.unloadPromise
+				return
+			}
+			let session: Session | undefined
+			try {
+				session = await entry.promise
+			} catch (error) {
+				const unavailable = error instanceof SessionRuntimeUnavailableError
+					|| (error instanceof SessionLoadError && error.domainError.type === 'session_runtime_unavailable')
+				if (!unavailable) throw error
+				session = entry.runtime
+			}
+			await session?.park()
+			const sessionId = entry.tenure.handle.sessionId
+			if (this.sessions.get(sessionId) === entry) this.sessions.delete(sessionId)
+			entry.listenerCleanup?.()
+		})())
+	}
+
+	revokeSession(handle: SessionActivation): void {
+		const tenure = this.activations.get(handle)
+		if (!tenure) throw new SessionRuntimeUnavailableError(handle.sessionId, 'revoked')
+		if (this.tenures.get(handle.sessionId) !== tenure || tenure.state === 'released' || tenure.state === 'revoked') return
+		tenure.state = 'revoked'
+		for (const entry of [...tenure.entries]) {
+			entry.activity.revoke()
+			entry.runtime?.revoke()
+			entry.listenerCleanup?.()
+			if (this.sessions.get(handle.sessionId) === entry) this.sessions.delete(handle.sessionId)
+			if (entry.runtime) this.forgetEntry(entry, entry.runtime)
+		}
+	}
+
+	private admission(sessionId: SessionId): Result<SessionTenure, DomainError> {
+		let tenure = this.tenures.get(sessionId)
+		if (!tenure) {
+			const activation = this.activateSession(sessionId)
+			if (!activation.ok) return activation
+			tenure = this.activations.get(activation.value)
+		}
+		if (!tenure || tenure.state !== 'active') return Err(SessionErrors.runtimeUnavailable(String(sessionId), tenure?.state ?? 'revoked'))
+		if (!this.sessions.has(sessionId) && tenure.entry?.runtime?.hasUnsafeResources()) return Err(SessionErrors.runtimeUnavailable(String(sessionId), 'unloading'))
+		return Ok(tenure)
+	}
+
+	private assertAdmission(tenure: SessionTenure): void {
+		if (this.shuttingDown || tenure.state !== 'active' || this.tenures.get(tenure.handle.sessionId) !== tenure) {
+			throw new SessionLoadError(SessionErrors.runtimeUnavailable(String(tenure.handle.sessionId), tenure.state))
+		}
+	}
 	/** Manager-level methods collected from plugin definitions across all presets */
 	private readonly managerMethods: Map<string, {
 		input: z4.ZodType
@@ -178,6 +342,7 @@ export class SessionManager {
 		this.platform = options.platform
 		this.systemPlugins = options.systemPlugins ?? []
 		this.sessionIdleTimeoutMs = options.sessionIdleTimeoutMs ?? 0
+		this.storeOptions = { queueTimeoutMs: options.writeQueueTimeoutMs }
 		this.managerMethods = this.collectManagerMethods()
 		if (this.sessionIdleTimeoutMs > 0) {
 			const sweepIntervalMs = Math.min(this.sessionIdleTimeoutMs, 60_000)
@@ -206,20 +371,7 @@ export class SessionManager {
 		return this.platform
 	}
 
-	/**
-	 * Deliver a scheduler wake that has come due.
-	 *
-	 * The host's entry point back into the SDK — on Cloudflare, called from
-	 * `alarm()` in an isolate that never armed the wake. SessionManager owns it
-	 * because it is the only thing that can turn a session id back into a live
-	 * session, so the key alone is enough input.
-	 *
-	 * Two vocabularies route here: `agent:` wakes re-enter the agent loop,
-	 * `plugin:` wakes call a plugin method. Anything else is a quiet no-op, and so
-	 * is a key naming a session, agent or plugin that is gone — wakes outlive what
-	 * they point at. Only genuinely unexpected failures (event store IO) throw, so
-	 * a host that retries alarms retries those and only those.
-	 */
+	/** Missing targets are ignored; unavailable runtimes reject so hosts do not acknowledge refused delivery. */
 	async dispatchWake(key: string): Promise<void> {
 		const agentWake = parseAgentWakeKey(key)
 		if (agentWake) {
@@ -240,7 +392,10 @@ export class SessionManager {
 				)
 				// A preset that no longer registers the plugin lands here, same as a
 				// missing agent does: the wake points at something that is gone.
-				if (!result.ok) this.logger.debug('Scheduler wake method rejected', { key, error: result.error.type })
+				if (!result.ok) {
+					if (result.error.type === 'session_runtime_unavailable') throw new SessionRuntimeUnavailableError(pluginWake.sessionId, 'parking')
+					this.logger.debug('Scheduler wake method rejected', { key, error: result.error.type })
+				}
 			})
 			return
 		}
@@ -250,27 +405,37 @@ export class SessionManager {
 
 	/** Run `deliver` against the session a due wake names, under a runtime lease. */
 	private async withWakeTarget(key: string, sessionId: SessionId, deliver: (session: Session) => Promise<void>): Promise<void> {
+		const admission = this.admission(sessionId)
+		if (!admission.ok) throw new SessionRuntimeUnavailableError(sessionId, 'revoked')
 		// Nothing armed before shutdown may load a session back in afterwards.
-		if (this.shuttingDown) return
+		if (this.shuttingDown) throw new SessionRuntimeUnavailableError(sessionId, 'unloading')
 		// Nor may a wake that lands mid-teardown rebuild what is being torn down —
 		// getSession() would wait out the unload and reload. onSessionReady re-arms.
 		const resident = this.sessions.get(sessionId)
-		if (resident && (resident.state === 'evicting' || resident.activity.getSnapshot().state !== 'ready')) return
+		if (resident && (resident.state === 'evicting' || resident.activity.getSnapshot().state !== 'ready')) {
+			throw new SessionRuntimeUnavailableError(sessionId, resident.activity.getSnapshot().state)
+		}
 
 		const sessionResult = await this.getSession(sessionId)
 		if (!sessionResult.ok) {
+			if (sessionResult.error.type === 'session_runtime_unavailable') throw new SessionRuntimeUnavailableError(sessionId, 'revoked')
 			this.logger.debug('Scheduler wake for a session that no longer loads', { key, error: sessionResult.error.type })
 			return
 		}
 		const session = sessionResult.value
-		// A closed session's log is sealed; re-entering it would only fail to write.
+		this.assertAdmission(admission.value)
 		if (session.state.status === 'closed') return
+		const current = this.sessions.get(sessionId)
+		if (current?.runtime !== session || current.activity.getSnapshot().state !== 'ready') {
+			throw new SessionRuntimeUnavailableError(sessionId, current?.activity.getSnapshot().state ?? 'disposed')
+		}
 
 		// Lease the delivery, not the delay before it — an idle session stays evictable while it waits.
 		const release = session.tryAcquireRuntimeLease(`wake:${key}`)
-		if (!release) return
+		if (!release) throw new SessionRuntimeUnavailableError(sessionId, 'parking')
 		try {
 			await deliver(session)
+			await session.waitForScheduler()
 		} finally {
 			release()
 		}
@@ -304,6 +469,9 @@ export class SessionManager {
 			return Err(ValidationErrors.invalid(`Invalid session id: ${JSON.stringify(options.sessionId)}`))
 		}
 		const sessionId = options?.sessionId ? SessionId(options.sessionId) : generateSessionId()
+		const admission = this.admission(sessionId)
+		if (!admission.ok) return admission
+		const tenure = admission.value
 		// First orchestrator gets seq 1
 		const orchestratorId = generateAgentId(ORCHESTRATOR_ROLE, 1)
 
@@ -373,29 +541,37 @@ export class SessionManager {
 		}
 
 		if (this.sessions.has(sessionId)) return Err(SessionErrors.alreadyExists(String(sessionId)))
-		const activity = new SessionRuntimeActivityController()
+		const activity = new SessionRuntimeActivityController(sessionId)
 		let entry: SessionCacheEntry
 		const creationPromise = Promise.resolve().then(async () => {
+			this.assertAdmission(tenure)
 			if (await this.eventStore.exists(sessionId)) throw new SessionLoadError(SessionErrors.alreadyExists(String(sessionId)))
+			this.assertAdmission(tenure)
 			await this.eventStore.appendBatch(sessionId, events)
+			this.assertAdmission(tenure)
 			const plugins = this.buildPlugins(preset)
 			const composedReducer = createApplyEvent(plugins)
 			const state = reconstructSessionState(events, composedReducer)
 			if (!state) throw new SessionLoadError(ValidationErrors.invalid('Failed to reconstruct session'))
-			const store = new SessionStore(sessionId, this.eventStore, state, composedReducer)
+			const store = new SessionStore(sessionId, this.eventStore, state, composedReducer, this.storeOptions)
 			return this.createSessionInstance(store, preset, plugins, entry)
 		})
 		entry = {
+			tenure,
 			state: 'loading',
 			promise: creationPromise,
 			activity,
 			lastAccessAt: performance.now(),
 		}
 		this.sessions.set(sessionId, entry)
+		tenure.entry = entry
+		tenure.entries.add(entry)
+		void creationPromise.then(() => { entry.settled = true }, () => { entry.settled = true })
 
 		let session: Session
 		try {
 			session = await creationPromise
+			this.assertAdmission(tenure)
 			if (this.sessions.get(sessionId) === entry && entry.state === 'loading') {
 				entry.state = 'ready'
 				entry.lastAccessAt = performance.now()
@@ -403,6 +579,8 @@ export class SessionManager {
 		} catch (error) {
 			if (this.sessions.get(sessionId) === entry) this.sessions.delete(sessionId)
 			entry.listenerCleanup?.()
+			this.forgetEntry(entry, entry.runtime)
+			if (tenure.state !== 'active') return Err(SessionErrors.runtimeUnavailable(String(sessionId), tenure.state))
 			if (error instanceof SessionLoadError) return Err(error.domainError)
 			throw error
 		}
@@ -449,6 +627,9 @@ export class SessionManager {
 
 		// Generate new session ID
 		const newSessionId = generateSessionId()
+		const admission = this.admission(newSessionId)
+		if (!admission.ok) return admission
+		const tenure = admission.value
 
 		// Resolve workspace dir for the new session
 		const rawWorkspaceDir = preset.workspaceDir
@@ -477,15 +658,17 @@ export class SessionManager {
 			})
 		}
 
-		const activity = new SessionRuntimeActivityController()
+		const activity = new SessionRuntimeActivityController(newSessionId)
 		let entry: SessionCacheEntry
 		const forkPromise = Promise.resolve().then(async () => {
+			this.assertAdmission(tenure)
 			await this.eventStore.appendBatch(newSessionId, forkedEvents)
+			this.assertAdmission(tenure)
 			const plugins = this.buildPlugins(preset)
 			const composedReducer = createApplyEvent(plugins)
 			const state = reconstructSessionState(forkedEvents, composedReducer)
 			if (!state) throw new SessionLoadError(ValidationErrors.invalid('Failed to reconstruct forked session'))
-			const store = new SessionStore(newSessionId, this.eventStore, state, composedReducer)
+			const store = new SessionStore(newSessionId, this.eventStore, state, composedReducer, this.storeOptions)
 			const recoveryData = checkRecoveryNeeded(state)
 			if (recoveryData) {
 				await store.emit(withSessionId(
@@ -499,20 +682,27 @@ export class SessionManager {
 			return this.createSessionInstance(store, preset, plugins, entry)
 		})
 		entry = {
+			tenure,
 			state: 'loading',
 			promise: forkPromise,
 			activity,
 			lastAccessAt: performance.now(),
 		}
 		this.sessions.set(newSessionId, entry)
+		tenure.entry = entry
+		tenure.entries.add(entry)
+		void forkPromise.then(() => { entry.settled = true }, () => { entry.settled = true })
 
 		let session: Session
 		try {
 			session = await forkPromise
+			this.assertAdmission(tenure)
 			if (this.sessions.get(newSessionId) === entry && entry.state === 'loading') entry.state = 'ready'
 		} catch (error) {
 			if (this.sessions.get(newSessionId) === entry) this.sessions.delete(newSessionId)
 			entry.listenerCleanup?.()
+			this.forgetEntry(entry, entry.runtime)
+			if (tenure.state !== 'active') return Err(SessionErrors.runtimeUnavailable(String(newSessionId), tenure.state))
 			if (error instanceof SessionLoadError) return Err(error.domainError)
 			throw error
 		}
@@ -535,8 +725,14 @@ export class SessionManager {
 	async getSession(
 		sessionId: SessionId,
 	): Promise<Result<Session, DomainError>> {
+		const admission = this.admission(sessionId)
+		if (!admission.ok) return admission
+		const tenure = admission.value
 		while (true) {
+			if (tenure.state !== 'active' || this.tenures.get(sessionId) !== tenure) return Err(SessionErrors.runtimeUnavailable(String(sessionId), tenure.state))
 			if (this.shuttingDown) return Err(ValidationErrors.invalid('Session manager is shutting down'))
+			const currentAdmission = this.admission(sessionId)
+			if (!currentAdmission.ok) return currentAdmission
 			let entry = this.sessions.get(sessionId)
 			if (entry?.state === 'evicting') {
 				await entry.unloadPromise
@@ -553,10 +749,11 @@ export class SessionManager {
 				entry.lastAccessAt = performance.now()
 			} else {
 				this.cacheMisses++
-				const activity = new SessionRuntimeActivityController()
+				const activity = new SessionRuntimeActivityController(sessionId)
 				let loadingEntry: SessionCacheEntry
 				const promise = Promise.resolve().then(() => this.loadSession(sessionId, loadingEntry))
 				loadingEntry = {
+					tenure,
 					state: 'loading',
 					activity,
 					lastAccessAt: performance.now(),
@@ -564,20 +761,24 @@ export class SessionManager {
 				}
 				entry = loadingEntry
 				this.sessions.set(sessionId, entry)
+				tenure.entry = entry
+				tenure.entries.add(entry)
+				void promise.then(() => { loadingEntry.settled = true }, () => { loadingEntry.settled = true })
 			}
 
 			try {
 				const session = await entry.promise
+				this.assertAdmission(tenure)
+				if (this.sessions.get(sessionId) !== entry || entry.activity.getSnapshot().state !== 'ready') continue
 				if (this.sessions.get(sessionId) === entry && entry.state === 'loading') {
-					if (session.state.status === 'closed') this.sessions.delete(sessionId)
-					else {
-						entry.state = 'ready'
-						entry.lastAccessAt = performance.now()
-					}
+					entry.state = 'ready'
+					entry.lastAccessAt = performance.now()
 				}
 				return Ok(session)
 			} catch (error) {
 				if (this.sessions.get(sessionId) === entry) this.sessions.delete(sessionId)
+				this.forgetEntry(entry, entry.runtime)
+				if (tenure.state !== 'active') return Err(SessionErrors.runtimeUnavailable(String(sessionId), tenure.state))
 				if (error instanceof SessionLoadError) return Err(error.domainError)
 				throw error
 			}
@@ -588,9 +789,11 @@ export class SessionManager {
 	 * Internal session loading - throws SessionLoadError on domain errors.
 	 */
 	private async loadSession(sessionId: SessionId, entry: SessionCacheEntry): Promise<Session> {
+		this.assertAdmission(entry.tenure)
 		// We need to peek at events first to determine the preset, so we can build plugins
 		// and compose the reducer before loading the store
 		const events = await this.eventStore.load(sessionId)
+		this.assertAdmission(entry.tenure)
 		if (events.length === 0) {
 			throw new SessionLoadError(SessionErrors.notFound(String(sessionId)))
 		}
@@ -610,14 +813,14 @@ export class SessionManager {
 		const composedReducer = createApplyEvent(plugins)
 
 		// Load store with composed reducer
-		const store = await SessionStore.fromEvents(sessionId, this.eventStore, events, composedReducer)
+		const store = await SessionStore.fromEvents(sessionId, this.eventStore, events, composedReducer, this.storeOptions)
+		this.assertAdmission(entry.tenure)
 		if (!store) {
 			throw new SessionLoadError(SessionErrors.notFound(String(sessionId)))
 		}
 
 		const state = store.getState()
 
-		// Don't cache closed sessions
 		if (state.status === 'closed') {
 			// Skip onSessionReady hooks — closed sessions are immutable, firing hooks
 			// would emit events to a sealed event log on every read / restart.
@@ -690,12 +893,17 @@ export class SessionManager {
 		sessionId: SessionId,
 		reason: string,
 	): Promise<Result<AcquiredSessionLease, DomainError>> {
+		const admission = this.admission(sessionId)
+		if (!admission.ok) return admission
+		const tenure = admission.value
 		while (true) {
 			const sessionResult = await this.getSession(sessionId)
 			if (!sessionResult.ok) return sessionResult
+			if (tenure.state !== 'active' || this.tenures.get(sessionId) !== tenure) return Err(SessionErrors.runtimeUnavailable(String(sessionId), tenure.state))
 
 			const entry = this.sessions.get(sessionId)
 			if (!entry) return Ok({ session: sessionResult.value, release: () => {} })
+			if (entry.runtime !== sessionResult.value) continue
 			const release = entry.activity.tryAcquire(reason)
 			if (!release) {
 				if (entry.unloadPromise) await entry.unloadPromise
@@ -893,9 +1101,13 @@ export class SessionManager {
 	async shutdown(): Promise<void> {
 		this.shuttingDown = true
 		if (this.evictionSweepTimer) clearInterval(this.evictionSweepTimer)
-		await Promise.all([...this.sessions].map(async ([sessionId, entry]) => {
+		const entries = new Set([...this.tenures.values()].flatMap((tenure) => [...tenure.entries]))
+		await Promise.all([...entries].map(async (entry) => {
+			const sessionId = entry.tenure.handle.sessionId
 			try {
 				const session = await entry.promise
+				if (entry.activity.getSnapshot().state === 'revoked') { await session.waitForLocalCleanup(); return }
+				if (entry.activity.getSnapshot().state === 'disposed') return
 				await this.beginCacheEntryDisposal(sessionId, entry, session, 'shutdown')
 			} catch (error) {
 				entry.listenerCleanup?.()
@@ -917,6 +1129,8 @@ export class SessionManager {
 		misses: number
 		evictions: number
 		loadedSessionCount: number
+		/** Tenures still guarding a runtime the cache already dropped. Should settle to zero. */
+		retainedRuntimeCount: number
 		sessions: Array<{
 			id: SessionId
 			state: SessionCacheEntry['state']
@@ -930,6 +1144,8 @@ export class SessionManager {
 			misses: this.cacheMisses,
 			evictions: this.cacheEvictions,
 			loadedSessionCount: this.sessions.size,
+			retainedRuntimeCount: [...this.tenures.values()]
+				.filter((tenure) => tenure.entry !== undefined || tenure.entries.size > 0).length,
 			sessions: [...this.sessions].map(([id, entry]) => {
 				const activity = entry.activity.getSnapshot()
 				return {
@@ -1137,29 +1353,38 @@ export class SessionManager {
 			llmLogger: this.llmLogger,
 			platform: this.platform,
 			runtimeActivity: entry.activity,
-			registerReopenedSession: (reopenedSession) => this.registerReopenedSession(reopenedSession, entry.activity),
+			registerReopenedSession: (reopenedSession) => this.registerReopenedSession(reopenedSession, entry.activity, entry.tenure),
+			// Drop the residency so the next access reloads and re-checks ownership;
+			// the runtime already stopped itself.
+			onOwnershipLost: () => {
+				if (this.sessions.get(store.sessionId) === entry) this.sessions.delete(store.sessionId)
+				entry.listenerCleanup?.()
+				entry.listenerCleanup = undefined
+				if (entry.runtime) this.forgetEntry(entry, entry.runtime)
+			},
 		})
-
-		// Only register cache eviction listener for active sessions (not closed)
-		if (store.getState().status !== 'closed') {
-			this.registerSessionEventListener(store.sessionId, store, session, entry)
-		}
-
-		// Ensure session and workspace directories exist before plugins run
-		await this.platform.fs.mkdir(sessionDir, { recursive: true })
-		const workspaceDir = store.getState().workspaceDir
-		if (workspaceDir) {
-			await this.platform.fs.mkdir(workspaceDir, { recursive: true })
-		}
-
+		entry.runtime = session
 		try {
+			this.assertAdmission(entry.tenure)
+			if (store.getState().status !== 'closed') {
+				this.registerSessionEventListener(store.sessionId, store, session, entry)
+			}
+			await this.platform.fs.mkdir(sessionDir, { recursive: true })
+			const workspaceDir = store.getState().workspaceDir
+			if (workspaceDir) {
+				await this.platform.fs.mkdir(workspaceDir, { recursive: true })
+			}
+			this.assertAdmission(entry.tenure)
 			// Safe for closed sessions — createContext is pure local setup, no event emit.
 			await session.initPluginContexts()
+			this.assertAdmission(entry.tenure)
 
 			// Skipped for closed sessions to preserve event log immutability.
 			if (!opts.skipReadyHooks) await session.callSessionReadyHooks()
+			this.assertAdmission(entry.tenure)
 		} catch (error) {
-			await session.dispose('evicted')
+			if (entry.tenure.state === 'revoked') session.revoke()
+			else if (entry.tenure.state === 'active') await session.dispose('evicted')
 			entry.listenerCleanup?.()
 			entry.listenerCleanup = undefined
 			throw error
@@ -1217,29 +1442,55 @@ export class SessionManager {
 	private registerReopenedSession(
 		session: Session,
 		activity: SessionRuntimeActivityController,
+		tenure: SessionTenure,
 	): Result<SessionReopenRegistration | undefined, DomainError> {
+		if (tenure.state !== 'active' || this.tenures.get(session.id) !== tenure) return Err(SessionErrors.runtimeUnavailable(String(session.id), tenure.state))
 		if (this.shuttingDown) return Err(ValidationErrors.invalid('Session manager is shutting down'))
 		if (activity.getSnapshot().state !== 'ready') return Ok(undefined)
-		if (this.sessions.has(session.id)) return Err(SessionErrors.alreadyExists(String(session.id)))
+		const current = this.sessions.get(session.id)
+		if (current && current.runtime !== session) return Err(SessionErrors.alreadyExists(String(session.id)))
+		if (current) {
+			current.listenerCleanup?.()
+			tenure.entries.delete(current)
+		}
 
 		const deferred = Promise.withResolvers<Session>()
 		void deferred.promise.catch(() => {})
 		const entry: SessionCacheEntry = {
+			tenure,
+			runtime: session,
 			state: 'loading',
 			promise: deferred.promise,
 			activity,
 			lastAccessAt: performance.now(),
 		}
 		this.sessions.set(session.id, entry)
+		tenure.entry = entry
+		tenure.entries.add(entry)
+		void deferred.promise.then(() => { entry.settled = true }, () => { entry.settled = true })
 
 		return Ok({
 			complete: async () => {
+				if (tenure.state === 'revoked' || this.tenures.get(session.id) !== tenure) {
+					throw new SessionRuntimeUnavailableError(session.id, 'revoked')
+				}
 				if (this.sessions.get(session.id) !== entry) {
 					throw new Error(`Reopened session lost cache ownership: ${session.id}`)
+				}
+				if (tenure.state === 'parking') {
+					entry.state = 'ready'
+					deferred.resolve(session)
+					return
 				}
 				this.registerSessionEventListener(session.id, session.store, session, entry)
 				try {
 					await session.callSessionReadyHooks()
+					if (activity.getSnapshot().state === 'parking') {
+						entry.state = 'ready'
+						deferred.resolve(session)
+						return
+					}
+					this.assertAdmission(tenure)
 					session.checkPendingAgents()
 					if (this.sessions.get(session.id) !== entry || entry.state !== 'loading' || activity.getSnapshot().state !== 'ready') {
 						throw new Error(`Reopened session became unavailable during ready hooks: ${session.id}`)
@@ -1248,11 +1499,16 @@ export class SessionManager {
 					entry.lastAccessAt = performance.now()
 					deferred.resolve(session)
 				} catch (error) {
+					if (activity.getSnapshot().state === 'parking' && error instanceof SessionRuntimeUnavailableError) {
+						entry.state = 'ready'
+						deferred.resolve(session)
+						return
+					}
 					if (this.sessions.get(session.id) === entry) this.sessions.delete(session.id)
 					entry.listenerCleanup?.()
 					entry.listenerCleanup = undefined
 					deferred.reject(error)
-					await session.dispose('evicted')
+					if (activity.getSnapshot().state === 'ready') await session.dispose('evicted')
 					throw error
 				}
 			},
@@ -1287,6 +1543,7 @@ export class SessionManager {
 		reason: RuntimeDisposalCause,
 	): Promise<void> {
 		if (entry.unloadPromise) return entry.unloadPromise
+		entry.disposalCause = reason
 		entry.state = 'evicting'
 		entry.activity.beginForcedUnload()
 		entry.unloadPromise = session.dispose(RUNTIME_DISPOSAL_CLOSE_REASON[reason])
@@ -1298,6 +1555,7 @@ export class SessionManager {
 				)
 			})
 			.finally(() => {
+				this.forgetEntry(entry, session)
 				if (this.sessions.get(sessionId) === entry) this.sessions.delete(sessionId)
 				entry.listenerCleanup?.()
 				entry.listenerCleanup = undefined
@@ -1305,6 +1563,25 @@ export class SessionManager {
 				this.logger.debug('Session runtime evicted', { sessionId, reason })
 			})
 		return entry.unloadPromise
+	}
+
+	private forgetEntry(entry: SessionCacheEntry, session: Session | undefined): void {
+		// Late contexts must finish initialization and cleanup before replacement admission.
+		if (!entry.settled) {
+			void entry.promise.catch(() => {}).then(() => this.forgetEntry(entry, entry.runtime))
+			return
+		}
+		const state = entry.activity.getSnapshot().state
+		if (session && state !== 'disposed' && state !== 'revoked') return
+		if (session?.hasUnsafeResources()) {
+			void session.waitForLocalCleanup().catch(() => {}).then(() => {
+				if (!session.hasUnsafeResources()) this.forgetEntry(entry, session)
+			})
+			return
+		}
+		if (!session) entry.activity.markDisposed()
+		entry.tenure.entries.delete(entry)
+		if (entry.tenure.entry === entry) entry.tenure.entry = undefined
 	}
 
 	private getSessionDir(sessionId: SessionId): string {

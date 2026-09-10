@@ -135,9 +135,48 @@ export class SessionNotFoundError extends EventStoreError {
 	}
 }
 
+/** The append definitely did not commit; retrying cannot duplicate this attempt. */
 export class EventAppendError extends EventStoreError {
 	constructor(sessionId: SessionId, cause?: unknown) {
 		super(`Failed to append event to session: ${sessionId}`, sessionId, cause)
 		this.name = 'EventAppendError'
+	}
+}
+
+/** The caller must recover from the committed log before deciding whether to retry. */
+export class EventAppendOutcomeUnknownError extends EventStoreError {
+	constructor(sessionId: SessionId, cause?: unknown) {
+		super(`Append outcome is unknown for session: ${sessionId}`, sessionId, cause)
+		this.name = 'EventAppendOutcomeUnknownError'
+	}
+}
+
+/**
+ * The write was refused because this runtime no longer owns the session.
+ *
+ * The seam a multi-writer host fences through: an EventStore bound to a host's
+ * lease throws this once the lease moved on. The append definitely did not
+ * commit, and the runtime that attempted it must stop rather than retry — a
+ * replacement is already writing the log.
+ */
+export class SessionOwnershipLostError extends EventAppendError {
+	constructor(sessionId: SessionId, cause?: unknown) {
+		super(sessionId, cause)
+		this.message = `Session ownership lost: ${sessionId}`
+		this.name = 'SessionOwnershipLostError'
+	}
+}
+
+export class EventLogCorruptionError extends EventStoreError {
+	constructor(sessionId: SessionId, public readonly offendingPath: string, cause?: unknown) {
+		super(`Corrupt event log: ${offendingPath}`, sessionId, cause)
+		this.name = 'EventLogCorruptionError'
+	}
+}
+
+export class FileEventStoreCapabilityError extends Error {
+	constructor() {
+		super('FileEventStore requires atomic same-directory FileSystem.rename')
+		this.name = 'FileEventStoreCapabilityError'
 	}
 }

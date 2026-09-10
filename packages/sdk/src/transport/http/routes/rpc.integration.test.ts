@@ -198,6 +198,31 @@ describe('RPC integration', () => {
 	// =========================================================================
 
 	describe('session method dispatch', () => {
+		it('user-chat delivery replay preserves the response shape and conflicts use the HTTP 200 error envelope', async () => {
+			const session = await harness.createSession('test')
+			const agentId = session.getEntryAgentId()
+			if (!agentId) throw new Error('Expected entry agent')
+			await session.pauseAgent(agentId, 'Inspect RPC delivery')
+			const input = { sessionId: session.sessionId, deliveryId: 'rpc-delivery', content: 'Hello via RPC' }
+			const first = await rpcCall(app, 'user-chat.sendMessage', input)
+			expect(first.status).toBe(200)
+			const result = await first.json()
+			expect(result).toEqual({ ok: true, value: { messageId: 'm1' } })
+			const replay = await rpcCall(app, 'user-chat.sendMessage', input)
+			expect(replay.status).toBe(200)
+			expect(await replay.json()).toEqual(result)
+			const conflict = await rpcCall(app, 'user-chat.sendMessage', { ...input, content: 'Changed' })
+			expect(conflict.status).toBe(200)
+			expect(await conflict.json()).toEqual({ ok: false, error: {
+				type: 'user_chat_delivery_conflict',
+				message: 'Delivery ID was already used with different content or agent target',
+			} })
+			const invalid = await rpcCall(app, 'user-chat.sendMessage', { ...input, deliveryId: '' })
+			expect(invalid.status).toBe(200)
+			expect(await invalid.json()).toMatchObject({ ok: false, error: { type: 'validation_error' } })
+			expect(await session.getEventsByType('user_chat_message_received')).toHaveLength(1)
+		})
+
 		it('sessions.get dispatches correctly', async () => {
 			const createRes = await rpcCall(app, 'sessions.create', { presetId: 'test' })
 			const createJson: RpcResponse<{ sessionId: string }> = JSON.parse(await createRes.text())
@@ -360,6 +385,34 @@ describe('RPC session leases', () => {
 
 		expect(res.status).toBe(400)
 		expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(1)
+		expect(httpLeaseReasons()).toEqual([])
+	})
+
+	it.each(['park', 'revoke'])('preserves the domain error after %s without implicitly reloading the runtime', async (operation) => {
+		const session = await harness.createSession('test')
+		const activation = harness.sessionManager.activateSession(session.sessionId)
+		if (!activation.ok) throw new Error(activation.error.message)
+		if (operation === 'park') {
+			await harness.sessionManager.parkSession(activation.value)
+		} else {
+			harness.sessionManager.revokeSession(activation.value)
+		}
+		expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
+
+		const res = await rpcCall(app, 'user-chat.sendMessage', { sessionId: session.sessionId, content: 'Must not reload' })
+
+		expect(res.status).toBe(200)
+		expect(await res.json()).toMatchObject({ ok: false, error: { type: 'session_runtime_unavailable' } })
+		expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
+		expect(await session.getEventsByType('user_chat_message_received')).toHaveLength(0)
+		expect(httpLeaseReasons()).toEqual([])
+	})
+
+	it('preserves the missing-session domain error when acquiring a plugin method lease', async () => {
+		const res = await rpcCall(app, 'user-chat.sendMessage', { sessionId: 'nonexistent-session-id', content: 'Missing' })
+
+		expect(res.status).toBe(200)
+		expect(await res.json()).toMatchObject({ ok: false, error: { type: 'session_not_found' } })
 		expect(httpLeaseReasons()).toEqual([])
 	})
 

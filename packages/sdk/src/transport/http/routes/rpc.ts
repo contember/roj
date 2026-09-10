@@ -91,7 +91,7 @@ async function dispatchMethod(
 			} finally {
 				sessionResult.value.release()
 			}
-		} else if (sessionResult.error.type === 'session_not_found') {
+		} else {
 			return { httpStatus: 200, body: formatError(sessionResult.error) }
 		}
 	}

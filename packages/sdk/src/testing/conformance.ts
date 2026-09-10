@@ -101,6 +101,7 @@ export type ConformancePort =
 	| 'fs.walk'
 	| 'fs.readFiles'
 	| 'fs.writeFiles'
+	| 'fs.rename'
 	| 'fs.rmFiles'
 	| 'fs.scopeReads'
 	| 'scheduler'
@@ -121,6 +122,7 @@ export const CONFORMANCE_PORTS: readonly ConformancePort[] = [
 	'fs.walk',
 	'fs.readFiles',
 	'fs.writeFiles',
+	'fs.rename',
 	'fs.rmFiles',
 	'fs.scopeReads',
 	'scheduler',
@@ -135,11 +137,12 @@ export const CONFORMANCE_PORTS: readonly ConformancePort[] = [
 	'llmCallLog',
 ]
 
-/** The five optional `FileSystem` members, as the port names that report them. */
-const OPTIONAL_FS_VERBS: readonly ('walk' | 'readFiles' | 'writeFiles' | 'rmFiles' | 'scopeReads')[] = [
+/** Optional `FileSystem` members, as the port names that report them. */
+const OPTIONAL_FS_VERBS: readonly ('walk' | 'readFiles' | 'writeFiles' | 'rename' | 'rmFiles' | 'scopeReads')[] = [
 	'walk',
 	'readFiles',
 	'writeFiles',
+	'rename',
 	'rmFiles',
 	'scopeReads',
 ]
@@ -808,6 +811,38 @@ const readFilesChecks: ConformanceCheck[] = [
 	},
 ]
 
+const renameChecks: ConformanceCheck[] = [
+	{
+		port: 'fs.rename',
+		name: 'same-directory rename moves exact bytes and replaces without modifying the old inode',
+		async run({ platform: { fs }, path }) {
+			const source = path('.pending-source')
+			const dest = path('committed')
+			await fs.writeFile(source, 'new 🌍 bytes')
+			await fs.writeFile(dest, 'old bytes')
+			const old = await fs.open(dest, 'r')
+			try {
+				await fs.rename?.(source, dest)
+				expect(await fs.exists(source)).toBe(false)
+				expect(await fs.readFile(dest, 'utf8')).toBe('new 🌍 bytes')
+				const buffer = Buffer.alloc(9)
+				const read = await old.read(buffer, 0, buffer.length, 0)
+				expect(buffer.subarray(0, read.bytesRead).toString('utf8')).toBe('old bytes')
+			} finally { await old.close() }
+		},
+	},
+	{
+		port: 'fs.rename',
+		name: 'rename of a missing source fails without changing the destination',
+		async run({ platform: { fs }, path }) {
+			await fs.writeFile(path('dest'), 'unchanged')
+			const error = await rejection(Promise.resolve(fs.rename?.(path('missing'), path('dest'))), 'missing source rename')
+			expect(errorCode(error)).toBe('ENOENT')
+			expect(await fs.readFile(path('dest'), 'utf8')).toBe('unchanged')
+		},
+	},
+]
+
 const writeFilesChecks: ConformanceCheck[] = [
 	{
 		port: 'fs.writeFiles',
@@ -1324,6 +1359,19 @@ const fsRevisionChecks: ConformanceCheck[] = [
 	},
 	{
 		port: 'fsRevision.numbered',
+		needs: ['fs.rename'],
+		name: 'the number moves after a rename',
+		async run({ platform, path }) {
+			await platform.fs.writeFile(path('pending'), 'batch')
+			const before = await platform.fsRevision?.current()
+			await platform.fs.rename?.(path('pending'), path('committed'))
+			const after = await platform.fsRevision?.current()
+			expect(typeof after).toBe('number')
+			expect(after).not.toBe(before)
+		},
+	},
+	{
+		port: 'fsRevision.numbered',
 		name: 'the number stands still without one',
 		async run({ platform, path }) {
 			await platform.fs.writeFile(path('a.txt'), 'a')
@@ -1562,6 +1610,7 @@ export const platformConformanceChecks: readonly ConformanceCheck[] = [
 	...walkChecks,
 	...readFilesChecks,
 	...writeFilesChecks,
+	...renameChecks,
 	...rmFilesChecks,
 	...scopeReadsChecks,
 	...schedulerChecks,

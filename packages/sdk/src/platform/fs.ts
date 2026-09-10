@@ -28,6 +28,8 @@ export interface FileSystem {
 
 	writeFile(path: string, data: string | Uint8Array): Promise<void>
 	appendFile(path: string, data: string | Uint8Array): Promise<void>
+	/** FileEventStore requires atomic same-directory rename, including replacement of metadata files. */
+	rename?(source: string, dest: string): Promise<void>
 
 	mkdir(path: string, options?: { recursive?: boolean }): Promise<void>
 	readdir(path: string): Promise<string[]>

@@ -249,7 +249,7 @@ type HookMap<TCtx> = {
  * close hooks must keep anything the session still needs; `closed` and
  * `shutdown` end it for good.
  */
-export type SessionCloseReason = 'closed' | 'evicted' | 'shutdown'
+export type SessionCloseReason = 'closed' | 'evicted' | 'shutdown' | 'parked' | 'revoked'
 
 type SessionHookMap<TCtx> = {
 	/**
@@ -257,6 +257,8 @@ type SessionHookMap<TCtx> = {
 	 * runtime is rebuilt from its event log and runs this hook again.
 	 */
 	onSessionReady: (ctx: TCtx) => Promise<void>
+	/** Quiesce background work before the runtime waits for admitted operations to drain. */
+	onSessionPark: (ctx: TCtx) => Promise<void>
 	/**
 	 * Runs once per resident runtime lifetime, not once per session — an idle
 	 * eviction runs it too, and the next access runs `onSessionReady` again.
@@ -340,6 +342,7 @@ type ErasedAgentHookMap = {
 type ErasedSessionHookMap = {
 	/** Fires once per resident runtime lifetime — a rebuilt runtime runs it again. */
 	onSessionReady: (ctx: BaseSessionHookContext) => Promise<void>
+	onSessionPark: (ctx: BaseSessionHookContext) => Promise<void>
 	/** Fires once per resident runtime lifetime — `reason` says whether the session ends or is only parked. */
 	onSessionClose: (ctx: BaseSessionHookContext & { reason: SessionCloseReason }) => Promise<void>
 	beforeMethod: (ctx: BaseSessionHookContext & { method: string; input: unknown; agentId?: AgentId }) => Promise<BeforeMethodResult>
@@ -871,7 +874,7 @@ export class PluginBuilder<
 // Build configured plugin — binds config into all closures
 // ============================================================================
 
-type NotifyFn = (type: string, payload: unknown) => void
+type NotifyFn = SessionContext['notify']
 
 /**
  * Hold `ctx.notify` to the contract the plugin declared with `.notification()`:
@@ -883,7 +886,7 @@ function guardNotify(
 	notifications: Record<string, { schema: z4.ZodType }>,
 	ctx: { notify: NotifyFn; logger: Logger },
 ): NotifyFn {
-	return (type, payload) => {
+	return (type, payload, activity) => {
 		const declared = notifications[type]
 		if (!declared) {
 			ctx.logger.error(`Plugin "${pluginName}" emitted undeclared notification "${type}"`)
@@ -898,7 +901,7 @@ function guardNotify(
 			return
 		}
 
-		ctx.notify(type, payload)
+		ctx.notify(type, payload, activity)
 	}
 }
 
@@ -1056,7 +1059,7 @@ function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): Confi
  * Callback type for resolving a plugin method call at runtime.
  * Used by session.ts and agent.ts to delegate to the session's callPluginMethod.
  */
-export type PluginMethodCaller = (pluginName: string, methodName: string, input: unknown) => Promise<Result<unknown, DomainError>>
+export type PluginMethodCaller = (pluginName: string, methodName: string, input: unknown, activity?: import('../sessions/runtime-activity.js').SessionRuntimeActivity) => Promise<Result<unknown, DomainError>>
 
 /**
  * Build a `deps` object for a plugin at runtime.

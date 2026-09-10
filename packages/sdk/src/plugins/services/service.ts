@@ -1011,14 +1011,14 @@ export class ServiceExecutor {
 		// skip the tail — portPool is process-global, so a skipped release loses those
 		// ports for the life of the server.
 		const failures: unknown[] = []
-		const parking = reason === 'evicted'
+		const parking = reason === 'evicted' || reason === 'parked'
 		try {
 			for (const [serviceType, entry] of [...this.services]) {
 				if (entry.status === 'stopped') continue
 				if (entry.status === 'starting' || entry.status === 'ready' || entry.status === 'stopping' || this.restartTimers.has(serviceType)) {
 					const forcedGraceMs = parking ? entry.config.gracefulStopMs ?? 5000 : 0
 					try {
-						if (concurrentStopTypes.has(serviceType)) {
+						if (reason === 'revoked' || concurrentStopTypes.has(serviceType)) {
 							await this.forceStopForClose(serviceType, entry, sessionId, forcedGraceMs)
 							continue
 						}

@@ -20,21 +20,37 @@ function isForbiddenOnClosed(event: DomainEvent): boolean {
  * and reconciliation. Subclasses only implement storage primitives.
  */
 export abstract class BaseEventStore implements EventStore {
+	private readonly operations = new Map<SessionId, Promise<unknown>>()
+
+	protected async serialize<T>(sessionId: SessionId, operation: () => Promise<T>): Promise<T> {
+		const previous = this.operations.get(sessionId) ?? Promise.resolve()
+		const current = previous.catch(() => {}).then(operation)
+		this.operations.set(sessionId, current)
+		try {
+			return await current
+		} finally {
+			if (this.operations.get(sessionId) === current) this.operations.delete(sessionId)
+		}
+	}
 	// === Public append API (with closed-session guard) ===
 
 	async append(sessionId: SessionId, event: DomainEvent): Promise<void> {
-		if (isForbiddenOnClosed(event)) {
-			await this.guardWriteToClosed(sessionId, [event])
-		}
-		await this.doAppend(sessionId, event)
+		return this.serialize(sessionId, async () => {
+			if (isForbiddenOnClosed(event)) {
+				await this.guardWriteToClosed(sessionId, [event])
+			}
+			await this.doAppend(sessionId, event)
+		})
 	}
 
 	async appendBatch(sessionId: SessionId, events: DomainEvent[]): Promise<void> {
-		if (events.length === 0) return
-		if (events.some(isForbiddenOnClosed)) {
-			await this.guardWriteToClosed(sessionId, events)
-		}
-		await this.doAppendBatch(sessionId, events)
+		return this.serialize(sessionId, async () => {
+			if (events.length === 0) return
+			if (events.some(isForbiddenOnClosed)) {
+				await this.guardWriteToClosed(sessionId, events)
+			}
+			await this.doAppendBatch(sessionId, events)
+		})
 	}
 
 	// === Storage primitives (subclasses implement) ===
@@ -55,13 +71,17 @@ export abstract class BaseEventStore implements EventStore {
 	// === Shared implementations ===
 
 	async getMetadata(sessionId: SessionId): Promise<SessionMetadata | null> {
-		return this.readMetadata(sessionId)
+		return this.serialize(sessionId, () => this.readMetadata(sessionId))
 	}
 
 	async updateMetadata(
 		sessionId: SessionId,
 		update: Partial<SessionMetadata>,
 	): Promise<void> {
+		return this.serialize(sessionId, () => this.mergeMetadata(sessionId, update))
+	}
+
+	protected async mergeMetadata(sessionId: SessionId, update: Partial<SessionMetadata>): Promise<void> {
 		const existing = await this.readMetadata(sessionId)
 		const merged = {
 			...existing,
@@ -116,6 +136,10 @@ export abstract class BaseEventStore implements EventStore {
 		sessionId: SessionId,
 		events: DomainEvent[],
 	): Promise<boolean> {
+		return this.serialize(sessionId, () => this.reconcileMetadataUnlocked(sessionId, events))
+	}
+
+	private async reconcileMetadataUnlocked(sessionId: SessionId, events: DomainEvent[]): Promise<boolean> {
 		if (events.length === 0) return false
 
 		const computed = computeMetadataFromEvents(sessionId, events)
@@ -235,7 +259,7 @@ export abstract class BaseEventStore implements EventStore {
 		}
 
 		update.metrics = metrics
-		await this.updateMetadata(sessionId, update)
+		await this.mergeMetadata(sessionId, update)
 	}
 
 	/**

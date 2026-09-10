@@ -10,7 +10,7 @@ import { buildServiceStatusMessage } from './prompt.js'
 import type { ServiceConfig, ServiceEntry } from './schema.js'
 import type { ServicePidRegistry } from './pid-registry.js'
 import { ServiceExecutor } from './service.js'
-import type { RuntimeLeaseRelease } from '~/core/sessions/runtime-activity.js'
+import type { RuntimeLeaseRelease, SessionRuntimeActivity } from '~/core/sessions/runtime-activity.js'
 
 export const serviceEvents = createEventsFactory({
 	events: {
@@ -193,6 +193,7 @@ export const servicePlugin = definePlugin('services')
 		const runtimeActivity = ctx.runtimeActivity
 		interface ServiceLease {
 			release: RuntimeLeaseRelease
+			activity: SessionRuntimeActivity
 			terminalPending: boolean
 		}
 		const serviceLeases = new Map<string, ServiceLease>()
@@ -201,20 +202,22 @@ export const servicePlugin = definePlugin('services')
 		const statusEffects = new Set<Promise<void>>()
 		let statusEffectTail = Promise.resolve()
 		let publicationEnabled = true
+		const publicationFailures: unknown[] = []
+		let closeActivity: SessionRuntimeActivity | undefined
 		const executor = new ServiceExecutor(logger, pluginConfig.portPool, {
 			fs: ctx.platform.fs,
 			process: ctx.platform.process,
 			pidRegistry: pluginConfig.pidRegistry,
 		})
-		const beginLifecycle = (serviceType: string): ServiceLease | undefined => {
+		const beginLifecycle = (serviceType: string, activity = closeActivity ?? runtimeActivity): ServiceLease | undefined => {
 			const existing = serviceLeases.get(serviceType)
 			if (existing && !existing.terminalPending) return existing
 
 			// Undefined once the runtime unloads — the close tail that runs then is
 			// already awaited by disposal, so nothing is left unguarded.
-			const release = runtimeActivity.tryAcquire(`service:${serviceType}`)
-			if (!release) return undefined
-			const lease: ServiceLease = { release, terminalPending: false }
+			const operation = activity.tryOperation(`service:${serviceType}`)
+			if (!operation) return undefined
+			const lease: ServiceLease = { release: () => operation.release(), activity: operation.activity, terminalPending: false }
 			serviceLeases.set(serviceType, lease)
 			return lease
 		}
@@ -244,6 +247,7 @@ export const servicePlugin = definePlugin('services')
 			preferredPort?: number,
 		) => {
 			const lease = beginLifecycle(config.type)
+			if (!lease) return Err({ message: 'Session runtime is no longer accepting services', recoverable: false })
 			try {
 				return await executor.start(config, sessionId, workspaceDir, preferredPort)
 			} finally {
@@ -257,6 +261,7 @@ export const servicePlugin = definePlugin('services')
 			preferredPort?: number,
 		) => {
 			const lease = beginLifecycle(config.type)
+			if (!lease) return Err({ message: 'Session runtime is no longer accepting services', recoverable: false })
 			try {
 				return await executor.restart(config, sessionId, workspaceDir, preferredPort)
 			} finally {
@@ -267,6 +272,17 @@ export const servicePlugin = definePlugin('services')
 			while (statusEffects.size > 0) {
 				await Promise.allSettled([...statusEffects])
 			}
+			const failures = publicationFailures.splice(0)
+			if (failures.length > 0) throw new AggregateError(failures, 'Service status publication failed')
+		}
+		const stopService = async (serviceType: string, sessionId: Parameters<ServiceExecutor['stop']>[1], activity: SessionRuntimeActivity) => {
+			const lease = beginLifecycle(serviceType, activity)
+			if (!lease) return Err({ message: 'Session runtime is no longer accepting services', recoverable: false })
+			try {
+				const result = await executor.stop(serviceType, sessionId)
+				await waitForStatusEffects()
+				return result
+			} finally { releaseLeaseWhenIdle(serviceType, lease) }
 		}
 		executor.onStartSettled = (serviceType) => {
 			const lease = serviceLeases.get(serviceType)
@@ -275,7 +291,8 @@ export const servicePlugin = definePlugin('services')
 		executor.onStatusChanged = (sessionId, serviceType, status, details) => {
 			if (!publicationEnabled) return
 			const terminal = status === 'stopped' || (status === 'failed' && details.restartAt === undefined)
-			const lease = terminal ? serviceLeases.get(serviceType) : beginLifecycle(serviceType)
+			const lease = beginLifecycle(serviceType)
+			if (!lease) return
 			if (terminal && lease) lease.terminalPending = true
 			pendingPublications.set(serviceType, (pendingPublications.get(serviceType) ?? 0) + 1)
 
@@ -294,7 +311,7 @@ export const servicePlugin = definePlugin('services')
 						restartAt: details.restartAt,
 						restartAttempt: details.restartAttempt,
 						restartMaxRetries: details.restartMaxRetries,
-					}))
+					}), lease.activity)
 					// Broadcast only after the durable projection catches up.
 					notify('serviceStatus', {
 						sessionId: String(sessionId),
@@ -304,8 +321,9 @@ export const servicePlugin = definePlugin('services')
 						restartAt: details.restartAt,
 						restartAttempt: details.restartAttempt,
 						restartMaxRetries: details.restartMaxRetries,
-					})
+					}, lease.activity)
 				} catch (error) {
+					publicationFailures.push(error)
 					logger.error('Failed to publish service status', error instanceof Error ? error : new Error(String(error)), {
 						serviceType,
 						status,
@@ -328,18 +346,22 @@ export const servicePlugin = definePlugin('services')
 		const close = async (
 			sessionId: Parameters<ServiceExecutor['close']>[0],
 			reason: Parameters<ServiceExecutor['close']>[1],
+			activity: SessionRuntimeActivity,
 		): Promise<void> => {
+			closeActivity = activity
+			if (reason === 'revoked') publicationEnabled = false
 			try {
 				await executor.close(sessionId, reason)
 			} finally {
 				publicationEnabled = false
 				executor.onStatusChanged = undefined
 				executor.onStartSettled = undefined
-				await waitForStatusEffects()
-				for (const [serviceType, lease] of serviceLeases) releaseLease(serviceType, lease)
+				try { await waitForStatusEffects() } finally {
+					for (const [serviceType, lease] of serviceLeases) releaseLease(serviceType, lease)
+				}
 			}
 		}
-		return { executor, startService, restartService, close }
+		return { executor, startService, restartService, stopService, close }
 	})
 	.agentConfig<ServiceAgentConfig>()
 	.method('start', {
@@ -405,7 +427,7 @@ export const servicePlugin = definePlugin('services')
 		}),
 		output: z.object({}),
 		handler: async (ctx, input) => {
-			const result = await ctx.pluginContext.executor.stop(input.serviceType, ctx.sessionId)
+			const result = await ctx.pluginContext.stopService(input.serviceType, ctx.sessionId, ctx.runtimeActivity)
 			if (!result.ok) return Err(ValidationErrors.invalid(result.error.message))
 			return Ok({})
 		},
@@ -573,7 +595,7 @@ export const servicePlugin = definePlugin('services')
 		}
 	})
 	.sessionHook('onSessionClose', async (ctx) => {
-		await ctx.pluginContext.close(ctx.sessionId, ctx.reason)
+		await ctx.pluginContext.close(ctx.sessionId, ctx.reason, ctx.runtimeActivity)
 	})
 	.tools((ctx) => {
 		const serviceMap = new Map(ctx.pluginConfig.services.map((svc) => [svc.type, svc]))

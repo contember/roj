@@ -12,7 +12,7 @@
 import z from "zod/v4";
 import { getAgentRole } from "~/core/agents/agent-roles.js";
 import { type AgentId, agentIdSchema } from "~/core/agents/schema.js";
-import { ValidationErrors } from "~/core/errors.js";
+import { createDomainError, type DomainError, ValidationErrors } from "~/core/errors.js";
 import { createEventsFactory } from "~/core/events/types.js";
 import { estimateTokens, truncateByTokens } from "~/core/llm/tokens.js";
 import { definePlugin } from "~/core/plugins/plugin-builder.js";
@@ -20,7 +20,7 @@ import { selectPluginState } from "~/core/sessions/reducer.js";
 import { sessionIdSchema } from "~/core/sessions/schema.js";
 import { getEntryAgentId } from "~/core/sessions/state.js";
 import { createTool } from "~/core/tools/definition.js";
-import { Err, Ok } from "~/lib/utils/result.js";
+import { Err, Ok, type Result } from "~/lib/utils/result.js";
 import { getUserCommunicationInstructions } from "~/prompts/base.js";
 import {
 	ASKING_QUESTIONS_SECTION,
@@ -57,6 +57,10 @@ export const userChatEvents = createEventsFactory({
 			messageId: chatMessageIdSchema,
 			content: z.string(),
 			timestamp: z.number(),
+			delivery: z.object({
+				id: z.string().min(1),
+				fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+			}).optional(),
 		}),
 		user_chat_answer_received: z.object({
 			agentId: agentIdSchema,
@@ -145,6 +149,7 @@ export interface PendingAnswerRecord {
 // ============================================================================
 
 export interface UserChatState {
+	acceptedDeliveries?: Map<string, { fingerprint: string; messageId: ChatMessageId }>;
 	messages: ChatMessage[];
 	counter: number;
 	pendingInbound: PendingInboundMessage[];
@@ -156,6 +161,28 @@ export interface UserChatState {
 
 interface UserChatPluginContext {
 	nextMessageSequence: number;
+	inFlightDeliveries: Map<string, {
+		fingerprint: string;
+		promise: Promise<Result<SendMessageOutput, DomainError>>;
+	}>;
+}
+
+export interface SendMessageOutput {
+	messageId: ChatMessageId;
+}
+
+function deliveryConflict(): DomainError {
+	return createDomainError(
+		"user_chat_delivery_conflict",
+		"Delivery ID was already used with different content or agent target",
+		409,
+	);
+}
+
+async function deliveryFingerprint(content: string, agentId: AgentId | undefined): Promise<string> {
+	const bytes = new TextEncoder().encode(JSON.stringify([content, agentId ?? null]));
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 // ============================================================================
@@ -448,6 +475,7 @@ export const userChatPlugin = definePlugin("user-chat")
 	.pluginConfig<UserChatPresetConfig>()
 	.events([userChatEvents])
 	.context(async (ctx): Promise<UserChatPluginContext> => ({
+		inFlightDeliveries: new Map(),
 		nextMessageSequence: nextMessageSequence(
 			selectPluginState<UserChatState>(ctx.sessionState, "messages"),
 		),
@@ -477,7 +505,14 @@ export const userChatPlugin = definePlugin("user-chat")
 						agentId: event.agentId,
 						messageIndex: state.messages.length,
 					};
+					const acceptedDeliveries = event.delivery
+						? new Map(state.acceptedDeliveries ?? []).set(event.delivery.id, {
+							fingerprint: event.delivery.fingerprint,
+							messageId: event.messageId,
+						})
+						: state.acceptedDeliveries;
 					return {
+						acceptedDeliveries,
 						messages: [...state.messages, userMessage],
 						counter: nextStateCounter(state, event.messageId),
 						pendingInbound: [...state.pendingInbound, pending],
@@ -506,6 +541,7 @@ export const userChatPlugin = definePlugin("user-chat")
 						answerValue: event.answerValue,
 					});
 					return {
+						...state,
 						messages: updatedMessages,
 						counter: nextStateCounter(state, event.messageId),
 						pendingInbound: [...state.pendingInbound, pending],
@@ -674,6 +710,7 @@ export const userChatPlugin = definePlugin("user-chat")
 	})
 	.method("sendMessage", {
 		input: z.object({
+			deliveryId: z.string().min(1).optional(),
 			agentId: agentIdSchema.optional(),
 			content: z.string(),
 		}),
@@ -681,58 +718,93 @@ export const userChatPlugin = definePlugin("user-chat")
 			messageId: chatMessageIdSchema,
 		}),
 		handler: async (ctx, input) => {
-			const agentId = input.agentId ?? getEntryAgentId(ctx.sessionState);
-			if (!agentId) {
-				throw new Error("No agent available");
+			const fingerprint = input.deliveryId === undefined
+				? undefined
+				: await deliveryFingerprint(input.content, input.agentId);
+			if (input.deliveryId !== undefined) {
+				const state = selectPluginState<UserChatState>(ctx.getSessionState(), "messages");
+				const receipt = state?.acceptedDeliveries?.get(input.deliveryId);
+				if (receipt) {
+					return receipt.fingerprint === fingerprint
+						? Ok({ messageId: receipt.messageId })
+						: Err(deliveryConflict());
+				}
+				const inFlight = ctx.pluginContext.inFlightDeliveries.get(input.deliveryId);
+				if (inFlight) {
+					return inFlight.fingerprint === fingerprint
+						? inFlight.promise
+						: Err(deliveryConflict());
+				}
 			}
+			const run = async (): Promise<Result<SendMessageOutput, DomainError>> => {
+				const agentId = input.agentId ?? getEntryAgentId(ctx.sessionState);
+				if (!agentId) {
+					throw new Error("No agent available");
+				}
 
-			// Hard limit
-			const tokenCount = estimateTokens(input.content);
-			if (tokenCount > MESSAGE_MAX_TOKENS) {
-				return Err(
-					ValidationErrors.invalid(
-						`Message too large: ~${tokenCount} tokens (max ${MESSAGE_MAX_TOKENS})`,
-					),
-				);
-			}
-
-			const messageId = generateChatMessageId(
-				reserveMessageSequence(ctx.pluginContext),
-			);
-
-			// Soft truncation — save full content to file, pass truncated + reference
-			let content = input.content;
-			const truncation =
-				tokenCount > MESSAGE_TRUNCATION_THRESHOLD
-					? truncateByTokens(input.content, MESSAGE_TRUNCATION_TARGET)
-					: null;
-			if (truncation) {
-				const filePath = `.user-messages/${messageId}.md`;
-				const writeResult = await ctx.files.session.write(
-					filePath,
-					input.content,
-				);
-				if (!writeResult.ok) {
-					// Without the full copy on disk the truncated message would silently lose content.
+				// Hard limit
+				const tokenCount = estimateTokens(input.content);
+				if (tokenCount > MESSAGE_MAX_TOKENS) {
 					return Err(
 						ValidationErrors.invalid(
-							`Failed to store full message: ${writeResult.error}`,
+							`Message too large: ~${tokenCount} tokens (max ${MESSAGE_MAX_TOKENS})`,
 						),
 					);
 				}
-				content = `${truncation.content}\n\n[Full message saved to: ${filePath} — use read_file to access it]`;
-			}
 
-			await ctx.emitEvent(
-				userChatEvents.create("user_chat_message_received", {
-					agentId: agentId,
-					messageId,
-					content,
-					timestamp: Date.now(),
+				const messageId = generateChatMessageId(
+					reserveMessageSequence(ctx.pluginContext),
+				);
+
+				// Soft truncation — save full content to file, pass truncated + reference
+				let content = input.content;
+				const truncation =
+					tokenCount > MESSAGE_TRUNCATION_THRESHOLD
+						? truncateByTokens(input.content, MESSAGE_TRUNCATION_TARGET)
+						: null;
+				if (truncation) {
+					const filePath = `.user-messages/${messageId}.md`;
+					const writeResult = await ctx.files.session.write(
+						filePath,
+						input.content,
+					);
+					if (!writeResult.ok) {
+						// Without the full copy on disk the truncated message would silently lose content.
+						return Err(
+							ValidationErrors.invalid(
+								`Failed to store full message: ${writeResult.error}`,
+							),
+						);
+					}
+					content = `${truncation.content}\n\n[Full message saved to: ${filePath} — use read_file to access it]`;
+				}
+
+				await ctx.emitEvent(
+					userChatEvents.create("user_chat_message_received", {
+						agentId: agentId,
+						messageId,
+						content,
+						timestamp: Date.now(),
+						...(input.deliveryId !== undefined && fingerprint !== undefined
+							? { delivery: { id: input.deliveryId, fingerprint } }
+							: {}),
+					}),
+				);
+				ctx.scheduleAgent(agentId);
+				return Ok({ messageId });
+			};
+			if (input.deliveryId === undefined || fingerprint === undefined) return run();
+			const deliveryId = input.deliveryId;
+			const entry = {
+				fingerprint,
+				promise: Promise.resolve().then(run).finally(() => {
+					if (ctx.pluginContext.inFlightDeliveries.get(deliveryId) === entry) {
+						ctx.pluginContext.inFlightDeliveries.delete(deliveryId);
+					}
 				}),
-			);
-			ctx.scheduleAgent(agentId);
-			return Ok({ messageId });
+			};
+			ctx.pluginContext.inFlightDeliveries.set(deliveryId, entry);
+			return entry.promise;
 		},
 	})
 	.method("answerQuestion", {

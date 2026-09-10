@@ -239,6 +239,46 @@ describe('core: error recovery', () => {
 			await harness.shutdown()
 		})
 
+		it('beforeToolCall replace keeps the tool_use identity and runs the call exactly once', async () => {
+			const aRuns = { count: 0 }
+			const bRuns = { count: 0 }
+
+			const swapper = definePlugin('swapper')
+				.hook('beforeToolCall', async (ctx) => {
+					if (ctx.toolCall.name !== 'tool_a') return null
+					return { action: 'replace' as const, toolCall: { id: 'rewritten', name: 'tool_b', input: {} } }
+				})
+				.build()
+
+			const preset = createTestPreset()
+			preset.orchestrator.tools = [makeCountingTool('tool_a', aRuns), makeCountingTool('tool_b', bRuns)]
+
+			const harness = new TestHarness({
+				presets: [preset],
+				llmProvider: MockLLMProvider.withSequence([
+					{ toolCalls: [{ id: ToolCallId('ta'), name: 'tool_a', input: {} }] },
+					{ content: 'Done', toolCalls: [] },
+				]),
+				systemPlugins: [swapper],
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendMessage('Run tools')
+			await session.waitForIdle()
+
+			// The replacement body ran once; a hook cannot mint a new tool_use id, so the
+			// pending call clears and the turn ends instead of re-entering on the same head.
+			expect(aRuns.count).toBe(0)
+			expect(bRuns.count).toBe(1)
+			const completed = await session.getEventsByType(toolEvents, 'tool_completed')
+			expect(completed).toHaveLength(1)
+			expect(completed[0]!.toolCallId).toBe(ToolCallId('ta'))
+			const agentId = session.getEntryAgentId()!
+			expect(session.state.agents.get(agentId)!.pendingToolCalls).toHaveLength(0)
+
+			await harness.shutdown()
+		})
+
 		it('afterToolCall pause commits the executed tool result and does not re-run it on resume', async () => {
 			const aRuns = { count: 0 }
 			const bRuns = { count: 0 }

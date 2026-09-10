@@ -45,12 +45,14 @@ import type { ToolCall } from '~/core/tools/schema.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { toolEvents } from '~/core/tools/state.js'
 import type { Scheduler } from '~/platform/scheduler.js'
+import { type RuntimeOperation, type SessionRuntimeActivity, SessionRuntimeUnavailableError } from '~/core/sessions/runtime-activity.js'
 import { getAgentUnconsumedMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
 import { AGENT_BASE_BRIEFING } from '~/prompts/base.js'
 import { buildEnvironmentSection } from '~/prompts/builder.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import type { Logger } from '../../lib/logger/logger.js'
 import type { SessionContext } from '../sessions/context.js'
+import { RuntimeFileStore } from '../sessions/context.js'
 import { isValidSessionId, SessionId } from '../sessions/schema.js'
 import type { SessionStore } from '../sessions/session-store.js'
 import type { SessionState } from '../sessions/state.js'
@@ -105,7 +107,7 @@ export interface AgentConfig<TInput = unknown> {
  */
 export interface AgentDependencies {
 	id: AgentId
-	getSessionContext: () => SessionContext
+	getSessionContext: (activity?: SessionRuntimeActivity) => SessionContext
 	store: SessionStore
 	llmProvider: LLMProvider
 	/** Named provider instances, passed to InferenceContext for middleware routing */
@@ -144,7 +146,11 @@ export interface AgentDependencies {
 export class Agent {
 	readonly id: AgentId
 	private readonly config: AgentConfig
-	private readonly getSessionContext: () => SessionContext
+	private readonly getSessionContext: (activity?: SessionRuntimeActivity) => SessionContext
+	private stepOperation?: RuntimeOperation
+	private locallyStopped = false
+	private schedulerTail: Promise<void> = Promise.resolve()
+	private schedulerFailure: unknown[] = []
 	private readonly store: SessionStore
 	private readonly logger: Logger
 	private readonly llmProvider: LLMProvider
@@ -267,17 +273,16 @@ export class Agent {
 		this.dropScheduledLease()
 		if (this.processing) return
 		if (this.store.isClosed()) return
-		let releaseProcessingLease: (() => void) | undefined
-		try {
-			releaseProcessingLease = this.getSessionContext().runtimeActivity.acquire(`agent:${this.id}:processing`)
-		} catch {
-			return
-		}
+		if (this.locallyStopped) return
 		this.processing = true
 		this.scheduled = false
 
 		try {
 			while (true) {
+				const operation = this.getSessionContext().runtimeActivity.tryOperation(`agent:${this.id}:step`)
+				if (!operation) return
+				this.stepOperation = operation
+				try {
 				const agentState = this.state
 				if (!agentState) break
 
@@ -302,23 +307,35 @@ export class Agent {
 						await this.executeOnStart(agentState)
 						continue
 
-					case 'tool_exec':
+					case 'tool_exec': {
 						this.logger.info('Executing pending tool calls', {
 							agentId: this.id,
 							count: agentState.pendingToolCalls.length,
 						})
-						for (const toolCall of agentState.pendingToolCalls) {
+						const toolCall = agentState.pendingToolCalls[0]
+						if (toolCall) {
 							await this.executeToolCall(toolCall)
 							// A tool hook may have paused the agent — stop the turn here instead of
 							// running the remaining tools (they stay pending and run after resume).
 							const currentState = this.state
 							if (!currentState || currentState.status === 'paused') return
 							if (this.abortController.signal.aborted) return
+							// Re-entering on an unchanged head would hand decide() the same call forever.
+							if (currentState.pendingToolCalls[0]?.id === toolCall.id) {
+								this.logger.error('Tool call stayed pending after execution, ending turn', undefined, {
+									agentId: this.id,
+									toolCallId: toolCall.id,
+									toolName: toolCall.name,
+								})
+								return
+							}
 						}
+						if (this.state?.pendingToolCalls.length) continue
 						// Schedule re-entry via debounce after tool execution
 						// (allows debounce callback to wait for child responses, etc.)
 						this.scheduleProcessing()
 						return
+					}
 
 					case 'resume_from_error': {
 						// Outer backoff between error-resume cycles: after an inference exhausts
@@ -346,6 +363,10 @@ export class Agent {
 						await this.executeOnComplete(agentState)
 						return
 				}
+				} finally {
+					operation.release()
+					this.stepOperation = undefined
+				}
 			}
 		} catch (err) {
 			if (this.abortController.signal.aborted) {
@@ -362,7 +383,6 @@ export class Agent {
 				this.pendingReschedule = false
 				this.scheduleProcessing()
 			}
-			releaseProcessingLease()
 		}
 	}
 
@@ -371,6 +391,7 @@ export class Agent {
 	 * Use this when receiving new messages or after tool execution.
 	 */
 	scheduleProcessing(): void {
+		if (this.locallyStopped || this.getSessionContext().runtimeActivity.getSnapshot().state !== 'ready') return
 		if (this.scheduled) return
 		if (this.store.isClosed()) return
 		// After shutdown() a fresh schedule would outlive the drain and fire against
@@ -420,6 +441,7 @@ export class Agent {
 	 * whether this process armed the delay or an alarm held it across an eviction.
 	 */
 	async deliverWake(kind: AgentWakeKind): Promise<void> {
+		this.getSessionContext().runtimeActivity.assertAvailable()
 		if (this.abortController.signal.aborted) return
 
 		switch (kind) {
@@ -438,6 +460,8 @@ export class Agent {
 
 	/** One debounce-callback check. Never rejects: on error it cancels the schedule. */
 	private async runDebounceCheck(scheduleNext: () => void): Promise<void> {
+		const operation = this.getSessionContext().runtimeActivity.tryOperation(`agent:${this.id}:debounce-check`)
+		if (!operation) return
 		try {
 			// Re-read state fresh each check — no stale data
 			const currentState = this.state
@@ -486,13 +510,16 @@ export class Agent {
 		} catch (err) {
 			this.logger.error('Debounce check failed', err instanceof Error ? err : undefined, { agentId: this.id })
 			this.cancelSchedule()
+		} finally {
+			operation.release()
 		}
 	}
 
 	/**
 	 * Shutdown the agent - cancel any scheduled processing.
 	 */
-	shutdown(): void {
+	shutdown(activity?: SessionRuntimeActivity): void {
+		if (activity) this.scheduler = this.getSessionContext(activity).platform.scheduler
 		try {
 			this.abortController.abort()
 		} catch {
@@ -525,6 +552,13 @@ export class Agent {
 	 * `extraMessages` is cacheable, matching the previous regular inference.
 	 */
 	async runAuxiliaryInference(extraMessages: LLMMessage[]): Promise<Result<InferenceResponse, LLMError>> {
+		return this.runScopedAuxiliaryInference(extraMessages, this.getSessionContext().runtimeActivity)
+	}
+
+	private async runScopedAuxiliaryInference(extraMessages: LLMMessage[], activity: SessionRuntimeActivity): Promise<Result<InferenceResponse, LLMError>> {
+		const operation = activity.tryOperation(`agent:${this.id}:auxiliary`)
+		if (!operation) throw new SessionRuntimeUnavailableError(this.store.sessionId, activity.getSnapshot().state)
+		try {
 		const agentState = this.state
 		if (!agentState) {
 			return Err({ type: 'invalid_request', message: `Agent ${this.id} has no state` })
@@ -557,7 +591,7 @@ export class Agent {
 			sessionId: this.store.sessionId,
 			agentId: this.id,
 			signal: this.abortController.signal,
-			fileStore: this.fileStore,
+			fileStore: new RuntimeFileStore(this.fileStore, operation.activity),
 			providers: this.llmProviders,
 		})
 
@@ -575,6 +609,7 @@ export class Agent {
 		}
 
 		return result
+		} finally { operation.release() }
 	}
 
 	// ============================================================================
@@ -763,7 +798,7 @@ export class Agent {
 							llmCallId = LLMCallId(callId)
 						},
 						signal: this.abortController.signal,
-						fileStore: this.fileStore,
+						fileStore: new RuntimeFileStore(this.fileStore, this.getSessionContext(this.stepOperation?.activity).runtimeActivity),
 						providers: this.llmProviders,
 					}),
 				{ logger: this.logger, signal: this.abortController.signal },
@@ -1013,20 +1048,47 @@ export class Agent {
 		}
 	}
 
+	stopLocalScheduling(): void {
+		this.locallyStopped = true
+		if (this.debounceCheckTimer) clearTimeout(this.debounceCheckTimer)
+		this.debounceCheckTimer = undefined
+		this.scheduled = false
+		this.pendingReschedule = false
+		this.dropScheduledLease()
+	}
+
+	revoke(): void {
+		this.stopLocalScheduling()
+		this.abortController.abort()
+	}
+
+	async waitForScheduler(): Promise<void> {
+		await this.schedulerTail
+		const failures = this.schedulerFailure.splice(0)
+		if (failures.length) throw new AggregateError(failures, 'Agent scheduler operations failed')
+	}
+
+	private enqueueScheduler(operation: (scheduler: Scheduler) => Promise<void>): void {
+		if (this.locallyStopped) return
+		const scheduler = this.tryGetScheduler()
+		if (!scheduler) return
+		const pending = operation(scheduler).catch((error: unknown) => {
+			this.schedulerFailure.push(error)
+			this.logger.error('Agent scheduler operation failed', error instanceof Error ? error : new Error(String(error)))
+		})
+		this.schedulerTail = Promise.all([this.schedulerTail, pending]).then(() => {})
+	}
+
 	/**
 	 * Arm a wake without awaiting the host: scheduleProcessing() and shutdown() are
 	 * synchronous, while a host may persist the wake asynchronously.
 	 */
 	private armWake(kind: AgentWakeKind, delayMs: number): void {
-		this.tryGetScheduler()?.wake(agentWakeKey(this.store.sessionId, this.id, kind), delayMs).catch((err: unknown) => {
-			this.logger.error('Failed to arm scheduler wake', err instanceof Error ? err : undefined, { agentId: this.id, kind })
-		})
+		this.enqueueScheduler((scheduler) => scheduler.wake(agentWakeKey(this.store.sessionId, this.id, kind), delayMs))
 	}
 
 	private cancelWake(kind: AgentWakeKind): void {
-		this.tryGetScheduler()?.cancel(agentWakeKey(this.store.sessionId, this.id, kind)).catch((err: unknown) => {
-			this.logger.error('Failed to cancel scheduler wake', err instanceof Error ? err : undefined, { agentId: this.id, kind })
-		})
+		this.enqueueScheduler((scheduler) => scheduler.cancel(agentWakeKey(this.store.sessionId, this.id, kind)))
 	}
 
 	/**
@@ -1064,8 +1126,10 @@ export class Agent {
 				))
 				return
 			} else if (beforeResult.action === 'replace') {
+				// The id pairs the result with the LLM's tool_use, so a hook may swap
+				// name and input but never identity.
 				effectiveToolCall = {
-					id: ToolCallId(beforeResult.toolCall.id),
+					id: toolCall.id,
 					name: beforeResult.toolCall.name,
 					input: beforeResult.toolCall.input,
 				}
@@ -1172,15 +1236,19 @@ export class Agent {
 	 * Run onPause plugin hooks. Called from Session.pauseAgent (manual pause) —
 	 * handler-triggered pauses go through emitHandlerPause which calls this itself.
 	 */
-	async notifyPaused(message?: string): Promise<void> {
-		await this.executeOnPause(message)
+	async notifyPaused(message?: string, activity: SessionRuntimeActivity = this.getSessionContext().runtimeActivity): Promise<void> {
+		const operation = activity.tryOperation(`agent:${this.id}:pause-hook`)
+		if (!operation) throw new SessionRuntimeUnavailableError(this.store.sessionId, activity.getSnapshot().state)
+		try {
+			await this.executeOnPause(message, operation.activity)
+		} finally { operation.release() }
 	}
 
 	/**
 	 * Build base AgentContext for handler/hook calls.
 	 */
-	private buildAgentContext(agentState: AgentState): AgentContext {
-		const sessionContext = this.getSessionContext()
+	private buildAgentContext(agentState: AgentState, activity: SessionRuntimeActivity | undefined = this.stepOperation?.activity): AgentContext {
+		const sessionContext = this.getSessionContext(activity)
 		return {
 			// SessionContext fields are rebuilt for up-to-date state.
 			sessionId: sessionContext.sessionId,
@@ -1206,7 +1274,7 @@ export class Agent {
 			agentConfig: this.config,
 			input: agentState.typedInput,
 			parentId: agentState.parentId,
-			runAuxiliaryInference: (extraMessages) => this.runAuxiliaryInference(extraMessages),
+			runAuxiliaryInference: (extraMessages) => this.runScopedAuxiliaryInference(extraMessages, sessionContext.runtimeActivity),
 		}
 	}
 
@@ -1225,15 +1293,16 @@ export class Agent {
 				if (!this.pluginMethodCaller) {
 					throw new Error('pluginMethodCaller not available')
 				}
-				return this.pluginMethodCaller(plugin.name, methodName, input)
+				return this.pluginMethodCaller(plugin.name, methodName, input, agentContext.runtimeActivity)
 			}
 		}
 
 		const sendNotification = this.sendNotification
 		const pluginName = plugin.name
 
-		const deps = this.pluginMethodCaller
-			? buildPluginDeps(plugin.dependencyNames, this.plugins, this.pluginMethodCaller)
+		const caller = this.pluginMethodCaller
+		const deps = caller
+			? buildPluginDeps(plugin.dependencyNames, this.plugins, (name, method, input) => caller(name, method, input, agentContext.runtimeActivity))
 			: {}
 
 		const schedule = this.scheduleCallback ?? (() => {})
@@ -1246,7 +1315,13 @@ export class Agent {
 			pluginState,
 			self,
 			schedule,
-			notify: (type: string, payload: unknown) => {
+			notify: (type: string, payload: unknown, continuation: SessionRuntimeActivity = agentContext.runtimeActivity) => {
+				try {
+					this.getSessionContext(continuation)
+				} catch (error) {
+					if (error instanceof SessionRuntimeUnavailableError) return
+					throw error
+				}
 				sendNotification?.({ pluginName, type, payload })
 			},
 			deps,
@@ -1617,13 +1692,13 @@ export class Agent {
 	 * or manual via Session.pauseAgent). Plugins can react to pause; return value is
 	 * null-only (no actions), since the agent is already paused.
 	 */
-	private async executeOnPause(reason?: string): Promise<void> {
+	private async executeOnPause(reason?: string, activity?: SessionRuntimeActivity): Promise<void> {
 		this.logger.debug('Executing onPause handlers', { agentId: this.id })
 
 		const agentState = this.state
 		if (!agentState) return
 
-		const agentContext = this.buildAgentContext(agentState)
+		const agentContext = this.buildAgentContext(agentState, activity)
 
 		for (const plugin of this.plugins) {
 			if (!plugin.agentHooks?.onPause) continue

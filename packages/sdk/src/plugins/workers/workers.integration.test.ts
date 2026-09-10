@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import z from 'zod/v4'
+import { EventAppendError } from '~/core/events/event-store.js'
 import { MemoryEventStore } from '~/core/events/memory.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { DomainEvent } from '~/core/events/types.js'
@@ -224,7 +225,7 @@ class GatedWorkerEffectEventStore extends MemoryEventStore {
 	override async append(sessionId: SessionId, event: DomainEvent): Promise<void> {
 		if (event.type === 'worker_sub_event' || event.type === 'mailbox_message' || event.type === 'worker_completed') {
 			this.startedTypes.add(event.type)
-			if (this.startedTypes.size === 3) this.markEffectsStarted()
+			this.markEffectsStarted()
 			await this.effectGate
 			await super.append(sessionId, event)
 			this.completedTypes.add(event.type)
@@ -410,8 +411,10 @@ function createInFlightEffectsWorker() {
 				return event.type === 'in_flight' ? { emitted: state.emitted + 1 } : state
 			},
 			execute: async (_config, ctx) => {
-				void ctx.emit({ type: 'in_flight' })
-				void ctx.notifyAgent('in-flight notification')
+				// Fire-and-forget, like worker code that does not await its own effects:
+				// a rejected append surfaces through waitForEffects, not as a crash.
+				void ctx.emit({ type: 'in_flight' }).catch(() => {})
+				void ctx.notifyAgent('in-flight notification').catch(() => {})
 				markStarted()
 				await bodyGate
 				return Ok({ status: 'done', summary: 'Body released' })
@@ -1115,7 +1118,7 @@ describe('workers plugin', () => {
 			}
 		})
 
-		it('refuses to cancel a completed worker still draining its effects', async () => {
+		it('orders terminal completion after effects and refuses cancellation of the completed worker', async () => {
 			const terminal = createTerminalThenEffectsWorker()
 			const eventStore = new ArmedGateEventStore()
 			const harness = createWorkersHarness({
@@ -1147,6 +1150,8 @@ describe('workers plugin', () => {
 				const { workerId } = z.object({ workerId: z.string() }).parse(spawned.value)
 				await terminal.started
 				await effectParked
+				expect(selectPluginState<Map<WorkerId, WorkerEntry>>(session.state, 'workers')?.get(WorkerId(workerId))?.status).toBe('running')
+				eventStore.release()
 				await waitFor(() => (
 					selectPluginState<Map<WorkerId, WorkerEntry>>(session.state, 'workers')?.get(WorkerId(workerId))?.status === 'completed'
 				))
@@ -1169,7 +1174,7 @@ describe('workers plugin', () => {
 			}
 		})
 
-		it('parks a paused worker again when its resume cannot launch, keeping it resumable', async () => {
+		it('does not let a queued spawn overtake a paused worker resume', async () => {
 			const resumable = createResumableWorker()
 			const eventStore = new ArmedGateEventStore()
 			const harness = createWorkersHarness({
@@ -1206,7 +1211,7 @@ describe('workers plugin', () => {
 				})
 				expect(paused.ok).toBe(true)
 
-				// Take the last slot while the resume is parked mid-emit, so its launch refuses.
+				// The durable resume precedes the competing spawn in the session write queue.
 				const statusParked = eventStore.arm(['worker_status_changed'])
 				const resumePromise = session.callPluginMethod('workers.resume', {
 					sessionId: String(session.sessionId),
@@ -1214,17 +1219,21 @@ describe('workers plugin', () => {
 					workerId,
 				})
 				await statusParked
-				await spawn()
+				const competingSpawn = session.callPluginMethod('workers.spawn', {
+					sessionId: String(session.sessionId), agentId: String(agentId), workerType: 'resumable', config: {},
+				})
 				eventStore.release()
 
 				const resumed = await resumePromise
-				expect(resumed.ok).toBe(false)
-				if (!resumed.ok) expect(resumed.error.message).toContain('Max concurrent workers reached')
+				expect(resumed.ok).toBe(true)
+				const competing = await competingSpawn
+				expect(competing.ok).toBe(false)
+				if (!competing.ok) expect(competing.error.message).toContain('Max concurrent workers reached')
 
 				const entry = selectPluginState<Map<WorkerId, WorkerEntry>>(session.state, 'workers')?.get(WorkerId(workerId))
-				expect(entry?.status).toBe('paused')
+				expect(entry?.status).toBe('running')
 				expect(entry).toHaveProperty('config')
-				expect(z.object({ ticks: z.number() }).parse(entry?.state)).toEqual({ ticks: 1 })
+				expect(z.object({ ticks: z.number() }).parse(entry?.state).ticks).toBeGreaterThanOrEqual(1)
 			} finally {
 				eventStore.release()
 				await harness.shutdown()
@@ -1455,7 +1464,7 @@ describe('workers plugin', () => {
 			await harness.shutdown()
 		})
 
-		it('waits for in-flight emit, notify, and terminal effects after worker close timeout', async () => {
+		it('drains admitted worker effects before persisting domain close', async () => {
 			const inFlight = createInFlightEffectsWorker()
 			const eventStore = new GatedWorkerEffectEventStore()
 			const llmProvider = MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] })
@@ -1485,32 +1494,21 @@ describe('workers plugin', () => {
 			if (!spawned.ok) throw new Error('Expected worker spawn to succeed')
 			const { workerId } = z.object({ workerId: z.string() }).parse(spawned.value)
 			await inFlight.started
-			const terminalSpawned = await session.callPluginMethod('workers.spawn', {
-				sessionId: String(session.sessionId),
-				agentId: String(agentId),
-				workerType: 'immediate',
-				config: { value: 'terminal-gate' },
-			})
-			expect(terminalSpawned.ok).toBe(true)
-			if (!terminalSpawned.ok) throw new Error('Expected terminal worker spawn to succeed')
-			const { workerId: terminalWorkerId } = z.object({ workerId: z.string() }).parse(terminalSpawned.value)
 			await eventStore.effectsStarted
 
 			let closeFinished = false
 			const closePromise = session.close().then(() => {
 				closeFinished = true
 			})
-			await new Promise((resolve) => setTimeout(resolve, 250))
 			expect(closeFinished).toBe(false)
 			const runtime = harness.sessionManager.getRuntimeCacheStats().sessions.find((entry) => entry.id === session.sessionId)
 			expect(runtime?.leaseReasons[`worker:${workerId}:effect`]).toBe(2)
-			expect(runtime?.leaseReasons[`worker:${terminalWorkerId}:effect`]).toBe(1)
 
 			eventStore.release()
 			await closePromise
 			expect(eventStore.hasCompleted('worker_sub_event')).toBe(true)
 			expect(eventStore.hasCompleted('mailbox_message')).toBe(true)
-			expect(eventStore.hasCompleted('worker_completed')).toBe(true)
+			expect(eventStore.hasCompleted('worker_completed')).toBe(false)
 			expect(llmProvider.getCallCount()).toBe(0)
 			const eventsAfterClose = await session.getEvents()
 			inFlight.finishBody()
@@ -1519,12 +1517,52 @@ describe('workers plugin', () => {
 			expect(await session.getEvents()).toEqual(eventsAfterClose)
 			expect(await session.getEventsByType(workerEvents, 'worker_sub_event')).toHaveLength(1)
 			expect(await session.getEventsByType(mailboxEvents, 'mailbox_message')).toHaveLength(1)
-			expect(await session.getEventsByType(workerEvents, 'worker_completed')).toHaveLength(1)
+			expect(await session.getEventsByType(workerEvents, 'worker_completed')).toHaveLength(0)
 			expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
 			await harness.shutdown()
 		})
 
 		it('bounds the effect drain so a stalled event store cannot hang close', async () => {
+			const inFlight = createInFlightEffectsWorker()
+			const eventStore = new GatedWorkerEffectEventStore()
+			const harness = createWorkersHarness({
+				presets: [createTestPreset({
+					plugins: [workerPlugin.configure({
+						workers: [inFlight.worker, immediateWorker],
+						stopTimeoutMs: 50,
+						effectDrainTimeoutMs: 50,
+					})],
+				})],
+				eventStore,
+				// session_closed queues behind the stalled effect append; close must fail on
+				// this bound rather than wait out a writer that never returns.
+				writeQueueTimeoutMs: 100,
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+			try {
+				const session = await harness.createSession('test')
+				const agentId = session.getEntryAgentId()
+				if (!agentId) throw new Error('Expected entry agent')
+				const spawned = await session.callPluginMethod('workers.spawn', {
+					sessionId: String(session.sessionId),
+					agentId: String(agentId),
+					workerType: 'in-flight-effects',
+					config: {},
+				})
+				expect(spawned.ok).toBe(true)
+				await inFlight.started
+
+				// The event store never releases. session_closed queues behind the stalled
+				// effect append, so close must fail on its own bound instead of hanging.
+				await expect(session.close()).rejects.toBeInstanceOf(EventAppendError)
+			} finally {
+				eventStore.release()
+				inFlight.finishBody()
+				await harness.shutdown()
+			}
+		})
+
+		it('bounds runtime shutdown without overtaking a stalled event append', async () => {
 			const inFlight = createInFlightEffectsWorker()
 			const eventStore = new GatedWorkerEffectEventStore()
 			const harness = createWorkersHarness({
@@ -1551,8 +1589,8 @@ describe('workers plugin', () => {
 				expect(spawned.ok).toBe(true)
 				await inFlight.started
 
-				// The event store never releases: close must still return on its own bound.
-				await session.close()
+				// Runtime disposal can detach a stuck writer; domain close must remain ordered behind it.
+				await harness.sessionManager.shutdown()
 				expect(harness.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
 			} finally {
 				eventStore.release()

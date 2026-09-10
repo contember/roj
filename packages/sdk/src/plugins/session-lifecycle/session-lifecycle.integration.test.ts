@@ -209,8 +209,9 @@ describe('session-lifecycle plugin', () => {
 			const first = await session.callPluginMethod('sessions.close', {})
 			expect(first.ok).toBe(true)
 
-			// Close again → error
-			const second = await session.callPluginMethod('sessions.close', {})
+			const closed = await harness.sessionManager.getSession(session.sessionId)
+			if (!closed.ok) throw new Error(closed.error.message)
+			const second = await closed.value.callPluginMethod('sessions.close', {})
 			expect(second.ok).toBe(false)
 			if (!second.ok) {
 				expect(second.error.type).toBe('session_closed')
@@ -253,9 +254,12 @@ describe('session-lifecycle plugin', () => {
 			await session.callPluginMethod('sessions.close', {})
 			expect(session.state.status).toBe('closed')
 
-			const result = await session.callPluginMethod('sessions.reopen', {})
+			const closed = await harness.sessionManager.getSession(session.sessionId)
+			if (!closed.ok) throw new Error(closed.error.message)
+			const result = await closed.value.callPluginMethod('sessions.reopen', {})
 			expect(result.ok).toBe(true)
-			expect(session.state.status).toBe('active')
+			expect(closed.value.state.status).toBe('active')
+			expect(session.state.status).toBe('closed')
 
 			await harness.shutdown()
 		})
@@ -287,7 +291,9 @@ describe('session-lifecycle plugin', () => {
 			const session = await harness.createSession('test')
 
 			await session.callPluginMethod('sessions.close', {})
-			await session.callPluginMethod('sessions.reopen', {})
+			const closed = await harness.sessionManager.getSession(session.sessionId)
+			if (!closed.ok) throw new Error(closed.error.message)
+			expect((await closed.value.callPluginMethod('sessions.reopen', {})).ok).toBe(true)
 
 			const events = await session.getEventsByType(sessionEvents, 'session_reopened')
 			expect(events).toHaveLength(1)

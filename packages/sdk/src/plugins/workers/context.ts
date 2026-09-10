@@ -121,6 +121,7 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 	private readonly reducer: (state: TState, event: TSubEvent) => TState
 	private readonly reserveMailboxMessageSequence: () => number
 	private readonly acquireEffectLease: () => (() => void) | null
+	private readonly isRuntimeAvailable: () => boolean
 	private readonly inFlightEffects = new Set<Promise<void>>()
 	private readonly effectLeases = new Set<() => void>()
 	private localState: TState
@@ -153,6 +154,7 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 		getSessionState: () => SessionState
 		reserveMailboxMessageSequence: () => number
 		acquireEffectLease: () => (() => void) | null
+		isRuntimeAvailable?: () => boolean
 		reducer: (state: TState, event: TSubEvent) => TState
 		initialState: TState
 		resumed: boolean
@@ -168,6 +170,7 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 		this.getSessionStateCallback = params.getSessionState
 		this.reserveMailboxMessageSequence = params.reserveMailboxMessageSequence
 		this.acquireEffectLease = params.acquireEffectLease
+		this.isRuntimeAvailable = params.isRuntimeAvailable ?? (() => true)
 		this.reducer = params.reducer
 		this.localState = params.initialState
 		this.resumed = params.resumed
@@ -188,12 +191,13 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 	 */
 	async emit(event: TSubEvent): Promise<void> {
 		await this.runEffect(async () => {
-			this.localState = this.reducer(this.localState, event)
 			await this.emitEvent(workerEvents.create('worker_sub_event', {
 				workerId: this.workerId,
 				workerType: this.workerType,
 				subEvent: event,
 			}))
+			// The append committed, so the state follows it.
+			this.localState = this.reducer(this.localState, event)
 		})
 	}
 
@@ -209,7 +213,7 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 	 * Returns false if cancelled.
 	 */
 	shouldContinue(): boolean {
-		return this.active && !this._cancelled
+		return this.active && !this._cancelled && this.isRuntimeAvailable()
 	}
 
 	/**
@@ -297,6 +301,9 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 			promise = effect()
 			this.inFlightEffects.add(promise)
 			await promise
+		} catch (error) {
+			if (!this.shouldContinue()) return false
+			throw error
 		} finally {
 			if (promise) this.inFlightEffects.delete(promise)
 			this.effectLeases.delete(releaseLease)
