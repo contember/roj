@@ -41,6 +41,8 @@ export interface GitCountAheadOptions extends GitRepoOptions {
 	base: string
 	/** Ref being measured. Defaults to HEAD. */
 	ref?: string
+	/** Count all commits in ref if base does not exist; other read failures must still reject. */
+	missingBase?: 'all'
 }
 
 /**

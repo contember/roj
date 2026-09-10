@@ -1258,6 +1258,9 @@ const gitChecks: ConformanceCheck[] = [
 			expect(await platform.git?.countAhead({ dir, base: GIT_FIXTURE.base })).toBe(1)
 			expect(await platform.git?.countAhead({ dir, base: GIT_FIXTURE.branch })).toBe(0)
 			expect(await platform.git?.countAhead({ dir, base: GIT_FIXTURE.base, ref: GIT_FIXTURE.base })).toBe(0)
+			const all = await platform.git?.log({ dir })
+			expect(await platform.git?.countAhead({ dir, base: 'refs/heads/not-published', missingBase: 'all' })).toBe(all?.length)
+			expect(await platform.git?.countAhead({ dir, base: GIT_FIXTURE.base, missingBase: 'all' })).toBe(1)
 		},
 	},
 	{

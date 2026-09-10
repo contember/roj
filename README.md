@@ -48,6 +48,12 @@ This works with both native Git and `platform.git`. The host owns fetching the
 remote ref. If the configured ref is missing or unreadable, refresh returns no
 snapshot and sends no notification; it does not substitute local `main` or zero.
 
+For an initial publication where the remote branch may not exist yet, set
+`missingBase: 'all'` alongside `baseBranch`. All HEAD commits then count as
+unpublished until the ref appears. An unreadable existing ref still produces no
+snapshot. A `platform.git` adapter must implement the corresponding
+`GitCountAheadOptions.missingBase` policy.
+
 ## Requirements
 
 - [Bun](https://bun.sh) (the monorepo, the server runtime and the test runner)
