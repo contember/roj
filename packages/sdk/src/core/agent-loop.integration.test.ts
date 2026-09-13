@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 import z from 'zod/v4'
+import type { DebounceContext } from '~/core/agents/debounce.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { ModelId } from '~/core/llm/schema.js'
@@ -252,6 +253,36 @@ describe('agent processing loop', () => {
 			await session.sendAndWaitForIdle('Record')
 
 			expect(seen).toEqual(['tc1', 'tc2'])
+
+			await harness.shutdown()
+		})
+
+		it('debounce callback sees a user message that is not in the mailbox', async () => {
+			const contexts: DebounceContext[] = []
+			const preset: Preset = {
+				id: 'test',
+				name: 'Test Preset',
+				orchestrator: {
+					system: 'You are a test agent.',
+					model: ModelId('mock'),
+					tools: [],
+					agents: [],
+					debounceCallback: (context) => {
+						contexts.push(context)
+						return 'process_now'
+					},
+				},
+				agents: [],
+			}
+			const harness = new TestHarness({
+				presets: [preset],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Hello back!', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Hello')
+
+			expect(contexts.some((c) => c.hasPendingInput && c.totalPending === 0)).toBe(true)
 
 			await harness.shutdown()
 		})

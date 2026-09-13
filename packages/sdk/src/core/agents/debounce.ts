@@ -13,6 +13,8 @@ export interface DebounceContext {
 	totalPending: number
 	/** Pending tool results awaiting LLM processing */
 	pendingToolResults: PendingToolResult[]
+	/** Whether any dequeue source holds input for this agent. `messages` is the mailbox alone, so a user chat message shows up only here. */
+	hasPendingInput: boolean
 }
 
 /**
@@ -76,7 +78,7 @@ export const batchingDebounceCallback: DebounceCallback = (context) => {
  */
 export const waitForResponseDebounceCallback: DebounceCallback = (context) => {
 	// If we have new messages, process immediately
-	if (context.totalPending > 0) {
+	if (context.totalPending > 0 || context.hasPendingInput) {
 		return 'process_now'
 	}
 
