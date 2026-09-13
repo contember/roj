@@ -62,6 +62,53 @@ describe('user-chat plugin', () => {
 			await harness.shutdown()
 		})
 
+		it('sendMessage with context → LLM sees the context, chat history keeps it apart from content', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			const result = await session.callPluginMethod('user-chat.sendMessage', {
+				content: 'Make this heading bigger',
+				context: 'Page: /about',
+			})
+			expect(result.ok).toBe(true)
+			await session.waitForIdle()
+
+			const lastRequest = harness.llmProvider.getLastRequest()
+			const lastMessage = lastRequest!.messages[lastRequest!.messages.length - 1]
+			expect(lastMessage.content).toBe('[User]: Make this heading bigger\n<user_context>\nPage: /about\n</user_context>')
+
+			const state = selectPluginState<UserChatState>(session.state, 'messages')
+			expect(state?.messages).toContainEqual(expect.objectContaining({
+				type: 'user_message',
+				content: 'Make this heading bigger',
+				context: 'Page: /about',
+			}))
+
+			await harness.shutdown()
+		})
+
+		it('sendMessage without context → LLM gets no context block', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Hello world')
+
+			const lastRequest = harness.llmProvider.getLastRequest()
+			const lastMessage = lastRequest!.messages[lastRequest!.messages.length - 1]
+			expect(lastMessage.content).toBe('[User]: Hello world')
+
+			const events = await session.getEventsByType('user_chat_message_received')
+			expect(events[0]).not.toHaveProperty('context')
+
+			await harness.shutdown()
+		})
+
 		it('sendMessage to specific agent (non-entry) via sendMessageToAgent', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
