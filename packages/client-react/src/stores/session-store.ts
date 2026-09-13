@@ -213,7 +213,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 	},
 
 	sendMessage: async (content) => {
-		const { sessionId, entryAgentId, pendingQuestions, pendingAttachments } = get()
+		const { sessionId, entryAgentId, pendingQuestions, pendingAttachments, messageContext } = get()
 		if (!sessionId || !entryAgentId || pendingQuestions.length > 0) return
 
 		// Collect ready attachments for display
@@ -252,7 +252,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 		try {
 			// Use content or a placeholder if only attachments
 			const messageContent = content.trim() || (readyAttachments.length > 0 ? `[${readyAttachments.map((a) => a.filename).join(', ')}]` : '')
-			unwrap(await api.call('user-chat.sendMessage', { sessionId, agentId: AgentId(entryAgentId), content: messageContent }))
+			unwrap(await api.call('user-chat.sendMessage', {
+				sessionId,
+				agentId: AgentId(entryAgentId),
+				content: messageContent,
+				context: messageContext ?? undefined,
+			}))
 			// Remove from pending on success and clear attachments
 			const newPendingMessages = new Map(get().pendingMessages)
 			newPendingMessages.delete(messageId)
