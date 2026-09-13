@@ -40,6 +40,7 @@ describe('Debounce Callbacks', () => {
 		oldestWaitingMs,
 		totalPending: messageCount,
 		pendingToolResults,
+		hasPendingInput: messageCount > 0,
 	})
 
 	describe('defaultDebounceCallback', () => {
@@ -140,6 +141,11 @@ describe('Debounce Callbacks', () => {
 			expect(waitForResponseDebounceCallback(context)).toBe('wait')
 		})
 
+		test("returns 'process_now' for input outside the mailbox, such as a user chat message", () => {
+			const context = { ...createContext(0, 0, [createToolResult('send_message', 1000)]), hasPendingInput: true }
+			expect(waitForResponseDebounceCallback(context)).toBe('process_now')
+		})
+
 		test("returns 'wait' for start_* agent tool", () => {
 			const context = createContext(0, 0, [
 				createToolResult('start_researcher', 1000),
@@ -225,6 +231,7 @@ describe('Debounce Callbacks', () => {
 				messages: [],
 				oldestWaitingMs: 0,
 				totalPending: 0,
+				hasPendingInput: false,
 				pendingToolResults: [
 					{ toolCallId: ToolCallId('tc-1'), toolName: 'send_message', timestamp: now - 59000, isError: false, content: '' },
 					{ toolCallId: ToolCallId('tc-2'), toolName: 'send_message', timestamp: now - 30000, isError: false, content: '' },

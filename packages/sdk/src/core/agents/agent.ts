@@ -453,8 +453,10 @@ export class Agent {
 			const unconsumed = getUnconsumedMessages(sessionState, this.id)
 			const pendingToolResults = currentState.pendingToolResults
 
+			const hasPendingInput = this.hasPluginPendingMessages()
+
 			// If no messages, no pending tool results, and no plugin pending, nothing to do
-			if (unconsumed.length === 0 && pendingToolResults.length === 0 && !this.hasPluginPendingMessages()) {
+			if (unconsumed.length === 0 && pendingToolResults.length === 0 && !hasPendingInput) {
 				this.cancelSchedule()
 				return
 			}
@@ -469,6 +471,7 @@ export class Agent {
 				oldestWaitingMs,
 				totalPending: unconsumed.length,
 				pendingToolResults,
+				hasPendingInput,
 			})
 
 			// Re-check after async callback — schedule could be cancelled during await
@@ -1099,6 +1102,7 @@ export class Agent {
 		const context: ToolContext = {
 			...this.buildAgentContext(agentState),
 			logger: this.logger.child({ toolName: toolCall.name }),
+			toolCallId: effectiveToolCall.id,
 		}
 
 		const result = await this.toolExecutor.execute(tool, effectiveToolCall.input, context)

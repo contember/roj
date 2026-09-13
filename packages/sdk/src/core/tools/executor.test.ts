@@ -14,6 +14,7 @@ import { SessionFileStore } from '../file-store/file-store.js'
 import type { ToolContext } from './context.js'
 import { createTool } from './definition.js'
 import { ToolExecutor } from './executor.js'
+import { ToolCallId } from './schema.js'
 
 // ============================================================================
 // Test Helpers
@@ -60,6 +61,7 @@ const createTestContext = (): ToolContext => {
 		input: undefined,
 		parentId: null,
 		runAuxiliaryInference: async () => Err({ type: 'invalid_request', message: 'not implemented in test' }),
+		toolCallId: ToolCallId('test-call'),
 	}
 }
 
