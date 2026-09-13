@@ -56,6 +56,7 @@ export const userChatEvents = createEventsFactory({
 			agentId: agentIdSchema,
 			messageId: chatMessageIdSchema,
 			content: z.string(),
+			context: z.string().optional(),
 			timestamp: z.number(),
 		}),
 		user_chat_answer_received: z.object({
@@ -95,6 +96,8 @@ export interface UserChatMessage {
 	type: "user_message";
 	messageId: ChatMessageId;
 	content: string;
+	/** What the client knew when the user sent the message; the LLM sees it, the chat does not. */
+	context?: string;
 	timestamp: number;
 }
 
@@ -384,6 +387,9 @@ function formatPendingForLLM(
 				? indexedMessage
 				: findUserMessage(messages, msg.messageId);
 			if (userMessage) parts.push(`[User]: ${userMessage.content}`);
+			if (userMessage?.context) {
+				parts.push(`<user_context>\n${userMessage.context}\n</user_context>`);
+			}
 		}
 	}
 	return parts.join("\n");
@@ -469,6 +475,7 @@ export const userChatPlugin = definePlugin("user-chat")
 						type: "user_message",
 						messageId: event.messageId,
 						content: event.content,
+						...(event.context !== undefined && { context: event.context }),
 						timestamp: event.timestamp,
 					};
 					const pending: PendingInboundMessage = {
@@ -676,6 +683,7 @@ export const userChatPlugin = definePlugin("user-chat")
 		input: z.object({
 			agentId: agentIdSchema.optional(),
 			content: z.string(),
+			context: z.string().optional(),
 		}),
 		output: z.object({
 			messageId: chatMessageIdSchema,
@@ -688,10 +696,12 @@ export const userChatPlugin = definePlugin("user-chat")
 
 			// Hard limit
 			const tokenCount = estimateTokens(input.content);
-			if (tokenCount > MESSAGE_MAX_TOKENS) {
+			const totalTokenCount =
+				tokenCount + (input.context === undefined ? 0 : estimateTokens(input.context));
+			if (totalTokenCount > MESSAGE_MAX_TOKENS) {
 				return Err(
 					ValidationErrors.invalid(
-						`Message too large: ~${tokenCount} tokens (max ${MESSAGE_MAX_TOKENS})`,
+						`Message too large: ~${totalTokenCount} tokens (max ${MESSAGE_MAX_TOKENS})`,
 					),
 				);
 			}
@@ -728,6 +738,7 @@ export const userChatPlugin = definePlugin("user-chat")
 					agentId: agentId,
 					messageId,
 					content,
+					...(input.context !== undefined && { context: input.context }),
 					timestamp: Date.now(),
 				}),
 			);
