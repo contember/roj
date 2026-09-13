@@ -39,6 +39,7 @@ export type { AgentTransportConfig, IAgentTransport, PluginNotification } from '
 // Runtime
 export { Agent } from '~/core/agents/agent.js'
 export type { AgentConfig } from '~/core/agents/agent.js'
+export type { DebounceCallback, DebounceContext, DebounceDecision } from '~/core/agents/debounce.js'
 export { SessionManager } from '~/core/sessions/session-manager.js'
 export type { SessionManagerOptions } from '~/core/sessions/session-manager.js'
 export { SessionRuntimeDetachedError, SessionStore } from '~/core/sessions/session-store.js'

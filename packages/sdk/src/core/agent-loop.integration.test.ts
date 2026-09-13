@@ -209,6 +209,52 @@ describe('agent processing loop', () => {
 
 			await harness.shutdown()
 		})
+
+		const createCallIdPreset = (seen: string[]): Preset => ({
+			id: 'test',
+			name: 'Test Preset',
+			orchestrator: {
+				system: 'You are a test agent.',
+				model: ModelId('mock'),
+				tools: [
+					createTool({
+						name: 'record_call_id',
+						description: 'Records the call id it runs under',
+						input: z.unknown(),
+						execute: async (_input, context) => {
+							seen.push(context.toolCallId)
+							return { ok: true, value: 'recorded' }
+						},
+					}),
+				],
+				agents: [],
+				debounceMs: 0,
+			},
+			agents: [],
+		})
+
+		it('tool context carries the id of the call being executed', async () => {
+			const seen: string[] = []
+			const harness = new TestHarness({
+				presets: [createCallIdPreset(seen)],
+				llmProvider: MockLLMProvider.withSequence([
+					{
+						toolCalls: [
+							{ id: ToolCallId('tc1'), name: 'record_call_id', input: {} },
+							{ id: ToolCallId('tc2'), name: 'record_call_id', input: {} },
+						],
+					},
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Record')
+
+			expect(seen).toEqual(['tc1', 'tc2'])
+
+			await harness.shutdown()
+		})
 	})
 
 	// =========================================================================

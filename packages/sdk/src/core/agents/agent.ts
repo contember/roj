@@ -1099,6 +1099,7 @@ export class Agent {
 		const context: ToolContext = {
 			...this.buildAgentContext(agentState),
 			logger: this.logger.child({ toolName: toolCall.name }),
+			toolCallId: effectiveToolCall.id,
 		}
 
 		const result = await this.toolExecutor.execute(tool, effectiveToolCall.input, context)
