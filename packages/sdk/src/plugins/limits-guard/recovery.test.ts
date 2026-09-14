@@ -13,7 +13,7 @@ import { checkLimits, resolveAgentLimits } from './limit-guard.js'
 
 const sessionId = SessionId('limits-recovery')
 const agentId = AgentId('worker')
-const applyEvent = createApplyEvent([limitsGuardPlugin.create()])
+const applyEvent = createApplyEvent([limitsGuardPlugin.create({})])
 const spawn = withSessionId(
 	sessionId,
 	agentEvents.create('agent_spawned', {
