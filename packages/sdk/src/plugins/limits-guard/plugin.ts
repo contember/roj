@@ -5,6 +5,7 @@ import { llmEvents } from '~/core/llm/state.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import type { SessionState } from '~/core/sessions/state.js'
+import type { ToolCallId } from '~/core/tools/schema.js'
 import { toolEvents } from '~/core/tools/state.js'
 import { responseFingerprint, toolCallFingerprint } from '~/lib/utils/hash.js'
 import { mailboxEvents } from '~/plugins/mailbox/state.js'
@@ -25,6 +26,8 @@ import {
 export interface AgentCounters {
 	inferenceCount: number
 	toolCallCount: number
+	/** Agents execute tools serially; recovery can start the same unfinished call again. */
+	countedToolCallId?: ToolCallId
 	spawnedAgentCount: number
 	messagesSentCount: number
 	/** Consecutive outbound-only turns with no newly consumed inbound work. */
@@ -259,12 +262,14 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 				case 'tool_started': {
 					const counters = limits.get(event.agentId)
 					if (!counters) return limits
+					if (counters.countedToolCallId === event.toolCallId) return limits
 
 					const fingerprint = toolCallFingerprint(event.toolName, event.input)
 					const newLimits = new Map(limits)
 					newLimits.set(event.agentId, {
 						...counters,
 						toolCallCount: counters.toolCallCount + 1,
+						countedToolCallId: event.toolCallId,
 						recentToolCallHashes: [...counters.recentToolCallHashes, fingerprint].slice(-20),
 					})
 					return newLimits
@@ -282,6 +287,7 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 					newLimits.set(event.agentId, {
 						...counters,
 						consecutiveToolFailures: restFailures,
+						countedToolCallId: undefined,
 					})
 					return newLimits
 				}
@@ -301,6 +307,7 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 							...counters.consecutiveToolFailures,
 							[toolName]: { count: (currentEntry?.count ?? 0) + 1, lastError: event.error },
 						},
+						countedToolCallId: undefined,
 					})
 					return newLimits
 				}
