@@ -600,6 +600,7 @@ export const userChatPlugin = definePlugin("user-chat")
 	.notification("agentMessage", {
 		schema: z.object({
 			sessionId: sessionIdSchema,
+			messageId: chatMessageIdSchema,
 			content: z.string(),
 			format: z.enum(["text", "markdown"]),
 			timestamp: z.number(),
@@ -671,6 +672,7 @@ export const userChatPlugin = definePlugin("user-chat")
 			);
 			ctx.notify("agentMessage", {
 				sessionId: ctx.sessionId,
+				messageId,
 				content: input.message,
 				format: input.format,
 				timestamp,
@@ -849,6 +851,7 @@ export const userChatPlugin = definePlugin("user-chat")
 			);
 			ctx.notify("agentMessage", {
 				sessionId: ctx.sessionId,
+				messageId: chatMessageId,
 				content,
 				format: "text",
 				timestamp: Date.now(),

@@ -544,6 +544,11 @@ describe('user-chat plugin', () => {
 			const messages = harness.notifications.getAgentMessages()
 			expect(messages).toHaveLength(1)
 			expect(messages[0].content).toBe('Hello user!')
+			const stored = selectPluginState<UserChatState>(session.state, 'messages')?.messages.filter(message => message.type === 'agent_message') ?? []
+			expect(stored).toHaveLength(1)
+			expect(harness.notifications.getByType('user-chat', 'agentMessage')[0].payload).toMatchObject({
+				messageId: stored[0].messageId,
+			})
 
 			await harness.shutdown()
 		})
@@ -1135,6 +1140,11 @@ describe('user-chat plugin', () => {
 			const messages = harness.notifications.getAgentMessages()
 			expect(messages).toHaveLength(1)
 			expect(messages[0].content).toBe('Hello from XML!')
+			const stored = selectPluginState<UserChatState>(session.state, 'messages')?.messages.filter(message => message.type === 'agent_message') ?? []
+			expect(stored).toHaveLength(1)
+			expect(harness.notifications.getByType('user-chat', 'agentMessage')[0].payload).toMatchObject({
+				messageId: stored[0].messageId,
+			})
 
 			await harness.shutdown()
 		})
