@@ -5,6 +5,7 @@ import { Err, Ok } from '~/lib/utils/result.js'
 import { withLLMRetry, withRetry } from './retry.js'
 
 const timeout: LLMError = { type: 'timeout', message: 'Request timed out' }
+const serverError: LLMError = { type: 'server_error', message: 'Bad gateway' }
 
 describe('withRetry abort handling', () => {
 	test('a cancel after a retryable failure reports the cancel, not the failure', async () => {
@@ -54,14 +55,14 @@ describe('withRetry abort handling', () => {
 		const result = await withLLMRetry(
 			async () => {
 				attempts++
-				return Err(timeout)
+				return Err(serverError)
 			},
 			{ maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 1 },
 		)
 
 		expect(attempts).toBe(3)
 		expect(result.ok).toBe(false)
-		if (!result.ok) expect(result.error.type).toBe('timeout')
+		if (!result.ok) expect(result.error.type).toBe('server_error')
 	})
 
 	test('the final failed attempt neither calculates nor logs another retry', async () => {
@@ -146,5 +147,37 @@ describe('withRetry abort handling', () => {
 
 		expect(attempts).toBe(2)
 		expect(result).toEqual(Ok('done'))
+	})
+})
+
+describe('withLLMRetry attempt caps', () => {
+	test('a timeout is attempted twice', async () => {
+		let attempts = 0
+
+		const result = await withLLMRetry(
+			async () => {
+				attempts++
+				return Err(timeout)
+			},
+			{ baseDelayMs: 1, maxDelayMs: 1 },
+		)
+
+		expect(attempts).toBe(2)
+		expect(result).toEqual(Err(timeout))
+	})
+
+	test('other retryable errors keep the full attempt budget', async () => {
+		let attempts = 0
+
+		const result = await withLLMRetry(
+			async () => {
+				attempts++
+				return Err(serverError)
+			},
+			{ baseDelayMs: 1, maxDelayMs: 1 },
+		)
+
+		expect(attempts).toBe(5)
+		expect(result).toEqual(Err(serverError))
 	})
 })

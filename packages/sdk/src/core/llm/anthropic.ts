@@ -18,7 +18,7 @@ import type {
 	RawToolSpec,
 } from './provider.js'
 import { mapProviderError } from './provider.js'
-import { ProviderRequestAbortError, runProviderRequest } from './provider-request.js'
+import { DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS, ProviderRequestAbortError, runProviderRequest } from './provider-request.js'
 import { sanitizeProviderMessages } from './message-sanitization.js'
 import type { RoutableLLMProvider } from './routing-provider.js'
 
@@ -252,7 +252,7 @@ export class AnthropicProvider implements RoutableLLMProvider {
 		this.logger = config.logger
 		this.imageProcessor = config.imageProcessor
 		this.thinkingBudget = config.thinkingBudget
-		this.timeout = config.timeout ?? 120000
+		this.timeout = config.timeout ?? DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS
 		this.fetchFn = config.fetch ?? globalThis.fetch
 	}
 
