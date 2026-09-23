@@ -19,7 +19,7 @@ import type {
 	RawInferenceRequest,
 } from './provider.js'
 import { mapProviderError } from './provider.js'
-import { ProviderRequestAbortError, runProviderRequest } from './provider-request.js'
+import { DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS, ProviderRequestAbortError, runProviderRequest } from './provider-request.js'
 import { sanitizeProviderMessages } from './message-sanitization.js'
 
 // ============================================================================
@@ -197,7 +197,7 @@ export class OpenRouterProvider implements LLMProvider {
 		this.defaultModel = config.defaultModel ?? 'anthropic/claude-sonnet-4.5'
 		this.logger = config.logger
 		this.imageProcessor = config.imageProcessor
-		this.timeout = config.timeout ?? 120000
+		this.timeout = config.timeout ?? DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS
 		this.fetchFn = config.fetch ?? globalThis.fetch
 	}
 

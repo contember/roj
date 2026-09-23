@@ -1,5 +1,8 @@
 export type ProviderRequestAbortCause = 'caller' | 'timeout'
 
+/** Bounds the whole non-streamed response, so it caps how many output tokens one call can produce. */
+export const DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS = 300_000
+
 export class ProviderRequestAbortError extends Error {
 	constructor(readonly abortCause: ProviderRequestAbortCause) {
 		super(abortCause === 'caller' ? 'Request was aborted' : 'Request timed out')

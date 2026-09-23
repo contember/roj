@@ -27,6 +27,8 @@ export const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
 export interface WithRetryOptions<E> extends RetryOptions {
 	isRetryable: (error: E) => boolean
 	getRetryDelay?: (error: E) => number | undefined
+	/** Lower attempt cap for the error just returned; `undefined` keeps `maxAttempts`. */
+	getMaxAttempts?: (error: E) => number | undefined
 	/** Error to return when the caller's signal aborts, whichever attempt that happens on. */
 	abortError?: E
 	logger?: Logger
@@ -83,7 +85,8 @@ export async function withRetry<T, E>(
 			return Err(options.abortError ?? lastError)
 		}
 
-		if (attempt >= opts.maxAttempts || !options.isRetryable(lastError)) {
+		const maxAttempts = Math.min(opts.maxAttempts, options.getMaxAttempts?.(lastError) ?? opts.maxAttempts)
+		if (attempt >= maxAttempts || !options.isRetryable(lastError)) {
 			return result
 		}
 
@@ -140,6 +143,16 @@ export function isRetryableLLMError(error: LLMError): boolean {
 }
 
 /**
+ * A timed-out request already cost a full timeout, and a response too long to finish
+ * in time times out again on the identical retry.
+ */
+const MAX_LLM_TIMEOUT_ATTEMPTS = 2
+
+function getLLMMaxAttempts(error: LLMError): number | undefined {
+	return error.type === 'timeout' ? MAX_LLM_TIMEOUT_ATTEMPTS : undefined
+}
+
+/**
  * Gets retry delay from LLM error if available (e.g., rate limit retry-after).
  */
 export function getLLMRetryDelay(error: LLMError): number | undefined {
@@ -157,6 +170,7 @@ export async function withLLMRetry<T>(
 		...options,
 		isRetryable: isRetryableLLMError,
 		getRetryDelay: getLLMRetryDelay,
+		getMaxAttempts: getLLMMaxAttempts,
 		abortError: { type: 'aborted', message: 'Request was aborted' },
 		context: 'LLM inference',
 	})
