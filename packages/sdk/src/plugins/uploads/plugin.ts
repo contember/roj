@@ -1,6 +1,7 @@
 import z from 'zod/v4'
 import type { AgentId } from '~/core/agents/schema.js'
 import { createDomainError, type DomainError, ValidationErrors } from '~/core/errors.js'
+import { EventAppendError } from '~/core/events/event-store.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import type { InferenceContext } from '~/core/llm/provider.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
@@ -888,6 +889,22 @@ function startAsyncUpload(args: {
 	})
 }
 
+/** Removes an upload whose 'processing' event definitely did not commit, so no later load turns it into an attachment. */
+async function discardUnrecordedUpload(prepared: PreparedUpload, logger: Logger): Promise<void> {
+	try {
+		const removedMetadata = await prepared.uploadStore.remove('meta.json')
+		if (!removedMetadata.ok) throw new Error(removedMetadata.error)
+		if (prepared.source.kind === 'file') {
+			const removedFile = await prepared.uploadStore.remove(prepared.filename)
+			if (!removedFile.ok) throw new Error(removedFile.error)
+		}
+	} catch (error) {
+		logger.error('Could not discard an upload whose start was not recorded', error instanceof Error ? error : undefined, {
+			uploadId: prepared.uploadIdStr,
+		})
+	}
+}
+
 /** The upload is already gone, so a host that cannot release its blobs leaves garbage, not a failed delete. */
 async function releaseBlobs(args: {
 	blobStore?: UploadBlobStore
@@ -1000,6 +1017,8 @@ async function beginAsyncUpload(args: {
 			}),
 		)
 	} catch (error) {
+		// An unknown outcome keeps the metadata: if the event landed, the next load must still run the upload.
+		if (error instanceof EventAppendError) await discardUnrecordedUpload(prepared, host.logger)
 		return abandonStart(host, prepared, error)
 	}
 	const processing = host.runtimeActivity.getSnapshot().state === 'ready'
