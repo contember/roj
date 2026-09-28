@@ -1002,16 +1002,15 @@ async function beginAsyncUpload(args: {
 	} catch (error) {
 		return abandonStart(host, prepared, error)
 	}
-	if (host.runtimeActivity.getSnapshot().state === 'parking') {
-		// The 'processing' event is committed, so the next load re-runs the upload from the log.
-		prepared.lifecycle.abandon()
-		return Ok({ uploadId: prepared.uploadIdStr, status: 'processing' })
-	}
 	const processing = host.runtimeActivity.getSnapshot().state === 'ready'
 		? host.runtimeActivity.tryOperation(`upload:${prepared.uploadIdStr}:processing`)
 		: null
+	if (!processing) {
+		// The 'processing' event is committed, so whichever runtime loads the session next re-runs it from the log.
+		prepared.lifecycle.abandon()
+		return Ok({ uploadId: prepared.uploadIdStr, status: 'processing' })
+	}
 	try {
-		if (!processing) throw new Error('Session runtime is unavailable')
 		prepared.lifecycle.attachRuntimeLease(() => processing.release())
 	} catch (error) {
 		return abandonStart(host, prepared, error)
