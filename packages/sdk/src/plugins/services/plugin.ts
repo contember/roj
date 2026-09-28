@@ -343,6 +343,16 @@ export const servicePlugin = definePlugin('services')
 			const removeEffect = () => statusEffects.delete(effect)
 			void effect.then(removeEffect, removeEffect)
 		}
+		const settleStatusEffectsForClose = async (reason: Parameters<ServiceExecutor['close']>[1]): Promise<void> => {
+			try {
+				await waitForStatusEffects()
+			} catch (error) {
+				// A failed publication holds no process or port. Only a park is retried, so
+				// only a park reports it as a failed close; a revoke would stay unsafe for good.
+				if (reason === 'parked') throw error
+				logger.error('Service status publication failed before close', error instanceof Error ? error : new Error(String(error)), { reason })
+			}
+		}
 		const close = async (
 			sessionId: Parameters<ServiceExecutor['close']>[0],
 			reason: Parameters<ServiceExecutor['close']>[1],
@@ -356,7 +366,7 @@ export const servicePlugin = definePlugin('services')
 				publicationEnabled = false
 				executor.onStatusChanged = undefined
 				executor.onStartSettled = undefined
-				try { await waitForStatusEffects() } finally {
+				try { await settleStatusEffectsForClose(reason) } finally {
 					for (const [serviceType, lease] of serviceLeases) releaseLease(serviceType, lease)
 				}
 			}
