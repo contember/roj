@@ -723,7 +723,8 @@ export const userChatPlugin = definePlugin("user-chat")
 	})
 	.method("sendMessage", {
 		input: z.object({
-			deliveryId: z.string().min(1).optional(),
+			// Every receipt stays in the projection for the session lifetime, so the ID must stay small.
+			deliveryId: z.string().min(1).max(256).optional(),
 			agentId: agentIdSchema.optional(),
 			content: z.string(),
 			context: z.string().optional(),

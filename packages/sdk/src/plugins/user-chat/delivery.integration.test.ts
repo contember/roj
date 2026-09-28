@@ -170,6 +170,15 @@ describe('user-chat delivery receipts', () => {
 		for (const event of events) expect(event).not.toHaveProperty('delivery')
 	})
 
+	it('rejects a delivery ID longer than 256 characters before accepting anything', async () => {
+		const { session } = await paused(harness())
+		expect(await session.callPluginMethod('user-chat.sendMessage', { deliveryId: 'x'.repeat(257), content: 'Hello' })).toMatchObject({
+			ok: false, error: { type: 'validation_error' },
+		})
+		expect(await session.getEventsByType('user_chat_message_received')).toHaveLength(0)
+		expect((await session.callPluginMethod('user-chat.sendMessage', { deliveryId: 'x'.repeat(256), content: 'Hello' })).ok).toBe(true)
+	})
+
 	it('does not rewrite full-content files when a long delivery is replayed', async () => {
 		const { session } = await paused(harness())
 		const write = spyOn(SessionFileStore.prototype, 'write')
