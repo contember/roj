@@ -391,30 +391,30 @@ describe('cross-host file-backed handoff', () => {
 	})
 
 	for (const committed of [false, true]) {
-		it(`recovers inbound delivery after ${committed ? 'committed rename with failed readback' : 'pending write before failed rename'} using the log rather than metadata`, async () => {
+		it(`recovers inbound delivery after ${committed ? 'an append that could not be rolled back' : 'an append that wrote nothing'} using the log rather than metadata`, async () => {
 			const f = await fixture()
 			const fs = createNodePlatform().fs
-			const rename = fs.rename
-			if (!rename) throw new Error('Node platform requires rename')
 			let armed = false
-			let blockedPath: string | undefined
-			let pendingPath: string | undefined
-			function readFile(path: string): Promise<Buffer>
-			function readFile(path: string, encoding: 'utf-8' | 'utf8'): Promise<string>
-			function readFile(path: string, encoding?: 'utf-8' | 'utf8'): Promise<Buffer | string> {
-				if (path === blockedPath) return Promise.reject(new Error('Injected readback unavailable'))
-				return encoding === undefined ? fs.readFile(path) : fs.readFile(path, encoding)
-			}
+			let rollingBack = false
 			const faultFs: FileSystem = {
-				...fs, readFile,
-				rename: async (source, target) => {
-					if (armed && target.includes(`${join('.events', 'batches')}/`)) {
+				...fs,
+				appendFile: async (path, data) => {
+					if (armed && path.endsWith(join('.events', 'events.jsonl'))) {
 						armed = false
-						pendingPath = source
-						if (committed) { await rename(source, target); blockedPath = target }
-						throw new Error('Injected rename response failure')
+						if (committed) {
+							await fs.appendFile(path, data)
+							rollingBack = true
+						}
+						throw new Error('Injected append response failure')
 					}
-					await rename(source, target)
+					await fs.appendFile(path, data)
+				},
+				rename: async (source, target) => {
+					if (rollingBack) {
+						rollingBack = false
+						throw new Error('Injected rollback failure')
+					}
+					await fs.rename?.(source, target)
 				},
 			}
 			const a = host(f, { fs: faultFs })
@@ -423,11 +423,8 @@ describe('cross-host file-backed handoff', () => {
 			armed = true
 			const failed = await session.callPluginMethod('user-chat.sendMessage', { deliveryId: 'd1', content: 'fault input' }).catch((error: unknown) => error)
 			expect(failed).toBeInstanceOf(committed ? EventAppendOutcomeUnknownError : EventAppendError)
-			expect(pendingPath).toBeDefined()
-			if (!pendingPath) throw new Error('Fault did not hit an event batch')
-			// Recovery never reads pending files, so a failed commit drops its own rather
-			// than leaving one behind for every retry.
-			expect(await fs.exists(pendingPath)).toBe(false)
+			const eventsDir = join(f.directory, 'sessions', session.id, '.events')
+			expect((await fs.readdir(eventsDir)).filter((name) => name.startsWith('.pending-'))).toEqual([])
 			if (committed) {
 				await expect(session.callPluginMethod('host-test.mark', { value: 'uncertain' })).rejects.toBeInstanceOf(EventAppendOutcomeUnknownError)
 			}

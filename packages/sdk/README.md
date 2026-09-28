@@ -142,34 +142,27 @@ request with the same ID once recovery and ownership are safe.
 `FileEventStore(basePath, fs, logger?)` requires `FileSystem.rename`. This method
 is optional on the general filesystem interface but mandatory for this store;
 construction without it throws `FileEventStoreCapabilityError`. The adapter must
-provide atomic same-directory rename, including replacement of metadata files.
+provide atomic same-directory rename.
 
-Under `sessions/<sessionId>/.events/`, valid legacy `events.jsonl` remains readable
-and is never appended to or rewritten by the new writer. New appends use
-`batches/0000000000000000.json`, followed by contiguous hexadecimal sequence names.
-Each version-1 envelope contains `version`, `batch`, `byteLength`, `sha256`, and
-`payload` (a JSON string containing a nonempty event array). Recovery validates
-the sequence, UTF-8, payload length/checksum, event shape, and session identity.
+Events live in `sessions/<sessionId>/.events/events.jsonl`, one JSON event per
+line. A line is committed once its newline is written. A trailing line without
+one is an append that never completed: reads ignore it, and the next append
+drops it by replacing the log through a rename.
 
-The writer writes `.pending-*` in the destination directory and atomically renames
-it into the committed batch name, and drops its own pending file when that rename
-fails. An append batch has all-or-none logical visibility, not a partially
-replayable prefix. Recovery ignores pending files and attempts their cleanup
-after validating committed history. Metadata is derived
-from events and refreshed separately; metadata-write failure does not undo a
-confirmed event commit. This protocol does **not** call fsync or guarantee survival
-of power loss. It requires a single writer instance per session, not merely a
-filesystem shared by several independently cached stores.
+An append that fails is rolled back to the last committed line, so a retry
+cannot duplicate it (`EventAppendError`). When the rollback fails too, the
+outcome is unknown (`EventAppendOutcomeUnknownError`) and the next load of the
+log decides it. A complete line that does not parse is `EventLogCorruptionError`.
 
-Nothing here enforces that. `rename` replaces its destination, so two stores over
-one directory overwrite each other's batches with no error and nothing a later
-recovery can detect. A host that runs more than one instance must fence
-externally and surface the loss through `SessionOwnershipLostError` — see
-**Ownership** below.
+`meta.json` is derived from the log and may lag it: a failed metadata write does
+not undo a committed append, and the counters are rebuilt from the log on the
+next append or load. Listing sessions reads only `meta.json`, never an event log.
 
-**Downgrade is unsupported after the first new batch commit.** An older SDK may
-see only legacy history. Safe rollback requires a suitable pre-write backup or a
-deployment that understands batches; never point an old SDK at newly written data.
+This protocol does **not** call fsync or guarantee survival of power loss. It
+requires a single writer instance per session: the store caches where the next
+append starts. Nothing enforces that. A host that runs more than one instance
+must fence externally and surface the loss through `SessionOwnershipLostError`
+— see **Ownership** below.
 
 ## Ownership
 
@@ -205,10 +198,10 @@ reconciling that on load is not implemented.
    confirmed not committed; `EventAppendOutcomeUnknownError` means it could not
    be determined. Do not blindly retry writes on an uncertain store instance.
 3. After an uncertain outcome, use a **fresh event store and runtime** under safe
-   single-writer ownership. Replay establishes which receipts and batches exist.
+   single-writer ownership. Replay establishes which receipts and events exist.
 4. On `EventLogCorruptionError`, stop and investigate or restore a verified backup.
-   Malformed historical legacy JSONL is not automatically repairable. Do not
-   truncate history or remove committed batches to make validation pass.
+   A malformed committed line is not automatically repairable. Do not truncate
+   history or remove committed lines to make validation pass.
 5. Retry unacknowledged deliveries with the same IDs and requests; retry pending
    durable wakes against the admitted owner. Confirm receipt/history recovery
    separately from inference or external-effect completion.
