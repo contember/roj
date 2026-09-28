@@ -227,14 +227,15 @@ describe('user-chat delivery receipts', () => {
 		expect(await fresh.callPluginMethod('user-chat.getMessages', { sessionId: session.sessionId })).not.toHaveProperty('value.acceptedDeliveries')
 	})
 
-	it('propagates unknown acceptance, fences retries, and replays the committed receipt after reload', async () => {
+	it('propagates unknown acceptance, refuses retries on the stopped runtime, and replays the committed receipt after reload', async () => {
 		const store = new DeliveryStore()
 		const owner = harness(store)
 		const { session } = await paused(owner)
 		store.failure = 'unknown'
 		const input = { deliveryId: 'unknown', content: 'Committed' }
 		await expect(session.callPluginMethod('user-chat.sendMessage', input)).rejects.toBeInstanceOf(EventAppendOutcomeUnknownError)
-		await expect(session.callPluginMethod('user-chat.sendMessage', input)).rejects.toThrow()
+		// The fence stopped the runtime, so the retry is refused before it can write a duplicate.
+		expect(await session.callPluginMethod('user-chat.sendMessage', input)).toMatchObject({ ok: false, error: { type: 'session_runtime_unavailable' } })
 		expect(await session.getEventsByType('user_chat_message_received')).toHaveLength(1)
 		await owner.shutdown()
 		const fresh = await harness(store).openSession(session.sessionId)
