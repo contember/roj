@@ -133,6 +133,11 @@ export interface CreateSystemOptions<TPlugins extends readonly PluginDefinition<
 	 * An evicted runtime is rebuilt from its event log and re-runs `onSessionReady`.
 	 */
 	sessionIdleTimeoutMs?: number
+	/**
+	 * Bound on waiting for a turn in a session's ordered write queue. Absent uses
+	 * the SDK default. A host that drains on a deadline should keep this under its own budget.
+	 */
+	writeQueueTimeoutMs?: number
 }
 
 // ============================================================================
@@ -161,6 +166,7 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		pidRegistry,
 		platform,
 		sessionIdleTimeoutMs,
+		writeQueueTimeoutMs,
 	} = options
 
 	// Build plugins accessor — typed record keyed by plugin name
@@ -187,6 +193,7 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		pidRegistry,
 		platform,
 		sessionIdleTimeoutMs,
+		writeQueueTimeoutMs,
 		systemPlugins: [...plugins],
 	})
 
