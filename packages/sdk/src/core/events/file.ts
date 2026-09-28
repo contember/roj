@@ -134,7 +134,8 @@ function copyMetadata(metadata: SessionMetadata | null): SessionMetadata | null 
  * as committed once its newline is on disk. meta.json contains session metadata
  * for quick access; it is derived from the log and may lag it.
  *
- * Requires a single writer per session: the committed length is cached per instance.
+ * Requires a single writer per session: the committed length is cached per instance,
+ * so a host that takes a session back must load it before appending.
  */
 export class FileEventStore extends BaseEventStore {
 	private readonly rename: (source: string, dest: string) => Promise<void>
@@ -198,6 +199,7 @@ export class FileEventStore extends BaseEventStore {
 
 		const path = this.getEventsPath(sessionId)
 		const content = events.map((event) => `${JSON.stringify(event)}\n`).join('')
+		const contentSize = Buffer.byteLength(content, 'utf8')
 		let committed: number | undefined
 		try {
 			await this.fs.mkdir(dirname(path), { recursive: true })
@@ -205,9 +207,9 @@ export class FileEventStore extends BaseEventStore {
 			await this.fs.appendFile(path, content)
 		} catch (cause) {
 			if (committed === undefined) throw new EventAppendError(sessionId, cause)
-			await this.rollBack(sessionId, committed, cause)
+			await this.rollBack(sessionId, committed, contentSize, cause)
 		}
-		this.committedSizes.set(sessionId, committed + Buffer.byteLength(content, 'utf8'))
+		this.committedSizes.set(sessionId, committed + contentSize)
 
 		// meta.json is derived from the log, so a failure to update it cannot undo a committed append.
 		if (this.staleMetadata.has(sessionId)) {
@@ -260,11 +262,13 @@ export class FileEventStore extends BaseEventStore {
 	}
 
 	/** Restore the log to what was committed before a failed append, so the append definitely did not commit. */
-	private async rollBack(sessionId: SessionId, committed: number, cause: unknown): Promise<never> {
+	private async rollBack(sessionId: SessionId, committed: number, appended: number, cause: unknown): Promise<never> {
 		this.committedSizes.delete(sessionId)
 		try {
 			const bytes = await this.readLogOrEmpty(sessionId)
 			if (bytes.length < committed) throw new Error('Event log shrank below its committed length')
+			// More bytes than this append could have written belong to another writer, and truncating would delete them.
+			if (bytes.length > committed + appended) throw new Error('Event log grew beyond the failed append')
 			if (bytes.length > committed) await this.replaceLog(sessionId, bytes.subarray(0, committed))
 		} catch {
 			// Whatever the append wrote may still be there, and the next load will replay it.
@@ -310,8 +314,10 @@ export class FileEventStore extends BaseEventStore {
 		}
 
 		const complete = completeLength(bytes)
+		// The log is the authority: another owner may have written since this instance cached a size.
 		// A torn tail is left for the next append to drop, so its length is not where that append starts.
 		if (complete === bytes.length) this.committedSizes.set(sessionId, complete)
+		else this.committedSizes.delete(sessionId)
 		const lines = bytes.subarray(0, complete).toString('utf8').split('\n')
 		const events: DomainEvent[] = []
 		for (const [index, line] of lines.entries()) {
