@@ -840,6 +840,53 @@ describe('workers plugin', () => {
 
 			await harness.shutdown()
 		})
+
+		it('rejects a sub-event its reducer throws on without logging it', async () => {
+			let emitFailure: unknown
+			const rejectingWorker = createWorkerDefinition(
+				'rejecting',
+				'Emits a sub-event its reducer rejects',
+				z.object({}),
+				{
+					initialState: () => ({}),
+					reduce: (state: {}, event: { type: string }) => {
+						if (event.type === 'poison') throw new Error('Reducer rejects poison')
+						return state
+					},
+					execute: async (_config, ctx) => {
+						emitFailure = await ctx.emit({ type: 'poison' }).then(() => undefined, (error: unknown) => error)
+						return Ok({ status: 'done', summary: 'Emit settled' })
+					},
+				},
+			)
+			const eventStore = new MemoryEventStore()
+			const preset = createTestPreset({ plugins: [workerPlugin.configure({ workers: [rejectingWorker] })] })
+			const harness = createWorkersHarness({
+				presets: [preset],
+				eventStore,
+				llmProvider: MockLLMProvider.withSequence([
+					{ toolCalls: [{ id: ToolCallId('tc1'), name: 'worker_rejecting_start', input: {} }] },
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
+			let reloaded: TestHarness | undefined
+			try {
+				const session = await harness.createSession('test')
+				await session.sendAndWaitForIdle('Start worker')
+				await waitFor(() => emitFailure !== undefined)
+				expect(emitFailure).toBeInstanceOf(Error)
+				expect(await session.getEventsByType(workerEvents, 'worker_sub_event')).toHaveLength(0)
+				await harness.shutdown()
+
+				// A logged poison event would throw again on every replay and leave the session unloadable.
+				reloaded = createWorkersHarness({ presets: [preset], eventStore })
+				const reopened = await reloaded.openSession(session.sessionId)
+				expect(reopened.sessionId).toBe(session.sessionId)
+			} finally {
+				await harness.shutdown()
+				await reloaded?.shutdown()
+			}
+		})
 	})
 
 	// =========================================================================
