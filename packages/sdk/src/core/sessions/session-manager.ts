@@ -136,6 +136,8 @@ export class SessionParkTimeoutError extends Error {
 interface SessionTenure {
 	readonly handle: SessionActivation
 	state: 'active' | 'parking' | 'released' | 'revoked'
+	/** Created by first access rather than by a host's activateSession — nobody holds its handle. */
+	readonly implicit: boolean
 	parkPromise?: Promise<void>
 	entry?: SessionCacheEntry
 	readonly entries: Set<SessionCacheEntry>
@@ -167,6 +169,10 @@ export class SessionManager {
 	private readonly activations = new WeakMap<SessionActivation, SessionTenure>()
 
 	activateSession(sessionId: SessionId): Result<SessionActivation, DomainError> {
+		return this.activate(sessionId, false)
+	}
+
+	private activate(sessionId: SessionId, implicit: boolean): Result<SessionActivation, DomainError> {
 		if (!isValidSessionId(sessionId)) return Err(ValidationErrors.invalid(`Invalid session id: ${sessionId}`))
 		if (this.shuttingDown) return Err(SessionErrors.runtimeUnavailable(String(sessionId), 'shutdown'))
 		const old = this.tenures.get(sessionId)
@@ -176,7 +182,7 @@ export class SessionManager {
 		}
 		if (old) { old.entries.clear(); old.entry = undefined }
 		const handle: SessionActivation = Object.freeze({ sessionId })
-		const tenure: SessionTenure = { handle, state: 'active', entries: new Set() }
+		const tenure: SessionTenure = { handle, state: 'active', implicit, entries: new Set() }
 		this.tenures.set(sessionId, tenure)
 		this.activations.set(handle, tenure)
 		return Ok(handle)
@@ -274,7 +280,7 @@ export class SessionManager {
 	private admission(sessionId: SessionId): Result<SessionTenure, DomainError> {
 		let tenure = this.tenures.get(sessionId)
 		if (!tenure) {
-			const activation = this.activateSession(sessionId)
+			const activation = this.activate(sessionId, true)
 			if (!activation.ok) return activation
 			tenure = this.activations.get(activation.value)
 		}
@@ -779,10 +785,20 @@ export class SessionManager {
 				if (this.sessions.get(sessionId) === entry) this.sessions.delete(sessionId)
 				this.forgetEntry(entry, entry.runtime)
 				if (tenure.state !== 'active') return Err(SessionErrors.runtimeUnavailable(String(sessionId), tenure.state))
-				if (error instanceof SessionLoadError) return Err(error.domainError)
+				if (error instanceof SessionLoadError) {
+					if (error.domainError.type === 'session_not_found') this.forgetUnknownSession(tenure)
+					return Err(error.domainError)
+				}
 				throw error
 			}
 		}
+	}
+
+	/** Drop the tenure a lookup of a nonexistent id created, so unknown ids cannot grow the map. */
+	private forgetUnknownSession(tenure: SessionTenure): void {
+		const { sessionId } = tenure.handle
+		if (!tenure.implicit || tenure.state !== 'active' || tenure.entries.size > 0) return
+		if (this.tenures.get(sessionId) === tenure) this.tenures.delete(sessionId)
 	}
 
 	/**
@@ -1131,6 +1147,8 @@ export class SessionManager {
 		loadedSessionCount: number
 		/** Tenures still guarding a runtime the cache already dropped. Should settle to zero. */
 		retainedRuntimeCount: number
+		/** Session ids this manager tracks ownership for. Grows with sessions that exist, not with ids asked for. */
+		tenureCount: number
 		sessions: Array<{
 			id: SessionId
 			state: SessionCacheEntry['state']
@@ -1146,6 +1164,7 @@ export class SessionManager {
 			loadedSessionCount: this.sessions.size,
 			retainedRuntimeCount: [...this.tenures.values()]
 				.filter((tenure) => tenure.entry !== undefined || tenure.entries.size > 0).length,
+			tenureCount: this.tenures.size,
 			sessions: [...this.sessions].map(([id, entry]) => {
 				const activity = entry.activity.getSnapshot()
 				return {
