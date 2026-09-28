@@ -272,6 +272,7 @@ export class FileEventStore extends BaseEventStore {
 			if (bytes.length > committed) await this.replaceLog(sessionId, bytes.subarray(0, committed))
 		} catch {
 			// Whatever the append wrote may still be there, and the next load will replay it.
+			this.staleMetadata.add(sessionId)
 			throw new EventAppendOutcomeUnknownError(sessionId, cause)
 		}
 		this.committedSizes.set(sessionId, committed)
