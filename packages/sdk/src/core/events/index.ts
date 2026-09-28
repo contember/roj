@@ -1,6 +1,7 @@
 export { BaseEventStore } from './base-event-store.js'
 export type { EventStore, LoadRangeOptions, LoadRangeResult } from './event-store.js'
 export {
+	ClosedSessionAppendError,
 	EventAppendError,
 	EventAppendOutcomeUnknownError,
 	EventLogCorruptionError,
