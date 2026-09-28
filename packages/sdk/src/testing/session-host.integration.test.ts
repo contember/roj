@@ -356,14 +356,37 @@ describe('cross-host file-backed handoff', () => {
 		await expect(session.callPluginMethod('host-test.mark', { value: 'late' }))
 			.rejects.toBeInstanceOf(SessionOwnershipLostError)
 
-		// The runtime stopped itself rather than retrying, and residency is gone, so a
-		// later access reloads and asks the store who owns the log now.
+		// The runtime stopped itself rather than retrying, and residency is gone.
 		expect(a.manager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
 		const b = host(f, { eventStore: backing.adapter(2) })
 		const reopened = await load(b, session.id)
 		expect((await reopened.callPluginMethod('host-test.mark', { value: 'new' })).ok).toBe(true)
 		const events = await backing.load(session.id)
 		expect(z.array(z.object({ value: z.string() })).parse(events.filter((event) => event.type === 'host_marker'))).toEqual([{ value: 'new' }])
+	})
+
+	it('refuses access on the stale host after ownership loss until the host activates again', async () => {
+		const f = await fixture()
+		const backing = new EpochBacking()
+		const a = host(f, { eventStore: backing.adapter(1) })
+		const session = await create(a)
+		const tenure = activate(a, session.id)
+		await backing.transfer(session.id)
+		await expect(session.callPluginMethod('host-test.mark', { value: 'late' }))
+			.rejects.toBeInstanceOf(SessionOwnershipLostError)
+		await session.whenSafe()
+
+		// A reload would replay the log and restart its work on a host that no longer
+		// owns it, only to fence again on the first write.
+		const misses = a.manager.getRuntimeCacheStats().misses
+		for (let attempt = 0; attempt < 3; attempt++) {
+			expect(await a.manager.getSession(session.id)).toMatchObject({ ok: false, error: { type: 'session_ownership_lost' } })
+			expect(await a.manager.callPluginMethod(session.id, 'host-test.mark', { value: 'again' }))
+				.toMatchObject({ ok: false, error: { type: 'session_ownership_lost' } })
+		}
+		expect(a.manager.getRuntimeCacheStats().misses).toBe(misses)
+		await expect(a.manager.parkSession(tenure)).rejects.toBeInstanceOf(SessionOwnershipLostError)
+		expect(a.manager.activateSession(session.id).ok).toBe(true)
 	})
 
 	it('revokes inference synchronously and discards a noncooperative provider result without executing tools', async () => {

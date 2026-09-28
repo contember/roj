@@ -45,7 +45,7 @@ import type { PortPool } from '~/plugins/services/port-pool.js'
 import type { ServiceConfig } from '~/plugins/services/schema.js'
 import { selectSessionStats, type SessionStatsState } from '~/plugins/session-stats/index.js'
 import type { PreprocessorRegistry } from '~/plugins/uploads/preprocessor.js'
-import { EventStore } from '../events/event-store.js'
+import { EventStore, SessionOwnershipLostError } from '../events/event-store.js'
 import { createApplyEvent } from './apply-event.js'
 import { rewriteEventsForFork } from './fork-utils.js'
 import { SessionStore } from './session-store.js'
@@ -137,7 +137,8 @@ export class SessionParkTimeoutError extends Error {
 
 interface SessionTenure {
 	readonly handle: SessionActivation
-	state: 'active' | 'parking' | 'released' | 'revoked'
+	/** `lost` once a write found another host owning the log; only activateSession clears it. */
+	state: 'active' | 'parking' | 'released' | 'revoked' | 'lost'
 	/** Created by first access rather than by a host's activateSession — nobody holds its handle. */
 	readonly implicit: boolean
 	parkPromise?: Promise<void>
@@ -213,6 +214,7 @@ export class SessionManager {
 			tenure.parkPromise = Promise.reject(new SessionRuntimeUnavailableError(handle.sessionId, 'unloading'))
 			return tenure.parkPromise
 		}
+		if (tenure.state === 'lost') return Promise.reject(new SessionOwnershipLostError(handle.sessionId))
 		if (this.tenures.get(handle.sessionId) !== tenure || tenure.state === 'released' || tenure.state === 'revoked') return Promise.resolve()
 		tenure.state = 'parking'
 		const entries = [...tenure.entries].filter((entry) => entry.activity.getSnapshot().state !== 'disposed')
@@ -279,6 +281,11 @@ export class SessionManager {
 		}
 	}
 
+	private refusal(tenure: SessionTenure): DomainError {
+		const sessionId = String(tenure.handle.sessionId)
+		return tenure.state === 'lost' ? SessionErrors.ownershipLost(sessionId) : SessionErrors.runtimeUnavailable(sessionId, tenure.state)
+	}
+
 	private admission(sessionId: SessionId): Result<SessionTenure, DomainError> {
 		let tenure = this.tenures.get(sessionId)
 		if (!tenure) {
@@ -286,14 +293,15 @@ export class SessionManager {
 			if (!activation.ok) return activation
 			tenure = this.activations.get(activation.value)
 		}
-		if (!tenure || tenure.state !== 'active') return Err(SessionErrors.runtimeUnavailable(String(sessionId), tenure?.state ?? 'revoked'))
+		if (!tenure) return Err(SessionErrors.runtimeUnavailable(String(sessionId), 'revoked'))
+		if (tenure.state !== 'active') return Err(this.refusal(tenure))
 		if (!this.sessions.has(sessionId) && tenure.entry?.runtime?.hasUnsafeResources()) return Err(SessionErrors.runtimeUnavailable(String(sessionId), 'unloading'))
 		return Ok(tenure)
 	}
 
 	private assertAdmission(tenure: SessionTenure): void {
 		if (this.shuttingDown || tenure.state !== 'active' || this.tenures.get(tenure.handle.sessionId) !== tenure) {
-			throw new SessionLoadError(SessionErrors.runtimeUnavailable(String(tenure.handle.sessionId), tenure.state))
+			throw new SessionLoadError(this.refusal(tenure))
 		}
 	}
 	/** Manager-level methods collected from plugin definitions across all presets */
@@ -588,7 +596,7 @@ export class SessionManager {
 			if (this.sessions.get(sessionId) === entry) this.sessions.delete(sessionId)
 			entry.listenerCleanup?.()
 			this.forgetEntry(entry, entry.runtime)
-			if (tenure.state !== 'active') return Err(SessionErrors.runtimeUnavailable(String(sessionId), tenure.state))
+			if (tenure.state !== 'active') return Err(this.refusal(tenure))
 			if (error instanceof SessionLoadError) return Err(error.domainError)
 			throw error
 		}
@@ -710,7 +718,7 @@ export class SessionManager {
 			if (this.sessions.get(newSessionId) === entry) this.sessions.delete(newSessionId)
 			entry.listenerCleanup?.()
 			this.forgetEntry(entry, entry.runtime)
-			if (tenure.state !== 'active') return Err(SessionErrors.runtimeUnavailable(String(newSessionId), tenure.state))
+			if (tenure.state !== 'active') return Err(this.refusal(tenure))
 			if (error instanceof SessionLoadError) return Err(error.domainError)
 			throw error
 		}
@@ -737,7 +745,7 @@ export class SessionManager {
 		if (!admission.ok) return admission
 		const tenure = admission.value
 		while (true) {
-			if (tenure.state !== 'active' || this.tenures.get(sessionId) !== tenure) return Err(SessionErrors.runtimeUnavailable(String(sessionId), tenure.state))
+			if (tenure.state !== 'active' || this.tenures.get(sessionId) !== tenure) return Err(this.refusal(tenure))
 			if (this.shuttingDown) return Err(ValidationErrors.invalid('Session manager is shutting down'))
 			const currentAdmission = this.admission(sessionId)
 			if (!currentAdmission.ok) return currentAdmission
@@ -786,7 +794,7 @@ export class SessionManager {
 			} catch (error) {
 				if (this.sessions.get(sessionId) === entry) this.sessions.delete(sessionId)
 				this.forgetEntry(entry, entry.runtime)
-				if (tenure.state !== 'active') return Err(SessionErrors.runtimeUnavailable(String(sessionId), tenure.state))
+				if (tenure.state !== 'active') return Err(this.refusal(tenure))
 				if (error instanceof SessionLoadError) {
 					if (error.domainError.type === 'session_not_found') this.forgetUnknownSession(tenure)
 					return Err(error.domainError)
@@ -917,7 +925,7 @@ export class SessionManager {
 		while (true) {
 			const sessionResult = await this.getSession(sessionId)
 			if (!sessionResult.ok) return sessionResult
-			if (tenure.state !== 'active' || this.tenures.get(sessionId) !== tenure) return Err(SessionErrors.runtimeUnavailable(String(sessionId), tenure.state))
+			if (tenure.state !== 'active' || this.tenures.get(sessionId) !== tenure) return Err(this.refusal(tenure))
 
 			const entry = this.sessions.get(sessionId)
 			if (!entry) return Ok({ session: sessionResult.value, release: () => {} })
@@ -1375,7 +1383,13 @@ export class SessionManager {
 			platform: this.platform,
 			runtimeActivity: entry.activity,
 			registerReopenedSession: (reopenedSession) => this.registerReopenedSession(reopenedSession, entry.activity, entry.tenure),
-			onStoreFenced: () => this.dropStoppedRuntime(entry.tenure, session),
+			onStoreFenced: (error) => {
+				this.dropStoppedRuntime(entry.tenure, session)
+				// The log has another owner, so reloading here would replay it and restart
+				// its work just to fence again. Refuse access until the host reactivates.
+				const tenure = entry.tenure
+				if (error instanceof SessionOwnershipLostError && tenure.state === 'active' && this.tenures.get(tenure.handle.sessionId) === tenure) tenure.state = 'lost'
+			},
 		})
 		entry.runtime = session
 		try {
@@ -1459,7 +1473,7 @@ export class SessionManager {
 		activity: SessionRuntimeActivityController,
 		tenure: SessionTenure,
 	): Result<SessionReopenRegistration | undefined, DomainError> {
-		if (tenure.state !== 'active' || this.tenures.get(session.id) !== tenure) return Err(SessionErrors.runtimeUnavailable(String(session.id), tenure.state))
+		if (tenure.state !== 'active' || this.tenures.get(session.id) !== tenure) return Err(this.refusal(tenure))
 		if (this.shuttingDown) return Err(ValidationErrors.invalid('Session manager is shutting down'))
 		if (activity.getSnapshot().state !== 'ready') return Ok(undefined)
 		const current = this.sessions.get(session.id)
