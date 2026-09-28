@@ -34,7 +34,7 @@ import type { MessageId } from '~/plugins/mailbox/schema.js'
 import { generateMessageId } from '~/plugins/mailbox/schema.js'
 import { mailboxEvents } from '~/plugins/mailbox/state.js'
 import { Agent, type AgentConfig } from '../agents/agent.js'
-import type { EventStore, SessionOwnershipLostError } from '../events/event-store.js'
+import type { EventStore } from '../events/event-store.js'
 import type { BaseEvent } from '../events/types.js'
 import { SessionFileStore } from '../file-store/file-store.js'
 import type { SessionContext } from '../sessions/context.js'
@@ -96,8 +96,8 @@ export interface SessionDependencies {
 	/** Lifecycle guard shared by the manager, agents, and plugins. */
 	runtimeActivity: SessionRuntimeActivityController
 	registerReopenedSession?: (session: Session) => Result<SessionReopenRegistration | undefined, DomainError>
-	/** Called after the runtime stops itself because another host took the log. */
-	onOwnershipLost?: (error: SessionOwnershipLostError) => void
+	/** Called after the runtime stops itself because its store fenced; the error is what fenced it. */
+	onStoreFenced?: (error: unknown) => void
 }
 
 // ============================================================================
@@ -159,12 +159,13 @@ export class Session {
 		this.platform = deps.platform
 		this.runtimeActivity = deps.runtimeActivity
 		this.registerReopenedSession = deps.registerReopenedSession
-		// Losing the log is not a drain: a replacement is already writing it, so stop
-		// rather than park — nothing this runtime still holds may reach the log again.
-		this.store.onOwnershipLost((error) => {
-			this.logger.warn('Session ownership lost, abandoning the runtime', { sessionId: this.id })
+		// A fenced store accepts no write, so there is nothing left to drain: stop rather
+		// than park. Whether the log moved to another host or holds a write of unknown
+		// outcome, only a fresh load from the log can tell what this runtime missed.
+		this.store.onFenced((error) => {
+			this.logger.warn('Session store fenced, abandoning the runtime', { sessionId: this.id, error: error instanceof Error ? error.message : String(error) })
 			this.revoke()
-			deps.onOwnershipLost?.(error)
+			deps.onStoreFenced?.(error)
 		})
 		// Initialize agents from state
 		this.initializeAgents()
