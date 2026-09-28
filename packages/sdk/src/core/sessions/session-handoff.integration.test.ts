@@ -50,6 +50,32 @@ describe('session tenures', () => {
 	})
 })
 
+describe('a fenced session store', () => {
+	it('drops the runtime so the next access reloads from the log', async () => {
+		let failures = 1
+		class FlakyStore extends MemoryEventStore {
+			override async append(id: SessionId, event: DomainEvent): Promise<void> {
+				if (event.type === 'session_overrides_set' && failures-- > 0) throw new Error('transient network error')
+				await super.append(id, event)
+			}
+		}
+		const host = new TestHarness({ presets: [createTestPreset()], eventStore: new FlakyStore() })
+		try {
+			const created = await host.createSession('test')
+			const first = await host.sessionManager.getSession(created.sessionId)
+			if (!first.ok) throw new Error(first.error.message)
+			// An unclassified failure may still have landed; this runtime cannot know.
+			await expect(first.value.setOverrides({})).rejects.toThrow('transient network error')
+			expect(host.sessionManager.getRuntimeCacheStats().loadedSessionCount).toBe(0)
+			await first.value.waitForLocalCleanup()
+			const second = await host.sessionManager.getSession(created.sessionId)
+			if (!second.ok) throw new Error(second.error.message)
+			expect(second.value).not.toBe(first.value)
+			expect(await second.value.setOverrides({})).toEqual({ ok: true, value: undefined })
+		} finally { await host.shutdown() }
+	})
+})
+
 describe('session park after a recovered failure', () => {
 	it('retries park hooks before final cleanup after a quiescence failure', async () => {
 		let attempts = 0

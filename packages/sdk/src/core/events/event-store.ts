@@ -30,6 +30,17 @@ export interface LoadRangeResult {
  * Implementace:
  * - FileEventStore - JSONL soubory (production)
  * - MemoryEventStore - in-memory (testy)
+ *
+ * An append reports its outcome through the class of what it throws, and the
+ * session runtime acts on it:
+ * - {@link EventAppendError}: the append definitely did not commit. Later appends proceed.
+ * - {@link SessionOwnershipLostError}: it did not commit, and this host no longer
+ *   owns the log. The store fences and the runtime stops.
+ * - Anything else: the outcome is unknown. The store fences, the runtime stops,
+ *   and the next load of the log decides it.
+ *
+ * An append that does not settle within `writeQueueTimeoutMs` counts as unknown.
+ * Throw `EventAppendError` only when nothing can land later.
  */
 export interface EventStore {
 	/**

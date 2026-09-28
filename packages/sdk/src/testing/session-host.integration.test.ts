@@ -426,7 +426,8 @@ describe('cross-host file-backed handoff', () => {
 			const eventsDir = join(f.directory, 'sessions', session.id, '.events')
 			expect((await fs.readdir(eventsDir)).filter((name) => name.startsWith('.pending-'))).toEqual([])
 			if (committed) {
-				await expect(session.callPluginMethod('host-test.mark', { value: 'uncertain' })).rejects.toBeInstanceOf(EventAppendOutcomeUnknownError)
+				// The fenced store stopped the runtime; only a fresh load can tell what landed.
+				expect(await session.callPluginMethod('host-test.mark', { value: 'uncertain' })).toMatchObject({ ok: false, error: { type: 'session_runtime_unavailable' } })
 			}
 			a.manager.revokeSession(tenure)
 			if (!committed) await fs.unlink(join(f.directory, 'sessions', session.id, '.events', 'meta.json'))

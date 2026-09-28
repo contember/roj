@@ -58,16 +58,21 @@ describe('SessionStore write lifetime', () => {
 			const storage = new DeferredStore()
 			storage.failure = failure
 			const { store, applied } = setup(storage)
+			const fences: unknown[] = []
+			store.onFenced((error) => fences.push(error))
 			const first = store.emit(event(1)).catch((error: unknown) => error)
 			const second = store.emit(event(2)).catch((error: unknown) => error)
 			await storage.entered.promise
 			storage.gate.resolve()
 			expect(await first).toBe(failure)
-			expect(await second).toBe(failure)
-			await expect(store.emit(event(3))).rejects.toBe(failure)
+			// A write refused by the fence never reached the store: a definite noncommit.
+			expect(await second).toBeInstanceOf(EventAppendError)
+			expect(await second).toMatchObject({ cause: failure })
+			await expect(store.emit(event(3))).rejects.toMatchObject({ cause: failure })
 			await expect(store.waitForIdle()).rejects.toBe(failure)
 			expect(storage.calls).toEqual([1])
 			expect(applied).toEqual([])
+			expect(fences).toEqual([failure])
 		})
 	}
 
@@ -114,18 +119,41 @@ describe('SessionStore write lifetime', () => {
 		expect(await storage.load(id)).toHaveLength(3)
 	})
 
-	it('fails a write that never gets its turn and fences what would follow it', async () => {
+	it('does not time out a write for the time it spent queued behind healthy ones', async () => {
+		class SlowStore extends MemoryEventStore {
+			override async append(sessionId: SessionId, value: DomainEvent): Promise<void> {
+				await Bun.sleep(30)
+				await super.append(sessionId, value)
+			}
+		}
+		const store = new SessionStore(id, new SlowStore(), createSessionState(id, 'test', 0), (state) => state, { queueTimeoutMs: 75 })
+		const writes = [1, 2, 3, 4, 5].map((timestamp) => store.emit(event(timestamp)))
+		await Promise.all(writes)
+		await store.waitForIdle()
+	})
+
+	it('fails an append that does not settle, fences, and refuses what queued behind it', async () => {
 		const storage = new DeferredStore()
-		const { store } = setup(storage, { queueTimeoutMs: 20 })
+		const { store, applied } = setup(storage, { queueTimeoutMs: 20 })
+		const fences: unknown[] = []
+		store.onFenced((error) => fences.push(error))
 		const stalled = store.emit(event(1)).catch((error: unknown) => error)
+		const queued = store.emit(event(2)).catch((error: unknown) => error)
 		await storage.entered.promise
-		// The head never returns, so the queued write definitely did not commit — and
-		// nothing may be ordered behind a head whose outcome is still open.
-		await expect(store.emit(event(2))).rejects.toBeInstanceOf(EventAppendError)
-		await expect(store.emit(event(3))).rejects.toBeInstanceOf(EventAppendOutcomeUnknownError)
+		// The head may still land, so its outcome is unknown; the write behind it never
+		// reached the store, so it definitely did not commit.
+		const unknown = await stalled
+		expect(unknown).toBeInstanceOf(EventAppendOutcomeUnknownError)
+		expect(await queued).toBeInstanceOf(EventAppendError)
+		expect(await queued).toMatchObject({ cause: unknown })
+		await expect(store.emit(event(3))).rejects.toMatchObject({ cause: unknown })
+		expect(fences).toEqual([unknown])
+		expect(storage.calls).toEqual([1])
 		expect(store.hasPendingWrites()).toBe(true)
 		storage.gate.resolve()
-		await stalled
+		await store.whenSettled()
+		expect(store.hasPendingWrites()).toBe(false)
+		expect(applied).toEqual([])
 	})
 
 	it('suppresses late projection and notification after detach', async () => {

@@ -95,10 +95,12 @@ export interface SessionManagerOptions {
 	/** Evict resident runtimes after this idle period. Absent or zero disables eviction. */
 	sessionIdleTimeoutMs?: number
 	/**
-	 * Bound on waiting for a turn in a session's ordered write queue.
+	 * Bound on one append once it reaches the head of a session's ordered write queue.
 	 *
-	 * A host that drains on a deadline (a pod on SIGTERM) should keep this under
-	 * its own budget, so a stalled store fails the close instead of outliving it.
+	 * An append that does not settle in time has an unknown outcome: the store
+	 * fences and the runtime stops. A host that drains on a deadline (a pod on
+	 * SIGTERM) should keep this under its own budget, so a stalled store fails the
+	 * close instead of outliving it.
 	 */
 	writeQueueTimeoutMs?: number
 }
@@ -1373,14 +1375,7 @@ export class SessionManager {
 			platform: this.platform,
 			runtimeActivity: entry.activity,
 			registerReopenedSession: (reopenedSession) => this.registerReopenedSession(reopenedSession, entry.activity, entry.tenure),
-			// Drop the residency so the next access reloads and re-checks ownership;
-			// the runtime already stopped itself.
-			onOwnershipLost: () => {
-				if (this.sessions.get(store.sessionId) === entry) this.sessions.delete(store.sessionId)
-				entry.listenerCleanup?.()
-				entry.listenerCleanup = undefined
-				if (entry.runtime) this.forgetEntry(entry, entry.runtime)
-			},
+			onStoreFenced: () => this.dropStoppedRuntime(entry.tenure, session),
 		})
 		entry.runtime = session
 		try {
@@ -1402,8 +1397,9 @@ export class SessionManager {
 			if (!opts.skipReadyHooks) await session.callSessionReadyHooks()
 			this.assertAdmission(entry.tenure)
 		} catch (error) {
+			const stopped = entry.activity.getSnapshot().state === 'revoked'
 			if (entry.tenure.state === 'revoked') session.revoke()
-			else if (entry.tenure.state === 'active') await session.dispose('evicted')
+			else if (entry.tenure.state === 'active' && !stopped) await session.dispose('evicted')
 			entry.listenerCleanup?.()
 			entry.listenerCleanup = undefined
 			throw error
@@ -1582,6 +1578,21 @@ export class SessionManager {
 				this.logger.debug('Session runtime evicted', { sessionId, reason })
 			})
 		return entry.unloadPromise
+	}
+
+	/**
+	 * Drop the residency of a runtime that stopped itself, so the next access reloads from the log.
+	 *
+	 * Looked up by runtime: a reopen replaces the cache entry but keeps the runtime.
+	 */
+	private dropStoppedRuntime(tenure: SessionTenure, session: Session): void {
+		for (const entry of [...tenure.entries]) {
+			if (entry.runtime !== session) continue
+			if (this.sessions.get(session.id) === entry) this.sessions.delete(session.id)
+			entry.listenerCleanup?.()
+			entry.listenerCleanup = undefined
+			this.forgetEntry(entry, session)
+		}
 	}
 
 	private forgetEntry(entry: SessionCacheEntry, session: Session | undefined): void {

@@ -57,15 +57,15 @@ from the host's deadline and they add up — none of them caps the whole drain.
 | — worker effects drain | `effectDrainTimeoutMs` | 5 s |
 | Admitted operations | unbounded | — |
 | The in-flight agent turn | unbounded — park does not abort it, revoke does | — |
-| A write waiting for its turn | `writeQueueTimeoutMs` | 30 s |
-| The in-flight append itself | unbounded | — |
+| A write waiting for its turn | the appends ahead of it, each bounded as below | — |
+| The in-flight append itself | `writeQueueTimeoutMs` | 30 s |
 | `onSessionClose('parked')` hooks | unbounded in aggregate | — |
 | — each service stop hook | `hookTimeoutMs` | 30 s |
 | The scheduler tail | unbounded | — |
 
-Four of those have no bound at all: admitted operations, the in-flight agent turn
-(which contains a provider request), the in-flight append, and the scheduler
-tail. Tuning the knobs alone therefore cannot make a park fit a budget.
+Three of those have no bound at all: admitted operations, the in-flight agent
+turn (which contains a provider request), and the scheduler tail. Tuning the
+knobs alone therefore cannot make a park fit a budget.
 
 `parkSession(handle, { timeoutMs })` bounds the caller's wait, not the drain.
 The park keeps running past the timeout and a later call races the same one, so
@@ -82,10 +82,25 @@ that found the runtime already gone rejects with `SessionRuntimeUnavailableError
 and is terminal.
 
 Appends are serialised per session so state follows the log, which makes one
-stalled write block every later one. `writeQueueTimeoutMs` bounds waiting for a
-turn. A turn that never comes definitely did not commit, and the store fences,
-because nothing may be ordered behind a head whose outcome is still open. A host
-that drains on a deadline should keep this under its own budget.
+stalled write block every later one. `writeQueueTimeoutMs` bounds each append
+from the moment it reaches the head of the queue, so a long queue of healthy
+writes never trips it. An append that does not settle in time has an unknown
+outcome and fences the store, because nothing may be ordered behind a write that
+may still land. The writes queued behind it are refused with `EventAppendError`:
+they never reached the store. A host that drains on a deadline should keep this
+under its own budget.
+
+## A fenced store
+
+The store fences when an append's outcome is unknown: the append timed out, or
+the event store threw something other than `EventAppendError`. It also fences on
+`SessionOwnershipLostError` and when a reducer throws on a committed event.
+
+A fenced runtime cannot write, so it has nothing to drain. It revokes itself and
+the manager drops the residency. Plugin close hooks run with reason `revoked`.
+While a write the store has not answered is still in flight, the id refuses new
+access as `unloading`. After that the next access reloads from the log, which
+decides whether the uncertain write landed.
 
 ## Losing the session to another host
 

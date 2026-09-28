@@ -22,17 +22,17 @@ import { getAgentState, reconstructSessionState } from '~/core/sessions/state.js
 // ============================================================================
 
 /**
- * Bound on waiting for a turn in the ordered write queue.
+ * Bound on one append once it reached the head of the ordered write queue.
  *
  * Appends are serialised so state follows the log, which makes one stalled write
- * block every later one. Waiting forever would wedge close and park, so a turn
- * that never comes fails definitively and fences the store: the stalled head may
- * still land, and nothing may be ordered behind an outcome nobody knows.
+ * block every later one. Waiting forever would wedge close and park, so an append
+ * that does not settle in time has an unknown outcome and fences the store: it
+ * may still land, and nothing may be ordered behind an outcome nobody knows.
  */
 export const SESSION_WRITE_QUEUE_TIMEOUT_MS = 30_000
 
 export interface SessionStoreOptions {
-	/** Bound on waiting for a turn in the write queue. Defaults to {@link SESSION_WRITE_QUEUE_TIMEOUT_MS}. */
+	/** Bound on one append at the head of the write queue. Defaults to {@link SESSION_WRITE_QUEUE_TIMEOUT_MS}. */
 	queueTimeoutMs?: number
 }
 
@@ -60,7 +60,9 @@ export class SessionStore {
 	private fence: { error: unknown } | undefined
 	private failure: { error: unknown } | undefined
 	private readonly pending = new Set<Promise<void>>()
-	private ownershipLost: ((error: SessionOwnershipLostError) => void) | undefined
+	/** Appends the store was asked for and has not answered yet, including ones whose wait timed out. */
+	private readonly appending = new Set<Promise<void>>()
+	private fenced: ((error: unknown) => void) | undefined
 
 	private readonly queueTimeoutMs: number
 
@@ -107,19 +109,26 @@ export class SessionStore {
 	}
 
 	/**
-	 * Observe the moment a write is refused because ownership moved to another host.
+	 * Observe the moment the store fences, so the owner can stop instead of retry.
 	 *
-	 * Fires once, after the store is fenced, so the owner can stop instead of retry.
+	 * Fires once. The error is what fenced it: a {@link SessionOwnershipLostError}
+	 * when another host took the log, otherwise a write whose outcome is unknown.
 	 */
-	onOwnershipLost(listener: (error: SessionOwnershipLostError) => void): void {
-		this.ownershipLost = listener
+	onFenced(listener: (error: unknown) => void): void {
+		this.fenced = listener
 	}
 
-	private loseOwnership(error: SessionOwnershipLostError): void {
-		this.fence ??= { error }
-		const listener = this.ownershipLost
-		this.ownershipLost = undefined
+	private fenceWith(error: unknown): void {
+		if (this.fence) return
+		this.fence = { error }
+		const listener = this.fenced
+		this.fenced = undefined
 		listener?.(error)
+	}
+
+	/** A write refused by an existing fence never reached the store, so it definitely did not commit. */
+	private refusal(fence: { error: unknown }): EventAppendError {
+		return new EventAppendError(this.sessionId, fence.error)
 	}
 
 	/** True once the owning runtime was disposed and the store stopped accepting writes. */
@@ -128,7 +137,12 @@ export class SessionStore {
 	}
 
 	hasPendingWrites(): boolean {
-		return this.pending.size > 0
+		return this.pending.size > 0 || this.appending.size > 0
+	}
+
+	/** Settle once no write is queued and the store answered every append it was asked for. */
+	async whenSettled(): Promise<void> {
+		while (this.hasPendingWrites()) await Promise.allSettled([...this.pending, ...this.appending])
 	}
 
 	/**
@@ -195,24 +209,19 @@ export class SessionStore {
 	}
 
 	private enqueue(events: DomainEvent[], append: () => Promise<void>): Promise<void> {
+		if (this.fence) return Promise.reject(this.refusal(this.fence))
 		if (this.detached) return Promise.reject(new SessionRuntimeDetachedError(this.sessionId, events))
-		if (this.fence) return Promise.reject(this.fence.error)
 		if (events.length === 0) return Promise.resolve()
-		const turn = withDeadline(this.tail, this.queueTimeoutMs, () => {
-			this.fence ??= { error: new EventAppendOutcomeUnknownError(this.sessionId, new Error('Session write queue stalled')) }
-			return new EventAppendError(this.sessionId, new Error('Timed out waiting for the session write queue'))
-		})
-		const operation = turn.then(async () => {
+		const operation = this.tail.then(async () => {
+			if (this.fence) throw this.refusal(this.fence)
 			if (this.detached) throw new SessionRuntimeDetachedError(this.sessionId, events)
-			if (this.fence) throw this.fence.error
 			try {
-				await append()
+				await this.appendWithin(append)
 			} catch (error) {
 				// Fence unless the store said the append definitely did not commit: an
 				// unclassified failure may still have landed, and nothing may be ordered
 				// behind an outcome nobody knows.
-				if (error instanceof SessionOwnershipLostError) this.loseOwnership(error)
-				else if (!(error instanceof EventAppendError)) this.fence ??= { error }
+				if (error instanceof SessionOwnershipLostError || !(error instanceof EventAppendError)) this.fenceWith(error)
 				throw error
 			}
 			if (this.detached) throw new SessionRuntimeDetachedError(this.sessionId, events)
@@ -221,7 +230,7 @@ export class SessionStore {
 				for (const event of events) next = this.applyEvent(next, event)
 				this._state = next
 			} catch (error) {
-				this.fence = { error }
+				this.fenceWith(error)
 				throw error
 			}
 			for (const event of events) {
@@ -238,6 +247,17 @@ export class SessionStore {
 			},
 		)
 		return operation
+	}
+
+	/** The timer starts with this append, so a long but healthy queue never trips it. */
+	private appendWithin(append: () => Promise<void>): Promise<void> {
+		const attempt = append()
+		this.appending.add(attempt)
+		const settle = () => { this.appending.delete(attempt) }
+		void attempt.then(settle, settle)
+		return withDeadline(attempt, this.queueTimeoutMs, () => (
+			new EventAppendOutcomeUnknownError(this.sessionId, new Error(`Append did not settle within ${this.queueTimeoutMs}ms`))
+		))
 	}
 
 	/**
