@@ -48,9 +48,20 @@ export class SessionRuntimeActivityController implements SessionRuntimeActivity 
 	private readonly revoked = Promise.withResolvers<never>()
 	private readonly scopes = new WeakSet<SessionRuntimeActivity>()
 	private pendingResources = 0
+	private readonly resourceWaiters = new Set<() => void>()
 
 	hasPendingResources(): boolean {
 		return this.pendingResources > 0
+	}
+
+	/** Settle once no tracked resource is running. */
+	async whenResourcesSettled(): Promise<void> {
+		while (this.pendingResources > 0) {
+			const settled = Promise.withResolvers<void>()
+			this.resourceWaiters.add(settled.resolve)
+			await settled.promise
+			this.resourceWaiters.delete(settled.resolve)
+		}
 	}
 
 	trackResource<T>(run: () => Promise<T>): Promise<T> {
@@ -61,7 +72,11 @@ export class SessionRuntimeActivityController implements SessionRuntimeActivity 
 	private async runResource<T>(run: () => Promise<T>): Promise<T> {
 		const operation = this.createOperation('resource')
 		this.pendingResources++
-		try { return await run() } finally { this.pendingResources--; operation.release() }
+		try { return await run() } finally {
+			this.pendingResources--
+			operation.release()
+			if (this.pendingResources === 0) for (const resolve of this.resourceWaiters) resolve()
+		}
 	}
 
 	assertOwnScope(activity: SessionRuntimeActivity): void {

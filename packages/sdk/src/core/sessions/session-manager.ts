@@ -1604,7 +1604,7 @@ export class SessionManager {
 		const state = entry.activity.getSnapshot().state
 		if (session && state !== 'disposed' && state !== 'revoked') return
 		if (session?.hasUnsafeResources()) {
-			void session.waitForLocalCleanup().catch(() => {}).then(() => {
+			void session.whenSafe().then(() => {
 				if (!session.hasUnsafeResources()) this.forgetEntry(entry, session)
 			})
 			return
