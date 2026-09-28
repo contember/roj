@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { EventAppendError, EventAppendOutcomeUnknownError } from '../events/event-store.js'
+import { ClosedSessionAppendError, EventAppendError, EventAppendOutcomeUnknownError } from '../events/event-store.js'
 import { MemoryEventStore } from '../events/memory.js'
 import type { DomainEvent } from '../events/types.js'
 import { withSessionId } from '../events/test-helpers.js'
@@ -100,6 +100,18 @@ describe('SessionStore write lifetime', () => {
 		await store.waitForIdle()
 		await store.emit(event(2))
 		await store.waitForIdle()
+	})
+
+	it('keeps writing after the closed-session guard refuses a hook event', async () => {
+		const storage = new MemoryEventStore()
+		const store = new SessionStore(id, storage, createSessionState(id, 'test', 0), (state) => state)
+		await store.emit(withSessionId(id, sessionEvents.create('session_created', { presetId: 'test' })))
+		await store.emit(withSessionId(id, sessionEvents.create('session_closed', {})))
+		const hook = withSessionId(id, sessionEvents.create('session_handler_started', { handlerName: 'onSessionReady', pluginName: 'test' }))
+		await expect(store.emit(hook)).rejects.toBeInstanceOf(ClosedSessionAppendError)
+		await expect(store.waitForIdle()).rejects.toBeInstanceOf(ClosedSessionAppendError)
+		await store.emit(withSessionId(id, sessionEvents.create('session_reopened', {})))
+		expect(await storage.load(id)).toHaveLength(3)
 	})
 
 	it('fails a write that never gets its turn and fences what would follow it', async () => {

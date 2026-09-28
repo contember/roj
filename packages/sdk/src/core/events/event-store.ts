@@ -151,6 +151,16 @@ export class EventAppendOutcomeUnknownError extends EventStoreError {
 	}
 }
 
+/** The store refused a hook event on a closed session before writing anything. */
+export class ClosedSessionAppendError extends EventAppendError {
+	constructor(sessionId: SessionId, types: readonly string[]) {
+		super(sessionId)
+		this.message = `Refusing to append session-level hook event(s) to closed session ${sessionId} (types: ${types.join(', ')}). `
+			+ `Closed sessions must not re-run plugin session hooks — see session-manager.ts:loadSession closed branch.`
+		this.name = 'ClosedSessionAppendError'
+	}
+}
+
 /**
  * The write was refused because this runtime no longer owns the session.
  *

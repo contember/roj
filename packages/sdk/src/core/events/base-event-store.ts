@@ -1,7 +1,7 @@
 import type { DomainEvent } from '~/core/events/types.js'
 import { sessionMetadataSchema } from '~/core/sessions/schema.js'
 import type { ListSessionsOptions, SessionId, SessionMetadata, SessionMetadataMetrics } from '~/core/sessions/schema.js'
-import { EventStoreError, type EventStore, type LoadRangeOptions, type LoadRangeResult } from './event-store.js'
+import { ClosedSessionAppendError, type EventStore, type LoadRangeOptions, type LoadRangeResult } from './event-store.js'
 import type { MetadataEvent } from './metadata-utils.js'
 import { computeMetadataFromEvents, needsReconciliation } from './metadata-utils.js'
 
@@ -288,11 +288,6 @@ export abstract class BaseEventStore implements EventStore {
 		const metadata = await this.readMetadata(sessionId)
 		if (metadata?.status !== 'closed') return
 
-		const forbiddenTypes = forbidden.map((e) => e.type).join(', ')
-		throw new EventStoreError(
-			`Refusing to append session-level hook event(s) to closed session ${sessionId} (types: ${forbiddenTypes}). `
-				+ `Closed sessions must not re-run plugin session hooks — see session-manager.ts:loadSession closed branch.`,
-			sessionId,
-		)
+		throw new ClosedSessionAppendError(sessionId, forbidden.map((e) => e.type))
 	}
 }
