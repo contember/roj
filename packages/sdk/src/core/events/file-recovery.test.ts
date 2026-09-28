@@ -136,6 +136,60 @@ describe('FileEventStore recovery', () => {
 		expect(await fresh().load(id)).toEqual(events)
 	})
 
+	describe('after the session moves to another host and back', () => {
+		const tornByOtherHost = async () => {
+			const other = fresh()
+			await other.load(id)
+			await other.appendBatch(id, [spawned(), spawned()])
+			await appendFile(log, '{"type":"agent_spa')
+		}
+
+		test('the next append drops the torn tail the other host left', async () => {
+			const store = fresh()
+			await store.append(id, events[0])
+			await tornByOtherHost()
+
+			const history = await store.load(id)
+			expect(history).toHaveLength(3)
+			const next = spawned()
+			await store.append(id, next)
+			expect(await fresh().load(id)).toEqual([...history, next])
+		})
+
+		test('a failed append does not roll back over what the other host committed', async () => {
+			let fail = false
+			const store = fresh(instrument(native, {
+				async appendFile(_path, _data, append) {
+					if (fail) throw failure
+					await append()
+				},
+			}))
+			await store.append(id, events[0])
+			await tornByOtherHost()
+
+			expect(await store.load(id)).toHaveLength(3)
+			fail = true
+			await expect(store.append(id, spawned())).rejects.toBeInstanceOf(EventAppendError)
+			expect(await fresh().load(id)).toHaveLength(3)
+		})
+
+		test('a failed append that finds bytes it did not write has an unknown outcome and keeps them', async () => {
+			let fail = false
+			const store = fresh(instrument(native, {
+				async appendFile(_path, _data, append) {
+					if (fail) throw failure
+					await append()
+				},
+			}))
+			await store.append(id, events[0])
+			await fresh().appendBatch(id, [spawned(), spawned()])
+
+			fail = true
+			await expect(store.append(id, spawned())).rejects.toBeInstanceOf(EventAppendOutcomeUnknownError)
+			expect(await fresh().load(id)).toHaveLength(3)
+		})
+	})
+
 	test('a complete line that does not parse is corruption, not a torn tail', async () => {
 		await fresh().append(id, events[0])
 		await appendFile(log, 'not json\n')
