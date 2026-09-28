@@ -116,5 +116,11 @@ host's lease throws `SessionOwnershipLostError` once that lease moved on.
 
 This is not a drain. The store fences, the runtime revokes itself rather than
 parking — a replacement already owns the log, so there is nothing to write — and
-the manager drops the residency, so the next access reloads and asks the store
-who owns it now. Plugin close hooks run with reason `revoked`.
+the manager drops the residency. Plugin close hooks run with reason `revoked`.
+
+The manager also marks the tenure lost. Reloading on this host would replay the
+log and restart its work, such as services and workers, only to fence again on
+the first write. So later access on this host is refused with the domain error
+`session_ownership_lost`, and `parkSession` rejects with
+`SessionOwnershipLostError`. This lasts until the host calls `activateSession`
+again, which it should do only once it holds the lease again.
