@@ -190,6 +190,28 @@ describe('FileEventStore recovery', () => {
 		})
 	})
 
+	test('an append whose rollback failed leaves the counters to be rebuilt from the log', async () => {
+		await fresh().append(id, events[0])
+		let fail = true
+		const store = fresh(instrument(native, {
+			async appendFile(_path, _data, append) {
+				await append()
+				if (fail) throw failure
+			},
+			async beforeRename() {
+				if (fail) throw failure
+			},
+		}))
+		const unknown = spawned()
+		await expect(store.append(id, unknown)).rejects.toBeInstanceOf(EventAppendOutcomeUnknownError)
+
+		fail = false
+		const next = spawned()
+		await store.append(id, next)
+		expect(await fresh().getMetadata(id)).toMatchObject({ metrics: { totalEvents: 3, totalAgents: 2 } })
+		expect(await store.loadRange(id, { since: 0 })).toEqual({ events: [unknown, next], fromIndex: 1, toIndex: 2 })
+	})
+
 	test('a complete line that does not parse is corruption, not a torn tail', async () => {
 		await fresh().append(id, events[0])
 		await appendFile(log, 'not json\n')
