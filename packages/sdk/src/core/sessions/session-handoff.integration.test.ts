@@ -685,6 +685,9 @@ describe('session activation handoff', () => {
 		release.resolve()
 		expect(await mutation).toBeInstanceOf(SessionRuntimeDetachedError)
 		expect(loaded.value.store.hasPendingWrites()).toBe(false)
+		await loaded.value.whenSafe()
+		await Bun.sleep(0)
+		expect(host.sessionManager.getRuntimeCacheStats().retainedRuntimeCount).toBe(0)
 		await host.shutdown()
 	})
 

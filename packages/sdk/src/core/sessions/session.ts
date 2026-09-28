@@ -573,7 +573,29 @@ export class Session {
 	}
 
 	hasUnsafeResources(): boolean {
-		return this.store.hasPendingWrites() || this.localCleanup !== undefined || this.parkHooksPromise !== undefined || this.cleanupFailed || this.pendingScheduler > 0 || this.runtimeActivity.hasPendingResources()
+		return this.hasPendingWork() || this.cleanupFailed
+	}
+
+	private hasPendingWork(): boolean {
+		return this.store.hasPendingWrites() || this.localCleanup !== undefined || this.parkHooksPromise !== undefined || this.pendingScheduler > 0 || this.runtimeActivity.hasPendingResources()
+	}
+
+	/**
+	 * Settle once nothing this runtime started is still running.
+	 *
+	 * A failed cleanup is not waited for, because nothing retries it, so a caller
+	 * still checks {@link hasUnsafeResources} afterwards.
+	 */
+	async whenSafe(): Promise<void> {
+		while (this.hasPendingWork()) {
+			await Promise.allSettled([
+				this.store.whenSettled(),
+				this.parkHooksPromise,
+				this.localCleanup,
+				this.schedulerTail,
+				this.runtimeActivity.whenResourcesSettled(),
+			])
+		}
 	}
 
 	async waitForLocalCleanup(): Promise<void> {
