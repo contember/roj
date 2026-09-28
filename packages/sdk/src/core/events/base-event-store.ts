@@ -139,7 +139,7 @@ export abstract class BaseEventStore implements EventStore {
 		return this.serialize(sessionId, () => this.reconcileMetadataUnlocked(sessionId, events))
 	}
 
-	private async reconcileMetadataUnlocked(sessionId: SessionId, events: DomainEvent[]): Promise<boolean> {
+	protected async reconcileMetadataUnlocked(sessionId: SessionId, events: DomainEvent[]): Promise<boolean> {
 		if (events.length === 0) return false
 
 		const computed = computeMetadataFromEvents(sessionId, events)

@@ -161,7 +161,7 @@ describe('FileEventStore', () => {
 	})
 
 	describe('append', () => {
-		test('appends single event to an immutable batch', async () => {
+		test('appends single event to JSONL file', async () => {
 			const event = withSessionId(
 				testSessionId,
 				sessionEvents.create('session_created', {
@@ -192,8 +192,7 @@ describe('FileEventStore', () => {
 
 			const rojDir = join(TEST_BASE_PATH, 'sessions', testSessionId, '.events')
 			const entries = await readdir(rojDir)
-			expect(entries).toContain('batches')
-			expect(entries).not.toContain('events.jsonl')
+			expect(entries).toContain('events.jsonl')
 		})
 
 		test('appends multiple events sequentially', async () => {
@@ -578,8 +577,10 @@ describe('FileEventStore', () => {
 			// The good records still load individually.
 			expect(await cold.getMetadata(testSessionId)).toMatchObject({ sessionId: testSessionId })
 
-			// Metadata-only directories cannot fabricate a committed session.
-			expect((await cold.listSessionsWithMetadata()).total).toBe(1)
+			// Bad records are not re-read — and so not re-reported — on every poll.
+			const reads = counting.metaReads()
+			await cold.listSessionsWithMetadata()
+			expect(counting.metaReads()).toBe(reads)
 		})
 
 		test('returns null for a session whose metadata cannot be parsed', async () => {
@@ -641,7 +642,7 @@ describe('FileEventStore', () => {
 	})
 
 	describe('metadata coherence', () => {
-		test('a write waits for a slow reader and uses the verified counters', async () => {
+		test('a write waits for a slow reader and uses the fresh counters', async () => {
 			await createSession(store, testSessionId)
 			await appendAgentSpawned(store, testSessionId)
 
@@ -682,7 +683,7 @@ describe('FileEventStore', () => {
 			expect(await coldStore().getMetadata(brokenId)).toBeNull()
 		})
 
-		test('a repaired metadata file cannot fabricate events', async () => {
+		test('re-reads metadata once a corrupt meta.json is repaired', async () => {
 			const repairedId = SessionId('repaired-session')
 			await writeRawMetadata(repairedId, 'not json at all')
 
@@ -691,6 +692,8 @@ describe('FileEventStore', () => {
 
 			expect(await cold.getMetadata(repairedId)).toBeNull()
 			expect(await cold.getMetadata(repairedId)).toBeNull()
+			// Reported once while the bytes stay the same — that is what caching the verdict buys.
+			expect(recorded.warns).toEqual(['Skipping unreadable session metadata'])
 
 			await writeRawMetadata(
 				repairedId,
@@ -703,24 +706,19 @@ describe('FileEventStore', () => {
 				}),
 			)
 
-			expect(await cold.getMetadata(repairedId)).toBeNull()
-			expect(await cold.loadRange(repairedId)).toEqual({ events: [], fromIndex: -1, toIndex: -1 })
+			expect(await cold.getMetadata(repairedId)).toMatchObject({ sessionId: repairedId })
 		})
 
-		test('skips an inaccessible session in the listing rather than erasing unread decorations', async () => {
+		test('reports an unreadable meta.json once, not on every poll', async () => {
 			await createSession(store, testSessionId)
-			await store.updateMetadata(testSessionId, { name: 'must survive', tags: ['kept'] })
-			const before = await readPersistedMetadata(testSessionId)
 
 			const recorded = recordingLogger()
 			const cold = new FileEventStore(TEST_BASE_PATH, denyingFileSystem(createNodeFileSystem()), recorded.logger)
 
-			// One unreadable session must not take the listing down for every other one.
 			expect((await cold.listSessionsWithMetadata()).total).toBe(0)
-			expect(recorded.warns).toContain('Skipping unreadable session in listing')
-			// A direct read still surfaces the failure, and nothing overwrote the record.
-			await expect(cold.getMetadata(testSessionId)).rejects.toThrow('EACCES')
-			expect(await readPersistedMetadata(testSessionId)).toEqual(before)
+			expect((await cold.listSessionsWithMetadata()).total).toBe(0)
+
+			expect(recorded.errors).toEqual(['Failed to read session metadata'])
 		})
 
 		test('forgets cached metadata when the data root disappears', async () => {
