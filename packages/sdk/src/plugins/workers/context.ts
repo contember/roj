@@ -187,16 +187,19 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 
 	/**
 	 * Emit a worker-specific event.
-	 * Applies the event to local state before persisting.
+	 * Runs the reducer before persisting, so an event it rejects never reaches the log,
+	 * and applies the event to local state once the append commits.
 	 */
 	async emit(event: TSubEvent): Promise<void> {
 		await this.runEffect(async () => {
+			// A logged event the reducer throws on would fail every replay of the session.
+			this.reducer(this.localState, event)
 			await this.emitEvent(workerEvents.create('worker_sub_event', {
 				workerId: this.workerId,
 				workerType: this.workerType,
 				subEvent: event,
 			}))
-			// The append committed, so the state follows it.
+			// Reduced again from the current state: a concurrent emit may have committed meanwhile.
 			this.localState = this.reducer(this.localState, event)
 		})
 	}
