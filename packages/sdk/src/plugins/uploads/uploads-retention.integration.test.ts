@@ -441,6 +441,45 @@ describe('uploads runtime retention', () => {
 		}
 	})
 
+	it('does not start an upload on the next load when its processing event definitely did not commit', async () => {
+		let refuseProcessing = true
+		class RefuseProcessingStore extends MemoryEventStore {
+			protected override async doAppend(sessionId: SessionId, event: DomainEvent): Promise<void> {
+				const parsed = z.object({ status: z.string() }).safeParse(event)
+				if (refuseProcessing && event.type === 'attachment_uploaded' && parsed.success && parsed.data.status === 'processing') {
+					throw new EventAppendError(sessionId, new Error('Injected processing append failure'))
+				}
+				await super.doAppend(sessionId, event)
+			}
+		}
+		const eventStore = new RefuseProcessingStore()
+		const basePath = `/tmp/roj-upload-noncommit-${crypto.randomUUID()}`
+		const dataFileStore = new SessionFileStore(basePath, undefined, false, createNodePlatform().fs, 'session')
+		const preset = createTestPreset({ plugins: [uploadsPlugin.configure({ dataFileStore })] })
+		const source = new TestHarness({ presets: [preset], eventStore })
+		let reloaded: TestHarness | undefined
+		try {
+			const session = await source.createSession('test')
+			const result = await session.callPluginMethod('uploads.uploadAsync', {
+				sessionId: String(session.sessionId), filename: 'refused.txt', mimeType: 'text/plain', size: 4, fileBuffer: Buffer.from('data'),
+			})
+			expect(result.ok).toBe(false)
+			await source.shutdown()
+
+			refuseProcessing = false
+			reloaded = new TestHarness({ presets: [preset], eventStore })
+			const reloadedSession = await reloaded.openSession(session.sessionId)
+			// The client got an error and uploads again; a start from the stale metadata would deliver the file twice.
+			// Without a preprocessor that start reaches the log within milliseconds, before shutdown could abort it.
+			await new Promise((resolve) => setTimeout(resolve, 50))
+			expect(await reloadedSession.getEventsByType(uploadEvents, 'attachment_uploaded')).toHaveLength(0)
+		} finally {
+			await source.shutdown()
+			await reloaded?.shutdown()
+			await rm(basePath, { recursive: true, force: true })
+		}
+	})
+
 	it('holds one runtime lease during async preprocessing and releases it after ready materialization', async () => {
 		const started = deferred()
 		const processingGate = deferred()

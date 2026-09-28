@@ -2,6 +2,7 @@ import { join } from 'node:path'
 import z from 'zod/v4'
 import type { AgentId } from '~/core/agents/schema.js'
 import { createDomainError, type DomainError, ValidationErrors } from '~/core/errors.js'
+import { EventAppendError } from '~/core/events/event-store.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import type { InferenceContext } from '~/core/llm/provider.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
@@ -643,6 +644,20 @@ function startAsyncUpload(args: {
 	})
 }
 
+/** Removes an upload whose 'processing' event definitely did not commit, so no later load starts it. */
+async function discardUnrecordedUpload(prepared: PreparedUpload, logger: Logger): Promise<void> {
+	try {
+		const removedMetadata = await prepared.uploadStore.remove('meta.json')
+		if (!removedMetadata.ok) throw new Error(removedMetadata.error)
+		const removedFile = await prepared.uploadStore.remove(prepared.filename)
+		if (!removedFile.ok) throw new Error(removedFile.error)
+	} catch (error) {
+		logger.error('Could not discard an upload whose start was not recorded', error instanceof Error ? error : undefined, {
+			uploadId: prepared.uploadIdStr,
+		})
+	}
+}
+
 async function removeUploadFiles(uploadStore: FileStore, path = ''): Promise<Result<void, string>> {
 	const listResult = await uploadStore.list(path, { maxDepth: 1 })
 	if (!listResult.ok) return listResult
@@ -1117,10 +1132,12 @@ export const uploadsPlugin = definePlugin('uploads')
 					}),
 				)
 			} catch (error) {
+				// An unknown outcome keeps pendingStart: if the event landed, the next load must still start the upload.
+				if (error instanceof EventAppendError) await discardUnrecordedUpload(prepared, ctx.logger)
 				prepared.lifecycle.abandon()
 				return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
 			}
-			const processing = ctx.runtimeActivity.getSnapshot().state === 'ready'
+			const processing =ctx.runtimeActivity.getSnapshot().state === 'ready'
 				? ctx.runtimeActivity.tryOperation(`upload:${prepared.uploadIdStr}:processing`)
 				: null
 			if (!processing) {
