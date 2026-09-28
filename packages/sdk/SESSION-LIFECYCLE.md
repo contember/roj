@@ -81,6 +81,12 @@ that threw is not cached, and one that later succeeds clears the failure. A park
 that found the runtime already gone rejects with `SessionRuntimeUnavailableError`
 and is terminal.
 
+A close hook that throws on park or revoke tells the runtime its resources may
+still be held, and the manager refuses the id while that is so. A park retry
+runs the hook again. After a revoke nothing does, so the id stays refused on
+this host until the process restarts. A hook should throw only when something is
+still held, and log a failure that it merely reports.
+
 Appends are serialised per session so state follows the log, which makes one
 stalled write block every later one. `writeQueueTimeoutMs` bounds each append
 from the moment it reaches the head of the queue, so a long queue of healthy

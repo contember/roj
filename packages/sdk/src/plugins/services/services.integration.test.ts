@@ -355,6 +355,33 @@ describe('services plugin', () => {
 		})
 	}
 
+	it('releases a revoked runtime whose earlier status publication failed', async () => {
+		class ReadyPublicationStore extends MemoryEventStore {
+			override async append(id: SessionId, event: DomainEvent): Promise<void> {
+				if (event.type === 'service_status_changed' && 'toStatus' in event && event.toStatus === 'ready') {
+					throw new EventAppendError(id, new Error('Injected ready publication failure'))
+				}
+				await super.append(id, event)
+			}
+		}
+		const harness = createServicesHarness({
+			presets: [createServicesPreset([quickService], ['quick'], new PortPool())],
+			eventStore: new ReadyPublicationStore(),
+		})
+		const session = await harness.createSession('test')
+		expect((await session.callPluginMethod('services.start', { serviceType: 'quick', waitForReady: true })).ok).toBe(true)
+		const activation = harness.sessionManager.activateSession(session.sessionId)
+		const runtime = await harness.sessionManager.getSession(session.sessionId)
+		if (!activation.ok || !runtime.ok) throw new Error('Session unavailable')
+
+		// The failed publication holds no process or port, so it must not keep the id
+		// unusable on this host once revoke cleanup has run.
+		harness.sessionManager.revokeSession(activation.value)
+		await runtime.value.whenSafe()
+		expect(runtime.value.hasUnsafeResources()).toBe(false)
+		expect(harness.sessionManager.activateSession(session.sessionId).ok).toBe(true)
+	})
+
 	it('keeps a runtime resident while a service is still starting, and evicts it once stopped', async () => {
 		const slowService: ServiceConfig = {
 			type: 'slow-start',
