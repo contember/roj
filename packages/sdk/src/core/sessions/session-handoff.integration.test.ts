@@ -22,6 +22,34 @@ function harness(plugins: ConstructorParameters<typeof TestHarness>[0]['systemPl
 	})
 }
 
+describe('session tenures', () => {
+	it('does not keep a tenure for an id that has no session', async () => {
+		const host = harness()
+		try {
+			const created = await host.createSession('test')
+			for (let index = 0; index < 5; index++) {
+				const unknown = SessionId(crypto.randomUUID())
+				expect(await host.sessionManager.getSession(unknown)).toMatchObject({ ok: false, error: { type: 'session_not_found' } })
+				expect((await host.sessionManager.acquireSessionLease(unknown, 'probe')).ok).toBe(false)
+			}
+			expect(host.sessionManager.getRuntimeCacheStats().tenureCount).toBe(1)
+			expect((await host.sessionManager.getSession(created.sessionId)).ok).toBe(true)
+		} finally { await host.shutdown() }
+	})
+
+	it('keeps a tenure a host activated even when its session does not exist yet', async () => {
+		const host = harness()
+		try {
+			const unknown = SessionId(crypto.randomUUID())
+			const activation = host.sessionManager.activateSession(unknown)
+			if (!activation.ok) throw new Error(activation.error.message)
+			expect((await host.sessionManager.getSession(unknown)).ok).toBe(false)
+			host.sessionManager.revokeSession(activation.value)
+			expect(await host.sessionManager.getSession(unknown)).toMatchObject({ ok: false, error: { type: 'session_runtime_unavailable' } })
+		} finally { await host.shutdown() }
+	})
+})
+
 describe('session park after a recovered failure', () => {
 	it('retries park hooks before final cleanup after a quiescence failure', async () => {
 		let attempts = 0
