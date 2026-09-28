@@ -400,6 +400,47 @@ describe('uploads runtime retention', () => {
 		}
 	})
 
+	it('reports a committed upload as processing when the runtime stops before it can start', async () => {
+		const held = deferred()
+		const release = deferred()
+		class HoldUploadStore extends MemoryEventStore {
+			override async append(sessionId: SessionId, event: DomainEvent): Promise<void> {
+				if (event.type === 'attachment_uploaded') {
+					held.resolve()
+					await release.promise
+				}
+				await super.append(sessionId, event)
+			}
+		}
+		const basePath = `/tmp/roj-upload-stopped-${crypto.randomUUID()}`
+		const dataFileStore = new SessionFileStore(basePath, undefined, false, createNodePlatform().fs, 'session')
+		const host = new TestHarness({
+			presets: [createTestPreset({ plugins: [uploadsPlugin.configure({ dataFileStore })] })],
+			eventStore: new HoldUploadStore(),
+		})
+		try {
+			const session = await host.createSession('test')
+			const uploading = session.callPluginMethod('uploads.uploadAsync', {
+				sessionId: String(session.sessionId), filename: 'late.txt', mimeType: 'text/plain', size: 4, fileBuffer: Buffer.from('data'),
+			})
+			await held.promise
+			const shutdown = host.sessionManager.shutdown()
+			release.resolve()
+			// The event committed, so the next load starts the upload; an error would make the client upload it again.
+			const upload = okValue(await uploading, asyncUploadSchema)
+			await shutdown
+			expect(upload.status).toBe('processing')
+			expect(await session.getEventsByType(uploadEvents, 'attachment_uploaded')).toHaveLength(1)
+			const metadata = await dataFileStore.scoped(`sessions/${session.sessionId}/uploads/${upload.uploadId}`).read('meta.json')
+			if (!metadata.ok) throw new Error(metadata.error)
+			expect(JSON.parse(metadata.value)).toMatchObject({ status: 'processing', pendingStart: true })
+		} finally {
+			release.resolve()
+			await host.shutdown()
+			await rm(basePath, { recursive: true, force: true })
+		}
+	})
+
 	it('holds one runtime lease during async preprocessing and releases it after ready materialization', async () => {
 		const started = deferred()
 		const processingGate = deferred()

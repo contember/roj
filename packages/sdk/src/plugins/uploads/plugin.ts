@@ -1120,15 +1120,15 @@ export const uploadsPlugin = definePlugin('uploads')
 				prepared.lifecycle.abandon()
 				return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
 			}
-			if (ctx.runtimeActivity.getSnapshot().state === 'parking') {
-				prepared.lifecycle.abandon()
-				return Ok({ uploadId: prepared.uploadIdStr, status: 'processing' })
-			}
 			const processing = ctx.runtimeActivity.getSnapshot().state === 'ready'
 				? ctx.runtimeActivity.tryOperation(`upload:${prepared.uploadIdStr}:processing`)
 				: null
+			if (!processing) {
+				// The upload is committed with pendingStart, so whichever runtime loads the session next starts it.
+				prepared.lifecycle.abandon()
+				return Ok({ uploadId: prepared.uploadIdStr, status: 'processing' })
+			}
 			try {
-				if (!processing) throw new Error('Session runtime is unavailable')
 				prepared.lifecycle.attachRuntimeLease(() => processing.release())
 			} catch (error) {
 				prepared.lifecycle.abandon()
