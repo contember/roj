@@ -111,7 +111,7 @@ Fence stale scheduler calls so an old owner cannot cancel or replace a new wake.
 
 `user-chat.sendMessage` accepts `{ content, agentId?, deliveryId? }` and returns
 `{ messageId }` in a successful `Result`. `deliveryId` is an optional nonempty
-opaque string scoped to the session. Without it, calls do not deduplicate.
+opaque string of at most 256 characters, scoped to the session. Without it, calls do not deduplicate.
 
 - A matching retry returns the original `messageId`, including after replay.
 - Concurrent matching calls in one runtime share the in-flight acceptance.
@@ -150,9 +150,9 @@ one is an append that never completed: reads ignore it, and the next append
 drops it by replacing the log through a rename.
 
 An append that fails is rolled back to the last committed line, so a retry
-cannot duplicate it (`EventAppendError`). When the rollback fails too, the
-outcome is unknown (`EventAppendOutcomeUnknownError`) and the next load of the
-log decides it. A complete line that does not parse is `EventLogCorruptionError`.
+cannot duplicate it (`EventAppendError`). When the rollback fails too, or the
+log holds lines this store did not write, the outcome is unknown
+(`EventAppendOutcomeUnknownError`) and the next load of the log decides it. A complete line that does not parse is `EventLogCorruptionError`.
 
 `meta.json` is derived from the log and may lag it: a failed metadata write does
 not undo a committed append, and the counters are rebuilt from the log on the
@@ -160,9 +160,13 @@ next append or load. Listing sessions reads only `meta.json`, never an event log
 
 This protocol does **not** call fsync or guarantee survival of power loss. It
 requires a single writer instance per session: the store caches where the next
-append starts. Nothing enforces that. A host that runs more than one instance
-must fence externally and surface the loss through `SessionOwnershipLostError`
-— see **Ownership** below.
+append starts, and loading a session refreshes that cache. Nothing enforces
+this. Two stores appending to one session can do more than interleave lines: a
+torn-tail repair rewrites the log and can delete events the other store
+committed. A host that takes a session back from another host must load it
+before appending. A host that runs more than one instance must fence externally
+and surface the loss through `SessionOwnershipLostError` — see **Ownership**
+below.
 
 ## Ownership
 
@@ -173,14 +177,18 @@ supplying an `EventStore` bound to whatever lease it holds. That store throws
 Nobody can revoke a host that is merely unreachable, so this is the only signal
 such a host can still get. It is a definite noncommit that also stops the
 runtime: the store fences, the session revokes itself rather than parking, and
-the manager drops the residency so the next access asks the store again. Close
-hooks run with reason `revoked`.
+the manager drops the residency and marks the tenure lost. Close hooks run with
+reason `revoked`. Later access on this host is refused with
+`session_ownership_lost`, and `parkSession` rejects with
+`SessionOwnershipLostError`, until the host calls `activateSession` again. Do
+that only once the host holds the lease again.
 
 A host that wants a graceful handoff instead uses `parkSession`, which drains
 and releases residency without ending the session. `parkSession(handle,
 { timeoutMs })` bounds the caller's wait, not the drain;
-`SessionManagerOptions.writeQueueTimeoutMs` bounds how long a write may wait for
-its turn. Neither caps the drain as a whole, and four of its waits are unbounded
+`writeQueueTimeoutMs` (on `SessionManagerOptions` and `createSystem`, or
+`SESSION_WRITE_QUEUE_TIMEOUT_MS`) bounds each append once it reaches the head of
+the write queue; an append that does not settle in time has an unknown outcome. Neither caps the drain as a whole, and four of its waits are unbounded
 — so size `timeoutMs` to the host's shutdown budget and treat revoke as the
 fallback when it fires. `SESSION-LIFECYCLE.md` lists every wait a drain spends,
 with its bound and default.
@@ -190,13 +198,26 @@ publish its terminal `service_status_changed`: the runtime stopped accepting
 writes, which is the point. A replaying host therefore sees it as `running`, and
 reconciling that on load is not implemented.
 
+## Writing an event store
+
+An append reports its outcome through what it throws:
+
+- `EventAppendError`: definitely not committed. Later appends proceed. Throw it
+  only when nothing can land later.
+- `SessionOwnershipLostError`: not committed, and this host no longer owns the
+  log. The runtime stops.
+- Anything else, or no answer within `writeQueueTimeoutMs`: unknown outcome. The
+  store fences, the runtime revokes itself and the manager drops it, so the next
+  access reloads from the log.
+
 ## Recovery checklist
 
 1. Stop routing new work to the affected tenure. Retain ownership for graceful
    park, or revoke locally and enforce external fencing before replacement.
 2. Preserve storage and error details. `EventAppendError` means the append was
    confirmed not committed; `EventAppendOutcomeUnknownError` means it could not
-   be determined. Do not blindly retry writes on an uncertain store instance.
+   be determined. `SessionOwnershipLostError` is an `EventAppendError`, but it
+   must not be retried on this host. Do not blindly retry writes on an uncertain store instance.
 3. After an uncertain outcome, use a **fresh event store and runtime** under safe
    single-writer ownership. Replay establishes which receipts and events exist.
 4. On `EventLogCorruptionError`, stop and investigate or restore a verified backup.

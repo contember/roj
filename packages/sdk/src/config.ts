@@ -55,7 +55,7 @@ export interface Config {
 	 */
 	sessionIdleTimeoutMs?: number
 	/**
-	 * Bound on waiting for a turn in a session's ordered write queue, from
+	 * Bound on one append once it reaches the head of a session's write queue, from
 	 * SESSION_WRITE_QUEUE_TIMEOUT_MS. Absent uses the SDK default (30 seconds).
 	 * A host that drains on a deadline should keep this under its own budget.
 	 */

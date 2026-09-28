@@ -134,7 +134,7 @@ export interface CreateSystemOptions<TPlugins extends readonly PluginDefinition<
 	 */
 	sessionIdleTimeoutMs?: number
 	/**
-	 * Bound on waiting for a turn in a session's ordered write queue. Absent uses
+	 * Bound on one append once it reaches the head of a session's write queue. Absent uses
 	 * the SDK default. A host that drains on a deadline should keep this under its own budget.
 	 */
 	writeQueueTimeoutMs?: number
