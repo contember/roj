@@ -364,6 +364,7 @@ function buildSystem(services: Services<PluginProfile>, options?: CreateSystemFr
 		pidRegistry: services.pidRegistry,
 		platform: services.platform,
 		sessionIdleTimeoutMs: services.config.sessionIdleTimeoutMs,
+		writeQueueTimeoutMs: services.config.writeQueueTimeoutMs,
 	}
 
 	return services.pluginProfile === 'isolate'
