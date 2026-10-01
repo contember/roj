@@ -8,7 +8,7 @@
 
 import type { Platform, Scheduler } from '@roj-ai/sdk/platform'
 import { createTimerScheduler } from '@roj-ai/sdk/platform'
-import type { Git, Workspace } from 'kompjutr'
+import type { Git, Workspace } from '@kompjutr/do'
 import { KompjutrEventStore } from './event-store.js'
 import { createKompjutrFileSystem } from './fs.js'
 import { createKompjutrGitClient } from './git.js'
@@ -41,7 +41,10 @@ export function createKompjutrPlatform(workspace: Workspace, options: KompjutrPl
 	const git = workspaceGit(workspace)
 
 	return {
-		fs: createKompjutrFileSystem({ compat: workspace.fs, filesystem: workspace.filesystem }),
+		fs: createKompjutrFileSystem({
+			compat: workspace.fs,
+			filesystem: workspace.filesystem,
+		}),
 		process: createUnsupportedProcessRunner(),
 		shell: createKompjutrShellRunner({
 			filesystem: workspace.filesystem,

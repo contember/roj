@@ -11,7 +11,7 @@
  */
 
 import type { SessionLogPage, SessionLogStore } from '@roj-ai/sdk/platform'
-import type { SqlDatabase } from 'kompjutr'
+import type { SqlDatabase } from '@kompjutr/do'
 
 const LOG_TABLE = 'roj_session_log'
 

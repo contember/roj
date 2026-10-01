@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { createGit, Workspace } from 'kompjutr'
+import { createGit, Workspace } from '@kompjutr/do'
 import { createKompjutrShellRunner } from './shell.js'
 import { BunSqliteStorage } from './testing/storage.js'
 
@@ -24,10 +24,22 @@ test('each run uses its requested cwd and forwards env and stdin', async () => {
 		stdin: 'stdin',
 		timeoutMs: 1,
 	})
-	const second = await runner.run({ command: 'pwd', cwd: "/one's", timeoutMs: 1 })
+	const second = await runner.run({
+		command: 'pwd',
+		cwd: "/one's",
+		timeoutMs: 1,
+	})
 
-	expect(first).toMatchObject({ stdout: 'stdin-env', exitCode: 0, timedOut: false })
-	expect(second).toMatchObject({ stdout: "/one's\n", exitCode: 0, timedOut: false })
+	expect(first).toMatchObject({
+		stdout: 'stdin-env',
+		exitCode: 0,
+		timedOut: false,
+	})
+	expect(second).toMatchObject({
+		stdout: "/one's\n",
+		exitCode: 0,
+		timedOut: false,
+	})
 	expect(runner.supportsTimeout).toBe(false)
 	expect(runner.confinement).toBe('none')
 })
@@ -36,7 +48,11 @@ test('injects Git from the same workspace', async () => {
 	const ws = workspace()
 	ws.filesystem.mkdir('/repo', { recursive: true })
 	ws.filesystem.writeFile('/repo/note.txt', new TextEncoder().encode('hello\n'))
-	const runner = createKompjutrShellRunner({ filesystem: ws.filesystem, git: ws.git, confinement: 'host' })
+	const runner = createKompjutrShellRunner({
+		filesystem: ws.filesystem,
+		git: ws.git,
+		confinement: 'host',
+	})
 
 	const result = await runner.run({
 		command: 'git init --initial-branch=main && git add note.txt && git commit -m initial && git status --short',
@@ -54,10 +70,12 @@ test('rejects path grants it cannot enforce', async () => {
 	const ws = workspace()
 	const runner = createKompjutrShellRunner({ filesystem: ws.filesystem })
 
-	await expect(runner.run({
-		command: 'true',
-		cwd: '/',
-		grants: [{ path: '/', mode: 'rw' }],
-		timeoutMs: 10_000,
-	})).rejects.toThrow('does not support path grants')
+	await expect(
+		runner.run({
+			command: 'true',
+			cwd: '/',
+			grants: [{ path: '/', mode: 'rw' }],
+			timeoutMs: 10_000,
+		}),
+	).rejects.toThrow('does not support path grants')
 })

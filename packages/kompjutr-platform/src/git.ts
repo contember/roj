@@ -8,7 +8,7 @@
  */
 
 import type { GitClient, GitCommit, GitCountAheadOptions, GitLogOptions, GitRepoOptions, GitStatusEntry } from '@roj-ai/sdk/platform'
-import type { Git, StatusEntry } from 'kompjutr'
+import type { Git, StatusEntry } from '@kompjutr/do'
 
 /**
  * kompjutr's ordinary codes are already the port's alphabet. Three are not:
@@ -30,7 +30,11 @@ export function createKompjutrGitClient(git: Git): GitClient {
 		},
 
 		async log(options: GitLogOptions): Promise<GitCommit[]> {
-			const commits = await git.log({ dir: options.dir, ref: options.ref, depth: options.depth })
+			const commits = await git.log({
+				dir: options.dir,
+				ref: options.ref,
+				depth: options.depth,
+			})
 			return commits.map((commit) => ({
 				oid: commit.oid,
 				message: commit.message,
@@ -40,13 +44,20 @@ export function createKompjutrGitClient(git: Git): GitClient {
 		},
 
 		async countAhead(options: GitCountAheadOptions): Promise<number> {
-			const result = await git.divergence({ dir: options.dir, current: options.ref ?? 'HEAD', upstream: options.base })
+			const result = await git.divergence({
+				dir: options.dir,
+				current: options.ref ?? 'HEAD',
+				upstream: options.base,
+			})
 			return result.ahead
 		},
 
 		async defaultBranch(options: GitRepoOptions): Promise<string | undefined> {
 			try {
-				const ref = await git.readRef({ dir: options.dir, ref: 'refs/remotes/origin/HEAD' })
+				const ref = await git.readRef({
+					dir: options.dir,
+					ref: 'refs/remotes/origin/HEAD',
+				})
 				if (ref.kind !== 'symbolic') return undefined
 				return ref.target.split('/').pop() || undefined
 			} catch {

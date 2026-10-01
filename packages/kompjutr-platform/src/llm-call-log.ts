@@ -23,7 +23,7 @@
  */
 
 import type { LLMCallOutcome, LLMCallPage, LLMCallRow, LLMCallStatus, LLMCallStore } from '@roj-ai/sdk/platform'
-import type { SqlDatabase } from 'kompjutr'
+import type { SqlDatabase } from '@kompjutr/do'
 
 const CALLS_TABLE = 'roj_llm_call'
 
@@ -106,7 +106,10 @@ export class KompjutrLLMCallLog implements LLMCallStore {
 	readonly maxBlobBytes: number | undefined
 	readonly #maxCallsPerSession: number
 
-	constructor(private readonly db: SqlDatabase, options: KompjutrLLMCallLogOptions = {}) {
+	constructor(
+		private readonly db: SqlDatabase,
+		options: KompjutrLLMCallLogOptions = {},
+	) {
 		this.#maxCallsPerSession = options.maxCallsPerSession ?? DEFAULT_MAX_CALLS_PER_SESSION
 		const ceiling = options.maxBlobBytes ?? DURABLE_OBJECT_COLUMN_BYTES
 		this.maxBlobBytes = ceiling > 0 ? ceiling : undefined

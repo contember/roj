@@ -1,18 +1,13 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import {
-	bootstrap,
-	createSystemFromServices,
-	MockLLMProvider,
-	ToolCallId,
-} from '@roj-ai/sdk'
+import { bootstrap, createSystemFromServices, MockLLMProvider, ToolCallId } from '@roj-ai/sdk'
 import type { Config, DomainEvent, SessionId } from '@roj-ai/sdk'
 import { filesystemPlugin } from '@roj-ai/sdk/tools/filesystem'
 import { shellPlugin } from '@roj-ai/sdk/tools/shell'
 import { createTestPreset, waitForAllAgentsIdle } from '@roj-ai/sdk/testing'
 import { expect, test } from 'bun:test'
-import { createGit, Workspace } from 'kompjutr'
+import { createGit, Workspace } from '@kompjutr/do'
 import { KompjutrEventStore, createKompjutrPlatform } from './index.js'
 import { BunSqliteStorage } from './testing/storage.js'
 
@@ -43,7 +38,11 @@ function testPreset() {
 		workspaceDir: WORKSPACE,
 		plugins: [
 			filesystemPlugin.configure({ respectGitignore: false }),
-			shellPlugin.configure({ cwd: WORKSPACE, sandboxed: true, timeout: 10_000 }),
+			shellPlugin.configure({
+				cwd: WORKSPACE,
+				sandboxed: true,
+				timeout: 10_000,
+			}),
 		],
 	})
 }
@@ -58,14 +57,11 @@ function boot(databasePath: string, provider: MockLLMProvider) {
 	workspace.filesystem.mkdir(DATA, { recursive: true })
 	workspace.filesystem.mkdir(WORKSPACE, { recursive: true })
 
-	const platform = createKompjutrPlatform(workspace, { shellConfinement: 'host' })
+	const platform = createKompjutrPlatform(workspace, {
+		shellConfinement: 'host',
+	})
 	const eventStore = new KompjutrEventStore(workspace.db)
-	const services = bootstrap(
-		testConfig(provider),
-		{ presets: [testPreset()] },
-		platform,
-		{ eventStore, pluginProfile: 'isolate' },
-	)
+	const services = bootstrap(testConfig(provider), { presets: [testPreset()] }, platform, { eventStore, pluginProfile: 'isolate' })
 
 	return {
 		storage,
@@ -77,17 +73,16 @@ function boot(databasePath: string, provider: MockLLMProvider) {
 }
 
 function startedToolNames(events: readonly DomainEvent[]): string[] {
-	return events.flatMap((event) =>
-		event.type === 'tool_started' && 'toolName' in event && typeof event.toolName === 'string'
-			? [event.toolName]
-			: [],
-	)
+	return events.flatMap((event) => (event.type === 'tool_started' && 'toolName' in event && typeof event.toolName === 'string' ? [event.toolName] : []))
 }
 
 async function sendTurn(runtime: ReturnType<typeof boot>, sessionId?: SessionId) {
-	const sessionResult = sessionId === undefined
-		? await runtime.system.sessionManager.createSession(PRESET, { workspaceDir: WORKSPACE })
-		: await runtime.system.sessionManager.getSession(sessionId)
+	const sessionResult =
+		sessionId === undefined
+			? await runtime.system.sessionManager.createSession(PRESET, {
+					workspaceDir: WORKSPACE,
+				})
+			: await runtime.system.sessionManager.getSession(sessionId)
 	if (!sessionResult.ok) throw new Error(sessionResult.error.message)
 
 	const session = sessionResult.value
@@ -111,35 +106,49 @@ test('Roj tools and state survive reopening the kompjutr SQLite workspace', asyn
 	try {
 		const provider = MockLLMProvider.withSequence([
 			{
-				toolCalls: [{
-					id: ToolCallId('write-note'),
-					name: 'write_file',
-					input: { path: `${WORKSPACE}/note.txt`, content: 'hello from Roj\n' },
-				}],
-			},
-			{
-				toolCalls: [{
-					id: ToolCallId('commit-note'),
-					name: 'run_command',
-					input: {
-						command: 'git init --initial-branch=main && git add note.txt && git commit -m initial',
-						cwd: WORKSPACE,
+				toolCalls: [
+					{
+						id: ToolCallId('write-note'),
+						name: 'write_file',
+						input: {
+							path: `${WORKSPACE}/note.txt`,
+							content: 'hello from Roj\n',
+						},
 					},
-				}],
+				],
 			},
 			{
-				toolCalls: [{
-					id: ToolCallId('write-dirty'),
-					name: 'run_command',
-					input: { command: "printf '%s\\n' dirty > dirty.txt", cwd: WORKSPACE },
-				}],
+				toolCalls: [
+					{
+						id: ToolCallId('commit-note'),
+						name: 'run_command',
+						input: {
+							command: 'git init --initial-branch=main && git add note.txt && git commit -m initial',
+							cwd: WORKSPACE,
+						},
+					},
+				],
 			},
 			{
-				toolCalls: [{
-					id: ToolCallId('read-note'),
-					name: 'read_file',
-					input: { path: `${WORKSPACE}/note.txt` },
-				}],
+				toolCalls: [
+					{
+						id: ToolCallId('write-dirty'),
+						name: 'run_command',
+						input: {
+							command: "printf '%s\\n' dirty > dirty.txt",
+							cwd: WORKSPACE,
+						},
+					},
+				],
+			},
+			{
+				toolCalls: [
+					{
+						id: ToolCallId('read-note'),
+						name: 'read_file',
+						input: { path: `${WORKSPACE}/note.txt` },
+					},
+				],
 			},
 			{ content: 'Done', toolCalls: [] },
 		])
@@ -160,7 +169,11 @@ test('Roj tools and state survive reopening the kompjutr SQLite workspace', asyn
 		expect(refreshed).toMatchObject({
 			ok: true,
 			value: {
-				snapshot: { committedAhead: 0, uncommittedFiles: 1, lastCommitMessage: 'initial' },
+				snapshot: {
+					committedAhead: 0,
+					uncommittedFiles: 1,
+					lastCommitMessage: 'initial',
+				},
 			},
 		})
 
@@ -171,7 +184,10 @@ test('Roj tools and state survive reopening the kompjutr SQLite workspace', asyn
 		active.storage.close()
 		active = undefined
 
-		const reopenedProvider = MockLLMProvider.withFixedResponse({ content: 'Resumed', toolCalls: [] })
+		const reopenedProvider = MockLLMProvider.withFixedResponse({
+			content: 'Resumed',
+			toolCalls: [],
+		})
 		active = boot(databasePath, reopenedProvider)
 		const reopenedResult = await active.system.sessionManager.getSession(sessionId)
 		if (!reopenedResult.ok) throw new Error(reopenedResult.error.message)

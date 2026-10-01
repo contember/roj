@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
-import { createGit, Workspace } from 'kompjutr'
-import { createShell } from 'kompjutr/shell'
+import { createGit, Workspace } from '@kompjutr/do'
+import { createShell } from '@kompjutr/do/shell'
 import { BunSqliteStorage, MAX_BIND_PARAMETERS } from './storage.js'
 
 function workspace(): Workspace {

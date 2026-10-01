@@ -9,7 +9,7 @@
 
 import { BaseEventStore, EventAppendError, EventStoreError, isDomainEvent, SessionId, sessionMetadataSchema } from '@roj-ai/sdk'
 import type { DomainEvent, LoadRangeOptions, LoadRangeResult, Logger, SessionMetadata } from '@roj-ai/sdk'
-import type { SqlDatabase } from 'kompjutr'
+import type { SqlDatabase } from '@kompjutr/do'
 
 const EVENTS_TABLE = 'roj_events'
 const METADATA_TABLE = 'roj_session_metadata'
@@ -27,7 +27,10 @@ export class KompjutrEventStore extends BaseEventStore {
 	/** Tail of the append chain per session; see #serialized. */
 	readonly #appendTails = new Map<SessionId, Promise<void>>()
 
-	constructor(private readonly db: SqlDatabase, private readonly logger?: Logger) {
+	constructor(
+		private readonly db: SqlDatabase,
+		private readonly logger?: Logger,
+	) {
 		super()
 
 		// WITHOUT ROWID stores rows in primary-key order, so a session's events are
@@ -175,7 +178,10 @@ export class KompjutrEventStore extends BaseEventStore {
 
 	/** A session whose metadata does not parse is skipped, never thrown over. */
 	#skip(sessionId: SessionId, reason: string): null {
-		this.logger?.warn('Skipping invalid session metadata', { sessionId, reason })
+		this.logger?.warn('Skipping invalid session metadata', {
+			sessionId,
+			reason,
+		})
 		return null
 	}
 
@@ -189,12 +195,8 @@ export class KompjutrEventStore extends BaseEventStore {
 	}
 
 	protected async getAllSessionMetadata(): Promise<SessionMetadata[]> {
-		const rows = this.db.all<{ session_id: string; metadata: string }>(
-			`SELECT session_id, metadata FROM ${METADATA_TABLE} ORDER BY session_id`,
-		)
-		return rows
-			.map((row) => this.#decodeMetadata(SessionId(row.session_id), row.metadata))
-			.filter((metadata): metadata is SessionMetadata => metadata !== null)
+		const rows = this.db.all<{ session_id: string; metadata: string }>(`SELECT session_id, metadata FROM ${METADATA_TABLE} ORDER BY session_id`)
+		return rows.map((row) => this.#decodeMetadata(SessionId(row.session_id), row.metadata)).filter((metadata): metadata is SessionMetadata => metadata !== null)
 	}
 
 	/** Index of the last stored event, -1 when the session has none. */
@@ -212,7 +214,10 @@ export class KompjutrEventStore extends BaseEventStore {
 		const previous = this.#appendTails.get(sessionId) ?? Promise.resolve()
 		const next = previous.then(task)
 		// The stored tail must never reject, or the next append inherits this failure.
-		this.#appendTails.set(sessionId, next.catch(() => undefined))
+		this.#appendTails.set(
+			sessionId,
+			next.catch(() => undefined),
+		)
 		return next
 	}
 

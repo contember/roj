@@ -1,8 +1,8 @@
 import { isDomainEvent, SessionId } from '@roj-ai/sdk'
 import type { DomainEvent } from '@roj-ai/sdk'
 import { beforeEach, expect, test } from 'bun:test'
-import { Database } from 'kompjutr'
-import type { SqlDatabase } from 'kompjutr'
+import { Database } from '@kompjutr/do'
+import type { SqlDatabase } from '@kompjutr/do'
 import { KompjutrEventStore } from './event-store.js'
 import { BunSqliteStorage } from './testing/storage.js'
 
@@ -46,8 +46,9 @@ test('a batch wider than one statement can bind lands whole', async () => {
 
 	const loaded = await store.load(SESSION)
 	expect(loaded).toHaveLength(100)
-	expect(loaded.map((entry) => 'index' in entry && typeof entry.index === 'number' ? entry.index : undefined))
-		.toEqual(Array.from({ length: 100 }, (_, index) => index))
+	expect(loaded.map((entry) => ('index' in entry && typeof entry.index === 'number' ? entry.index : undefined))).toEqual(
+		Array.from({ length: 100 }, (_, index) => index),
+	)
 })
 
 test('a batch that fails part way through leaves nothing behind', async () => {
@@ -105,7 +106,11 @@ test('listSessions unions both tables', async () => {
 	await store.append(SESSION, created(SESSION))
 	// Metadata without a single event — a session created but never written to.
 	// The merge is validated whole, so a partial over no existing record writes nothing.
-	await store.updateMetadata(OTHER, { presetId: 'other-preset', status: 'active', createdAt: Date.now() })
+	await store.updateMetadata(OTHER, {
+		presetId: 'other-preset',
+		status: 'active',
+		createdAt: Date.now(),
+	})
 
 	expect(await store.listSessions()).toEqual([SESSION, OTHER].sort())
 })

@@ -1,7 +1,7 @@
 import type { ShellRunner } from '@roj-ai/sdk/platform'
-import type { Filesystem, Git } from 'kompjutr'
-import { createGitCommand } from 'kompjutr/git/shell'
-import { createShell } from 'kompjutr/shell'
+import type { Filesystem, Git } from '@kompjutr/do'
+import { createGitCommand } from '@kompjutr/do/git-shell'
+import { createShell } from '@kompjutr/do/shell'
 
 export interface KompjutrShellRunnerOptions {
 	filesystem: Filesystem
@@ -16,9 +16,7 @@ function quoteShellWord(value: string): string {
 }
 
 export function createKompjutrShellRunner(options: KompjutrShellRunnerOptions): ShellRunner {
-	const commands = options.git === undefined
-		? undefined
-		: new Map([['git', createGitCommand(options.git)]])
+	const commands = options.git === undefined ? undefined : new Map([['git', createGitCommand(options.git)]])
 	const shell = createShell({ fs: options.filesystem, commands })
 
 	return {

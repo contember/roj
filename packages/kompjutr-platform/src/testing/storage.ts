@@ -11,7 +11,7 @@
  */
 
 import { Database as BunDatabase, type SQLQueryBindings } from 'bun:sqlite'
-import type { DurableObjectStorageLike, SQLCursorLike, SQLStorageLike } from 'kompjutr'
+import type { DurableObjectStorageLike, SQLCursorLike, SQLStorageLike } from '@kompjutr/do'
 
 /** What a Durable Object binds per statement. The 101st raises, as workerd does. */
 export const MAX_BIND_PARAMETERS = 100
@@ -42,7 +42,10 @@ class Cursor<Row extends object> implements SQLCursorLike<Row>, IterableIterator
 	#prefetched: IteratorResult<Row> | null
 	#done = false
 
-	constructor(rows: Iterator<Row>, private readonly onRow: () => void) {
+	constructor(
+		rows: Iterator<Row>,
+		private readonly onRow: () => void,
+	) {
 		this.#rows = rows
 		this.#prefetched = this.#pull()
 	}

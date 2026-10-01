@@ -9,7 +9,7 @@
 
 import type { Platform } from '@roj-ai/sdk/platform'
 import { GIT_FIXTURE, runPlatformConformance } from '@roj-ai/sdk/testing/conformance'
-import { createGit, Workspace } from 'kompjutr'
+import { createGit, Workspace } from '@kompjutr/do'
 import { createKompjutrPlatform } from './index.js'
 import { BunSqliteStorage } from './testing/storage.js'
 
@@ -35,7 +35,9 @@ runPlatformConformance({
 		})
 		workspace.filesystem.mkdir(ROOT, { recursive: true })
 
-		const platform = createKompjutrPlatform(workspace, { shellConfinement: 'host' })
+		const platform = createKompjutrPlatform(workspace, {
+			shellConfinement: 'host',
+		})
 		workspaces.set(platform, workspace)
 
 		return { platform, root: ROOT }

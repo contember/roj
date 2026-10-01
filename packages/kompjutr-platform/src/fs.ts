@@ -8,7 +8,7 @@
  * the port states — `appendFile`, a recursive `cp`, and a walk's symlink sizes.
  */
 
-import type { Filesystem, NodeFsCompat, Stat } from 'kompjutr'
+import type { Filesystem, NodeFsCompat, Stat } from '@kompjutr/do'
 import type { FileSystem, ReadableFileHandle, ReadFilesEntry, WalkEntry, WalkOptions, WriteFilesEntry, WriteFilesOptions } from '@roj-ai/sdk/platform'
 
 /** Pages a subtree scan. kompjutr caps a page at 1,000 rows. */
@@ -58,7 +58,9 @@ export function createKompjutrFileSystem(options: KompjutrFileSystemOptions): Fi
 	const copyEntries = (entries: { source: string; destination: string }[]): void => {
 		let pending = entries
 		while (pending.length > 0) {
-			const batch = filesystem.copyFiles(pending.slice(0, COPY_BATCH), { parents: true })
+			const batch = filesystem.copyFiles(pending.slice(0, COPY_BATCH), {
+				parents: true,
+			})
 			const deferred = [...batch.remaining, ...pending.slice(COPY_BATCH)]
 			if (deferred.length >= pending.length) throw fileError('EIO', pending[0]?.source ?? '', 'copy made no progress')
 			pending = deferred
@@ -118,7 +120,10 @@ export function createKompjutrFileSystem(options: KompjutrFileSystemOptions): Fi
 			const root = filesystem.realpath(source)
 			copyEntries([
 				{ source: root, destination: dest },
-				...scanSubtree(root).map((path) => ({ source: path, destination: `${dest}${path.slice(root.length)}` })),
+				...scanSubtree(root).map((path) => ({
+					source: path,
+					destination: `${dest}${path.slice(root.length)}`,
+				})),
 			])
 		},
 
@@ -165,13 +170,19 @@ export function createKompjutrFileSystem(options: KompjutrFileSystemOptions): Fi
 		// them off, so each is stated rather than left to whichever layer answers.
 		writeFiles: async (entries: readonly WriteFilesEntry[], writeOptions?: WriteFilesOptions) => {
 			filesystem.writeFiles(
-				entries.map((entry) => ({ path: entry.path, bytes: toBytes(entry.content) })),
+				entries.map((entry) => ({
+					path: entry.path,
+					bytes: toBytes(entry.content),
+				})),
 				{ parents: writeOptions?.createParents ?? false },
 			)
 		},
 
 		rmFiles: async (paths: readonly string[], rmOptions?: { recursive?: boolean; force?: boolean }) => {
-			filesystem.removeFiles(paths, { recursive: rmOptions?.recursive ?? false, force: rmOptions?.force ?? false })
+			filesystem.removeFiles(paths, {
+				recursive: rmOptions?.recursive ?? false,
+				force: rmOptions?.force ?? false,
+			})
 		},
 
 		scopeReads: (fn) => filesystem.withReadScope(fn),
