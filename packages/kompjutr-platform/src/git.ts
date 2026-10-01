@@ -44,6 +44,10 @@ export function createKompjutrGitClient(git: Git): GitClient {
 		},
 
 		async countAhead(options: GitCountAheadOptions): Promise<number> {
+			if (options.missingBase === 'all' && (await git.tryRevParse({ dir: options.dir, ref: options.base })) === undefined) {
+				const commits = await git.log({ dir: options.dir, ref: options.ref ?? 'HEAD' })
+				return commits.length
+			}
 			const result = await git.divergence({
 				dir: options.dir,
 				current: options.ref ?? 'HEAD',
