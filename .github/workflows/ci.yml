@@ -49,9 +49,9 @@ jobs:
           sudo apt-get install -y bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
-      # Fails rather than skips, so the limits cannot silently stop being exercised.
-      - name: Run sandbox resource-limit tests
-        run: ROJ_REQUIRE_SANDBOX=1 bun test packages/sdk/src/bun-platform/shell-limits.smoke.test.ts
+      # Fails rather than skips, so sandbox limits and namespace isolation stay exercised.
+      - name: Run sandbox resource-limit and namespace tests
+        run: ROJ_REQUIRE_SANDBOX=1 bun test packages/sdk/src/bun-platform/shell-limits.smoke.test.ts packages/sdk/src/plugins/shell/sandbox-namespace.integration.test.ts
 
       # Replays committed LLM snapshots — no provider key, no network calls.
       # Guards the full client → REST → standalone-server → agent path, which
