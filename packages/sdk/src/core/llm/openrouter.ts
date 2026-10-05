@@ -198,7 +198,7 @@ export class OpenRouterProvider implements LLMProvider {
 		this.logger = config.logger
 		this.imageProcessor = config.imageProcessor
 		this.timeout = config.timeout ?? DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS
-		this.fetchFn = config.fetch ?? globalThis.fetch
+		this.fetchFn = config.fetch ?? globalThis.fetch.bind(globalThis)
 	}
 
 	async inference(request: InferenceRequest, context?: InferenceContext): Promise<Result<InferenceResponse, LLMError>> {

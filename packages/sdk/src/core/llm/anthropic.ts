@@ -253,7 +253,7 @@ export class AnthropicProvider implements RoutableLLMProvider {
 		this.imageProcessor = config.imageProcessor
 		this.thinkingBudget = config.thinkingBudget
 		this.timeout = config.timeout ?? DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS
-		this.fetchFn = config.fetch ?? globalThis.fetch
+		this.fetchFn = config.fetch ?? globalThis.fetch.bind(globalThis)
 	}
 
 	/**
