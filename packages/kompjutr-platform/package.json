@@ -4,6 +4,9 @@
 	"type": "module",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
+	"roj": {
+		"bunOnlyExports": ["./testing"]
+	},
 	"exports": {
 		".": {
 			"types": "./dist/index.d.ts",
@@ -18,7 +21,9 @@
 	},
 	"files": [
 		"src",
-		"dist"
+		"dist",
+		"!src/**/*.test.ts",
+		"!dist/**/*.test.*"
 	],
 	"publishConfig": {
 		"access": "public"
@@ -36,6 +41,7 @@
 		"type-check": "tsc --noEmit"
 	},
 	"dependencies": {
+		"@kompjutr/do": "0.1.2",
 		"@roj-ai/sdk": "workspace:*"
 	},
 	"devDependencies": {
