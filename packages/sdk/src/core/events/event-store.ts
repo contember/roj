@@ -30,6 +30,17 @@ export interface LoadRangeResult {
  * Implementace:
  * - FileEventStore - JSONL soubory (production)
  * - MemoryEventStore - in-memory (testy)
+ *
+ * An append reports its outcome through the class of what it throws, and the
+ * session runtime acts on it:
+ * - {@link EventAppendError}: the append definitely did not commit. Later appends proceed.
+ * - {@link SessionOwnershipLostError}: it did not commit, and this host no longer
+ *   owns the log. The store fences and the runtime stops.
+ * - Anything else: the outcome is unknown. The store fences, the runtime stops,
+ *   and the next load of the log decides it.
+ *
+ * An append that does not settle within `writeQueueTimeoutMs` counts as unknown.
+ * Throw `EventAppendError` only when nothing can land later.
  */
 export interface EventStore {
 	/**
@@ -135,9 +146,58 @@ export class SessionNotFoundError extends EventStoreError {
 	}
 }
 
+/** The append definitely did not commit; retrying cannot duplicate this attempt. */
 export class EventAppendError extends EventStoreError {
 	constructor(sessionId: SessionId, cause?: unknown) {
 		super(`Failed to append event to session: ${sessionId}`, sessionId, cause)
 		this.name = 'EventAppendError'
+	}
+}
+
+/** The caller must recover from the committed log before deciding whether to retry. */
+export class EventAppendOutcomeUnknownError extends EventStoreError {
+	constructor(sessionId: SessionId, cause?: unknown) {
+		super(`Append outcome is unknown for session: ${sessionId}`, sessionId, cause)
+		this.name = 'EventAppendOutcomeUnknownError'
+	}
+}
+
+/** The store refused a hook event on a closed session before writing anything. */
+export class ClosedSessionAppendError extends EventAppendError {
+	constructor(sessionId: SessionId, types: readonly string[]) {
+		super(sessionId)
+		this.message = `Refusing to append session-level hook event(s) to closed session ${sessionId} (types: ${types.join(', ')}). `
+			+ `Closed sessions must not re-run plugin session hooks — see session-manager.ts:loadSession closed branch.`
+		this.name = 'ClosedSessionAppendError'
+	}
+}
+
+/**
+ * The write was refused because this runtime no longer owns the session.
+ *
+ * The seam a multi-writer host fences through: an EventStore bound to a host's
+ * lease throws this once the lease moved on. The append definitely did not
+ * commit, and the runtime that attempted it must stop rather than retry — a
+ * replacement is already writing the log.
+ */
+export class SessionOwnershipLostError extends EventAppendError {
+	constructor(sessionId: SessionId, cause?: unknown) {
+		super(sessionId, cause)
+		this.message = `Session ownership lost: ${sessionId}`
+		this.name = 'SessionOwnershipLostError'
+	}
+}
+
+export class EventLogCorruptionError extends EventStoreError {
+	constructor(sessionId: SessionId, public readonly offendingPath: string, cause?: unknown) {
+		super(`Corrupt event log: ${offendingPath}`, sessionId, cause)
+		this.name = 'EventLogCorruptionError'
+	}
+}
+
+export class FileEventStoreCapabilityError extends Error {
+	constructor() {
+		super('FileEventStore requires atomic same-directory FileSystem.rename')
+		this.name = 'FileEventStoreCapabilityError'
 	}
 }

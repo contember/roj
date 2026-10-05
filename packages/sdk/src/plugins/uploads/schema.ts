@@ -107,6 +107,8 @@ export interface UploadMetadata {
 	size: number
 	path: string
 	status: 'processing' | 'ready' | 'failed' | 'deleted'
+	/** Processing was accepted but has not been launched by a runtime yet. */
+	pendingStart?: boolean
 	extractedContent?: string
 	derivedPaths?: string[]
 	createdAt: number

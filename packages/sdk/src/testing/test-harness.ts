@@ -19,6 +19,7 @@ import type { SessionOverridesPatch, SessionState } from '~/core/sessions/state.
 import { ToolExecutor } from '~/core/tools/executor.js'
 import { silentLogger } from '~/lib/logger/logger.js'
 import { createNodePlatform } from './node-platform.js'
+import type { Scheduler } from '~/platform/scheduler.js'
 import type { Result } from '~/lib/utils/result.js'
 import { NotificationCollector } from './notification-collector.js'
 import { waitForAllAgentsIdle } from './wait-helpers.js'
@@ -58,6 +59,9 @@ export class TestHarness {
 		eventStore?: MemoryEventStore
 		/** Resident session idle timeout. Zero or absent disables eviction. */
 		sessionIdleTimeoutMs?: number
+		writeQueueTimeoutMs?: number
+		/** Stand in for a durable scheduler, so tests can fail a wake the way a real one does. */
+		scheduler?: Scheduler
 		/** Extra notification sink, run after the recorder. Throwing here simulates a hostile embedder. */
 		onUserOutput?: (notification: PluginNotification) => void
 	}) {
@@ -93,7 +97,7 @@ export class TestHarness {
 		const basePath = `/tmp/roj-test-${Math.random().toString(36).slice(2)}`
 		this.basePath = basePath
 		const toolExecutor = new ToolExecutor(silentLogger)
-		const platform = createNodePlatform()
+		const platform = { ...createNodePlatform(), ...(options.scheduler ? { scheduler: options.scheduler } : {}) }
 		const dataFileStore = new SessionFileStore(basePath, undefined, false, platform.fs, 'session')
 
 		// When llmLogger is provided, wrap the mock provider so calls get logged
@@ -116,6 +120,7 @@ export class TestHarness {
 			llmLogger: options.llmLogger,
 			platform,
 			sessionIdleTimeoutMs: options.sessionIdleTimeoutMs,
+			writeQueueTimeoutMs: options.writeQueueTimeoutMs,
 			systemPlugins: mergeSystemPlugins([...fullPlugins, ...(options.systemPlugins ?? [])]),
 		})
 	}

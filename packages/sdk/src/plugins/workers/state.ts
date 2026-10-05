@@ -12,6 +12,7 @@ import z from 'zod/v4'
 import { agentIdSchema } from '~/core/agents/schema.js'
 import { createEventsFactory } from '~/core/events/types.js'
 import type { BaseEvent } from '~/core/events/types.js'
+import type { SessionRuntimeActivity } from '~/core/sessions/runtime-activity.js'
 import { workerIdSchema } from './worker.js'
 
 export const workerEvents = createEventsFactory({
@@ -21,7 +22,9 @@ export const workerEvents = createEventsFactory({
 			agentId: agentIdSchema,
 			workerType: z.string(),
 			config: z.unknown(),
+			pendingStart: z.boolean().optional(),
 		}),
+		worker_execution_started: z.object({ workerId: workerIdSchema }),
 		worker_sub_event: z.object({
 			workerId: workerIdSchema,
 			workerType: z.string(),
@@ -61,4 +64,4 @@ export type WorkerFailedEvent = (typeof workerEvents)['Events']['worker_failed']
 /**
  * Event emitter callback - emits events without sessionId (added automatically).
  */
-export type EmitEvent = (event: Omit<BaseEvent<string>, 'sessionId'>) => Promise<void>
+export type EmitEvent = (event: Omit<BaseEvent<string>, 'sessionId'>, activity?: SessionRuntimeActivity) => Promise<void>

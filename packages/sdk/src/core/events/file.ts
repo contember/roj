@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import z from 'zod/v4'
 import type { DomainEvent } from '~/core/events/types.js'
@@ -7,49 +8,18 @@ import { domainEventSchema, isValidSessionId, SessionId, sessionMetadataSchema }
 import type { SessionMetadata } from '~/core/sessions/schema.js'
 import { BaseEventStore } from './base-event-store.js'
 import type { LoadRangeOptions, LoadRangeResult } from './event-store.js'
-import { EventAppendError, EventStoreError } from './event-store.js'
+import {
+	EventAppendError,
+	EventAppendOutcomeUnknownError,
+	EventLogCorruptionError,
+	EventStoreError,
+	FileEventStoreCapabilityError,
+} from './event-store.js'
 
 /**
- * Simple async mutex for serializing access to a shared resource.
- * Used to prevent concurrent writes to the same session's event file.
- */
-class AsyncMutex {
-	private locked = false
-	private queue: Array<() => void> = []
-
-	async acquire(): Promise<void> {
-		if (!this.locked) {
-			this.locked = true
-			return
-		}
-
-		return new Promise<void>((resolve) => {
-			this.queue.push(resolve)
-		})
-	}
-
-	release(): void {
-		const next = this.queue.shift()
-		if (next) {
-			next()
-		} else {
-			this.locked = false
-		}
-	}
-
-	async withLock<T>(fn: () => Promise<T>): Promise<T> {
-		await this.acquire()
-		try {
-			return await fn()
-		} finally {
-			this.release()
-		}
-	}
-}
-
-/**
- * Read last N lines from a file efficiently by reading chunks from the end.
- * Returns lines in order (oldest first).
+ * Read last N complete lines from a file efficiently by reading chunks from the end.
+ * Returns lines in order (oldest first). A trailing fragment without a newline is
+ * an append that never completed, so it is not a line.
  */
 async function readLastLines(fs: FileSystem, filePath: string, lineCount: number): Promise<string[]> {
 	if (lineCount <= 0) return []
@@ -64,6 +34,7 @@ async function readLastLines(fs: FileSystem, filePath: string, lineCount: number
 		const chunkSize = 8192 // 8KB chunks
 		let position = fileSize
 		let buffer = ''
+		let tailDropped = false
 		const lines: string[] = []
 
 		while (position > 0 && lines.length < lineCount) {
@@ -78,6 +49,10 @@ async function readLastLines(fs: FileSystem, filePath: string, lineCount: number
 			// Extract complete lines from buffer
 			const parts = buffer.split('\n')
 			buffer = parts[0] // Keep incomplete first part
+			if (!tailDropped && parts.length > 1) {
+				parts.pop()
+				tailDropped = true
+			}
 
 			// Add complete lines (in reverse, from end)
 			for (let i = parts.length - 1; i > 0; i--) {
@@ -90,7 +65,7 @@ async function readLastLines(fs: FileSystem, filePath: string, lineCount: number
 		}
 
 		// Handle remaining buffer (first line of file)
-		if (buffer.trim() && lines.length < lineCount) {
+		if (tailDropped && buffer.trim() && lines.length < lineCount) {
 			lines.unshift(buffer.trim())
 		}
 
@@ -123,6 +98,11 @@ function isNotFound(error: unknown): boolean {
 	return errorCode(error) === 'ENOENT'
 }
 
+/** Bytes up to and including the last newline: an append is committed once its newline is written. */
+function completeLength(bytes: Buffer): number {
+	return bytes.lastIndexOf(0x0a) + 1
+}
+
 /** Before the cache every read parsed fresh JSON — keep that, so a mutating caller cannot corrupt it. */
 function copyMetadata(metadata: SessionMetadata | null): SessionMetadata | null {
 	if (!metadata) return null
@@ -150,11 +130,21 @@ function copyMetadata(metadata: SessionMetadata | null): SessionMetadata | null 
  *       (agent workspace files)
  * ```
  *
- * Each line in events.jsonl is a JSON-serialized domain event.
- * meta.json contains session metadata for quick access.
+ * Each line in events.jsonl is a JSON-serialized domain event, and a line counts
+ * as committed once its newline is on disk. meta.json contains session metadata
+ * for quick access; it is derived from the log and may lag it.
+ *
+ * Requires a single writer per session: the committed length is cached per instance,
+ * so a host that takes a session back must load it before appending.
  */
 export class FileEventStore extends BaseEventStore {
-	private readonly sessionLocks = new Map<SessionId, AsyncMutex>()
+	private readonly rename: (source: string, dest: string) => Promise<void>
+
+	/** Byte length of the complete lines in events.jsonl, where the next append starts. */
+	private readonly committedSizes = new Map<SessionId, number>()
+
+	/** Sessions whose meta.json missed a committed append, so its counters cannot be advanced incrementally. */
+	private readonly staleMetadata = new Set<SessionId>()
 
 	/**
 	 * Parsed meta.json per session, so a `/status` poll costs one readdir instead of
@@ -179,19 +169,9 @@ export class FileEventStore extends BaseEventStore {
 		private readonly logger: Logger = silentLogger,
 	) {
 		super()
-	}
-
-	/**
-	 * Get or create a mutex for a specific session.
-	 * Ensures serialized access to each session's event file.
-	 */
-	private getLock(sessionId: SessionId): AsyncMutex {
-		let lock = this.sessionLocks.get(sessionId)
-		if (!lock) {
-			lock = new AsyncMutex()
-			this.sessionLocks.set(sessionId, lock)
-		}
-		return lock
+		const rename = fs.rename
+		if (typeof rename !== 'function') throw new FileEventStoreCapabilityError()
+		this.rename = rename.bind(fs)
 	}
 
 	private getSessionDir(sessionId: SessionId): string {
@@ -211,82 +191,146 @@ export class FileEventStore extends BaseEventStore {
 	}
 
 	protected async doAppend(sessionId: SessionId, event: DomainEvent): Promise<void> {
-		const lock = this.getLock(sessionId)
-
-		await lock.withLock(async () => {
-			const path = this.getEventsPath(sessionId)
-
-			try {
-				// Ensure directory exists
-				await this.fs.mkdir(dirname(path), { recursive: true })
-
-				// Append event as JSON line
-				const line = JSON.stringify(event) + '\n'
-				await this.fs.appendFile(path, line)
-
-				// Update metadata
-				await this.updateMetadataFromEvents(sessionId, [event])
-			} catch (error) {
-				throw new EventAppendError(sessionId, error)
-			}
-		})
+		await this.doAppendBatch(sessionId, [event])
 	}
 
 	protected async doAppendBatch(sessionId: SessionId, events: DomainEvent[]): Promise<void> {
 		if (events.length === 0) return
 
-		const lock = this.getLock(sessionId)
+		const path = this.getEventsPath(sessionId)
+		const content = events.map((event) => `${JSON.stringify(event)}\n`).join('')
+		const contentSize = Buffer.byteLength(content, 'utf8')
+		let committed: number | undefined
+		try {
+			await this.fs.mkdir(dirname(path), { recursive: true })
+			committed = await this.committedSize(sessionId)
+			await this.fs.appendFile(path, content)
+		} catch (cause) {
+			if (committed === undefined) throw new EventAppendError(sessionId, cause)
+			await this.rollBack(sessionId, committed, contentSize, cause)
+		}
+		this.committedSizes.set(sessionId, committed + contentSize)
 
-		await lock.withLock(async () => {
-			const path = this.getEventsPath(sessionId)
+		// meta.json is derived from the log, so a failure to update it cannot undo a committed append.
+		if (this.staleMetadata.has(sessionId)) {
+			await this.repairMetadata(sessionId)
+			return
+		}
+		try {
+			await this.updateMetadataFromEvents(sessionId, events)
+		} catch (error) {
+			this.staleMetadata.add(sessionId)
+			this.logger.warn('Session metadata lags the event log', { sessionId, reason: String(error) })
+		}
+	}
 
-			try {
-				// Ensure directory exists
-				await this.fs.mkdir(dirname(path), { recursive: true })
+	protected override async reconcileMetadataUnlocked(sessionId: SessionId, events: DomainEvent[]): Promise<boolean> {
+		const changed = await super.reconcileMetadataUnlocked(sessionId, events)
+		this.staleMetadata.delete(sessionId)
+		return changed
+	}
 
-				// Append all events as JSON lines
-				const content = events.map((e) => JSON.stringify(e)).join('\n') + '\n'
-				await this.fs.appendFile(path, content)
+	/** Recompute stale metadata from the whole log. A failure leaves it stale for the next attempt. */
+	private async repairMetadata(sessionId: SessionId): Promise<void> {
+		try {
+			await this.reconcileMetadataUnlocked(sessionId, await this.readEvents(sessionId))
+		} catch (error) {
+			this.logger.warn('Session metadata lags the event log', { sessionId, reason: String(error) })
+		}
+	}
 
-				// Update metadata in a single batch
-				await this.updateMetadataFromEvents(sessionId, events)
-			} catch (error) {
-				throw new EventAppendError(sessionId, error)
-			}
-		})
+	/** Where the next append starts, dropping a line that an interrupted append left incomplete. */
+	private async committedSize(sessionId: SessionId): Promise<number> {
+		const cached = this.committedSizes.get(sessionId)
+		if (cached !== undefined) return cached
+
+		let bytes: Buffer
+		try {
+			bytes = await this.fs.readFile(this.getEventsPath(sessionId))
+		} catch (error) {
+			if (!isNotFound(error)) throw error
+			this.committedSizes.set(sessionId, 0)
+			return 0
+		}
+		const size = completeLength(bytes)
+		if (size !== bytes.length) {
+			this.logger.warn('Dropping an incomplete line from the event log', { sessionId, bytes: bytes.length - size })
+			await this.replaceLog(sessionId, bytes.subarray(0, size))
+		}
+		this.committedSizes.set(sessionId, size)
+		return size
+	}
+
+	/** Restore the log to what was committed before a failed append, so the append definitely did not commit. */
+	private async rollBack(sessionId: SessionId, committed: number, appended: number, cause: unknown): Promise<never> {
+		this.committedSizes.delete(sessionId)
+		try {
+			const bytes = await this.readLogOrEmpty(sessionId)
+			if (bytes.length < committed) throw new Error('Event log shrank below its committed length')
+			// More bytes than this append could have written belong to another writer, and truncating would delete them.
+			if (bytes.length > committed + appended) throw new Error('Event log grew beyond the failed append')
+			if (bytes.length > committed) await this.replaceLog(sessionId, bytes.subarray(0, committed))
+		} catch {
+			// Whatever the append wrote may still be there, and the next load will replay it.
+			this.staleMetadata.add(sessionId)
+			throw new EventAppendOutcomeUnknownError(sessionId, cause)
+		}
+		this.committedSizes.set(sessionId, committed)
+		throw new EventAppendError(sessionId, cause)
+	}
+
+	private async readLogOrEmpty(sessionId: SessionId): Promise<Buffer> {
+		try {
+			return await this.fs.readFile(this.getEventsPath(sessionId))
+		} catch (error) {
+			if (isNotFound(error)) return Buffer.alloc(0)
+			throw error
+		}
+	}
+
+	/** Swap in a whole new log in one rename, so a crash leaves either the old bytes or the new ones. */
+	private async replaceLog(sessionId: SessionId, content: Buffer): Promise<void> {
+		const pending = join(this.getEventsDir(sessionId), `.pending-${randomUUID()}`)
+		try {
+			await this.fs.writeFile(pending, content)
+			await this.rename(pending, this.getEventsPath(sessionId))
+		} finally {
+			await this.fs.unlink(pending).catch(() => {})
+		}
 	}
 
 	async load(sessionId: SessionId): Promise<DomainEvent[]> {
+		return this.serialize(sessionId, () => this.readEvents(sessionId))
+	}
+
+	private async readEvents(sessionId: SessionId): Promise<DomainEvent[]> {
 		const path = this.getEventsPath(sessionId)
 
+		let bytes: Buffer
 		try {
-			const content = await this.fs.readFile(path, 'utf-8')
-			const lines = content.split('\n').filter((line) => line.trim())
-
-			return lines.map((line, index) => {
-				try {
-					const parsed = JSON.parse(line)
-					// Validate with Zod to ensure basic structure integrity
-					// The schema uses passthrough(), so unknown properties are preserved
-					const validated = domainEventSchema.parse(parsed)
-					return validated as unknown as DomainEvent
-				} catch (parseError) {
-					throw new EventStoreError(
-						`Failed to parse event at line ${index + 1}`,
-						sessionId,
-						parseError,
-					)
-				}
-			})
+			bytes = await this.fs.readFile(path)
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-				return []
-			}
-			if (error instanceof EventStoreError) {
-				throw error
-			}
+			if (isNotFound(error)) return []
 			throw new EventStoreError('Failed to load events', sessionId, error)
 		}
+
+		const complete = completeLength(bytes)
+		// The log is the authority: another owner may have written since this instance cached a size.
+		// A torn tail is left for the next append to drop, so its length is not where that append starts.
+		if (complete === bytes.length) this.committedSizes.set(sessionId, complete)
+		else this.committedSizes.delete(sessionId)
+		const lines = bytes.subarray(0, complete).toString('utf8').split('\n')
+		const events: DomainEvent[] = []
+		for (const [index, line] of lines.entries()) {
+			if (!line.trim()) continue
+			try {
+				// The schema uses passthrough(), so unknown properties are preserved
+				events.push(domainEventSchema.parse(JSON.parse(line)) as unknown as DomainEvent)
+			} catch (parseError) {
+				throw new EventLogCorruptionError(sessionId, `${path}:${index + 1}`, parseError)
+			}
+		}
+		return events
 	}
 
 	async exists(sessionId: SessionId): Promise<boolean> {
@@ -314,11 +358,19 @@ export class FileEventStore extends BaseEventStore {
 		sessionId: SessionId,
 		options?: LoadRangeOptions,
 	): Promise<LoadRangeResult> {
-		const since = options?.since ?? -1
+		return this.serialize(sessionId, () => this.readRange(sessionId, options))
+	}
+
+	private async readRange(
+		sessionId: SessionId,
+		options?: LoadRangeOptions,
+	): Promise<LoadRangeResult> {
+		const since = Math.max(-1, options?.since ?? -1)
 		const limit = options?.limit
 
 		// Get total event count from metadata
-		const metadata = await this.getMetadata(sessionId)
+		if (this.staleMetadata.has(sessionId)) await this.repairMetadata(sessionId)
+		const metadata = await this.readMetadata(sessionId)
 		const totalEvents = metadata?.metrics?.totalEvents ?? 0
 
 		// toIndex always reflects the actual last event in the store (for polling cursor)
@@ -338,7 +390,7 @@ export class FileEventStore extends BaseEventStore {
 		// (partial read always reads from the end, so it's wrong if limit causes a gap)
 		const rangeExtendsToEnd = fromIndex + neededCount >= totalEvents
 		if (neededCount > totalEvents * 0.5 || !rangeExtendsToEnd) {
-			const allEvents = await this.load(sessionId)
+			const allEvents = await this.readEvents(sessionId)
 			const events = allEvents.slice(
 				fromIndex,
 				limit ? fromIndex + limit : undefined,

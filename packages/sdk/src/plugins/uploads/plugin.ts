@@ -1,10 +1,13 @@
+import { join } from 'node:path'
 import z from 'zod/v4'
 import type { AgentId } from '~/core/agents/schema.js'
 import { createDomainError, type DomainError, ValidationErrors } from '~/core/errors.js'
+import { EventAppendError } from '~/core/events/event-store.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import type { InferenceContext } from '~/core/llm/provider.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import type { SessionContext } from '~/core/sessions/context.js'
+import { RuntimeFileStore } from '~/core/sessions/context.js'
 import type { RuntimeLeaseRelease, SessionRuntimeActivity } from '~/core/sessions/runtime-activity.js'
 import { SessionId } from '~/core/sessions/schema.js'
 import { getEntryAgentId } from '~/core/sessions/state.js'
@@ -345,6 +348,7 @@ async function runPreprocessor(args: {
 	controller: AbortController
 	inferenceContext?: Omit<InferenceContext, 'signal'>
 }): Promise<UploadResult> {
+	args.controller.signal.throwIfAborted()
 	const preprocessor = args.preprocessorRegistry?.getForMimeType(args.mimeType)
 	if (!preprocessor) return { status: 'ready' }
 
@@ -586,6 +590,8 @@ async function processUpload(args: {
 
 function startAsyncUpload(args: {
 	pluginContext: UploadsPluginContext
+	runtimeActivity: SessionRuntimeActivity
+	pendingMetadata: UploadMetadata
 	prepared: PreparedUpload
 	sessionId: SessionId
 	upload: UploadDescriptor
@@ -600,6 +606,9 @@ function startAsyncUpload(args: {
 	// start() rejects synchronously when `run` throws before its first await — that rejection needs a handler.
 	void args.prepared.lifecycle.start(async () => {
 		try {
+			await writeMetadata(args.prepared.uploadStore, { ...args.pendingMetadata, pendingStart: false })
+			args.runtimeActivity.assertAvailable()
+			args.prepared.lifecycle.controller.signal.throwIfAborted()
 			await processUpload({
 				pluginContext: args.pluginContext,
 				prepared: args.prepared,
@@ -633,6 +642,20 @@ function startAsyncUpload(args: {
 			filename: args.upload.filename,
 		})
 	})
+}
+
+/** Removes an upload whose 'processing' event definitely did not commit, so no later load starts it. */
+async function discardUnrecordedUpload(prepared: PreparedUpload, logger: Logger): Promise<void> {
+	try {
+		const removedMetadata = await prepared.uploadStore.remove('meta.json')
+		if (!removedMetadata.ok) throw new Error(removedMetadata.error)
+		const removedFile = await prepared.uploadStore.remove(prepared.filename)
+		if (!removedFile.ok) throw new Error(removedFile.error)
+	} catch (error) {
+		logger.error('Could not discard an upload whose start was not recorded', error instanceof Error ? error : undefined, {
+			uploadId: prepared.uploadIdStr,
+		})
+	}
 }
 
 async function removeUploadFiles(uploadStore: FileStore, path = ''): Promise<Result<void, string>> {
@@ -748,7 +771,7 @@ export const uploadsPlugin = definePlugin('uploads')
 						}),
 					)
 
-					const { dataFileStore } = ctx.pluginConfig
+					const dataFileStore = new RuntimeFileStore(ctx.pluginConfig.dataFileStore, ctx.runtimeActivity)
 					for (const uploadIdStr of token) {
 						await withUploadLock(ctx.pluginContext, uploadIdStr, async () => {
 							const uploadStore = dataFileStore.scoped(`sessions/${ctx.sessionId}/uploads/${uploadIdStr}`)
@@ -781,7 +804,7 @@ export const uploadsPlugin = definePlugin('uploads')
 			),
 		}),
 		handler: async (ctx, input) => {
-			const { dataFileStore } = ctx.pluginConfig
+			const dataFileStore = new RuntimeFileStore(ctx.pluginConfig.dataFileStore, ctx.runtimeActivity)
 			const sessionId = input.sessionId
 
 			const uploadsPath = `sessions/${sessionId}/uploads`
@@ -835,7 +858,7 @@ export const uploadsPlugin = definePlugin('uploads')
 		}),
 		output: z.object({}),
 		handler: async (ctx, input) => {
-			const { dataFileStore } = ctx.pluginConfig
+			const dataFileStore = new RuntimeFileStore(ctx.pluginConfig.dataFileStore, ctx.runtimeActivity)
 			const uploadStore = dataFileStore.scoped(`sessions/${input.sessionId}/uploads/${input.uploadId}`)
 			try {
 				return await runTrackedMutation({
@@ -899,7 +922,7 @@ export const uploadsPlugin = definePlugin('uploads')
 			attachments: z.array(z.unknown()),
 		}),
 		handler: async (ctx, input) => {
-			const { dataFileStore } = ctx.pluginConfig
+			const dataFileStore = new RuntimeFileStore(ctx.pluginConfig.dataFileStore, ctx.runtimeActivity)
 			const sessionRoot = ctx.files.getRoots().session
 			const attachments: MessageAttachment[] = []
 
@@ -942,7 +965,7 @@ export const uploadsPlugin = definePlugin('uploads')
 		}),
 		output: z.object({}),
 		handler: async (ctx, input) => {
-			const { dataFileStore } = ctx.pluginConfig
+			const dataFileStore = new RuntimeFileStore(ctx.pluginConfig.dataFileStore, ctx.runtimeActivity)
 			try {
 				return await runTrackedMutation({
 					pluginContext: ctx.pluginContext,
@@ -1010,7 +1033,7 @@ export const uploadsPlugin = definePlugin('uploads')
 		handler: async (ctx, input) => {
 			const preparedResult = await prepareUpload({
 				pluginContext: ctx.pluginContext,
-				dataFileStore: ctx.pluginConfig.dataFileStore,
+				dataFileStore: new RuntimeFileStore(ctx.pluginConfig.dataFileStore, ctx.runtimeActivity),
 				logger: ctx.logger,
 				input,
 			})
@@ -1073,7 +1096,7 @@ export const uploadsPlugin = definePlugin('uploads')
 		handler: async (ctx, input) => {
 			const preparedResult = await prepareUpload({
 				pluginContext: ctx.pluginContext,
-				dataFileStore: ctx.pluginConfig.dataFileStore,
+				dataFileStore: new RuntimeFileStore(ctx.pluginConfig.dataFileStore, ctx.runtimeActivity),
 				logger: ctx.logger,
 				input,
 			})
@@ -1094,6 +1117,7 @@ export const uploadsPlugin = definePlugin('uploads')
 				size: upload.size,
 				path: prepared.filePath,
 				status: 'processing',
+				pendingStart: true,
 				createdAt: prepared.createdAt,
 			}
 			try {
@@ -1108,12 +1132,21 @@ export const uploadsPlugin = definePlugin('uploads')
 					}),
 				)
 			} catch (error) {
+				// An unknown outcome keeps pendingStart: if the event landed, the next load must still start the upload.
+				if (error instanceof EventAppendError) await discardUnrecordedUpload(prepared, ctx.logger)
 				prepared.lifecycle.abandon()
 				return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
 			}
+			const processing =ctx.runtimeActivity.getSnapshot().state === 'ready'
+				? ctx.runtimeActivity.tryOperation(`upload:${prepared.uploadIdStr}:processing`)
+				: null
+			if (!processing) {
+				// The upload is committed with pendingStart, so whichever runtime loads the session next starts it.
+				prepared.lifecycle.abandon()
+				return Ok({ uploadId: prepared.uploadIdStr, status: 'processing' })
+			}
 			try {
-				const releaseRuntimeLease = ctx.runtimeActivity.acquire(`upload:${prepared.uploadIdStr}:processing`)
-				prepared.lifecycle.attachRuntimeLease(releaseRuntimeLease)
+				prepared.lifecycle.attachRuntimeLease(() => processing.release())
 			} catch (error) {
 				prepared.lifecycle.abandon()
 				return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
@@ -1137,18 +1170,20 @@ export const uploadsPlugin = definePlugin('uploads')
 					? {
 							sessionId: sessionIdString,
 							agentId: String(entryAgentId),
-							fileStore: ctx.files,
+							fileStore: new RuntimeFileStore(ctx.files, processing.activity),
 						}
 					: undefined
 				startAsyncUpload({
 					pluginContext: ctx.pluginContext,
-					prepared,
+					runtimeActivity: processing.activity,
+					pendingMetadata: processingMeta,
+					prepared: { ...prepared, uploadStore: new RuntimeFileStore(prepared.uploadStore, processing.activity) },
 					sessionId,
 					upload,
 					config: ctx.pluginConfig,
 					inferenceContext,
-					emitEvent: ctx.emitEvent,
-					notify: ctx.notify,
+					emitEvent: (event) => ctx.emitEvent(event, processing.activity),
+					notify: (type, payload) => ctx.notify(type, payload, processing.activity),
 					logger: ctx.logger,
 					entryAgentId,
 					scheduleAgent: ctx.scheduleAgent,
@@ -1173,7 +1208,7 @@ export const uploadsPlugin = definePlugin('uploads')
 		for (const entry of listResult.value) {
 			if (entry.type !== 'directory') continue
 			seenUploadIds.add(entry.name)
-			const uploadStore = ctx.pluginConfig.dataFileStore.scoped(`${uploadsPath}/${entry.name}`)
+			const uploadStore = new RuntimeFileStore(ctx.pluginConfig.dataFileStore, ctx.runtimeActivity).scoped(`${uploadsPath}/${entry.name}`)
 			try {
 				const metaResult = await uploadStore.read('meta.json')
 				if (!metaResult.ok) continue
@@ -1224,6 +1259,39 @@ export const uploadsPlugin = definePlugin('uploads')
 					continue
 				}
 				if (metadata.terminalEventPersisted) continue
+				if (metadata.status === 'processing' && metadata.pendingStart) {
+					if (ctx.runtimeActivity.getSnapshot().state !== 'ready') continue
+					if (!isBasename(metadata.filename)) throw new Error('Invalid pending upload filename')
+					const processing = ctx.runtimeActivity.tryOperation(`upload:${uploadId}:processing`)
+					if (!processing) continue
+					const lifecycle = reserveUploadLifecycle(ctx.pluginContext, uploadId)
+					lifecycle.attachRuntimeLease(() => processing.release())
+					try {
+						const entryAgentId = getEntryAgentId(ctx.sessionState)
+						const filePath = join(uploadStore.getRoots().session, metadata.filename)
+						startAsyncUpload({
+							pluginContext: ctx.pluginContext,
+							runtimeActivity: processing.activity,
+							pendingMetadata: { ...metadata, path: filePath },
+							prepared: {
+								uploadId: parsedUploadId.value, uploadIdStr: uploadId,
+								uploadStore: new RuntimeFileStore(uploadStore, processing.activity),
+								filename: metadata.filename, filePath, createdAt: metadata.createdAt, lifecycle,
+							},
+							sessionId: ctx.sessionId,
+							upload: { filename: metadata.filename, mimeType: metadata.mimeType, size: metadata.size },
+							config: ctx.pluginConfig,
+							inferenceContext: entryAgentId ? {
+								sessionId: String(ctx.sessionId), agentId: String(entryAgentId),
+								fileStore: new RuntimeFileStore(ctx.files, processing.activity),
+							} : undefined,
+							emitEvent: (event) => ctx.emitEvent(event, processing.activity),
+							notify: (type, payload) => ctx.notify(type, payload, processing.activity),
+							logger: ctx.logger, entryAgentId, scheduleAgent: ctx.scheduleAgent,
+						})
+					} catch (error) { lifecycle.abandon(); throw error }
+					continue
+				}
 
 				if (metadata.status === 'processing') {
 					metadata.status = 'failed'

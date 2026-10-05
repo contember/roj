@@ -324,7 +324,7 @@ export const sessionLifecyclePlugin = definePlugin('sessions')
 	})
 	.method('getEvents', {
 		input: z4.object({
-			since: z4.number().int().optional(),
+			since: z4.number().int().min(-1).optional(),
 			limit: z4.number().int().optional(),
 			offset: z4.number().int().optional(),
 			type: z4.string().optional(),

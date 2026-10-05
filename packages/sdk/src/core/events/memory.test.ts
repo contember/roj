@@ -20,6 +20,33 @@ describe('MemoryEventStore', () => {
 	})
 
 	describe('append', () => {
+		test('serializes concurrent appends and metadata updates without losing counters', async () => {
+			await store.append(testSessionId, withSessionId(testSessionId, sessionEvents.create('session_created', { presetId: 'test' })))
+			const spawn = withSessionId(testSessionId, agentEvents.create('agent_spawned', {
+				agentId: generateTestAgentId(), definitionName: 'test', parentId: null,
+			}))
+			await Promise.all([
+				...Array.from({ length: 30 }, () => store.append(testSessionId, spawn)),
+				store.updateMetadata(testSessionId, { name: 'kept', tags: ['tag'] }),
+				store.appendBatch(testSessionId, [spawn, spawn]),
+			])
+			expect(await store.load(testSessionId)).toHaveLength(33)
+			expect(await store.getMetadata(testSessionId)).toMatchObject({
+				name: 'kept', tags: ['tag'], metrics: { totalEvents: 33, totalAgents: 32 },
+			})
+		})
+
+		test('checks the closed-session guard inside the append lock', async () => {
+			await store.append(testSessionId, withSessionId(testSessionId, sessionEvents.create('session_created', { presetId: 'test' })))
+			const close = store.append(testSessionId, withSessionId(testSessionId, sessionEvents.create('session_closed', {})))
+			const hook = store.append(testSessionId, withSessionId(testSessionId, sessionEvents.create('session_handler_started', {
+				handlerName: 'onSessionReady', pluginName: 'test',
+			})))
+			await close
+			await expect(hook).rejects.toThrow('Refusing to append')
+			expect(await store.load(testSessionId)).toHaveLength(2)
+		})
+
 		test('appends single event', async () => {
 			const event = withSessionId(
 				testSessionId,

@@ -450,6 +450,7 @@ export const agentsPlugin = definePlugin(PLUGIN_NAME)
 		}
 	})
 	.sessionHook('onSessionClose', async (ctx) => {
+		if (ctx.reason === 'parked' || ctx.reason === 'revoked') return
 		if (ctx.pluginConfig.superviseChildrenIntervalMs === undefined) return
 
 		// Eviction runs this too, and onSessionReady re-arms on the next load —
