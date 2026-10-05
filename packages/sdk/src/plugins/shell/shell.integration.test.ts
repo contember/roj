@@ -39,16 +39,47 @@ describe('shell plugin', () => {
 	// =========================================================================
 
 	describe('run_command tool', () => {
+		it('serializes runner truncation metadata in the tool response', async () => {
+			const harness = createShellHarness({
+				presets: [createShellPreset()],
+				llmProvider: MockLLMProvider.withSequence([
+					{
+						toolCalls: [
+							{
+								id: ToolCallId('truncated'),
+								name: 'run_command',
+								input: { command: "head -c 1048577 /dev/zero | tr '\\0' ' '" },
+							},
+						],
+					},
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
+			try {
+				const session = await harness.createSession('test')
+				await session.sendAndWaitForIdle('Run command')
+				const toolMessages = harness.llmProvider.getCallHistory()[1].messages.filter((message) => message.role === 'tool')
+				expect(toolMessages).toHaveLength(1)
+				const output = contentToString(toolMessages[0].content)
+				expect(output).toContain('"truncated": true')
+				expect(output).toContain('"exitCode": 0')
+			} finally {
+				await harness.shutdown()
+			}
+		})
+
 		it('echo hello → stdout contains "hello", exitCode 0', async () => {
 			const harness = createShellHarness({
 				presets: [createShellPreset()],
 				llmProvider: MockLLMProvider.withSequence([
 					{
-						toolCalls: [{
-							id: ToolCallId('tc1'),
-							name: 'run_command',
-							input: { command: 'echo hello' },
-						}],
+						toolCalls: [
+							{
+								id: ToolCallId('tc1'),
+								name: 'run_command',
+								input: { command: 'echo hello' },
+							},
+						],
 					},
 					{ content: 'Done', toolCalls: [] },
 				]),
@@ -71,11 +102,13 @@ describe('shell plugin', () => {
 				presets: [createShellPreset()],
 				llmProvider: MockLLMProvider.withSequence([
 					{
-						toolCalls: [{
-							id: ToolCallId('tc1'),
-							name: 'run_command',
-							input: { command: 'false' },
-						}],
+						toolCalls: [
+							{
+								id: ToolCallId('tc1'),
+								name: 'run_command',
+								input: { command: 'false' },
+							},
+						],
 					},
 					{ content: 'Done', toolCalls: [] },
 				]),
@@ -97,11 +130,13 @@ describe('shell plugin', () => {
 				presets: [createShellPreset()],
 				llmProvider: MockLLMProvider.withSequence([
 					{
-						toolCalls: [{
-							id: ToolCallId('tc1'),
-							name: 'run_command',
-							input: { command: 'echo error_output >&2' },
-						}],
+						toolCalls: [
+							{
+								id: ToolCallId('tc1'),
+								name: 'run_command',
+								input: { command: 'echo error_output >&2' },
+							},
+						],
 					},
 					{ content: 'Done', toolCalls: [] },
 				]),
@@ -123,11 +158,13 @@ describe('shell plugin', () => {
 				presets: [createShellPreset()],
 				llmProvider: MockLLMProvider.withSequence([
 					{
-						toolCalls: [{
-							id: ToolCallId('tc1'),
-							name: 'run_command',
-							input: { command: 'cat', stdin: 'stdin_content' },
-						}],
+						toolCalls: [
+							{
+								id: ToolCallId('tc1'),
+								name: 'run_command',
+								input: { command: 'cat', stdin: 'stdin_content' },
+							},
+						],
 					},
 					{ content: 'Done', toolCalls: [] },
 				]),
@@ -146,18 +183,22 @@ describe('shell plugin', () => {
 
 		it('command with env vars → env vars available', async () => {
 			const harness = createShellHarness({
-				presets: [createShellPreset({
-					shellConfig: {
-						env: { TEST_VAR: 'test_value_123' },
-					},
-				})],
+				presets: [
+					createShellPreset({
+						shellConfig: {
+							env: { TEST_VAR: 'test_value_123' },
+						},
+					}),
+				],
 				llmProvider: MockLLMProvider.withSequence([
 					{
-						toolCalls: [{
-							id: ToolCallId('tc1'),
-							name: 'run_command',
-							input: { command: 'echo $TEST_VAR' },
-						}],
+						toolCalls: [
+							{
+								id: ToolCallId('tc1'),
+								name: 'run_command',
+								input: { command: 'echo $TEST_VAR' },
+							},
+						],
 					},
 					{ content: 'Done', toolCalls: [] },
 				]),
@@ -182,16 +223,20 @@ describe('shell plugin', () => {
 	describe('timeout', () => {
 		it('slow command with short timeout → timedOut: true', async () => {
 			const harness = createShellHarness({
-				presets: [createShellPreset({
-					shellConfig: { timeout: 500 },
-				})],
+				presets: [
+					createShellPreset({
+						shellConfig: { timeout: 500 },
+					}),
+				],
 				llmProvider: MockLLMProvider.withSequence([
 					{
-						toolCalls: [{
-							id: ToolCallId('tc1'),
-							name: 'run_command',
-							input: { command: 'sleep 10', timeout: 500 },
-						}],
+						toolCalls: [
+							{
+								id: ToolCallId('tc1'),
+								name: 'run_command',
+								input: { command: 'sleep 10', timeout: 500 },
+							},
+						],
 					},
 					{ content: 'Done', toolCalls: [] },
 				]),
@@ -216,16 +261,20 @@ describe('shell plugin', () => {
 	describe('working directory', () => {
 		it('pwd with custom cwd → output matches cwd', async () => {
 			const harness = createShellHarness({
-				presets: [createShellPreset({
-					shellConfig: { cwd: '/tmp' },
-				})],
+				presets: [
+					createShellPreset({
+						shellConfig: { cwd: '/tmp' },
+					}),
+				],
 				llmProvider: MockLLMProvider.withSequence([
 					{
-						toolCalls: [{
-							id: ToolCallId('tc1'),
-							name: 'run_command',
-							input: { command: 'pwd' },
-						}],
+						toolCalls: [
+							{
+								id: ToolCallId('tc1'),
+								name: 'run_command',
+								input: { command: 'pwd' },
+							},
+						],
 					},
 					{ content: 'Done', toolCalls: [] },
 				]),
@@ -251,12 +300,12 @@ describe('shell plugin', () => {
 	describe('disabled', () => {
 		it('enabled: false → no run_command tool', async () => {
 			const harness = createShellHarness({
-				presets: [createTestPreset({
-					plugins: [shellPlugin.configure({ cwd: '/tmp', sandboxed: false })],
-					orchestratorPlugins: [
-						shellPlugin.configureAgent({ enabled: false }),
-					],
-				})],
+				presets: [
+					createTestPreset({
+						plugins: [shellPlugin.configure({ cwd: '/tmp', sandboxed: false })],
+						orchestratorPlugins: [shellPlugin.configureAgent({ enabled: false })],
+					}),
+				],
 				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
 			})
 

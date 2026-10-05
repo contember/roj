@@ -92,9 +92,7 @@ async function resolveAgentPath(
 			}
 			return Ok(absolutePath)
 		}
-		const validPrefixes = workspaceDir
-			? `${VIRTUAL_SESSION}/ or ${VIRTUAL_WORKSPACE}/`
-			: `${VIRTUAL_SESSION}/`
+		const validPrefixes = workspaceDir ? `${VIRTUAL_SESSION}/ or ${VIRTUAL_WORKSPACE}/` : `${VIRTUAL_SESSION}/`
 		return Err({ message: `Path must start with ${validPrefixes}. Got: '${agentPath}'`, recoverable: false })
 	}
 	// Non-sandboxed: validate within allowed dirs
@@ -102,8 +100,7 @@ async function resolveAgentPath(
 	const normalizedSession = resolve(sessionDir)
 	const normalizedWorkspace = workspaceDir ? resolve(workspaceDir) : null
 	const isInSession = absolutePath === normalizedSession || absolutePath.startsWith(normalizedSession + '/')
-	const isInWorkspace = normalizedWorkspace
-		&& (absolutePath === normalizedWorkspace || absolutePath.startsWith(normalizedWorkspace + '/'))
+	const isInWorkspace = normalizedWorkspace && (absolutePath === normalizedWorkspace || absolutePath.startsWith(normalizedWorkspace + '/'))
 	if (!isInSession && !isInWorkspace) {
 		return Err({ message: `Path '${agentPath}' is outside allowed directories`, recoverable: false })
 	}
@@ -174,6 +171,7 @@ export interface ShellResult {
 	exitCode: number
 	signal?: string
 	timedOut: boolean
+	truncated?: boolean
 	durationMs: number
 }
 
@@ -187,19 +185,17 @@ export class ShellExecutor {
 	private readonly fs: FileSystem
 	private readonly shell?: ShellRunner
 
-	constructor(private config: ShellConfig, deps: ShellExecutorDeps) {
+	constructor(
+		private config: ShellConfig,
+		deps: ShellExecutorDeps,
+	) {
 		this.fs = deps.fs
 		this.shell = deps.shell
 	}
 
-	async execute(
-		input: RunCommandInput,
-		environment: SessionEnvironment,
-	): Promise<Result<ShellResult, ToolError>> {
+	async execute(input: RunCommandInput, environment: SessionEnvironment): Promise<Result<ShellResult, ToolError>> {
 		const args = typeof input.args === 'string' ? [input.args] : input.args
-		const fullCommand = args
-			? `${shellEscape(input.command)} ${args.map(shellEscape).join(' ')}`
-			: input.command
+		const fullCommand = args ? `${shellEscape(input.command)} ${args.map(shellEscape).join(' ')}` : input.command
 
 		const timeout = input.timeout ?? this.config.timeout ?? 30000
 		const startTime = Date.now()
@@ -279,6 +275,7 @@ export class ShellExecutor {
 				exitCode: result.exitCode,
 				signal: result.signal,
 				timedOut: result.timedOut,
+				...(result.truncated === undefined ? {} : { truncated: result.truncated }),
 				durationMs: Date.now() - startTime,
 			})
 		} catch (error) {
@@ -297,11 +294,7 @@ export class ShellExecutor {
 	 * Paths under the hidden home roots exist only where a grant mounts them back; the rest of
 	 * the tree the sandbox binds read-only, so a directory there grants nothing.
 	 */
-	private async resolveSandboxCwd(
-		agentCwd: string,
-		sessionDir: string,
-		workspaceDir: string | undefined,
-	): Promise<Result<string, ToolError>> {
+	private async resolveSandboxCwd(agentCwd: string, sessionDir: string, workspaceDir: string | undefined): Promise<Result<string, ToolError>> {
 		if (!isAbsolute(agentCwd)) {
 			return Err({ message: `Working directory '${agentCwd}' must be an absolute path`, recoverable: false })
 		}
@@ -323,11 +316,7 @@ export class ShellExecutor {
 		}
 
 		if (HIDDEN_ROOTS.some((root) => isWithin(normalized, root))) {
-			const mounted = [
-				VIRTUAL_SESSION,
-				...(workspaceDir ? [VIRTUAL_WORKSPACE] : []),
-				...this.boundRoots().map((root) => root.seen),
-			]
+			const mounted = [VIRTUAL_SESSION, ...(workspaceDir ? [VIRTUAL_WORKSPACE] : []), ...this.boundRoots().map((root) => root.seen)]
 			return Err({
 				message: `Path '${agentCwd}' is not mounted in this sandbox. Mounted roots: ${mounted.join(', ')}`,
 				recoverable: false,

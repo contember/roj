@@ -79,8 +79,8 @@ export interface ShellRunResult {
 export interface ShellRunner {
 	/** Declared, not assumed: a caller that needs confinement checks it before running. */
 	readonly confinement: ShellConfinement
-	/** Whether `timeoutMs` terminates the run before it resolves with `timedOut: true`. */
-	readonly supportsTimeout: boolean
+	/** Whether `timeoutMs` terminates the run before it resolves with `timedOut: true`. Omitted means true for legacy runners. */
+	readonly supportsTimeout?: boolean
 
 	/**
 	 * Run one command line to completion and buffer its output.
