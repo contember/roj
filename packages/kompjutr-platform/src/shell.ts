@@ -17,7 +17,6 @@ function quoteShellWord(value: string): string {
 
 export function createKompjutrShellRunner(options: KompjutrShellRunnerOptions): ShellRunner {
 	const commands = options.git === undefined ? undefined : new Map([['git', createGitCommand(options.git)]])
-	const shell = createShell({ fs: options.filesystem, commands })
 
 	return {
 		confinement: options.confinement ?? 'none',
@@ -28,10 +27,16 @@ export function createKompjutrShellRunner(options: KompjutrShellRunnerOptions): 
 				throw new Error('kompjutr shell does not support path grants')
 			}
 
-			const result = await shell.run(`cd ${quoteShellWord(runOptions.cwd)} && ${runOptions.command}`, {
-				env: runOptions.env,
-				stdin: runOptions.stdin,
-			})
+			// ShellSession caches cwd per instance, even though instances share the default SQL row.
+			const shell = createShell({ fs: options.filesystem, commands })
+			const cwdResult = await shell.run(`cd ${quoteShellWord(runOptions.cwd)}`)
+			const result =
+				cwdResult.exitCode === 0
+					? await shell.run(runOptions.command, {
+							env: runOptions.env,
+							stdin: runOptions.stdin,
+						})
+					: cwdResult
 			return {
 				stdout: result.stdout,
 				stderr: result.stderr,
