@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Database } from '@kompjutr/do'
 import type { LLMCallOutcome, LLMCallRow } from '@roj-ai/sdk/platform'
@@ -212,7 +213,7 @@ function createLegacy(db: Database, original: LLMCallRow): void {
 }
 
 test('reads old schema near-limit rows, migrates on completion, and survives reopening', async () => {
-	const directory = mkdtempSync('/tmp/opencode/llm-call-log-')
+	const directory = mkdtempSync(join(tmpdir(), 'llm-call-log-'))
 	const path = join(directory, 'calls.sqlite')
 	let storage = new BunSqliteStorage(path)
 	try {
