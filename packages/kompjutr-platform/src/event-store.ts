@@ -7,7 +7,7 @@
  * key. This is the write path an event-sourced session spends its day on.
  */
 
-import { BaseEventStore, EventAppendError, EventStoreError, isDomainEvent, SessionId, sessionMetadataSchema } from '@roj-ai/sdk'
+import { BaseEventStore, domainEventSchema, EventAppendError, EventStoreError, isDomainEvent, SessionId, sessionMetadataSchema } from '@roj-ai/sdk'
 import type { DomainEvent, LoadRangeOptions, LoadRangeResult, Logger, SessionMetadata } from '@roj-ai/sdk'
 import type { SqlDatabase } from '@kompjutr/do'
 
@@ -166,8 +166,6 @@ export class KompjutrEventStore extends BaseEventStore {
 			})
 		})
 
-		// The chain's tail is per-session state; a deleted session must not keep one.
-		this.#appendTails.delete(sessionId)
 		return events
 	}
 
@@ -214,23 +212,24 @@ export class KompjutrEventStore extends BaseEventStore {
 		const previous = this.#appendTails.get(sessionId) ?? Promise.resolve()
 		const next = previous.then(task)
 		// The stored tail must never reject, or the next append inherits this failure.
-		this.#appendTails.set(
-			sessionId,
-			next.catch(() => undefined),
-		)
+		const tail = next
+			.catch(() => undefined)
+			.then(() => {
+				if (this.#appendTails.get(sessionId) === tail) this.#appendTails.delete(sessionId)
+			})
+		this.#appendTails.set(sessionId, tail)
 		return next
 	}
 
 	#decodeEvent(sessionId: SessionId, row: EventRow): DomainEvent {
-		let parsed: unknown
 		try {
-			parsed = JSON.parse(row.payload)
+			const parsed = domainEventSchema.parse(JSON.parse(row.payload))
+			// The schema validates fields; the SDK guard supplies the domain event brand.
+			if (!isDomainEvent(parsed)) throw new Error('Invalid domain event')
+			return parsed
 		} catch (error) {
 			throw new EventStoreError(`Failed to parse event at index ${row.seq}`, sessionId, error)
 		}
-
-		if (!isDomainEvent(parsed)) throw new EventStoreError(`Failed to parse event at index ${row.seq}`, sessionId)
-		return parsed
 	}
 
 	/**

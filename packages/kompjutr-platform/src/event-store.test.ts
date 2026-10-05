@@ -1,4 +1,4 @@
-import { isDomainEvent, SessionId } from '@roj-ai/sdk'
+import { EventAppendError, EventStoreError, isDomainEvent, SessionId } from '@roj-ai/sdk'
 import type { DomainEvent } from '@roj-ai/sdk'
 import { beforeEach, expect, test } from 'bun:test'
 import { Database } from '@kompjutr/do'
@@ -76,6 +76,9 @@ test('a batch that fails part way through leaves nothing behind', async () => {
 
 	// The 33 rows of the first chunk went with the rollback; the earlier event stands.
 	expect(await store.load(SESSION)).toHaveLength(1)
+	await failing.append(SESSION, event(SESSION, 'recovered'))
+	expect(await failing.load(SESSION)).toHaveLength(2)
+	expect((await failing.getMetadata(SESSION))?.metrics?.totalEvents).toBe(2)
 })
 
 test('loadRange returns what followed the cursor, and holds it when nothing did', async () => {
@@ -153,4 +156,51 @@ test('a session does not see another session events', async () => {
 
 	expect(await store.load(SESSION)).toHaveLength(1)
 	expect(await store.load(OTHER)).toHaveLength(1)
+})
+
+test('delete preserves serialization of appends queued for the recreated session', async () => {
+	await store.append(SESSION, created(SESSION))
+	const deleted = store.deleteSession(SESSION)
+	const recreated = store.append(SESSION, created(SESSION))
+	expect(await deleted).toBe(1)
+	const second = store.append(SESSION, event(SESSION, 'second'))
+	await Promise.all([recreated, second])
+
+	expect(await store.load(SESSION)).toHaveLength(2)
+	expect((await store.getMetadata(SESSION))?.metrics?.totalEvents).toBe(2)
+})
+
+test('a queued append proceeds after its predecessor fails', async () => {
+	db.run(`CREATE TRIGGER reject_event BEFORE INSERT ON roj_events
+		WHEN json_extract(NEW.payload, '$.type') = 'rejected'
+		BEGIN SELECT RAISE(FAIL, 'rejected event'); END`)
+	const failed = expect(store.append(SESSION, event(SESSION, 'rejected'))).rejects.toBeInstanceOf(EventAppendError)
+	const recovered = store.append(SESSION, created(SESSION))
+	await Promise.all([failed, recovered])
+
+	expect(await store.load(SESSION)).toHaveLength(1)
+	expect((await store.getMetadata(SESSION))?.metrics?.totalEvents).toBe(1)
+})
+
+test.each([
+	{ type: 42, sessionId: SESSION, timestamp: 1 },
+	{ type: 'test_event', sessionId: 42, timestamp: 1 },
+	{ type: 'test_event', sessionId: SESSION, timestamp: 'yesterday' },
+])('load and loadRange reject invalid event field types: %j', async (invalid) => {
+	await store.append(SESSION, created(SESSION))
+	db.run('INSERT INTO roj_events (session_id, seq, payload) VALUES (?, ?, ?)', SESSION, 1, JSON.stringify(invalid))
+
+	for (const result of [() => store.load(SESSION), () => store.loadRange(SESSION, { since: 0 })]) {
+		await expect(result()).rejects.toBeInstanceOf(EventStoreError)
+		await expect(result()).rejects.toMatchObject({ sessionId: SESSION, message: 'Failed to parse event at index 1' })
+	}
+})
+
+test('load and loadRange preserve extension fields and file-store session ID semantics', async () => {
+	const payload = { type: 'plugin_event', sessionId: 'legacy/id', timestamp: 1, extension: { nested: [1, 'two'] } }
+	if (!isDomainEvent(payload)) throw new Error('not a domain event')
+	db.run('INSERT INTO roj_events (session_id, seq, payload) VALUES (?, ?, ?)', SESSION, 0, JSON.stringify(payload))
+
+	expect(await store.load(SESSION)).toEqual([payload])
+	expect((await store.loadRange(SESSION)).events).toEqual([payload])
 })

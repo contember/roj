@@ -75,7 +75,7 @@ export type { InferenceCompletedEvent, InferenceFailedEvent, InferenceStartedEve
 export { estimateTokens } from '~/core/llm/tokens.js'
 export { applyEvent } from '~/core/sessions/apply-event.js'
 export { selectPluginState } from '~/core/sessions/reducer.js'
-export { isValidSessionId, parseSessionId, SessionId } from '~/core/sessions/schema.js'
+export { domainEventSchema, isValidSessionId, parseSessionId, SessionId } from '~/core/sessions/schema.js'
 export type { RuntimeLeaseRelease, SessionRuntimeActivity, SessionRuntimeActivitySnapshot } from '~/core/sessions/runtime-activity.js'
 export type { SessionMetadata } from '~/core/sessions/schema.js'
 // Exported so a consumer can validate a callManagerMethod('sessions.list')

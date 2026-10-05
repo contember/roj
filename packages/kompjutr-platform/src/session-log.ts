@@ -31,8 +31,8 @@ export class KompjutrSessionLog implements SessionLogStore {
 	}
 
 	append(sessionId: string, line: string): void {
-		const seq = this.#claimSeq(sessionId)
 		try {
+			const seq = this.#claimSeq(sessionId)
 			this.db.run(`INSERT INTO ${LOG_TABLE} (session_id, seq, line) VALUES (?, ?, ?)`, sessionId, seq, line)
 		} catch {
 			// A dropped line must never fail the caller — nothing awaits logging, and
