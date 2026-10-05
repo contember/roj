@@ -75,8 +75,8 @@ export const fullPlugins = [
 
 /**
  * Built-in plugins that run without an OS process table, for hosts like a Worker
- * isolate. Drops `uploads`, `resources` and `services` — each of them shells out
- * (pdftotext/markitdown, unzip, dev servers).
+ * isolate. Drops `uploads` and `resources`, which shell out. Services require
+ * the host's `createServiceExecutor` when no process table is available.
  *
  * `satisfies` keeps this a strict subset of `fullPlugins`, so it cannot name a
  * plugin the RPC contract does not know about.
@@ -89,6 +89,7 @@ export const isolatePlugins = [
 	agentStatusPlugin,
 	userChatPlugin,
 	llmDebugPlugin,
+	servicePlugin,
 	filesystemPlugin,
 	logsPlugin,
 	sessionStatsPlugin,

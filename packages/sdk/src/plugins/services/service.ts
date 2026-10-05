@@ -149,6 +149,22 @@ export interface ServiceExecutorDeps {
 	hookTimeoutMs?: number
 }
 
+/** Lifecycle used by the services plugin, independently of how a host runs it. */
+export type ServiceExecutorPort = Pick<
+	ServiceExecutor,
+	| 'onStatusChanged'
+	| 'onStartSettled'
+	| 'start'
+	| 'stop'
+	| 'restart'
+	| 'close'
+	| 'getStatus'
+	| 'getLogs'
+	| 'waitForReady'
+	| 'hasScheduledRestart'
+	| 'reapProcessGroup'
+>
+
 type ProcessGroupProbe = { state: 'alive' | 'gone' } | { state: 'error'; error: Error }
 
 let serviceExecutorObserverForTesting: ((executor: ServiceExecutor) => void) | undefined

@@ -201,11 +201,13 @@ export const servicePlugin = definePlugin('services')
 		const statusEffects = new Set<Promise<void>>()
 		let statusEffectTail = Promise.resolve()
 		let publicationEnabled = true
-		const executor = new ServiceExecutor(logger, pluginConfig.portPool, {
-			fs: ctx.platform.fs,
-			process: ctx.platform.process,
-			pidRegistry: pluginConfig.pidRegistry,
-		})
+		const executor =
+			ctx.platform.createServiceExecutor?.(logger, pluginConfig.portPool) ??
+			new ServiceExecutor(logger, pluginConfig.portPool, {
+				fs: ctx.platform.fs,
+				process: ctx.platform.process,
+				pidRegistry: pluginConfig.pidRegistry,
+			})
 		const beginLifecycle = (serviceType: string): ServiceLease | undefined => {
 			const existing = serviceLeases.get(serviceType)
 			if (existing && !existing.terminalPending) return existing

@@ -14,6 +14,9 @@ import type { ProcessRunner } from './process.js'
 import type { Scheduler } from './scheduler.js'
 import type { SessionLogStore } from './session-log.js'
 import type { ShellRunner } from './shell.js'
+import type { Logger } from '../lib/logger/logger.js'
+import type { PortPool } from '../plugins/services/port-pool.js'
+import type { ServiceExecutorPort } from '../plugins/services/service.js'
 
 export type {
 	Dirent,
@@ -36,6 +39,10 @@ export type { LiveScheduler, Scheduler, WakeHandler } from './scheduler.js'
 export type { SessionLogPage, SessionLogStore } from './session-log.js'
 export type { ShellConfinement, ShellGrant, ShellLimits, ShellRunner, ShellRunOptions, ShellRunResult } from './shell.js'
 
+export type { ServiceExecutorPort } from '../plugins/services/service.js'
+export type { PortPool } from '../plugins/services/port-pool.js'
+export type { ServiceConfig, ServiceStatus, ServiceStopSource } from '../plugins/services/schema.js'
+
 /**
  * Aggregate platform capabilities passed through the system at bootstrap.
  *
@@ -53,6 +60,8 @@ export interface Platform {
 	shell?: ShellRunner
 	/** Git over the host's repositories. Absent on hosts that cannot run git. */
 	git?: GitClient
+	/** Session-scoped service lifecycle for hosts whose services are not OS processes. */
+	createServiceExecutor?: (logger: Logger, portPool: PortPool) => ServiceExecutorPort
 	/**
 	 * Cheap "has the filesystem changed" counter. Absent on hosts that cannot
 	 * answer it, which then recompute whatever they would have gated on.
