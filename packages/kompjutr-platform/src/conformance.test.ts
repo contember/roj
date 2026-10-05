@@ -8,7 +8,7 @@
  */
 
 import type { Platform } from '@roj-ai/sdk/platform'
-import { GIT_FIXTURE, runPlatformConformance } from '@roj-ai/sdk/testing/conformance'
+import { GIT_FIXTURE, runPlatformConformance } from '../../sdk/src/testing/conformance.js'
 import { createGit, Workspace } from '@kompjutr/do'
 import { createKompjutrPlatform } from './index.js'
 import { BunSqliteStorage } from './testing/storage.js'

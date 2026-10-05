@@ -55,8 +55,21 @@ export function createKompjutrFileSystem(options: KompjutrFileSystemOptions): Fi
 	}
 
 	/** Copies inside SQLite, so file bytes never enter the isolate. */
-	const copyEntries = (entries: { source: string; destination: string }[]): void => {
-		let pending = entries
+	const copyEntries = (entries: { source: string; destination: string }[], force = true): void => {
+		let pending = entries.filter(({ source, destination }) => {
+			const sourceStat = filesystem.stat(source)
+			const destinationStat = filesystem.stat(destination)
+			if (sourceStat !== null && destinationStat !== null && sourceStat.ino === destinationStat.ino) {
+				throw fileError('ERR_FS_CP_EINVAL', destination, 'source and destination are the same file')
+			}
+			if (sourceStat?.type === 'dir' && destinationStat !== null && destinationStat.type !== 'dir') {
+				throw fileError('ERR_FS_CP_DIR_TO_NON_DIR', destination, 'cannot overwrite a non-directory with a directory')
+			}
+			if (sourceStat?.type !== 'dir' && destinationStat?.type === 'dir') {
+				throw fileError('ERR_FS_CP_NON_DIR_TO_DIR', destination, 'cannot overwrite a directory with a non-directory')
+			}
+			return force || destinationStat === null || sourceStat?.type === 'dir'
+		})
 		while (pending.length > 0) {
 			const batch = filesystem.copyFiles(pending.slice(0, COPY_BATCH), {
 				parents: true,
@@ -65,6 +78,13 @@ export function createKompjutrFileSystem(options: KompjutrFileSystemOptions): Fi
 			if (deferred.length >= pending.length) throw fileError('EIO', pending[0]?.source ?? '', 'copy made no progress')
 			pending = deferred
 		}
+	}
+
+	const remove = (path: string, rmOptions?: { recursive?: boolean; force?: boolean }): void => {
+		if (!rmOptions?.recursive && filesystem.stat(path)?.type === 'dir') {
+			throw fileError('ERR_FS_EISDIR', path, 'is a directory')
+		}
+		compat.rmSync(path, rmOptions)
 	}
 
 	return {
@@ -80,7 +100,7 @@ export function createKompjutrFileSystem(options: KompjutrFileSystemOptions): Fi
 
 		// The shim's own appendFile is ENOSYS; write at the current end instead.
 		appendFile: async (path, data) => {
-			const stat = filesystem.stat(path)
+			const stat = filesystem.statTarget(path)
 			if (stat === null) {
 				compat.writeFileSync(path, data)
 				return
@@ -106,25 +126,28 @@ export function createKompjutrFileSystem(options: KompjutrFileSystemOptions): Fi
 		},
 
 		rm: async (path, rmOptions) => {
-			compat.rmSync(path, rmOptions)
+			remove(path, rmOptions)
 		},
 
 		cp: async (source, dest, cpOptions) => {
 			const stat = filesystem.stat(source)
 			if (stat === null) throw fileError('ENOENT', source, 'no such file or directory')
 			if (stat.type !== 'dir') {
-				copyEntries([{ source, destination: dest }])
+				copyEntries([{ source, destination: dest }], cpOptions?.force)
 				return
 			}
 			if (!cpOptions?.recursive) throw fileError('EISDIR', source, 'is a directory')
 			const root = filesystem.realpath(source)
-			copyEntries([
-				{ source: root, destination: dest },
-				...scanSubtree(root).map((path) => ({
-					source: path,
-					destination: `${dest}${path.slice(root.length)}`,
-				})),
-			])
+			copyEntries(
+				[
+					{ source: root, destination: dest },
+					...scanSubtree(root).map((path) => ({
+						source: path,
+						destination: `${dest}${path.slice(root.length)}`,
+					})),
+				],
+				cpOptions?.force,
+			)
 		},
 
 		// The shim exposes fds, not handles; wrap one in the read subset the port uses.
@@ -158,20 +181,42 @@ export function createKompjutrFileSystem(options: KompjutrFileSystemOptions): Fi
 		},
 
 		readFiles: async (paths: readonly string[]): Promise<ReadFilesEntry[]> => {
-			const entries = await compat.readFiles(paths)
-			return entries.map((entry) => ({
-				path: entry.path,
-				...(entry.content === undefined ? {} : { content: Buffer.from(entry.content) }),
-				...(entry.error === undefined ? {} : { error: entry.error }),
-			}))
+			try {
+				const entries = await compat.readFiles(paths)
+				return entries.map((entry, index) => ({
+					path: paths[index] ?? entry.path,
+					...(entry.content === undefined ? {} : { content: Buffer.from(entry.content) }),
+					...(entry.error === undefined ? {} : { error: entry.error }),
+				}))
+			} catch (error) {
+				if (!(error instanceof Error) || !('code' in error) || (error.code !== 'ENOTDIR' && error.code !== 'ELOOP')) throw error
+				// Path resolution can abort the upstream batch before it reports individual failures.
+				return Promise.all(
+					paths.map(async (path): Promise<ReadFilesEntry> => {
+						try {
+							const [entry] = await compat.readFiles([path])
+							if (!entry) throw new Error('readFiles returned no entry')
+							return {
+								path,
+								...(entry.content === undefined ? {} : { content: Buffer.from(entry.content) }),
+								...(entry.error === undefined ? {} : { error: entry.error }),
+							}
+						} catch (entryError) {
+							if (entryError instanceof Error && 'code' in entryError && typeof entryError.code === 'string') {
+								return { path, error: entryError.code }
+							}
+							throw entryError
+						}
+					}),
+				)
+			}
 		},
 
-		// kompjutr defaults `parents`, `force` and `recursive` on; the port defaults
-		// them off, so each is stated rather than left to whichever layer answers.
+		// The bulk primitive replaces final links; resolve them as single writes do.
 		writeFiles: async (entries: readonly WriteFilesEntry[], writeOptions?: WriteFilesOptions) => {
 			filesystem.writeFiles(
 				entries.map((entry) => ({
-					path: entry.path,
+					path: filesystem.realpath(entry.path),
 					bytes: toBytes(entry.content),
 				})),
 				{ parents: writeOptions?.createParents ?? false },
@@ -179,10 +224,7 @@ export function createKompjutrFileSystem(options: KompjutrFileSystemOptions): Fi
 		},
 
 		rmFiles: async (paths: readonly string[], rmOptions?: { recursive?: boolean; force?: boolean }) => {
-			filesystem.removeFiles(paths, {
-				recursive: rmOptions?.recursive ?? false,
-				force: rmOptions?.force ?? false,
-			})
+			for (const path of paths) remove(path, rmOptions)
 		},
 
 		scopeReads: (fn) => filesystem.withReadScope(fn),

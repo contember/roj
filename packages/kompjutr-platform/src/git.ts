@@ -63,7 +63,8 @@ export function createKompjutrGitClient(git: Git): GitClient {
 					ref: 'refs/remotes/origin/HEAD',
 				})
 				if (ref.kind !== 'symbolic') return undefined
-				return ref.target.split('/').pop() || undefined
+				const prefix = 'refs/remotes/origin/'
+				return ref.target.startsWith(prefix) ? ref.target.slice(prefix.length) || undefined : undefined
 			} catch {
 				// "undefined means unknown, so the caller applies its own default."
 				return undefined
