@@ -60,7 +60,7 @@ test('a cursor yields rows without materialising them', () => {
 	for (const value of [1, 2, 3]) storage.sql.exec('INSERT INTO t VALUES (?)', value)
 
 	storage.resetCounters()
-	const cursor = storage.sql.exec<{ a: number }>('SELECT a FROM t ORDER BY a')
+	const cursor = storage.sql.exec('SELECT a FROM t ORDER BY a')
 	const first = cursor[Symbol.iterator]().next()
 
 	expect(first.value).toEqual({ a: 1 })
@@ -88,5 +88,5 @@ test('a failed transaction leaves nothing behind', () => {
 		}),
 	).toThrow('abandoned')
 
-	expect(storage.sql.exec<{ n: number }>('SELECT count(*) AS n FROM t').toArray()).toEqual([{ n: 0 }])
+	expect(storage.sql.exec('SELECT count(*) AS n FROM t').toArray()).toEqual([{ n: 0 }])
 })
