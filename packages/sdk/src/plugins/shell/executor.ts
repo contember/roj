@@ -338,7 +338,7 @@ export class ShellExecutor {
 	}
 
 	private async requireExists(hostPath: string, agentCwd: string, seen: string): Promise<Result<string, ToolError>> {
-		if (await this.fs.exists(hostPath)) return Ok(seen)
+		if (await this.fs.exists(hostPath)) return Ok(this.shell?.confinement === 'paths' ? seen : hostPath)
 		return Err({ message: `Working directory '${agentCwd}' does not exist`, recoverable: false })
 	}
 

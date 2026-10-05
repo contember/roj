@@ -108,6 +108,15 @@ test('Roj tools and state survive reopening the kompjutr SQLite workspace', asyn
 			{
 				toolCalls: [
 					{
+						id: ToolCallId('default-cwd'),
+						name: 'run_command',
+						input: { command: 'pwd > /workspace/default-cwd.txt' },
+					},
+				],
+			},
+			{
+				toolCalls: [
+					{
 						id: ToolCallId('write-note'),
 						name: 'write_file',
 						input: {
@@ -156,7 +165,10 @@ test('Roj tools and state survive reopening the kompjutr SQLite workspace', asyn
 		const session = await sendTurn(active)
 		const sessionId = session.id
 
-		expect(provider.getCallCount()).toBe(5)
+		expect(provider.getCallCount()).toBe(6)
+		expect((await active.eventStore.load(sessionId)).filter(event => event.type === 'tool_failed')).toEqual([])
+		expect(await active.platform.fs.readFile(`${WORKSPACE}/default-cwd.txt`, 'utf-8')).toBe(`/data/sessions/${sessionId}\n`)
+		await active.platform.fs.unlink(`${WORKSPACE}/default-cwd.txt`)
 		expect(await active.platform.fs.readFile(`${WORKSPACE}/note.txt`, 'utf-8')).toBe('hello from Roj\n')
 		expect(await active.platform.fs.readFile(`${WORKSPACE}/dirty.txt`, 'utf-8')).toBe('dirty\n')
 
@@ -178,7 +190,7 @@ test('Roj tools and state survive reopening the kompjutr SQLite workspace', asyn
 		})
 
 		const events = await active.eventStore.load(sessionId)
-		expect(startedToolNames(events)).toEqual(['write_file', 'run_command', 'run_command', 'read_file'])
+		expect(startedToolNames(events)).toEqual(['run_command', 'write_file', 'run_command', 'run_command', 'read_file'])
 		expect(events.filter((event) => event.type === 'tool_failed')).toEqual([])
 		await active.system.shutdown()
 		active.storage.close()

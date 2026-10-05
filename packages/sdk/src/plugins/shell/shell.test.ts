@@ -258,7 +258,7 @@ describe('ShellExecutor', () => {
 		expect(result.ok).toBe(true)
 		if (!result.ok) return
 		expect(result.value.stdout).toBe('recorded')
-		expect(calls[0].cwd).toBe('/home/user/session')
+		expect(calls[0].cwd).toBe('/tmp')
 		expect(calls[0].grants).toBeUndefined()
 	})
 
