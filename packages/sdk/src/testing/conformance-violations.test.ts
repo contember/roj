@@ -2,7 +2,7 @@
  * Evidence that the conformance suite can fail.
  *
  * A suite nobody has seen fail is not evidence, and the node platform answers
- * six of the seventeen reported ports — so most of the checks have never met an
+ * only some of the reported ports — so most of the checks have never met an
  * implementation at all. This file builds one that answers every port, shows the
  * suite passes against it, then breaks exactly one clause at a time and shows
  * which check catches it.
@@ -451,10 +451,51 @@ const violations: Violation[] = [
 				...platform,
 				shell: {
 					confinement: 'paths',
+					supportsTimeout: shell.supportsTimeout,
 					// Runs where the grant points, but unconfined — so the probe still resolves.
 					run: (options) => {
 						const first = options.grants?.[0]
 						return shell.run({ ...options, cwd: first ? first.source ?? first.path : options.cwd, grants: undefined })
+					},
+				},
+			}
+		},
+	},
+	{
+		name: 'shell declares timeout support but does not terminate the run',
+		ports: ['shell', 'shell.timeout'],
+		caughtBy: 'a timeout terminates the command and reports timedOut',
+		break: (platform) => {
+			const shell = platform.shell
+			if (!shell) throw new Error('the equipped platform answers shell')
+			return {
+				...platform,
+				shell: {
+					...shell,
+					supportsTimeout: true,
+					run: (options) => options.command === 'sleep 30'
+						? Promise.resolve({ stdout: '', stderr: '', exitCode: 0, timedOut: false })
+						: shell.run(options),
+				},
+			}
+		},
+	},
+	{
+		name: 'shell reports a timeout while the command keeps running',
+		ports: ['shell', 'shell.timeout'],
+		caughtBy: 'a timed-out run cannot keep mutating after it resolves',
+		break: (platform) => {
+			const shell = platform.shell
+			if (!shell) throw new Error('the equipped platform answers shell')
+			return {
+				...platform,
+				shell: {
+					...shell,
+					supportsTimeout: true,
+					run: (options) => {
+						if (!options.command.startsWith('sleep 1;')) return shell.run(options)
+						void shell.run({ ...options, timeoutMs: 10_000 }).catch(() => {})
+						return Promise.resolve({ stdout: '', stderr: '', exitCode: 1, timedOut: true })
 					},
 				},
 			}

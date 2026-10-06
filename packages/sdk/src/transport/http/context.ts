@@ -9,13 +9,13 @@
  */
 
 import type { PreprocessorRegistry } from '~/plugins/uploads/preprocessor.js'
-import type { Services } from '../../bootstrap.js'
+import type { PluginProfile, Services } from '../../bootstrap.js'
 import type { SessionManager } from '../../core/sessions/session-manager.js'
 
 /**
  * Extended services with SessionManager for HTTP routes.
  */
-export type AppServices = Services & {
+export type AppServices = Services<PluginProfile> & {
 	sessionRuntime: SessionManager
 	/** Bearer token for authenticating HTTP requests. Optional - only used in worker mode. */
 	agentToken?: string

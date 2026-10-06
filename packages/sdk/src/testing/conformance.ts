@@ -93,7 +93,8 @@ export const GIT_FIXTURE: {
 /**
  * What the suite reports on. Most are ports; the dotted ones are facets a port
  * either has or does not — a scheduler that delivers its own wakes, a shell that
- * confines by paths — and they are named so that not exercising one is visible.
+ * terminates on timeout or confines by paths — and they are named so that not
+ * exercising one is visible.
  */
 export type ConformancePort =
 	| 'fs'
@@ -106,6 +107,7 @@ export type ConformancePort =
 	| 'scheduler'
 	| 'scheduler.live'
 	| 'shell'
+	| 'shell.timeout'
 	| 'shell.paths'
 	| 'shell.host'
 	| 'git'
@@ -126,6 +128,7 @@ export const CONFORMANCE_PORTS: readonly ConformancePort[] = [
 	'scheduler',
 	'scheduler.live',
 	'shell',
+	'shell.timeout',
 	'shell.paths',
 	'shell.host',
 	'git',
@@ -230,9 +233,7 @@ interface WalkShape {
 }
 
 function walkShapes(base: string, entries: readonly WalkEntry[]): WalkShape[] {
-	return entries
-		.map((entry) => ({ path: relativeTo(base, entry.path), type: entry.type, size: entry.size }))
-		.sort((a, b) => a.path.localeCompare(b.path))
+	return entries.map((entry) => ({ path: relativeTo(base, entry.path), type: entry.type, size: entry.size })).sort((a, b) => a.path.localeCompare(b.path))
 }
 
 /**
@@ -251,16 +252,13 @@ async function walkWithReaddir(fs: FileSystem, dir: string, options?: WalkOption
 			if (options?.excludeHidden && dirent.name.startsWith('.')) continue
 
 			const path = joinPath(current, [dirent.name])
-			const type: WalkEntry['type'] = dirent.isSymbolicLink()
-				? 'symlink'
-				: dirent.isDirectory()
-					? 'directory'
-					: dirent.isFile()
-						? 'file'
-						: 'other'
+			const type: WalkEntry['type'] = dirent.isSymbolicLink() ? 'symlink' : dirent.isDirectory() ? 'directory' : dirent.isFile() ? 'file' : 'other'
 
-			const stats = await fs.stat(path).then((value) => value, () => undefined)
-			const size = type === 'directory' ? 0 : stats?.size ?? 0
+			const stats = await fs.stat(path).then(
+				(value) => value,
+				() => undefined,
+			)
+			const size = type === 'directory' ? 0 : (stats?.size ?? 0)
 			const mtime = stats?.mtimeMs ?? 0
 
 			out.push({ path, type, size, mtime })
@@ -274,13 +272,15 @@ async function walkWithReaddir(fs: FileSystem, dir: string, options?: WalkOption
 
 /** The per-path `readFile` loop `FileSystem.readFiles` replaces. */
 async function readFilesWithLoop(fs: FileSystem, paths: readonly string[]): Promise<ReadFilesEntry[]> {
-	return Promise.all(paths.map(async (path): Promise<ReadFilesEntry> => {
-		try {
-			return { path, content: await fs.readFile(path) }
-		} catch (error) {
-			return { path, error: errorCode(error) ?? String(error) }
-		}
-	}))
+	return Promise.all(
+		paths.map(async (path): Promise<ReadFilesEntry> => {
+			try {
+				return { path, content: await fs.readFile(path) }
+			} catch (error) {
+				return { path, error: errorCode(error) ?? String(error) }
+			}
+		}),
+	)
 }
 
 /**
@@ -335,12 +335,15 @@ function contextFor(target: ConformanceTarget, instance: PlatformInstance): Conf
 			if (!repo) {
 				const dir = joinPath(instance.root, ['fixture-repo'])
 				const build = target.buildGitRepo ?? defaultBuildGitRepo
-				repo = build(instance, dir).then(() => dir, (error) => {
-					throw new Error(
-						`could not build the fixture repository: ${error instanceof Error ? error.message : String(error)}. `
-							+ 'A host that cannot run `git` supplies ConformanceTarget.buildGitRepo.',
-					)
-				})
+				repo = build(instance, dir).then(
+					() => dir,
+					(error) => {
+						throw new Error(
+							`could not build the fixture repository: ${error instanceof Error ? error.message : String(error)}. ` +
+								'A host that cannot run `git` supplies ConformanceTarget.buildGitRepo.',
+						)
+					},
+				)
 			}
 			return repo
 		},
@@ -416,9 +419,7 @@ const fsChecks: ConformanceCheck[] = [
 			expect((await fs.readdir(path())).sort()).toEqual(['a.txt', 'b.txt', 'dir'])
 
 			const dirents = await fs.readdir(path(), { withFileTypes: true })
-			const classified = dirents
-				.map((dirent) => [dirent.name, dirent.isDirectory(), dirent.isFile()])
-				.sort()
+			const classified = dirents.map((dirent) => [dirent.name, dirent.isDirectory(), dirent.isFile()]).sort()
 			expect(classified).toEqual([
 				['a.txt', false, true],
 				['b.txt', false, true],
@@ -763,8 +764,9 @@ const readFilesChecks: ConformanceCheck[] = [
 			const looped = await readFilesWithLoop(fs, paths)
 
 			expect(batched.map((entry) => entry.path)).toEqual(paths)
-			expect(batched.map((entry) => (entry.content ? textOf(entry.content) : undefined)))
-				.toEqual(looped.map((entry) => (entry.content ? textOf(entry.content) : undefined)))
+			expect(batched.map((entry) => (entry.content ? textOf(entry.content) : undefined))).toEqual(
+				looped.map((entry) => (entry.content ? textOf(entry.content) : undefined)),
+			)
 			expect(batched.map((entry) => entry.error)).toEqual([undefined, undefined, undefined])
 		},
 	},
@@ -869,10 +871,7 @@ const rmFilesChecks: ConformanceCheck[] = [
 			const fs = platform.fs
 			await fs.writeFile(path('a.txt'), 'a')
 
-			await rejection(
-				Promise.resolve(fs.rmFiles?.([path('missing.txt')])),
-				'rmFiles of a missing path without force',
-			)
+			await rejection(Promise.resolve(fs.rmFiles?.([path('missing.txt')])), 'rmFiles of a missing path without force')
 			await fs.rmFiles?.([path('missing.txt'), path('a.txt')], { force: true })
 			expect(await fs.exists(path('a.txt'))).toBe(false)
 		},
@@ -885,10 +884,7 @@ const rmFilesChecks: ConformanceCheck[] = [
 			await fs.mkdir(path('tree', 'nested'), { recursive: true })
 			await fs.writeFile(path('tree', 'nested', 'leaf.txt'), 'leaf')
 
-			await rejection(
-				Promise.resolve(fs.rmFiles?.([path('tree')])),
-				'rmFiles of a populated directory without recursive',
-			)
+			await rejection(Promise.resolve(fs.rmFiles?.([path('tree')])), 'rmFiles of a populated directory without recursive')
 			expect(await fs.exists(path('tree', 'nested', 'leaf.txt'))).toBe(true)
 
 			await fs.rmFiles?.([path('tree')], { recursive: true })
@@ -908,10 +904,7 @@ const scopeReadsChecks: ConformanceCheck[] = [
 			await fs.writeFile(path('sub', 'b.txt'), 'bb')
 
 			const outside = [await fs.readFile(path('a.txt'), 'utf-8'), (await fs.readdir(path())).sort().join(',')]
-			const inside = await fs.scopeReads?.(async () => [
-				await fs.readFile(path('a.txt'), 'utf-8'),
-				(await fs.readdir(path())).sort().join(','),
-			])
+			const inside = await fs.scopeReads?.(async () => [await fs.readFile(path('a.txt'), 'utf-8'), (await fs.readdir(path())).sort().join(',')])
 
 			expect(inside).toEqual(outside)
 		},
@@ -922,9 +915,11 @@ const scopeReadsChecks: ConformanceCheck[] = [
 		async run({ platform }) {
 			const marker = new Error('block failed')
 			const caught = await rejection(
-				Promise.resolve(platform.fs.scopeReads?.(async () => {
-					throw marker
-				})),
+				Promise.resolve(
+					platform.fs.scopeReads?.(async () => {
+						throw marker
+					}),
+				),
 				'scopeReads over a block that throws',
 			)
 			expect(caught).toBe(marker)
@@ -1071,6 +1066,14 @@ const shellChecks: ConformanceCheck[] = [
 	},
 	{
 		port: 'shell',
+		name: 'declares a boolean timeout capability or omits it for legacy support',
+		async run({ platform }) {
+			const capability = platform.shell?.supportsTimeout
+			expect(capability === undefined || typeof capability === 'boolean').toBe(true)
+		},
+	},
+	{
+		port: 'shell',
 		name: 'a non-zero exit resolves rather than rejects',
 		async run({ platform, root }) {
 			const result = await shellRun(platform, { command: 'exit 3', cwd: root, timeoutMs: 10_000 })
@@ -1129,7 +1132,7 @@ const shellChecks: ConformanceCheck[] = [
 		},
 	},
 	{
-		port: 'shell',
+		port: 'shell.timeout',
 		name: 'a timeout terminates the command and reports timedOut',
 		async run({ platform, root }) {
 			const started = Date.now()
@@ -1137,6 +1140,21 @@ const shellChecks: ConformanceCheck[] = [
 			expect(result.timedOut).toBe(true)
 			expect(Date.now() - started).toBeLessThan(20_000)
 			expect(result.exitCode).not.toBe(0)
+		},
+	},
+	{
+		port: 'shell.timeout',
+		name: 'a timed-out run cannot keep mutating after it resolves',
+		async run({ platform, path, root }) {
+			const marker = path('late-after-timeout.txt')
+			const result = await shellRun(platform, {
+				command: 'sleep 1; printf late > late-after-timeout.txt',
+				cwd: root,
+				timeoutMs: 100,
+			})
+			expect(result.timedOut).toBe(true)
+			await sleep(1_200)
+			expect(await platform.fs.exists(marker)).toBe(false)
 		},
 	},
 	{
@@ -1281,10 +1299,7 @@ const gitChecks: ConformanceCheck[] = [
 
 			await rejection(Promise.resolve(platform.git?.status({ dir })), 'status outside a repository')
 			await rejection(Promise.resolve(platform.git?.log({ dir })), 'log outside a repository')
-			await rejection(
-				Promise.resolve(platform.git?.countAhead({ dir, base: GIT_FIXTURE.base })),
-				'countAhead outside a repository',
-			)
+			await rejection(Promise.resolve(platform.git?.countAhead({ dir, base: GIT_FIXTURE.base })), 'countAhead outside a repository')
 
 			// `defaultBranch` says undefined means unknown, so outside a repo it may answer either way.
 			const branch = await platform.git?.defaultBranch({ dir }).catch(() => undefined)
@@ -1605,11 +1620,16 @@ async function probeInstance(target: ConformanceTarget, instance: PlatformInstan
 
 	const confinement = platform.shell?.confinement
 	add('shell', platform.shell !== undefined)
+	add(
+		'shell.timeout',
+		platform.shell !== undefined && platform.shell.supportsTimeout !== false,
+		platform.shell === undefined ? 'port absent' : 'the runner declares no wall-clock timeout support',
+	)
 	const confines = await probeConfinement(instance)
 	add('shell.paths', confines.ok, confines.note)
 	add('shell.host', confinement === 'host', `confinement is ${confinement ?? 'absent'}`)
 
-	const buildable = platform.git !== undefined && await canBuildGitRepo(target, platform)
+	const buildable = platform.git !== undefined && (await canBuildGitRepo(target, platform))
 	add('git', buildable, platform.git === undefined ? undefined : 'no way to build a fixture repository — declare ConformanceTarget.buildGitRepo')
 
 	add('fsRevision', platform.fsRevision !== undefined)
@@ -1698,9 +1718,7 @@ export async function runConformanceCheck(target: ConformanceTarget, check: Conf
 /** The checks a host answering `answered` should be held to. */
 export function checksFor(answered: Iterable<ConformancePort>): ConformanceCheck[] {
 	const ports = new Set(answered)
-	return platformConformanceChecks.filter((check) =>
-		ports.has(check.port) && (check.needs ?? []).every((port) => ports.has(port))
-	)
+	return platformConformanceChecks.filter((check) => ports.has(check.port) && (check.needs ?? []).every((port) => ports.has(port)))
 }
 
 function describeSkip(support: PortSupport): string {
@@ -1722,9 +1740,7 @@ export function runPlatformConformance(target: ConformanceTarget): void {
 		const skipped = support.filter((entry) => !entry.answered)
 
 		console.log(
-			`[conformance] ${target.name}\n`
-				+ `  exercised: ${exercised.join(', ') || 'none'}\n`
-				+ `  skipped:   ${skipped.map(describeSkip).join(', ') || 'none'}`,
+			`[conformance] ${target.name}\n` + `  exercised: ${exercised.join(', ') || 'none'}\n` + `  skipped:   ${skipped.map(describeSkip).join(', ') || 'none'}`,
 		)
 
 		for (const port of CONFORMANCE_PORTS) {

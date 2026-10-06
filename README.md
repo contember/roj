@@ -17,6 +17,7 @@ mailbox, compaction — lives in plugins you compose per preset and per agent.
 | Package | Description |
 |---|---|
 | [`@roj-ai/sdk`](packages/sdk) | Agent runtime — LLM providers, sessions, agents, event store, plugin system, built-in tools |
+| [`@roj-ai/kompjutr-platform`](packages/kompjutr-platform) | SQLite-backed filesystem, Git, shell and persistence adapter for Kompjutr workspaces |
 | [`@roj-ai/transport`](packages/transport) | WebSocket transport + RPC protocol (browser and Bun adapters) |
 | [`@roj-ai/shared`](packages/shared) | Shared types, projections, RPC schemas |
 | [`@roj-ai/client`](packages/client) | Vanilla RPC client + platform REST client |

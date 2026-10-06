@@ -21,7 +21,8 @@ export { createSystem } from './core/system.js'
 export type { CreateSystemOptions, System } from './core/system.js'
 
 // Lib exports
-export { FileEventStore, MemoryEventStore } from '~/core/events/index.js'
+export { BaseEventStore, EventAppendError, EventStoreError, FileEventStore, MemoryEventStore, SessionNotFoundError } from '~/core/events/index.js'
+export type { EventStore, LoadRangeOptions, LoadRangeResult } from '~/core/events/index.js'
 export { MockLLMProvider, OpenRouterProvider, RequestMatchers } from '~/core/llm/index.js'
 export type { MockInferenceHandler, OpenRouterConfig } from '~/core/llm/index.js'
 export { ConsoleLogger, JsonLogger } from '~/lib/logger/index.js'
@@ -74,7 +75,7 @@ export type { InferenceCompletedEvent, InferenceFailedEvent, InferenceStartedEve
 export { estimateTokens } from '~/core/llm/tokens.js'
 export { applyEvent } from '~/core/sessions/apply-event.js'
 export { selectPluginState } from '~/core/sessions/reducer.js'
-export { isValidSessionId, parseSessionId, SessionId } from '~/core/sessions/schema.js'
+export { domainEventSchema, isValidSessionId, parseSessionId, SessionId } from '~/core/sessions/schema.js'
 export type { RuntimeLeaseRelease, SessionRuntimeActivity, SessionRuntimeActivitySnapshot } from '~/core/sessions/runtime-activity.js'
 export type { SessionMetadata } from '~/core/sessions/schema.js'
 // Exported so a consumer can validate a callManagerMethod('sessions.list')
