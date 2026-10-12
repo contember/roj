@@ -549,6 +549,11 @@ export class Session {
 			return Err(ValidationErrors.invalid(`Unknown method: ${method}`))
 		}
 
+		const callerContext = caller ?? DEFAULT_CALLER
+		if (methodDef.callers && !methodDef.callers.includes(callerContext.source)) {
+			return Err(MethodErrors.callerNotAllowed(method, callerContext.source))
+		}
+
 		// Validate input
 		const parsed = methodDef.input.safeParse(input)
 		if (!parsed.success) {
@@ -564,7 +569,7 @@ export class Session {
 			try {
 				const gateCtx = {
 					...this.buildSessionHookContext(gatePlugin),
-					caller: caller ?? DEFAULT_CALLER,
+					caller: callerContext,
 					method,
 					input: parsed.data,
 					agentId,
@@ -585,7 +590,7 @@ export class Session {
 		const deps = this.buildPluginDeps(plugin)
 		const ctx = {
 			...sessionContext,
-			caller: caller ?? DEFAULT_CALLER,
+			caller: callerContext,
 			logger: this.logger.child({ method, agentId }),
 			pluginConfig: undefined,
 			pluginContext,

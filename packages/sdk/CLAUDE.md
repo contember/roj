@@ -59,7 +59,7 @@ definePlugin('name')
   .agentConfig<T>()           // Per-agent config
   .events([eventDefs])        // Domain events (Zod-typed)
   .state<T>({ key, initial, reduce })  // State slice with reducer
-  .method('name', { input, output, handler })  // RPC method
+  .method('name', { input, output, handler, callers })  // RPC method; `callers` limits who may call it
   .tools((ctx) => [...])      // Agent tools
   .hook('beforeInference', handler)  // Lifecycle hook
   .build()

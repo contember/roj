@@ -139,6 +139,8 @@ export type CallerContext = {
 	meta: Record<string, unknown>
 }
 
+export type CallerSource = CallerContext['source']
+
 export const DEFAULT_CALLER: CallerContext = { source: 'client', meta: {} }
 export const AGENT_CALLER: CallerContext = { source: 'agent', meta: {} }
 
@@ -366,6 +368,8 @@ export interface ConfiguredPlugin {
 	methods: Record<string, {
 		input: z4.ZodType
 		output: z4.ZodType
+		/** Who may call the method; absent means anyone. See PluginBuilder.method(). */
+		callers?: readonly CallerSource[]
 		handler: (ctx: BaseMethodHandlerContext, input: unknown) => Promise<Result<unknown, DomainError>>
 	}>
 	/** Registered notification types (for introspection/documentation) */
@@ -469,6 +473,8 @@ interface BuilderConfig {
 	methods: Record<string, {
 		input: z4.ZodType
 		output: z4.ZodType
+		/** Who may call the method; absent means anyone. See PluginBuilder.method(). */
+		callers?: readonly CallerSource[]
 		handler: (ctx: BaseMethodHandlerContext, input: unknown) => Promise<Result<unknown, DomainError>>
 	}>
 	managerMethods: Record<string, {
@@ -612,6 +618,11 @@ export class PluginBuilder<
 		def: {
 			input: z4.ZodSchema<TInput>
 			output: z4.ZodSchema<TOutput>
+			/**
+			 * Who may call the method; absent means anyone. Checked before the input is parsed. A call
+			 * that carries no caller counts as `client`, and so does one from another plugin's `deps`.
+			 */
+			callers?: readonly CallerSource[]
 			handler: (ctx: MethodHandlerContext<TConfig, TContext, TState, TNotifications, TDeps>, input: TInput) => Promise<Result<TOutput, DomainError>>
 		},
 	): PluginBuilder<
@@ -1016,6 +1027,7 @@ function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): Confi
 		wrappedMethods[name] = {
 			input: method.input,
 			output: method.output,
+			callers: method.callers,
 			handler: (ctx, input) => method.handler({ ...ctx, pluginConfig, notify: notifyFor(ctx) }, input),
 		}
 	}

@@ -162,7 +162,7 @@ export type { WorkerError, WorkerResult } from '~/plugins/workers/index.js'
 
 // Plugin builder
 export { DEFAULT_PLUGIN_ORDER, definePlugin } from '~/core/plugins/plugin-builder.js'
-export type { CallerContext, ConfiguredPlugin, PluginDefinition, SessionCloseReason } from '~/core/plugins/plugin-builder.js'
+export type { CallerContext, CallerSource, ConfiguredPlugin, PluginDefinition, SessionCloseReason } from '~/core/plugins/plugin-builder.js'
 
 // Zod (re-export for presets that need schemas)
 export { default as z } from 'zod/v4'
