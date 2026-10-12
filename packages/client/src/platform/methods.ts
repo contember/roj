@@ -11,6 +11,25 @@ import type { SandboxState } from './sandbox-state.js'
 // Instance methods
 // ============================================================================
 
+/**
+ * Where an instance's agents run.
+ * - `sandbox`: an E2B VM, with shell, files, git, resources and preview.
+ * - `isolate`: inside the platform, as a Durable Object facet. It starts in seconds and has no pause, but
+ *   no shell, git, resources or preview either. The template is not used.
+ */
+export type InstanceRuntime = 'sandbox' | 'isolate'
+
+/** What an isolate instance's outbound `fetch` may reach, and what the platform adds on the way. */
+export interface InstanceEgress {
+	/** Origins (`https://host[:port]`) the agent may fetch. The LLM provider is always reachable. */
+	allowedOrigins: string[]
+	/**
+	 * Headers the platform adds to requests to one origin, e.g. a credential for a tool's API. The agent
+	 * never sees them. Write-only: no method returns a value.
+	 */
+	headers?: Array<{ origin: string; name: string; value: string }>
+}
+
 export interface CreateInstanceInput {
 	templateSlug: string
 	bundleSlug?: string
@@ -18,6 +37,10 @@ export interface CreateInstanceInput {
 	name: string
 	vcsType?: 'github' | 'gitLocal' | 'none'
 	metadata?: Record<string, unknown>
+	/** Defaults to `sandbox`. */
+	runtime?: InstanceRuntime
+	/** `isolate` only. Without it the agent can reach nothing but the LLM provider. */
+	egress?: InstanceEgress
 	autoCreateSession?: {
 		presetId: string
 		blocking?: boolean
@@ -88,6 +111,16 @@ export interface GetInstanceStatusOutput {
 		serviceType: string | null
 		port: number
 	}>
+}
+
+/** Replaces an isolate instance's egress. Requires an API key; an instance token is refused. */
+export interface SetInstanceEgressInput {
+	instanceId: string
+	egress: InstanceEgress
+}
+
+export interface SetInstanceEgressOutput {
+	ok: boolean
 }
 
 export interface ArchiveInstanceInput {
@@ -399,6 +432,7 @@ export const platformMethods = defineMethods({
 	'instances.list': method<ListInstancesInput, ListInstancesOutput>(),
 	'instances.status': method<GetInstanceStatusInput, GetInstanceStatusOutput>(),
 	'instances.archive': method<ArchiveInstanceInput, ArchiveInstanceOutput>(),
+	'instances.setEgress': method<SetInstanceEgressInput, SetInstanceEgressOutput>(),
 
 	// Sessions
 	'sessions.create': method<CreateSessionInput, CreateSessionOutput>(),
