@@ -13,18 +13,11 @@
  */
 
 import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { dirname, join, posix } from 'node:path'
+import { join, posix } from 'node:path'
+import { APP_BUNDLE_MODULE, type LoaderModule, type RuntimeModules } from './modules.js'
 
-/** A Worker Loader module: a `.js` name maps to ES module source, any other name needs its type. */
-export type LoaderModule = string | { js: string }
-
-export interface RuntimeModules {
-	mainModule: string
-	modules: Record<string, LoaderModule>
-}
-
-/** The module name the main module imports the app's config from. */
-export const APP_BUNDLE_MODULE = 'roj-app-bundle'
+export type { LoaderModule, RuntimeModules } from './modules.js'
+export { APP_BUNDLE_MODULE, unresolvedImports, withAppBundle } from './modules.js'
 
 const MAIN_MODULE = 'main.js'
 const SDK_DIR = 'sdk'
@@ -99,34 +92,4 @@ export async function buildRuntimeModules(): Promise<RuntimeModules> {
 	} finally {
 		await rm(workDir, { recursive: true, force: true })
 	}
-}
-
-/** The runtime's modules plus one app bundle: what a host passes to `LOADER.get()`. */
-export function withAppBundle(runtime: RuntimeModules, appBundle: string): RuntimeModules {
-	return { mainModule: runtime.mainModule, modules: { ...runtime.modules, [APP_BUNDLE_MODULE]: { js: appBundle } } }
-}
-
-const STATIC_IMPORT = /^(?:import|export)\b[^;'"]*?\bfrom\s*["']([^"']+)["']|^import\s*["']([^"']+)["']/gm
-const DYNAMIC_IMPORT = /\bimport\(\s*["']([^"']+)["']\s*\)/g
-
-/**
- * Imports that would not resolve under the loader's rules. Bun's unminified ESM output
- * keeps every static import at the start of a line, which is what the scan relies on.
- * Platform builtins (`node:`, `cloudflare:`) are not checked.
- */
-export function unresolvedImports(modules: Record<string, LoaderModule>): { module: string; specifier: string }[] {
-	const missing: { module: string; specifier: string }[] = []
-	for (const [name, module] of Object.entries(modules)) {
-		const source = typeof module === 'string' ? module : module.js
-		const specifiers = [
-			...[...source.matchAll(STATIC_IMPORT)].map(match => match[1] ?? match[2]),
-			...[...source.matchAll(DYNAMIC_IMPORT)].map(match => match[1]),
-		]
-		for (const specifier of specifiers) {
-			if (specifier === undefined || /^(?:node|cloudflare):/.test(specifier)) continue
-			const resolved = specifier.startsWith('/') ? specifier.slice(1) : posix.join(dirname(name), specifier)
-			if (!(resolved in modules)) missing.push({ module: name, specifier })
-		}
-	}
-	return missing
 }

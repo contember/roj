@@ -15,6 +15,11 @@
 			"import": "./dist/index.js",
 			"default": "./dist/index.js"
 		},
+		"./host": {
+			"types": "./dist/host.d.ts",
+			"import": "./dist/host.js",
+			"default": "./dist/host.js"
+		},
 		"./build": {
 			"types": "./dist/build.d.ts",
 			"import": "./dist/build.js",

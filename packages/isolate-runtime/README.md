@@ -27,6 +27,14 @@ credentials. The runtime sends the placeholder `EGRESS_PROVIDED_KEY` as its Open
 
 `e2e/host.ts` is a complete minimal host.
 
+## Exports
+
+| | |
+|---|---|
+| `.` | The runtime: `createIsolateRuntime`, the alarm scheduler. Runs inside the facet. |
+| `./host` | For the host Worker: the `RuntimeHost` contract, `withAppBundle`, `unresolvedImports`, the runtime version. Imports nothing from the runtime. |
+| `./build` | Bun only: `buildRuntimeModules`. |
+
 ## Building the modules
 
 ```ts
