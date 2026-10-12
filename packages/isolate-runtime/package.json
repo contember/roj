@@ -1,0 +1,56 @@
+{
+	"name": "@roj-ai/isolate-runtime",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"roj": {
+		"bunOnlyExports": [
+			"./build"
+		]
+	},
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		},
+		"./build": {
+			"types": "./dist/build.d.ts",
+			"import": "./dist/build.js",
+			"default": "./dist/build.js"
+		}
+	},
+	"files": [
+		"src",
+		"dist",
+		"!src/**/*.test.ts",
+		"!dist/**/*.test.*"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/contember/roj.git",
+		"directory": "packages/isolate-runtime"
+	},
+	"homepage": "https://github.com/contember/roj/tree/main/packages/isolate-runtime#readme",
+	"bugs": {
+		"url": "https://github.com/contember/roj/issues"
+	},
+	"scripts": {
+		"type-check": "tsc --noEmit && tsc -p tsconfig.worker.json && tsc -p e2e/tsconfig.json"
+	},
+	"dependencies": {
+		"@kompjutr/do": "0.1.2",
+		"@roj-ai/kompjutr-platform": "workspace:*",
+		"@roj-ai/sdk": "workspace:*"
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "5.20260925.1",
+		"@types/bun": "catalog:",
+		"typescript": "catalog:build",
+		"wrangler": "4.143.0"
+	}
+}

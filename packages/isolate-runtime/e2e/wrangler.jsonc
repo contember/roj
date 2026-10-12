@@ -1,0 +1,14 @@
+{
+	"name": "roj-isolate-runtime-e2e",
+	"main": "host.ts",
+	"compatibility_date": "2026-09-25",
+	// `experimental` gates worker_loaders and DO facets locally; `enable_ctx_exports` gives the
+	// loopback entrypoints (RuntimeHost, EgressGateway) handed to the loaded code.
+	"compatibility_flags": ["nodejs_compat", "experimental", "enable_ctx_exports"],
+	"durable_objects": {
+		"bindings": [{ "name": "INSTANCE", "class_name": "InstanceDO" }]
+	},
+	"worker_loaders": [{ "binding": "LOADER" }],
+	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["InstanceDO"] }],
+	"rules": []
+}

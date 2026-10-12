@@ -1,0 +1,14 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"composite": false,
+		"noEmit": true,
+		"rootDir": "."
+	},
+	"include": ["src/**/*", "e2e/*.test.ts"],
+	"exclude": ["node_modules", "dist", "src/worker"],
+	"references": [
+		{ "path": "../sdk" },
+		{ "path": "../kompjutr-platform" }
+	]
+}
