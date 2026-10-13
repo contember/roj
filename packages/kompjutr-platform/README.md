@@ -1,10 +1,10 @@
 # @roj-ai/kompjutr-platform
 
 Run the Roj SDK against a [Kompjutr](https://www.npmjs.com/package/@kompjutr/do)
-workspace. This adapter uses `@kompjutr/do` **0.1.2** from npm.
+workspace. This adapter uses `@kompjutr/do` **0.1.3** from npm.
 
 ```bash
-bun add @roj-ai/sdk @roj-ai/kompjutr-platform @kompjutr/do@0.1.2
+bun add @roj-ai/sdk @roj-ai/kompjutr-platform @kompjutr/do@0.1.3
 ```
 
 ## Connect a workspace
@@ -47,16 +47,38 @@ resume after eviction; the default scheduler uses in-memory timers.
   a native process runner. Process spawning and native dev servers are unsupported;
   hosts can supply a service executor through SDK bootstrap overrides.
 - `shellConfinement` defaults to `none`. Set it to `host` only when the host
-  isolates the entire workspace. It does not create a per-directory sandbox.
-  Shell path grants are unsupported.
-- Known limitation: the host shell runner does not implement the virtual
-  `/home/user/session` and `/home/user/workspace` namespace exposed by
-  preset-level `sandboxed: true`. Support requires a native upstream namespace
-  shared by filesystem resolution, shell execution and Git; this work is deferred.
-  Existing Bun/bwrap virtual paths are unchanged.
+  isolates the entire workspace. Set it to `paths` when one workspace holds
+  several sessions' files; see [Path confinement](#path-confinement).
 - Session logs, LLM call logs and events are stored as SQL rows. Pass the
   `KompjutrEventStore` explicitly to bootstrap to use SQL event persistence.
 - The host owns authentication, workspace isolation and storage lifetime.
+
+## Path confinement
+
+With `shellConfinement: 'paths'`, every shell run sees only the grants the SDK
+sends for it. Presets keep the virtual `/home/user/session` and
+`/home/user/workspace` paths of `sandboxed: true`; each grant maps a virtual
+directory onto a real workspace directory.
+
+- The shell runs over a `createMountedFilesystem` view built per run. Paths
+  outside every grant do not exist (`ENOENT`), and `ro` grants reject writes.
+- The view fails closed on symlinks: an absolute target, a target above its
+  source, or a target in another mount reads as absent. A kernel bind mount
+  would follow it.
+- Grant sources resolve to their real directory first. Grant paths must not
+  nest, and every source must be an existing directory, or the run is rejected.
+- A run without grants is unconfined, as on the Bun platform.
+- Git keeps the real filesystem, so checkouts and dirty tracking stay real-path
+  based. The `git` command translates the cwd and absolute path operands to
+  real paths and prints real paths back as virtual ones (`rev-parse
+  --show-toplevel`, `init`, `clone` and error messages). It refuses absolute path operands
+  outside the grants, `init` and `clone` targets outside a writable grant, and a
+  repository whose root no writable grant shows.
+- Git needs no `.git` or `.gitconfig` grants: its data lives in SQL tables, not
+  in a `.git` directory. Do not place a checkout at `/` or above a session's
+  directories.
+- Confinement covers files, not Git data. Checkouts of one store still share
+  refs, objects and config across sessions.
 
 ## LLM call storage
 

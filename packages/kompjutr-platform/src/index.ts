@@ -6,7 +6,7 @@
  * that can hand kompjutr a SQL storage.
  */
 
-import type { Platform, Scheduler } from '@roj-ai/sdk/platform'
+import type { Platform, Scheduler, ShellConfinement } from '@roj-ai/sdk/platform'
 import { createTimerScheduler } from '@roj-ai/sdk/platform'
 import type { Git, Workspace } from '@kompjutr/do'
 import { KompjutrEventStore } from './event-store.js'
@@ -29,8 +29,12 @@ export interface KompjutrPlatformOptions {
 	scheduler?: Scheduler
 	/** Retention and column ceiling for the LLM call log. */
 	llmCallLog?: KompjutrLLMCallLogOptions
-	/** How the workspace itself is isolated. Defaults to `none`. */
-	shellConfinement?: 'host' | 'none'
+	/**
+	 * How shell commands are confined. `paths` mounts each run's grants as its
+	 * only filesystem; `host` means the workspace holds one session's files.
+	 * Defaults to `none`.
+	 */
+	shellConfinement?: ShellConfinement
 }
 
 export function createKompjutrPlatform(workspace: Workspace, options: KompjutrPlatformOptions = {}): Platform {
