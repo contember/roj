@@ -105,7 +105,8 @@ export class BunSqliteStorage implements DurableObjectStorageLike {
 					throw new Error(`too many SQL variables: ${bindings.length} exceeds the ${MAX_BIND_PARAMETERS} a Durable Object binds`)
 				}
 				this.statementCount++
-				const statement = this.db.query<Row, SQLQueryBindings[]>(query)
+				// Not `query()`: it caches by SQL text, and a nested cursor over the same SQL would share one statement.
+				const statement = this.db.prepare<Row, SQLQueryBindings[]>(query)
 				const rows = statement.iterate(...bindings.map(toBinding))
 				return new Cursor<Row>(rows, () => {
 					this.rowCount++
