@@ -18,6 +18,15 @@ const createHarness = () => {
 				return Ok({ ok: true })
 			},
 		})
+		.method('approve', {
+			input: z.object({}),
+			output: z.object({ ok: z.boolean() }),
+			callers: ['client'],
+			handler: async (ctx) => {
+				handled.push(ctx.caller.source)
+				return Ok({ ok: true })
+			},
+		})
 		.method('read', {
 			input: z.object({}),
 			output: z.object({ ok: z.boolean() }),
@@ -36,6 +45,14 @@ const createHarness = () => {
 			callers: ['system'],
 			handler: async (ctx) => {
 				const result = await ctx.deps.guarded.configure({ value: 'x' })
+				return Ok({ ok: result.ok })
+			},
+		})
+		.method('relayApprove', {
+			input: z.object({}),
+			output: z.object({ ok: z.boolean() }),
+			handler: async (ctx) => {
+				const result = await ctx.deps.guarded.approve({})
 				return Ok({ ok: result.ok })
 			},
 		})
@@ -71,6 +88,7 @@ describe('core: method callers', () => {
 		const result = await session.callPluginMethod('guarded.configure', { value: 'x' })
 
 		expect(result.ok).toBe(false)
+		if (!result.ok) expect(result.error.type).toBe('method_caller_not_allowed')
 		expect(handled).toEqual([])
 
 		await harness.shutdown()
@@ -101,14 +119,28 @@ describe('core: method callers', () => {
 		await harness.shutdown()
 	})
 
-	it('does not pass the outer caller on through deps', async () => {
+	it('passes the outer caller on through deps', async () => {
 		const { harness, handled } = createHarness()
 		const session = await harness.createSession('test')
 
 		const result = await session.callPluginMethod('dependent.relay', {}, { caller: { source: 'system', meta: {} } })
 
-		expect(result).toEqual({ ok: true, value: { ok: false } })
-		expect(handled).toEqual([])
+		expect(result).toEqual({ ok: true, value: { ok: true } })
+		expect(handled).toEqual(['system'])
+
+		await harness.shutdown()
+	})
+
+	it('does not let an open method lend its caller more authority through deps', async () => {
+		const { harness, handled } = createHarness()
+		const session = await harness.createSession('test')
+
+		const fromAgent = await session.callPluginMethod('dependent.relayApprove', {}, { caller: { source: 'agent', meta: {} } })
+		const fromClient = await session.callPluginMethod('dependent.relayApprove', {}, { caller: { source: 'client', meta: {} } })
+
+		expect(fromAgent).toEqual({ ok: true, value: { ok: false } })
+		expect(fromClient).toEqual({ ok: true, value: { ok: true } })
+		expect(handled).toEqual(['client'])
 
 		await harness.shutdown()
 	})

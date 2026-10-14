@@ -587,7 +587,7 @@ export class Session {
 		const sessionContext = this.buildSessionContext()
 		const pluginState = plugin.slice ? plugin.slice.select(this.store.getState()) : undefined
 		const pluginContext = this.pluginContexts.get(pluginName)
-		const deps = this.buildPluginDeps(plugin)
+		const deps = this.buildPluginDeps(plugin, callerContext)
 		const ctx = {
 			...sessionContext,
 			caller: callerContext,
@@ -800,13 +800,14 @@ export class Session {
 
 	/**
 	 * Build deps object for a plugin — delegates method calls to callPluginMethod.
+	 * Calls keep the caller of the code making them, so a plugin cannot lend its caller more authority.
 	 */
-	private buildPluginDeps(plugin: ConfiguredPlugin) {
+	private buildPluginDeps(plugin: ConfiguredPlugin, caller: CallerContext) {
 		return buildPluginDeps(
 			plugin.dependencyNames,
 			this.plugins,
 			async (depPluginName, methodName, input) => {
-				return await this.callPluginMethod(`${depPluginName}.${methodName}`, input)
+				return await this.callPluginMethod(`${depPluginName}.${methodName}`, input, undefined, caller)
 			},
 		)
 	}
@@ -920,7 +921,7 @@ export class Session {
 			}
 		}
 
-		const deps = this.buildPluginDeps(plugin)
+		const deps = this.buildPluginDeps(plugin, AGENT_CALLER)
 
 		return {
 			...sessionContext,

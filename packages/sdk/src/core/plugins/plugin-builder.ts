@@ -620,7 +620,7 @@ export class PluginBuilder<
 			output: z4.ZodSchema<TOutput>
 			/**
 			 * Who may call the method; absent means anyone. Checked before the input is parsed. A call
-			 * that carries no caller counts as `client`, and so does one from another plugin's `deps`.
+			 * that carries no caller counts as `client`; one through `deps` keeps the caller of the code making it.
 			 */
 			callers?: readonly CallerSource[]
 			handler: (ctx: MethodHandlerContext<TConfig, TContext, TState, TNotifications, TDeps>, input: TInput) => Promise<Result<TOutput, DomainError>>
