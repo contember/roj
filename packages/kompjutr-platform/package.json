@@ -41,7 +41,7 @@
 		"type-check": "tsc --noEmit"
 	},
 	"dependencies": {
-		"@kompjutr/do": "0.1.3",
+		"@kompjutr/do": "0.1.4",
 		"@roj-ai/sdk": "workspace:*"
 	},
 	"devDependencies": {
