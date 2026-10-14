@@ -9,6 +9,8 @@ import type {
 	ListInstancesInput,
 	ListInstancesOutput,
 	ArchiveInstanceOutput,
+	SetInstanceEgressInput,
+	SetInstanceEgressOutput,
 	CreateSessionInput,
 	CreateSessionOutput,
 	ListSessionsOutput,
@@ -56,6 +58,7 @@ export interface RojClient {
 		getStatus(instanceId: string): Promise<GetInstanceStatusOutput>
 		list(input?: ListInstancesInput): Promise<ListInstancesOutput>
 		archive(instanceId: string): Promise<ArchiveInstanceOutput>
+		setEgress(input: SetInstanceEgressInput): Promise<SetInstanceEgressOutput>
 	}
 	sessions: {
 		create(input: CreateSessionInput): Promise<CreateSessionOutput>
@@ -186,6 +189,7 @@ export function createRojClient(options: RojClientOptions): RojClient {
 			getStatus: (instanceId) => call('instances.status', { instanceId }),
 			list: (input) => call('instances.list', input ?? {}),
 			archive: (instanceId) => call('instances.archive', { instanceId }),
+			setEgress: (input) => call('instances.setEgress', input),
 		},
 		sessions: {
 			create: (input) => call('sessions.create', input),

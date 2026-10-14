@@ -89,6 +89,8 @@ const inputSchemas = {
 		vcsType: z.enum(['github', 'gitLocal', 'none']).optional(),
 		metadata: z.record(z.string(), z.unknown()).optional(),
 		autoCreateSession: AutoCreateSessionSchema.optional(),
+		// The standalone server runs agents in its own process, which is the sandbox runtime; it has no egress control.
+		runtime: z.literal('sandbox').optional(),
 	}),
 	'instances.get': z.strictObject({ instanceId: z.string() }),
 	'instances.list': z.strictObject({
