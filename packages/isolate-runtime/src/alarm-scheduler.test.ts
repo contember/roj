@@ -75,10 +75,10 @@ describe('alarm scheduler', () => {
 		expect(storage.alarm).toBe(T0 + 500)
 	})
 
-	test('a throwing delivery does not strand the wakes behind it', async () => {
+	test('a throwing delivery does not strand the other wakes, and is delivered again', async () => {
 		setSystemTime(T0)
 		const storage = new MemoryAlarmStorage()
-		const scheduler = createAlarmScheduler({ storage })
+		const scheduler = createAlarmScheduler({ storage, inFlightRetryMs: 60_000 })
 		await scheduler.wake('a', 0)
 		await scheduler.wake('b', 0)
 
@@ -89,7 +89,56 @@ describe('alarm scheduler', () => {
 		})
 
 		expect(delivered).toEqual(['a', 'b'])
+		expect(scheduler.stats()).toMatchObject({ pending: 0, inFlight: 1 })
+		expect(storage.alarm).toBe(T0 + 60_000)
+
+		setSystemTime(T0 + 60_000)
+		expect(await scheduler.deliverDue(async () => {})).toEqual(['a'])
 		expect(scheduler.stats()).toMatchObject({ pending: 0, inFlight: 0 })
+	})
+
+	test('delivers due wakes concurrently, so a long turn does not hold up the others', async () => {
+		setSystemTime(T0)
+		const storage = new MemoryAlarmStorage()
+		const scheduler = createAlarmScheduler({ storage })
+		await scheduler.wake('long', 0)
+		await scheduler.wake('short', 0)
+
+		let finishLong = () => {}
+		const finished: string[] = []
+		const draining = scheduler.deliverDue(async key => {
+			if (key === 'long') await new Promise<void>(resolve => (finishLong = resolve))
+			finished.push(key)
+		})
+		await Bun.sleep(0)
+
+		expect(finished).toEqual(['short'])
+		finishLong()
+		await draining
+		expect(finished).toEqual(['short', 'long'])
+	})
+
+	test('flush writes the slot again after a failed write, and throws when that fails too', async () => {
+		setSystemTime(T0)
+		const storage = new MemoryAlarmStorage()
+		let failures = 1
+		const flaky = {
+			kv: storage.kv,
+			setAlarm: async (at: number) => {
+				if (failures-- > 0) throw new Error('slot unavailable')
+				await storage.setAlarm(at)
+			},
+			deleteAlarm: () => storage.deleteAlarm(),
+		}
+		const scheduler = createAlarmScheduler({ storage: flaky })
+
+		await expect(scheduler.wake('a', 1_000)).rejects.toThrow('slot unavailable')
+		await scheduler.flush()
+		expect(storage.alarm).toBe(T0 + 1_000)
+
+		failures = 2
+		await expect(scheduler.wake('b', 500)).rejects.toThrow('slot unavailable')
+		await expect(scheduler.flush()).rejects.toThrow('slot unavailable')
 	})
 
 	test('ignores wakes and cancels while suspended', async () => {

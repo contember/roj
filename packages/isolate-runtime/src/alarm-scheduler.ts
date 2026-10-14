@@ -65,7 +65,7 @@ export interface AlarmScheduler extends Scheduler {
 	 * `deliver`. Call from the DO's `alarm()`; returns the keys delivered.
 	 */
 	deliverDue(deliver: WakeHandler): Promise<string[]>
-	/** Settle the pending alarm writes. Call before an entry point returns. */
+	/** Settle the pending alarm writes. Call before an entry point returns. Throws when the slot cannot be written. */
 	flush(): Promise<void>
 	/**
 	 * Ignore wakes and cancels while `fn` runs.
@@ -193,15 +193,16 @@ export function createAlarmScheduler(host: AlarmSchedulerHost): AlarmScheduler {
 			// strand the ones behind it.
 			await reconcile()
 
-			for (const key of due) {
+			// Concurrently: one wake runs a whole agent turn, and the slot fires one alarm at a time.
+			await Promise.all(due.map(async key => {
 				delivered += 1
 				try {
 					await deliver(key)
+					retries.delete(key)
 				} catch {
-					// The handler owns its own error reporting; the drain must still finish.
+					// The handler owns its error reporting. The retry row stays, so the wake is delivered again.
 				}
-				retries.delete(key)
-			}
+			}))
 			if (due.length > 0) await reconcile()
 			return due
 		},
@@ -213,6 +214,8 @@ export function createAlarmScheduler(host: AlarmSchedulerHost): AlarmScheduler {
 				seen = tail
 				await seen
 			}
+			// A failed write leaves rows the slot does not cover. Try once more, and let a second failure surface.
+			if (earliest() !== armedAt) await reconcile()
 		},
 
 		async suspend<T>(fn: () => Promise<T>): Promise<T> {
