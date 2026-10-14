@@ -6,6 +6,7 @@
 		{ "path": "./shared" },
 		{ "path": "./sdk" },
 		{ "path": "./kompjutr-platform" },
+		{ "path": "./isolate-runtime" },
 		{ "path": "./client" },
 		{ "path": "./client-react" },
 		{ "path": "./debug" },

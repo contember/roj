@@ -40,6 +40,8 @@ packages/
   platform-cli/        # CLI for agent bundle build/upload (@roj-ai/platform-cli)
   standalone-server/   # Single-instance local runtime (@roj-ai/standalone-server)
   sandbox-runtime/     # Bun agent host for E2B (@roj-ai/sandbox-runtime)
+  kompjutr-platform/   # SDK platform on Durable Object SQLite (@roj-ai/kompjutr-platform)
+  isolate-runtime/     # Runtime as a Durable Object facet loaded by the Worker Loader (@roj-ai/isolate-runtime)
   demo/                # Local-only App Builder demo + e2e test (@roj-ai/demo, not published)
 ```
 
