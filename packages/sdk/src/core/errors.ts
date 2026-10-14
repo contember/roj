@@ -57,4 +57,6 @@ export const ValidationErrors = {
 export const MethodErrors = {
 	/** A `beforeMethod` plugin hook denied the call (e.g. a budget guard blocking new user input). */
 	denied: (message: string) => createDomainError('method_denied', message, 403),
+	/** The method's `callers` list does not include the caller's source. */
+	callerNotAllowed: (method: string, source: string) => createDomainError('method_caller_not_allowed', `${method} cannot be called by ${source}`, 403),
 }

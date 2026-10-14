@@ -549,6 +549,11 @@ export class Session {
 			return Err(ValidationErrors.invalid(`Unknown method: ${method}`))
 		}
 
+		const callerContext = caller ?? DEFAULT_CALLER
+		if (methodDef.callers && !methodDef.callers.includes(callerContext.source)) {
+			return Err(MethodErrors.callerNotAllowed(method, callerContext.source))
+		}
+
 		// Validate input
 		const parsed = methodDef.input.safeParse(input)
 		if (!parsed.success) {
@@ -564,7 +569,7 @@ export class Session {
 			try {
 				const gateCtx = {
 					...this.buildSessionHookContext(gatePlugin),
-					caller: caller ?? DEFAULT_CALLER,
+					caller: callerContext,
 					method,
 					input: parsed.data,
 					agentId,
@@ -582,10 +587,10 @@ export class Session {
 		const sessionContext = this.buildSessionContext()
 		const pluginState = plugin.slice ? plugin.slice.select(this.store.getState()) : undefined
 		const pluginContext = this.pluginContexts.get(pluginName)
-		const deps = this.buildPluginDeps(plugin)
+		const deps = this.buildPluginDeps(plugin, callerContext)
 		const ctx = {
 			...sessionContext,
-			caller: caller ?? DEFAULT_CALLER,
+			caller: callerContext,
 			logger: this.logger.child({ method, agentId }),
 			pluginConfig: undefined,
 			pluginContext,
@@ -795,13 +800,14 @@ export class Session {
 
 	/**
 	 * Build deps object for a plugin — delegates method calls to callPluginMethod.
+	 * Calls keep the caller of the code making them, so a plugin cannot lend its caller more authority.
 	 */
-	private buildPluginDeps(plugin: ConfiguredPlugin) {
+	private buildPluginDeps(plugin: ConfiguredPlugin, caller: CallerContext) {
 		return buildPluginDeps(
 			plugin.dependencyNames,
 			this.plugins,
 			async (depPluginName, methodName, input) => {
-				return await this.callPluginMethod(`${depPluginName}.${methodName}`, input)
+				return await this.callPluginMethod(`${depPluginName}.${methodName}`, input, undefined, caller)
 			},
 		)
 	}
@@ -915,7 +921,7 @@ export class Session {
 			}
 		}
 
-		const deps = this.buildPluginDeps(plugin)
+		const deps = this.buildPluginDeps(plugin, AGENT_CALLER)
 
 		return {
 			...sessionContext,
