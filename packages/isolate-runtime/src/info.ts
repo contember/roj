@@ -2,5 +2,5 @@
 
 import pkg from '../package.json' with { type: 'json' }
 
-export const ISOLATE_RUNTIME_VERSION = pkg.version as string
-export const ISOLATE_RUNTIME_NAME = pkg.name as string
+export const ISOLATE_RUNTIME_VERSION = pkg.version
+export const ISOLATE_RUNTIME_NAME = pkg.name

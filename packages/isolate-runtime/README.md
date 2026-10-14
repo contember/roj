@@ -20,8 +20,8 @@ credentials. The runtime sends the placeholder `EGRESS_PROVIDED_KEY` as its Open
 
 | | |
 |---|---|
-| `env.HOST` | A `RuntimeHost` (`src/host-contract.ts`): the host DO's alarm slot and a sink for user-output notifications (`{ type, payload, ts }`, the shape the sandbox runtime sends over its agent WebSocket). |
-| `globalOutbound` | The egress gateway. |
+| `env.HOST` | A `RuntimeHost` (`src/host-contract.ts`): the host DO's alarm slot and a sink for user-output notifications (`{ type, payload, ts }`, the shape the sandbox runtime sends over its agent WebSocket). A notification is app output: treat it as untrusted. Each is a separate call, so two may arrive out of order. |
+| `globalOutbound` | The egress gateway. It must not follow redirects: return them, so the next hop comes through the gateway again. |
 | `alarm()` | Calls `deliverWakes()` on the facet. A facet has no alarm of its own. |
 | Caller | The facet serves the sandbox runtime's HTTP surface (`/rpc`, `/status`, `/sessions/*`) with no auth of its own. The host sets `_caller` on every RPC from the principal it authenticated, and drops whatever the client sent. |
 
@@ -59,6 +59,6 @@ agents left `inferring` to `pending`. The lost provider call is made again and b
 ## Tests
 
 - `bun test packages/isolate-runtime/src`: scheduler, runtime on `bun:sqlite`, module build. Part of `bun run test`.
-- `bun test packages/isolate-runtime/e2e`: the runtime in workerd under `wrangler dev`, with a fake provider behind the gateway. Run by hand.
+- `bun run --cwd packages/isolate-runtime test:e2e`: the runtime in workerd under `wrangler dev`, with a fake provider behind the gateway. Run by hand, from the package directory: under `bun test` started at the repo root, `Bun.build` fails to resolve the `@kompjutr/do` subpath exports.
 
 Facets and the Worker Loader are in open beta. Locally they need the `experimental` compatibility flag.

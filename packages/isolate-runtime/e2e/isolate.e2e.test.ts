@@ -1,6 +1,6 @@
 /**
  * Runs the runtime in workerd: built modules, an app bundle built like `roj build`, loaded through the
- * Worker Loader as a facet of `host.ts`. Not part of `bun run test`; run with `bun test packages/isolate-runtime/e2e`.
+ * Worker Loader as a facet of `host.ts`. Not part of `bun run test`; run with `bun run --cwd packages/isolate-runtime test:e2e`.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'

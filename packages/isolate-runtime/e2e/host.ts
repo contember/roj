@@ -123,7 +123,8 @@ export class EgressGateway extends WorkerEntrypoint<Env, InstanceProps> {
 		for (const added of policy.headers) {
 			if (added.origin === origin) headers.set(added.header, added.value)
 		}
-		const outgoing = new Request(request, { headers })
+		// Manual: a followed redirect would carry the added headers to an origin nobody checked.
+		const outgoing = new Request(request.url, { method: request.method, headers, body: request.body, redirect: 'manual' })
 		return origin === PROVIDER_ORIGIN ? fakeProvider(outgoing, policy) : fetch(outgoing)
 	}
 }
