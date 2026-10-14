@@ -240,6 +240,20 @@ describe('standalone platform RPC', () => {
 		expect(fixture.calls).toEqual([])
 	})
 
+	it('accepts the sandbox runtime and refuses the isolate runtime and egress on instances.create', async () => {
+		const fixture = await createFixture()
+
+		const sandbox = await rpc(fixture.app, 'instances.create', { ...createInstanceInput(), runtime: 'sandbox' })
+		const isolate = await rpc(fixture.app, 'instances.create', { ...createInstanceInput(), runtime: 'isolate' })
+		const egress = await rpc(fixture.app, 'instances.create', { ...createInstanceInput(), egress: { allowedOrigins: [] } })
+
+		expect(sandbox.ok).toBe(true)
+		expect(isolate.ok).toBe(false)
+		expect(egress.ok).toBe(false)
+		if (egress.ok) throw new Error('Expected egress to be refused')
+		expect(egress.error.message).toContain('Unrecognized key')
+	})
+
 	it('injects resourceIds and fileIds once before initialPrompt', async () => {
 		const fixture = await createFixture()
 		const resourceFile = await fixture.registry.uploadFile({
