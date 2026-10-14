@@ -107,7 +107,7 @@
       "name": "@roj-ai/isolate-runtime",
       "version": "0.1.0",
       "dependencies": {
-        "@kompjutr/do": "0.1.2",
+        "@kompjutr/do": "0.1.4",
         "@roj-ai/kompjutr-platform": "workspace:*",
         "@roj-ai/sdk": "workspace:*",
       },
@@ -424,13 +424,13 @@
 
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
 
-    "@kompjutr/do": ["@kompjutr/do@0.1.2", "", { "dependencies": { "@kompjutr/drive": "0.1.2", "@kompjutr/git": "0.1.2", "@kompjutr/sqlite": "0.1.2" } }, "sha512-4tsiFPEU124k9t237j5uzSF4l7CJO0786jwuOm6WEMBYPV3QFGzSgCtSdfX6Q5vBZqLPT4APG5iPUOfdhTTbzw=="],
+    "@kompjutr/do": ["@kompjutr/do@0.1.4", "", { "dependencies": { "@kompjutr/drive": "0.1.4", "@kompjutr/git": "0.1.4", "@kompjutr/sqlite": "0.1.4" } }, "sha512-0hDkclaAcZZnxUIhtJ3vN3DpS85H+IZtQlKOz7TKmGlxdab4ZaH/3mMUAIL2mkw+Obtpts6mNTYHS4zBBQEsKg=="],
 
-    "@kompjutr/drive": ["@kompjutr/drive@0.1.2", "", {}, "sha512-2qmR07qmn4mw+4NTADfEWTGirGbrLh8JigSZyITjXSmyW2xhUJsHohMDHfTfcL5liohWuuNSxmJLdCWKOldp9Q=="],
+    "@kompjutr/drive": ["@kompjutr/drive@0.1.4", "", {}, "sha512-On0mVmXzv81nrig977IO3TosrS0kk09sM1PY5SHr1Q2sqNDJcI/g8yq3dlYwWoPhvmAT56SigS5nvY40aOETDw=="],
 
-    "@kompjutr/git": ["@kompjutr/git@0.1.2", "", { "dependencies": { "@kompjutr/drive": "0.1.2", "@kompjutr/sqlite": "0.1.2", "pako": "2.2.0" } }, "sha512-LcF04wY9cpNeStcUSmPjceQ6+TgCOWrowEoL5Ihc4CN3+GFQjF8MVUD2sXQktbJHm7ZOUMRMdmZk5Mg/wWF4Lw=="],
+    "@kompjutr/git": ["@kompjutr/git@0.1.4", "", { "dependencies": { "@kompjutr/drive": "0.1.4", "@kompjutr/sqlite": "0.1.4", "pako": "2.2.0" } }, "sha512-nAPS9t3YsS0FT7BXH1THCXJPu+iP6asCT5lrcno+Nf3xB5r/jHKAOdzguRRn/pe/R91iClofIaJKuASVUDqJKA=="],
 
-    "@kompjutr/sqlite": ["@kompjutr/sqlite@0.1.2", "", {}, "sha512-2zls7mrwLuGsv/lEvfOiMOOqvP/GHGIRzebxg9o31YIgepuxmQwCjKRhNeXgLo9RXEKkkLXc9q0g2BGs/itmKQ=="],
+    "@kompjutr/sqlite": ["@kompjutr/sqlite@0.1.4", "", {}, "sha512-KYBKjtNUKIUBeMxdoErCCyXJ0C9DuftP4hbFwO4kijPDQpBcOqMkyGCB5lMc4mCDi/KlluhHXX6zabtACeIfhA=="],
 
     "@nodelib/fs.scandir": ["@nodelib/fs.scandir@2.1.5", "", { "dependencies": { "@nodelib/fs.stat": "2.0.5", "run-parallel": "^1.1.9" } }, "sha512-vq24Bq3ym5HEQm2NKCr3yXDwjc7vTsEThRDnkp2DK9p1uqLR+DHurm/NOTo0KG7HYHU7eppKZj3MyqYuMBf62g=="],
 
@@ -966,8 +966,6 @@
 
     "@roj-ai/isolate-runtime/@types/bun": ["@types/bun@1.4.3", "", { "dependencies": { "bun-types": "1.4.3" } }, "sha512-N67Pqy8JXbAY/j0tNraS3V5mubGvc6rrrNDmDCtZLlFzccbUJPDb0tvgUBC5q4m8ybkP93Jcn1QB+RYQ6PvBhw=="],
 
-    "@roj-ai/kompjutr-platform/@kompjutr/do": ["@kompjutr/do@0.1.4", "", { "dependencies": { "@kompjutr/drive": "0.1.4", "@kompjutr/git": "0.1.4", "@kompjutr/sqlite": "0.1.4" } }, "sha512-0hDkclaAcZZnxUIhtJ3vN3DpS85H+IZtQlKOz7TKmGlxdab4ZaH/3mMUAIL2mkw+Obtpts6mNTYHS4zBBQEsKg=="],
-
     "@roj-ai/kompjutr-platform/@types/bun": ["@types/bun@1.4.3", "", { "dependencies": { "bun-types": "1.4.3" } }, "sha512-N67Pqy8JXbAY/j0tNraS3V5mubGvc6rrrNDmDCtZLlFzccbUJPDb0tvgUBC5q4m8ybkP93Jcn1QB+RYQ6PvBhw=="],
 
     "@roj-ai/platform-cli/@types/bun": ["@types/bun@1.3.14", "", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
@@ -1019,12 +1017,6 @@
     "@roj-ai/demo/@types/bun/bun-types": ["bun-types@1.3.14", "", { "dependencies": { "@types/node": "*" } }, "sha512-4N0ig0fEomHt5R0KCFWjovxow98rIoRwKolrYdCcknNwMekCXRnWEUvgu5soYV8QXtVsrUD8B95MBOZGPvr6KQ=="],
 
     "@roj-ai/isolate-runtime/@types/bun/bun-types": ["bun-types@1.4.3", "", { "dependencies": { "@types/node": "*", "undici-types": "*" } }, "sha512-tinRJNGOmUN+tEAsn2y2e942n9JHRHR42iUYzDH75NmhJqVBokGSQkkfSFdNWwsANIdrK6ACH9t01M452YyTwg=="],
-
-    "@roj-ai/kompjutr-platform/@kompjutr/do/@kompjutr/drive": ["@kompjutr/drive@0.1.4", "", {}, "sha512-On0mVmXzv81nrig977IO3TosrS0kk09sM1PY5SHr1Q2sqNDJcI/g8yq3dlYwWoPhvmAT56SigS5nvY40aOETDw=="],
-
-    "@roj-ai/kompjutr-platform/@kompjutr/do/@kompjutr/git": ["@kompjutr/git@0.1.4", "", { "dependencies": { "@kompjutr/drive": "0.1.4", "@kompjutr/sqlite": "0.1.4", "pako": "2.2.0" } }, "sha512-nAPS9t3YsS0FT7BXH1THCXJPu+iP6asCT5lrcno+Nf3xB5r/jHKAOdzguRRn/pe/R91iClofIaJKuASVUDqJKA=="],
-
-    "@roj-ai/kompjutr-platform/@kompjutr/do/@kompjutr/sqlite": ["@kompjutr/sqlite@0.1.4", "", {}, "sha512-KYBKjtNUKIUBeMxdoErCCyXJ0C9DuftP4hbFwO4kijPDQpBcOqMkyGCB5lMc4mCDi/KlluhHXX6zabtACeIfhA=="],
 
     "@roj-ai/kompjutr-platform/@types/bun/bun-types": ["bun-types@1.4.3", "", { "dependencies": { "@types/node": "*", "undici-types": "*" } }, "sha512-tinRJNGOmUN+tEAsn2y2e942n9JHRHR42iUYzDH75NmhJqVBokGSQkkfSFdNWwsANIdrK6ACH9t01M452YyTwg=="],
 

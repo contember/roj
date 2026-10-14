@@ -45,10 +45,11 @@
 		"url": "https://github.com/contember/roj/issues"
 	},
 	"scripts": {
-		"type-check": "tsc --noEmit && tsc -p tsconfig.worker.json && tsc -p e2e/tsconfig.json"
+		"type-check": "tsc --noEmit && tsc -p tsconfig.worker.json && tsc -p e2e/tsconfig.json",
+		"test:e2e": "bun test ./e2e"
 	},
 	"dependencies": {
-		"@kompjutr/do": "0.1.2",
+		"@kompjutr/do": "0.1.4",
 		"@roj-ai/kompjutr-platform": "workspace:*",
 		"@roj-ai/sdk": "workspace:*"
 	},
