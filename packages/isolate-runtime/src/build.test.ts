@@ -74,4 +74,10 @@ describe('buildRuntimeModules', () => {
 			{ module: 'main.js', specifier: './missing.js' },
 		])
 	})
+
+	test("reports Bun's import.meta.require, which workerd lacks", () => {
+		const modules = { 'roj-app-bundle': { js: 'var __require = import.meta.require;\nexport default {}\n' } }
+
+		expect(unresolvedImports(modules)).toEqual([{ module: 'roj-app-bundle', specifier: 'import.meta.require' }])
+	})
 })

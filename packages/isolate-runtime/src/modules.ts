@@ -32,11 +32,13 @@ function resolveModuleName(importer: string, specifier: string): string {
 
 const STATIC_IMPORT = /^(?:import|export)\b[^;'"]*?\bfrom\s*["']([^"']+)["']|^import\s*["']([^"']+)["']/gm
 const DYNAMIC_IMPORT = /\bimport\(\s*["']([^"']+)["']\s*\)/g
+/** Bun's `target: 'bun'` output loads CommonJS dependencies through it; workerd has no such API. */
+const BUN_REQUIRE = 'import.meta.require'
 
 /**
- * Imports that would not resolve under the loader's rules. Bun's unminified ESM output
- * keeps every static import at the start of a line, which is what the scan relies on.
- * Platform builtins (`node:`, `cloudflare:`) are not checked.
+ * Imports that would not resolve under the loader's rules, plus any use of `import.meta.require`,
+ * reported with that as the specifier. Bun's unminified ESM output keeps every static import at the
+ * start of a line, which is what the scan relies on. Platform builtins (`node:`, `cloudflare:`) are not checked.
  */
 export function unresolvedImports(modules: Record<string, LoaderModule>): { module: string; specifier: string }[] {
 	const missing: { module: string; specifier: string }[] = []
@@ -50,6 +52,7 @@ export function unresolvedImports(modules: Record<string, LoaderModule>): { modu
 			if (specifier === undefined || /^(?:node|cloudflare):/.test(specifier)) continue
 			if (!(resolveModuleName(name, specifier) in modules)) missing.push({ module: name, specifier })
 		}
+		if (source.includes(BUN_REQUIRE)) missing.push({ module: name, specifier: BUN_REQUIRE })
 	}
 	return missing
 }
