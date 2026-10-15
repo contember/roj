@@ -8,6 +8,7 @@ import type { EventStore } from '~/core/events/event-store.js'
 import { FileEventStore, MemoryEventStore } from '~/core/events/index.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import { DefaultImageProcessor } from '~/core/image/image-processor.js'
+import type { ImageResizer } from '~/core/image/types.js'
 import { VipsImageResizer } from '~/core/image/vips-resizer.js'
 import { AnthropicProvider } from '~/core/llm/anthropic.js'
 import { LLMLogger, LoggingLLMProvider, MockLLMProvider } from '~/core/llm/index.js'
@@ -173,7 +174,8 @@ export function bootstrap(config: Config, userConfig: RojConfig, platform: Platf
 			? new MemoryEventStore()
 			: new FileEventStore(config.dataPath, platform.fs, logger))
 
-	const { llmProvider, llmProviders, llmLogger } = createLLMProvider(config, logger, platform)
+	const imageResizer = platform.imageResizer ?? new VipsImageResizer({ fs: platform.fs, process: platform.process, tmpDir: platform.tmpDir })
+	const { llmProvider, llmProviders, llmLogger } = createLLMProvider(config, logger, platform, imageResizer)
 
 	// The one place the declared sandbox settings are folded in — every host lands here.
 	const resolvedPresets = applySandboxSettings(userConfig)
@@ -188,12 +190,8 @@ export function bootstrap(config: Config, userConfig: RojConfig, platform: Platf
 
 	const preprocessorRegistry = new PreprocessorRegistry()
 	const imageClassifierGate = new Semaphore(config.imageClassifierConcurrency ?? 10)
-	// Dedicated resizer for the classification path: separate from the LLM
-	// provider's general-purpose ImageProcessor (which keeps a higher
-	// maxDimension for agent file-inspection tool calls). The classifier
-	// hands each image to the resizer with its own 1024px override.
-	const classifierImageResizer = new VipsImageResizer({ fs: platform.fs, process: platform.process, tmpDir: platform.tmpDir })
-	preprocessorRegistry.register(new ImageClassifierPreprocessor({ llmProvider, logger, fs: platform.fs, gate: imageClassifierGate, imageResizer: classifierImageResizer }))
+	// Shares the LLM provider's resizer; the classifier asks it for 1024px images per call.
+	preprocessorRegistry.register(new ImageClassifierPreprocessor({ llmProvider, logger, fs: platform.fs, gate: imageClassifierGate, imageResizer }))
 	// PdfPreprocessor must come before MarkitdownPreprocessor — both could
 	// match `application/pdf` in principle, but the registry uses first-hit
 	// and PdfPreprocessor's `pdftotext + pdfimages -all + streaming` pipeline
@@ -228,7 +226,7 @@ function createLogger(config: Config): Logger {
 		: new ConsoleLogger({ level: config.logLevel })
 }
 
-function createLLMProvider(config: Config, logger: Logger, platform: Platform): {
+function createLLMProvider(config: Config, logger: Logger, platform: Platform, imageResizer: ImageResizer): {
 	llmProvider: LLMProvider
 	llmProviders: ReadonlyMap<string, LLMProvider>
 	llmLogger?: LLMLogger
@@ -238,7 +236,6 @@ function createLLMProvider(config: Config, logger: Logger, platform: Platform): 
 		return { llmProvider: mock, llmProviders: new Map([['mock', mock]]) }
 	}
 
-	const imageResizer = new VipsImageResizer({ fs: platform.fs, process: platform.process, tmpDir: platform.tmpDir })
 	const imageProcessor = new DefaultImageProcessor(imageResizer, platform.fs)
 
 	const routableProviders: RoutableLLMProvider[] = []
