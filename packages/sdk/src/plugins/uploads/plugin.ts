@@ -37,6 +37,8 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10MB
 const ALLOWED_MIME_TYPES = [
 	'image/',
 	'text/',
+	'video/mp4',
+	'video/webm',
 	'application/pdf',
 	'application/json',
 	'application/xml',
