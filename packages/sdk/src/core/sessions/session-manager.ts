@@ -184,7 +184,7 @@ export class SessionManager {
 			this.evictionSweepTimer = setInterval(() => {
 				void this.evictIdleSessions()
 			}, sweepIntervalMs)
-			this.evictionSweepTimer.unref()
+			this.evictionSweepTimer.unref?.()
 		}
 
 		// A live scheduler has nowhere else to deliver. Hosts that wake out-of-band
