@@ -10,7 +10,7 @@ import { selectPluginState } from '~/core/sessions/reducer.js'
 import { createTool } from '~/core/tools/definition.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { toolEvents } from '~/core/tools/state.js'
-import { Ok } from '~/lib/utils/result.js'
+import { Err, Ok } from '~/lib/utils/result.js'
 import { contextCompactPlugin } from '~/plugins/context-compact/index.js'
 import { getAgentMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
 import { mailboxEvents } from '~/plugins/mailbox/state.js'
@@ -316,6 +316,137 @@ describe('limits-guard plugin', () => {
 			expect(pauseEvents.some((event) => event.agentId === entryAgentId)).toBe(false)
 			const warningEvents = await session.getEventsByType(limitsEvents, 'limit_warning')
 			expect(warningEvents.some((event) => event.limitName === 'maxConsecutiveNoProgressTurns')).toBe(false)
+
+			await harness.shutdown()
+		})
+
+		it('a failing tool alternating with another successful tool → warned by name, then paused', async () => {
+			let inferenceCount = 0
+			let sawNamedWarning = false
+
+			const flakyTool = createTool({
+				name: 'flaky_tool',
+				description: 'Always fails.',
+				input: z.object({ attempt: z.number() }),
+				execute: async () => Err({ message: 'flaky_tool is broken', recoverable: true }),
+			})
+			const okTool = createTool({
+				name: 'ok_tool',
+				description: 'Always succeeds.',
+				input: z.object({ attempt: z.number() }),
+				execute: async () => Ok('fine'),
+			})
+
+			const harness = createLimitsHarness({
+				presets: [createMultiAgentPreset([
+					{
+						name: 'worker',
+						system: 'Worker agent.',
+						tools: [flakyTool, okTool],
+						agents: [],
+						plugins: [limitsGuardPlugin.configureAgent({
+							limits: { maxConsecutiveToolFailures: 3, maxRepeatedToolCalls: 10, maxTurns: 100 },
+						})],
+					},
+				], { orchestratorSystem: 'Orchestrator agent.' })],
+				mockHandler: (request) => {
+					if (request.systemPrompt.endsWith('Orchestrator agent.')) {
+						const hasStartedWorker = request.messages.some((message) =>
+							message.role === 'assistant'
+							&& message.toolCalls?.some((toolCall) => toolCall.name === 'start_worker')
+						)
+						return hasStartedWorker
+							? { content: 'Orchestration complete', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+							: {
+								content: null,
+								toolCalls: [{ id: ToolCallId('start-worker'), name: 'start_worker', input: { message: 'Do the work' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+					}
+
+					inferenceCount++
+					if (JSON.stringify(request.messages).includes('Tool \\"flaky_tool\\" has failed 2 times in a row')) {
+						sawNamedWarning = true
+					}
+					const toolName = inferenceCount % 2 === 1 ? 'flaky_tool' : 'ok_tool'
+					return {
+						content: null,
+						toolCalls: [{ id: ToolCallId(`worker-${inferenceCount}`), name: toolName, input: { attempt: inferenceCount } }],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetrics(),
+					}
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendMessage('Start')
+			await waitUntil(() => session.state.agents.get(AgentId('worker_1'))?.status === 'paused')
+
+			const worker = session.state.agents.get(AgentId('worker_1'))!
+			expect(worker.pauseMessage).toContain(`Tool 'flaky_tool' failed 3 consecutive times`)
+			expect(sawNamedWarning).toBe(true)
+			// flaky, ok, flaky, ok, flaky → the 6th inference sees the third failure and pauses.
+			expect(inferenceCount).toBe(6)
+
+			await harness.shutdown()
+		})
+
+		it('repeated identical tool call → agent paused before the failure limit', async () => {
+			let inferenceCount = 0
+
+			const failingTool = createTool({
+				name: 'failing_tool',
+				description: 'Always fails.',
+				input: z.object({ path: z.string() }),
+				execute: async () => Err({ message: 'failing_tool is broken', recoverable: true }),
+			})
+
+			const harness = createLimitsHarness({
+				presets: [createMultiAgentPreset([
+					{
+						name: 'worker',
+						system: 'Worker agent.',
+						tools: [failingTool],
+						agents: [],
+						plugins: [limitsGuardPlugin.configureAgent({
+							limits: { maxConsecutiveToolFailures: 5, maxRepeatedToolCalls: 4, maxTurns: 100 },
+						})],
+					},
+				], { orchestratorSystem: 'Orchestrator agent.' })],
+				mockHandler: (request) => {
+					if (request.systemPrompt.endsWith('Orchestrator agent.')) {
+						const hasStartedWorker = request.messages.some((message) =>
+							message.role === 'assistant'
+							&& message.toolCalls?.some((toolCall) => toolCall.name === 'start_worker')
+						)
+						return hasStartedWorker
+							? { content: 'Orchestration complete', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+							: {
+								content: null,
+								toolCalls: [{ id: ToolCallId('start-worker'), name: 'start_worker', input: { message: 'Do the work' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+					}
+
+					inferenceCount++
+					return {
+						content: null,
+						toolCalls: [{ id: ToolCallId(`worker-${inferenceCount}`), name: 'failing_tool', input: { path: 'same.txt' } }],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetrics(),
+					}
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendMessage('Start')
+			await waitUntil(() => session.state.agents.get(AgentId('worker_1'))?.status === 'paused')
+
+			const worker = session.state.agents.get(AgentId('worker_1'))!
+			expect(worker.pauseMessage).toBe('Repeated identical tool call detected (4 times)')
+			expect(inferenceCount).toBe(5)
 
 			await harness.shutdown()
 		})
