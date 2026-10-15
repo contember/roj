@@ -19,15 +19,29 @@ import type { SandboxState } from './sandbox-state.js'
  */
 export type InstanceRuntime = 'sandbox' | 'isolate'
 
+/**
+ * Part of one origin: the origin itself, or only the paths under `pathPrefix`. The prefix matches whole
+ * segments, so `/api/tools` covers `/api/tools` and `/api/tools/run` but not `/api/toolsX`.
+ */
+export interface EgressTarget {
+	/** `https://host[:port]` */
+	origin: string
+	/** Starts with `/`. Omitted: every path of the origin. */
+	pathPrefix?: string
+}
+
 /** What an isolate instance's outbound `fetch` may reach, and what the platform adds on the way. */
 export interface InstanceEgress {
-	/** Origins (`https://host[:port]`) the agent may fetch. The LLM provider is always reachable. */
-	allowedOrigins: string[]
 	/**
-	 * Headers the platform adds to requests to one origin, e.g. a credential for a tool's API. The agent
+	 * What the agent may fetch: origins (`https://host[:port]`), or origins narrowed to a path prefix.
+	 * The LLM provider is always reachable.
+	 */
+	allowedOrigins: Array<string | EgressTarget>
+	/**
+	 * Headers the platform adds to requests to a target, e.g. a credential for a tool's API. The agent
 	 * never sees them. Write-only: no method returns a value.
 	 */
-	headers?: Array<{ origin: string; name: string; value: string }>
+	headers?: Array<EgressTarget & { name: string; value: string }>
 }
 
 export interface CreateInstanceInput {
