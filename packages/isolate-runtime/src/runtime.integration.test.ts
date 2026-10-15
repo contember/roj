@@ -14,8 +14,11 @@ afterEach(() => setSystemTime())
 class TestHost implements RuntimeHost {
 	alarm: number | null = null
 	readonly broadcasts: RuntimeBroadcast[] = []
+	/** While set, alarm writes wait for it, as a facet's parent does until the facet's `blockConcurrencyWhile` ends. */
+	gate: Promise<void> | null = null
 
 	async setAlarm(scheduledTime: number) {
+		await this.gate
 		this.alarm = scheduledTime
 	}
 
@@ -60,6 +63,18 @@ async function runAlarms(runtime: IsolateRuntime, host: TestHost) {
 	}
 }
 
+/** Leaves a turn in flight on the provider call, then drops the isolate, as an eviction does. */
+async function evictMidTurn(object: ReturnType<typeof createObject>): Promise<string> {
+	const evicted = boot(object, () => new Promise(() => {}))
+	await evicted.start()
+	const sessionId = createdSchema.parse(await rpc(evicted, 'sessions.create', { presetId: 'test' })).value.sessionId
+	await rpc(evicted, 'user-chat.sendMessage', { sessionId, content: 'Hi' })
+	setSystemTime(object.host.alarm ?? T0)
+	void evicted.deliverWakes()
+	await Bun.sleep(50)
+	return sessionId
+}
+
 async function eventTypes(runtime: IsolateRuntime, sessionId: string): Promise<string[]> {
 	const result = eventsSchema.parse(await rpc(runtime, 'sessions.getEvents', { sessionId }))
 	return result.value.events.map(event => event.type)
@@ -88,15 +103,7 @@ describe('isolate runtime', () => {
 	test('a turn lost to an eviction is retried by the alarm and finished by the next isolate', async () => {
 		setSystemTime(T0)
 		const object = createObject()
-		const evicted = boot(object, () => new Promise(() => {}))
-		await evicted.start()
-		const sessionId = createdSchema.parse(await rpc(evicted, 'sessions.create', { presetId: 'test' })).value.sessionId
-		await rpc(evicted, 'user-chat.sendMessage', { sessionId, content: 'Hi' })
-
-		// The delivery hangs on the provider call, and the isolate goes away with it.
-		setSystemTime(object.host.alarm ?? T0)
-		void evicted.deliverWakes()
-		await Bun.sleep(50)
+		const sessionId = await evictMidTurn(object)
 		expect(object.host.alarm).toBe(Date.now() + RETRY_MS)
 
 		const next = boot(object, answering)
@@ -105,5 +112,21 @@ describe('isolate runtime', () => {
 
 		expect(object.host.alarm).toBeNull()
 		expect(await eventTypes(next, sessionId)).toContain('inference_completed')
+	})
+
+	test('start does not wait on the host, which cannot answer a facet that is still starting', async () => {
+		setSystemTime(T0)
+		const object = createObject()
+		await evictMidTurn(object)
+		const { promise: gate, resolve: openGate } = Promise.withResolvers<void>()
+		const restarted = { storage: object.storage, host: new TestHost() }
+		restarted.host.gate = gate
+
+		const next = boot(restarted, answering)
+		expect(await Promise.race([next.start().then(() => 'started'), Bun.sleep(100).then(() => 'blocked')])).toBe('started')
+
+		openGate()
+		await next.fetch(new Request('http://runtime/status'))
+		expect(restarted.host.alarm).toBe(Date.now() + RETRY_MS)
 	})
 })

@@ -38,7 +38,11 @@ export interface IsolateRuntimeOptions {
 }
 
 export interface IsolateRuntime {
-	/** Loads open sessions, which recovers agents an eviction left mid-turn. Await before serving. */
+	/**
+	 * Loads open sessions, which recovers agents an eviction left mid-turn. Await before serving.
+	 * It never waits on the host: a facet runs it in `blockConcurrencyWhile`, and the parent cannot
+	 * answer the facet until that ends. The alarm writes it queues settle in the next `fetch` or `deliverWakes`.
+	 */
 	start(): Promise<void>
 	fetch(request: Request): Promise<Response>
 	/** Call from the host's `alarm()`. Returns the wake keys delivered. */
@@ -95,7 +99,6 @@ export function createIsolateRuntime(options: IsolateRuntimeOptions): IsolateRun
 	return {
 		async start() {
 			await system.sessionManager.loadAllSessions()
-			await scheduler.flush()
 		},
 
 		async fetch(request) {
