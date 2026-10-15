@@ -6,6 +6,7 @@
  * runtime packages (e.g. `@roj-ai/sdk/bun-platform`) and wired in at bootstrap time.
  */
 
+import type { ImageResizer } from '../core/image/types.js'
 import type { FileSystem } from './fs.js'
 import type { FsRevision } from './fs-revision.js'
 import type { GitClient } from './git.js'
@@ -39,6 +40,7 @@ export type { LiveScheduler, Scheduler, WakeHandler } from './scheduler.js'
 export type { SessionLogPage, SessionLogStore } from './session-log.js'
 export type { ShellConfinement, ShellGrant, ShellLimits, ShellRunner, ShellRunOptions, ShellRunResult } from './shell.js'
 
+export type { ImageResizeOptions, ImageResizer, ImageResizeResult } from '../core/image/types.js'
 export type { ServiceExecutorPort } from '../plugins/services/service.js'
 export type { PortPool } from '../plugins/services/port-pool.js'
 export type { ServiceConfig, ServiceStatus, ServiceStopSource } from '../plugins/services/schema.js'
@@ -77,6 +79,11 @@ export interface Platform {
 	 * writing `sessions/<id>/calls/<callId>.json` and listing that directory.
 	 */
 	llmCallLog?: LLMCallStore
+	/**
+	 * Shrinks images before they reach a model. Absent on hosts with a process table,
+	 * which keep resizing with the `vipsheader` / `vipsthumbnail` binaries.
+	 */
+	imageResizer?: ImageResizer
 	/** Absolute path to the OS temp directory (equivalent to `os.tmpdir()` on Node/Bun). */
 	tmpDir: string
 }

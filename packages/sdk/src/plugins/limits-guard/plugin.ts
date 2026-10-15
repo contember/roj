@@ -122,18 +122,11 @@ export type BudgetExceededEvent = (typeof limitsEvents)['Events']['budget_exceed
 // ============================================================================
 
 /**
- * Resolve tool name from agent state for tool_completed/tool_failed events.
- * Must run BEFORE core reducer (which clears executingToolCall).
+ * Name of the tool behind a tool_completed/tool_failed event. Plugin reducers run after the
+ * core reducer, which has already cleared the running call and recorded the named result.
  */
-function resolveToolName(
-	sessionState: { agents: Map<AgentId, { executingToolCall?: { toolName: string }; pendingToolCalls: Array<{ id: string; name: string }> }> },
-	agentId: AgentId,
-	toolCallId: string,
-): string {
-	const agent = sessionState.agents.get(agentId)
-	if (!agent) return 'unknown'
-	return agent.executingToolCall?.toolName
-		?? agent.pendingToolCalls.find((tc) => tc.id === toolCallId)?.name
+function resolveToolName(sessionState: SessionState, agentId: AgentId, toolCallId: ToolCallId): string {
+	return sessionState.agents.get(agentId)?.pendingToolResults.find((result) => result.toolCallId === toolCallId)?.toolName
 		?? 'unknown'
 }
 
@@ -279,7 +272,6 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 					const counters = limits.get(event.agentId)
 					if (!counters) return limits
 
-					// Resolve tool name from agent state (must run before core clears executingToolCall)
 					const toolName = resolveToolName(sessionState, event.agentId, event.toolCallId)
 					const { [toolName]: _, ...restFailures } = counters.consecutiveToolFailures
 
@@ -296,7 +288,6 @@ export const limitsGuardPlugin = definePlugin('limits-guard')
 					const counters = limits.get(event.agentId)
 					if (!counters) return limits
 
-					// Resolve tool name from agent state (must run before core clears executingToolCall)
 					const toolName = resolveToolName(sessionState, event.agentId, event.toolCallId)
 					const currentEntry = counters.consecutiveToolFailures[toolName]
 
