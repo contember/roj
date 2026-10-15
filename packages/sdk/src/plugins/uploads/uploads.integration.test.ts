@@ -202,6 +202,55 @@ describe('uploads plugin', () => {
 			await harness.shutdown()
 		})
 
+		it.each([
+			['clip.mp4', 'video/mp4'],
+			['clip.webm', 'video/webm'],
+		])('upload %s → ready', async (filename, mimeType) => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			const fileContent = Buffer.from('video bytes')
+
+			const result = await session.callPluginMethod('uploads.upload', {
+				sessionId: String(session.sessionId),
+				filename,
+				mimeType,
+				size: fileContent.length,
+				fileBuffer: fileContent,
+			})
+
+			expect(okValue(result, uploadResultSchema).status).toBe('ready')
+
+			await harness.shutdown()
+		})
+
+		it('upload a video format other than mp4 or webm → error', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+
+			const result = await session.callPluginMethod('uploads.upload', {
+				sessionId: String(session.sessionId),
+				filename: 'clip.mov',
+				mimeType: 'video/quicktime',
+				size: 11,
+				fileBuffer: Buffer.from('video bytes'),
+			})
+
+			expect(result.ok).toBe(false)
+			if (!result.ok) {
+				expect(result.error.message).toContain('Unsupported file type')
+			}
+
+			await harness.shutdown()
+		})
+
 		it('upload without preprocessor → extractedContent undefined', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
