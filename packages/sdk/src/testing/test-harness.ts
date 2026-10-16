@@ -58,6 +58,7 @@ export class TestHarness {
 		eventStore?: MemoryEventStore
 		/** Resident session idle timeout. Zero or absent disables eviction. */
 		sessionIdleTimeoutMs?: number
+		uploadMaxFileSize?: number
 		/** Extra notification sink, run after the recorder. Throwing here simulates a hostile embedder. */
 		onUserOutput?: (notification: PluginNotification) => void
 	}) {
@@ -116,6 +117,7 @@ export class TestHarness {
 			llmLogger: options.llmLogger,
 			platform,
 			sessionIdleTimeoutMs: options.sessionIdleTimeoutMs,
+			uploadMaxFileSize: options.uploadMaxFileSize,
 			systemPlugins: mergeSystemPlugins([...fullPlugins, ...(options.systemPlugins ?? [])]),
 		})
 	}

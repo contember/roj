@@ -178,6 +178,34 @@ describe('uploads plugin', () => {
 			await harness.shutdown()
 		})
 
+		it('configured maxFileSize replaces the 10MB default', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				uploadMaxFileSize: 20 * 1024 * 1024,
+			})
+
+			const session = await harness.createSession('test')
+			const upload = (filename: string, size: number) =>
+				session.callPluginMethod('uploads.upload', {
+					sessionId: String(session.sessionId),
+					filename,
+					mimeType: 'text/plain',
+					size,
+					fileBuffer: Buffer.from('tiny'),
+				})
+
+			expect(okValue(await upload('medium.txt', 11 * 1024 * 1024), uploadResultSchema).status).toBe('ready')
+
+			const tooLarge = await upload('huge.txt', 21 * 1024 * 1024)
+			expect(tooLarge.ok).toBe(false)
+			if (!tooLarge.ok) {
+				expect(tooLarge.error.message).toContain('File too large: max 20MB')
+			}
+
+			await harness.shutdown()
+		})
+
 		it('upload unsupported MIME type → error', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],

@@ -314,6 +314,7 @@ function buildSystem(services: Services<PluginProfile>, options?: CreateSystemFr
 		onUserOutput: options?.onUserOutput,
 		preprocessorRegistry: services.preprocessorRegistry,
 		uploadArchiveLimits: services.config.uploadArchiveLimits,
+		uploadMaxFileSize: services.config.uploadMaxFileSize,
 		resourceArchiveLimits: services.config.resourceArchiveLimits,
 		llmLogger: services.llmLogger,
 		portPool: services.portPool,
