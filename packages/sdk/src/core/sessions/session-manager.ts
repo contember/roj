@@ -83,6 +83,7 @@ export interface SessionManagerOptions {
 	onUserOutput?: UserOutputCallback
 	preprocessorRegistry?: PreprocessorRegistry
 	uploadArchiveLimits?: ArchiveLimitOverrides
+	uploadMaxFileSize?: number
 	resourceArchiveLimits?: ArchiveLimitOverrides
 	llmLogger?: LLMLogger
 	portPool?: PortPool
@@ -142,6 +143,7 @@ export class SessionManager {
 	private readonly onUserOutput?: UserOutputCallback
 	private readonly preprocessorRegistry?: PreprocessorRegistry
 	private readonly uploadArchiveLimits?: ArchiveLimitOverrides
+	private readonly uploadMaxFileSize?: number
 	private readonly resourceArchiveLimits?: ArchiveLimitOverrides
 	private readonly llmLogger?: LLMLogger
 	private readonly portPool?: PortPool
@@ -171,6 +173,7 @@ export class SessionManager {
 		this.onUserOutput = options.onUserOutput
 		this.preprocessorRegistry = options.preprocessorRegistry
 		this.uploadArchiveLimits = options.uploadArchiveLimits
+		this.uploadMaxFileSize = options.uploadMaxFileSize
 		this.resourceArchiveLimits = options.resourceArchiveLimits
 		this.llmLogger = options.llmLogger
 		this.portPool = options.portPool
@@ -1079,6 +1082,7 @@ export class SessionManager {
 			dataFileStore: this.dataFileStore,
 			preprocessorRegistry: this.preprocessorRegistry,
 			archiveLimits: this.uploadArchiveLimits,
+			maxFileSize: this.uploadMaxFileSize,
 		})
 
 		if (this.resourceArchiveLimits) {

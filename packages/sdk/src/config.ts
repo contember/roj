@@ -46,6 +46,8 @@ export interface Config {
 
 	/** Aggregate limits across every ZIP nested in one attachment upload. */
 	uploadArchiveLimits?: ArchiveLimitOverrides
+	/** Largest attachment upload in bytes. Absent keeps the uploads plugin default of 10 MB. */
+	uploadMaxFileSize?: number
 	/** Per-archive limits for resource ZIP injection. */
 	resourceArchiveLimits?: ArchiveLimitOverrides
 	/**
@@ -159,6 +161,9 @@ export const validateConfig = (config: Config): string[] => {
 
 	validateArchiveLimitOverrides('uploadArchiveLimits', config.uploadArchiveLimits, errors)
 	validateArchiveLimitOverrides('resourceArchiveLimits', config.resourceArchiveLimits, errors)
+	if (config.uploadMaxFileSize !== undefined && (!Number.isSafeInteger(config.uploadMaxFileSize) || config.uploadMaxFileSize <= 0)) {
+		errors.push(`Invalid uploadMaxFileSize: ${config.uploadMaxFileSize}`)
+	}
 	if (config.sessionIdleTimeoutMs !== undefined && (!Number.isSafeInteger(config.sessionIdleTimeoutMs) || config.sessionIdleTimeoutMs < 0)) {
 		errors.push(`Invalid sessionIdleTimeoutMs: ${config.sessionIdleTimeoutMs}`)
 	}

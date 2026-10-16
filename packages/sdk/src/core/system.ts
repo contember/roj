@@ -121,6 +121,7 @@ export interface CreateSystemOptions<TPlugins extends readonly PluginDefinition<
 	onUserOutput?: UserOutputCallback
 	preprocessorRegistry?: PreprocessorRegistry
 	uploadArchiveLimits?: ArchiveLimitOverrides
+	uploadMaxFileSize?: number
 	resourceArchiveLimits?: ArchiveLimitOverrides
 	llmLogger?: LLMLogger
 	portPool?: PortPool
@@ -155,6 +156,7 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		onUserOutput,
 		preprocessorRegistry,
 		uploadArchiveLimits,
+		uploadMaxFileSize,
 		resourceArchiveLimits,
 		llmLogger,
 		portPool,
@@ -181,6 +183,7 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		onUserOutput,
 		preprocessorRegistry,
 		uploadArchiveLimits,
+		uploadMaxFileSize,
 		resourceArchiveLimits,
 		llmLogger,
 		portPool,

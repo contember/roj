@@ -31,7 +31,7 @@ const statusChangedSchema = z.object({
 // Constants
 // ============================================================================
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10MB
+const DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024 // 10MB
 
 /** Allowed MIME type patterns */
 const ALLOWED_MIME_TYPES = [
@@ -68,6 +68,8 @@ const uploadStorageError = (): DomainError => createDomainError('upload_storage_
 export interface UploadsPluginConfig {
 	dataFileStore: FileStore
 	preprocessorRegistry?: PreprocessorRegistry
+	/** Largest accepted file in bytes. Defaults to 10 MB. */
+	maxFileSize?: number
 	processingTimeoutMs?: number
 	processingAbortGraceMs?: number
 	/** Bound in ms on the close-time wait for in-flight uploads and mutations. Must be positive; anything else uses the 30s default. */
@@ -181,9 +183,9 @@ function toStoredFilename(filename: string): string {
 	return filename.normalize('NFC')
 }
 
-function validateUploadInput(input: Pick<UploadInput, 'size' | 'mimeType' | 'filename'>): string | undefined {
+function validateUploadInput(input: Pick<UploadInput, 'size' | 'mimeType' | 'filename'>, maxFileSize: number): string | undefined {
 	if (!isBasename(input.filename)) return 'Invalid filename'
-	if (input.size > MAX_FILE_SIZE) return `File too large: max ${MAX_FILE_SIZE / (1024 * 1024)}MB`
+	if (input.size > maxFileSize) return `File too large: max ${maxFileSize / (1024 * 1024)}MB`
 	if (!isAllowedMimeType(input.mimeType)) return `Unsupported file type: ${input.mimeType}`
 	return undefined
 }
@@ -290,11 +292,12 @@ function runTrackedMutation<T>(args: {
 async function prepareUpload(args: {
 	pluginContext: UploadsPluginContext
 	dataFileStore: FileStore
+	maxFileSize: number
 	logger: Logger
 	input: UploadInput
 }): Promise<Result<PreparedUpload, DomainError>> {
 	const filename = toStoredFilename(args.input.filename)
-	const validationError = validateUploadInput({ ...args.input, filename })
+	const validationError = validateUploadInput({ ...args.input, filename }, args.maxFileSize)
 	if (validationError) return Err(ValidationErrors.invalid(validationError))
 
 	const uploadId = generateUploadId()
@@ -1013,6 +1016,7 @@ export const uploadsPlugin = definePlugin('uploads')
 			const preparedResult = await prepareUpload({
 				pluginContext: ctx.pluginContext,
 				dataFileStore: ctx.pluginConfig.dataFileStore,
+				maxFileSize: ctx.pluginConfig.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
 				logger: ctx.logger,
 				input,
 			})
@@ -1076,6 +1080,7 @@ export const uploadsPlugin = definePlugin('uploads')
 			const preparedResult = await prepareUpload({
 				pluginContext: ctx.pluginContext,
 				dataFileStore: ctx.pluginConfig.dataFileStore,
+				maxFileSize: ctx.pluginConfig.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
 				logger: ctx.logger,
 				input,
 			})
