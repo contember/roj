@@ -1,6 +1,7 @@
 {
 	"name": "@roj-ai/sdk",
 	"version": "0.1.0",
+	"license": "MIT",
 	"type": "module",
 	"main": "./dist/index.js",
 	"roj": {
