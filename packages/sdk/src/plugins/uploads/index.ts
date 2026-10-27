@@ -10,7 +10,7 @@ export type { Preprocessor, PreprocessorContext, PreprocessorResult, UploadArtif
 export { PreprocessorRegistry } from './preprocessor.js'
 
 export { fileUploadSource } from './source.js'
-export type { UploadBlobStore, UploadSource } from './source.js'
+export type { UploadBlobContext, UploadBlobStore, UploadSource } from './source.js'
 
 // Preprocessor implementations
 export {

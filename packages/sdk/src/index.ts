@@ -179,7 +179,7 @@ export type {
 } from '~/plugins/uploads/preprocessors/index.js'
 export type { UploadMetadata, UploadSourceRef } from '~/plugins/uploads/schema.js'
 export { fileUploadSource } from '~/plugins/uploads/source.js'
-export type { UploadBlobStore, UploadSource } from '~/plugins/uploads/source.js'
+export type { UploadBlobContext, UploadBlobStore, UploadSource } from '~/plugins/uploads/source.js'
 export type { ArchiveLimitOverrides, ArchiveLimits } from '~/lib/archive/index.js'
 export { userChatEvents, userChatPlugin } from '~/plugins/user-chat/plugin.js'
 export type { UserChatAgentConfig, UserChatPresetConfig, UserCommunicationMode } from '~/plugins/user-chat/plugin.js'
