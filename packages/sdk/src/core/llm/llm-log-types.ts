@@ -21,6 +21,17 @@ export type ChatMessageContentItemImage = {
 	}
 }
 
+/** A whole document handed to the model; providers that read PDFs natively see its pages, not extracted text. */
+export type ChatMessageContentItemDocument = {
+	type: 'document'
+	document: {
+		mediaType: 'application/pdf'
+		/** Base64 of the file bytes, without a `data:` prefix. */
+		data: string
+		filename?: string
+	}
+}
+
 /**
  * Union of all content item types.
  * Start with text and image, extend with audio/video as needed.
@@ -28,6 +39,7 @@ export type ChatMessageContentItemImage = {
 export type ChatMessageContentItem =
 	| ChatMessageContentItemText
 	| ChatMessageContentItemImage
+	| ChatMessageContentItemDocument
 
 /**
  * Tool result content - string or array of content items.

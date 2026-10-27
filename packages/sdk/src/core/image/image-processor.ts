@@ -1,9 +1,12 @@
 import { resolve } from 'node:path'
 import type { FileStore } from '~/core/file-store/types.js'
-import type { ChatMessageContentItem, ToolResultContent } from '~/core/llm/llm-log-types.js'
+import type { ChatMessageContentItem, ChatMessageContentItemImage, ChatMessageContentItemText, ToolResultContent } from '~/core/llm/llm-log-types.js'
 import { getImageMimeType } from '~/lib/mime.js'
 import type { FileSystem } from '~/platform/fs.js'
 import type { ImageProcessor, ImageProcessorConfig, ImageResizer } from './types.js'
+
+/** A resolved image, or the text that says why it could not be. */
+type ResolvedImage = ChatMessageContentItemImage | ChatMessageContentItemText
 
 function formatFileSize(bytes: number): string {
 	return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
@@ -52,7 +55,7 @@ export class DefaultImageProcessor implements ImageProcessor {
 	private async resolveDirect(
 		rawPath: string,
 		detail: 'auto' | 'low' | 'high' | undefined,
-	): Promise<ChatMessageContentItem> {
+	): Promise<ResolvedImage> {
 		const filePath = resolve(rawPath)
 		try {
 			if (!(await this.fs.exists(filePath))) {
@@ -74,7 +77,7 @@ export class DefaultImageProcessor implements ImageProcessor {
 		path: string,
 		detail: 'auto' | 'low' | 'high' | undefined,
 		fileStore: FileStore,
-	): Promise<ChatMessageContentItem> {
+	): Promise<ResolvedImage> {
 		const mimeType = getImageMimeType(path)
 		if (!mimeType) {
 			return { type: 'text', text: `[Image unavailable: ${path} - unsupported format]` }
@@ -98,7 +101,7 @@ export class DefaultImageProcessor implements ImageProcessor {
 		filePath: string,
 		mimeType: string,
 		detail: 'auto' | 'low' | 'high' | undefined,
-	): Promise<ChatMessageContentItem> {
+	): Promise<ResolvedImage> {
 		let resized: { path: string; mimeType: string; tempFile?: string } | undefined
 		try {
 			resized = await this.resizer.resize(filePath, mimeType, { maxFileSizeBytes: this.config.maxFileSizeBytes })

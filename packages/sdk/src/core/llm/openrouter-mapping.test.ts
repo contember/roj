@@ -232,3 +232,93 @@ describe('OpenRouterProvider reasoning budget', () => {
 		expect(JSON.stringify(http.body)).not.toContain('"reasoning"')
 	})
 })
+
+describe('OpenRouterProvider document mapping', () => {
+	test('maps a document to a file part with a PDF data URL', async () => {
+		const http = await createProvider().buildHttpRequest(buildRequest([{
+			role: 'user',
+			content: [
+				{ type: 'document', document: { mediaType: 'application/pdf', data: 'JVBERi0xLjQK', filename: 'scan.pdf' } },
+				{ type: 'text', text: 'Transcribe it.' },
+			],
+		}]))
+
+		expect(http.body).toMatchObject({
+			messages: [
+				{ role: 'system' },
+				{
+					role: 'user',
+					content: [
+						{ type: 'file', file: { filename: 'scan.pdf', file_data: 'data:application/pdf;base64,JVBERi0xLjQK' } },
+						{ type: 'text', text: 'Transcribe it.' },
+					],
+				},
+			],
+		})
+	})
+
+	test('names a document without a filename document.pdf, also in a tool result', async () => {
+		const http = await createProvider().buildHttpRequest(buildRequest([
+			{ role: 'user', content: 'Read the file.' },
+			{ role: 'assistant', content: '', toolCalls: [{ id: ToolCallId('call_1'), name: 'read', input: {} }] },
+			{
+				role: 'tool',
+				toolCallId: ToolCallId('call_1'),
+				content: [{ type: 'document', document: { mediaType: 'application/pdf', data: 'JVBERi0xLjQK' } }],
+			},
+		]))
+
+		expect(http.body).toMatchObject({
+			messages: [
+				{ role: 'system' },
+				{ role: 'user' },
+				{ role: 'assistant' },
+				{
+					role: 'tool',
+					tool_call_id: 'call_1',
+					content: [{ type: 'file', file: { filename: 'document.pdf', file_data: 'data:application/pdf;base64,JVBERi0xLjQK' } }],
+				},
+			],
+		})
+	})
+
+	test('an error tool result carries a document only as its placeholder', async () => {
+		const data = 'JVBERi0xLjQK'
+		const http = await createProvider().buildHttpRequest(buildRequest([
+			{ role: 'user', content: 'Read the file.' },
+			{ role: 'assistant', content: '', toolCalls: [{ id: ToolCallId('call_1'), name: 'read', input: {} }] },
+			{
+				role: 'tool',
+				toolCallId: ToolCallId('call_1'),
+				isError: true,
+				content: [{ type: 'text', text: 'Could not finish.' }, { type: 'document', document: { mediaType: 'application/pdf', data } }],
+			},
+		]))
+
+		const sha256 = new Bun.CryptoHasher('sha256').update(data).digest('hex')
+		const placeholder = `[document application/pdf, ${data.length} base64 chars, base64 sha256 ${sha256}; content omitted]`
+		expect(http.body).toMatchObject({
+			messages: [
+				{ role: 'system' },
+				{ role: 'user' },
+				{ role: 'assistant' },
+				{
+					role: 'tool',
+					content: `[ERROR] ${JSON.stringify([{ type: 'text', text: 'Could not finish.' }, { type: 'text', text: placeholder }])}`,
+				},
+			],
+		})
+		expect(JSON.stringify(http.body)).not.toContain(data)
+	})
+
+	test('an image part keeps its image_url shape', async () => {
+		const http = await createProvider().buildHttpRequest(buildRequest([{
+			role: 'user',
+			content: [{ type: 'image_url', imageUrl: { url: 'data:image/png;base64,abc123', detail: 'low' } }],
+		}]))
+
+		expect(http.body).toMatchObject({
+			messages: [{ role: 'system' }, { role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,abc123', detail: 'low' } }] }],
+		})
+	})
+})

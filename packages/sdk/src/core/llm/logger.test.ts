@@ -18,9 +18,12 @@ import { ToolCallId } from '~/core/tools/schema.js'
 import { countFsCalls, withReadFiles } from '~/lib/utils/fs-batch-doubles.test.js'
 import type { LLMCallOutcome, LLMCallPage, LLMCallRow, LLMCallStore } from '~/platform/llm-call-log.js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
+import { SessionFileStore } from '~/core/file-store/file-store.js'
 import { LLMLogger } from './logger.js'
 import type { LLMLoggerConfig } from './logger.js'
-import type { InferenceRequest, InferenceResponse, LLMError } from './provider.js'
+import { LoggingLLMProvider } from './logging-provider.js'
+import { MockLLMProvider } from './mock.js'
+import type { InferenceContext, InferenceRequest, InferenceResponse, LLMError } from './provider.js'
 
 // ============================================================================
 // Test helpers
@@ -190,6 +193,62 @@ for (const sink of SINKS) {
 				expect(call?.request.tools?.[0]?.name).toBe('test_tool')
 
 				await expectSinkUsed(sessionId, ['create', 'get'])
+			})
+
+			it('stores a document as a placeholder with its base64 length and SHA-256, never its base64', async () => {
+				const sessionId = SessionId('test-session-doc')
+				const data = Buffer.from('%PDF-1.4\nnot really a pdf\n').toString('base64')
+				const sha256 = new Bun.CryptoHasher('sha256').update(data).digest('hex')
+				const document = { mediaType: 'application/pdf' as const, data, filename: 'scan.pdf' }
+
+				const callId = await logger.createCall(sessionId, AgentId('test-agent-1'), {
+					...createTestRequest(),
+					messages: [
+						{ role: 'user', content: [{ type: 'document', document }, { type: 'text', text: 'Transcribe it.' }] },
+						{ role: 'assistant', content: '', toolCalls: [{ id: ToolCallId('tc-1'), name: 'read', input: {} }] },
+						{ role: 'tool', toolCallId: ToolCallId('tc-1'), content: [{ type: 'document', document: { mediaType: 'application/pdf', data } }] },
+					],
+				})
+
+				const call = await logger.getCall(sessionId, callId)
+				expect(call?.request.messages.map((m) => m.content)).toEqual([
+					[
+						{ type: 'text', text: `[document application/pdf "scan.pdf", ${data.length} base64 chars, base64 sha256 ${sha256}; content omitted]` },
+						{ type: 'text', text: 'Transcribe it.' },
+					],
+					'',
+					[{ type: 'text', text: `[document application/pdf, ${data.length} base64 chars, base64 sha256 ${sha256}; content omitted]` }],
+				])
+				expect(JSON.stringify(call)).not.toContain(data)
+			})
+
+			it('stores a placeholder for malformed base64 instead of throwing', async () => {
+				const sessionId = SessionId('test-session-bad-doc')
+				const data = '%%% not base64 %%%'
+				const sha256 = new Bun.CryptoHasher('sha256').update(data).digest('hex')
+
+				const callId = await logger.createCall(sessionId, AgentId('test-agent-1'), {
+					...createTestRequest(),
+					messages: [{ role: 'user', content: [{ type: 'document', document: { mediaType: 'application/pdf', data } }] }],
+				})
+
+				const call = await logger.getCall(sessionId, callId)
+				expect(call?.request.messages[0]?.content).toEqual([
+					{ type: 'text', text: `[document application/pdf, ${data.length} base64 chars, base64 sha256 ${sha256}; content omitted]` },
+				])
+			})
+
+			it('keeps image and text items as they are', async () => {
+				const sessionId = SessionId('test-session-image')
+				const content = [{ type: 'text' as const, text: 'Look.' }, { type: 'image_url' as const, imageUrl: { url: 'file:///shot.png', detail: 'low' as const } }]
+
+				const callId = await logger.createCall(sessionId, AgentId('test-agent-1'), {
+					...createTestRequest(),
+					messages: [{ role: 'user', content }],
+				})
+
+				const call = await logger.getCall(sessionId, callId)
+				expect(call?.request.messages[0]?.content).toEqual(content)
 			})
 		})
 
@@ -448,5 +507,28 @@ describe('LLMLogger over a store that forgot the call', () => {
 		await logger.failCall(sessionId, callId, createTestError(), 10)
 
 		expect(await logger.getCall(sessionId, callId)).toBeNull()
+	})
+})
+
+describe('LoggingLLMProvider with a malformed document', () => {
+	it('returns the same result whether the call is logged or not', async () => {
+		const request: InferenceRequest = {
+			...createTestRequest(),
+			messages: [{ role: 'user', content: [{ type: 'document', document: { mediaType: 'application/pdf', data: '%%% not base64 %%%' } }] }],
+		}
+		const provider = new MockLLMProvider(() => createTestResponse())
+		const logged = new LoggingLLMProvider(provider, new LLMLogger(createTestConfig({ store: new MemoryLLMCallStore() })))
+		const context: InferenceContext = {
+			sessionId: 'logged-session',
+			agentId: 'a1',
+			fileStore: new SessionFileStore(tmpdir(), undefined, false, createNodeFileSystem(), 'session'),
+		}
+
+		const unlogged = await logged.inference(request)
+		const withLog = await logged.inference(request, context)
+
+		expect(withLog).toEqual(unlogged)
+		expect(withLog.ok).toBe(true)
+		expect(provider.getLastRequest()?.messages).toEqual(request.messages)
 	})
 })

@@ -20,6 +20,7 @@ import type {
 } from './provider.js'
 import { mapProviderError } from './provider.js'
 import { DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS, ProviderRequestAbortError, runProviderRequest } from './provider-request.js'
+import { omitDocumentData } from './document-content.js'
 import { sanitizeProviderMessages } from './message-sanitization.js'
 
 // ============================================================================
@@ -105,6 +106,8 @@ interface OpenRouterContentItem {
 	type: string
 	text?: string
 	image_url?: { url: string; detail?: string }
+	/** PDF input: `file_data` is a base64 data URL. */
+	file?: { filename: string; file_data: string }
 	cache_control?: OpenRouterCacheControl
 }
 
@@ -363,7 +366,9 @@ export class OpenRouterProvider implements LLMProvider {
 			case 'tool': {
 				const resolvedContent = await this.imageProcessor.resolveContent(msg.content, context?.fileStore)
 				if (msg.isError) {
-					const errorText = typeof resolvedContent === 'string' ? resolvedContent : JSON.stringify(resolvedContent)
+					// Error text is a plain string, so a document cannot travel as one and only its placeholder is kept.
+					const withoutDocuments = await omitDocumentData(resolvedContent)
+					const errorText = typeof withoutDocuments === 'string' ? withoutDocuments : JSON.stringify(withoutDocuments)
 					return {
 						role: 'tool',
 						content: `[ERROR] ${errorText}`,
@@ -409,13 +414,24 @@ export class OpenRouterProvider implements LLMProvider {
 	private mapContentToOpenRouter(content: string | ChatMessageContentItem[]): string | OpenRouterContentItem[] {
 		if (typeof content === 'string') return content
 		return content.map((item): OpenRouterContentItem => {
-			if (item.type === 'text') {
-				return { type: 'text', text: item.text }
+			switch (item.type) {
+				case 'text':
+					return { type: 'text', text: item.text }
+				case 'image_url':
+					return { type: 'image_url', image_url: { url: item.imageUrl.url, detail: item.imageUrl.detail } }
+				case 'document':
+					return {
+						type: 'file',
+						file: {
+							filename: item.document.filename ?? 'document.pdf',
+							file_data: `data:${item.document.mediaType};base64,${item.document.data}`,
+						},
+					}
+				default: {
+					const unsupported: never = item
+					throw new Error(`Unsupported content item: ${JSON.stringify(unsupported)}`)
+				}
 			}
-			if (item.type === 'image_url') {
-				return { type: 'image_url', image_url: { url: item.imageUrl.url, detail: item.imageUrl.detail } }
-			}
-			return { type: 'text', text: JSON.stringify(item) }
 		})
 	}
 

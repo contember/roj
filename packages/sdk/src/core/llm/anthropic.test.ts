@@ -718,3 +718,61 @@ describe('AnthropicProvider model routing', () => {
 		expect(provider.normalizeModel('claude-opus-4-6')).toBe('claude-opus-4-6')
 	})
 })
+
+// ============================================================================
+// PDF documents
+// ============================================================================
+
+describe('AnthropicProvider document mapping', () => {
+	const pdf = { mediaType: 'application/pdf' as const, data: 'JVBERi0xLjQK', filename: 'scan.pdf' }
+	const documentBlock = { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0xLjQK' }, title: 'scan.pdf' }
+
+	test('maps a user document to a base64 document block', async () => {
+		const http = await createProvider().buildHttpRequest(buildRequest([{
+			role: 'user',
+			content: [{ type: 'document', document: pdf }, { type: 'text', text: 'Transcribe it.' }],
+		}]))
+
+		expect(http.body).toMatchObject({
+			messages: [{ role: 'user', content: [documentBlock, { type: 'text', text: 'Transcribe it.' }] }],
+		})
+	})
+
+	test('a document without a filename gets no title', async () => {
+		const http = await createProvider().buildHttpRequest(buildRequest([{
+			role: 'user',
+			content: [{ type: 'document', document: { mediaType: 'application/pdf', data: 'JVBERi0xLjQK' } }],
+		}]))
+
+		expect(http.body).toMatchObject({
+			messages: [{ content: [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0xLjQK' } }] }],
+		})
+		expect(JSON.stringify(http.body)).not.toContain('"title"')
+	})
+
+	test('maps a document inside a tool result', async () => {
+		const result = await mapMessage({
+			role: 'tool',
+			content: [{ type: 'document', document: pdf }],
+			toolCallId: ToolCallId('tc_1'),
+		})
+
+		expect(result).toEqual({
+			role: 'user',
+			content: [{ type: 'tool_result', tool_use_id: 'tc_1', content: [documentBlock], is_error: undefined }],
+		})
+	})
+
+	test('a cache breakpoint on a message ending with a document lands on the document block', async () => {
+		const http = await createProvider().buildHttpRequest(buildRequest(applyCacheBreakpoint([{
+			role: 'user',
+			content: [{ type: 'text', text: 'Read this.' }, { type: 'document', document: pdf }],
+		}], 0)))
+
+		expect(http.body).toMatchObject({
+			messages: [{
+				content: [{ type: 'text', text: 'Read this.' }, { ...documentBlock, cache_control: { type: 'ephemeral' } }],
+			}],
+		})
+	})
+})

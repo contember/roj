@@ -137,6 +137,16 @@ interface AnthropicImageBlockParam {
 	cache_control?: AnthropicCacheControl
 }
 
+interface AnthropicDocumentBlockParam {
+	type: 'document'
+	source: { type: 'base64'; media_type: 'application/pdf'; data: string }
+	title?: string
+	cache_control?: AnthropicCacheControl
+}
+
+/** Blocks a user turn and a tool result carry alike. */
+type AnthropicUserContentBlockParam = AnthropicTextBlockParam | AnthropicImageBlockParam | AnthropicDocumentBlockParam
+
 interface AnthropicToolUseBlockParam {
 	type: 'tool_use'
 	id: string
@@ -148,15 +158,14 @@ interface AnthropicToolUseBlockParam {
 interface AnthropicToolResultBlockParam {
 	type: 'tool_result'
 	tool_use_id: string
-	content: string | Array<AnthropicTextBlockParam | AnthropicImageBlockParam>
+	content: string | AnthropicUserContentBlockParam[]
 	is_error?: boolean
 	cache_control?: AnthropicCacheControl
 }
 
 /** Blocks the API accepts `cache_control` on — everything except a replayed thinking block. */
 type AnthropicCacheableBlockParam =
-	| AnthropicTextBlockParam
-	| AnthropicImageBlockParam
+	| AnthropicUserContentBlockParam
 	| AnthropicToolUseBlockParam
 	| AnthropicToolResultBlockParam
 
@@ -509,15 +518,24 @@ export class AnthropicProvider implements RoutableLLMProvider {
 		}
 	}
 
-	private mapUserContentItems(items: ChatMessageContentItem[]): Array<AnthropicTextBlockParam | AnthropicImageBlockParam> {
-		return items.map((item) => {
-			if (item.type === 'text') {
-				return { type: 'text' as const, text: item.text }
+	private mapUserContentItems(items: ChatMessageContentItem[]): AnthropicUserContentBlockParam[] {
+		return items.map((item): AnthropicUserContentBlockParam => {
+			switch (item.type) {
+				case 'text':
+					return { type: 'text', text: item.text }
+				case 'image_url':
+					return this.mapImageContent(item.imageUrl.url)
+				case 'document': {
+					const { mediaType, data, filename } = item.document
+					const block: AnthropicDocumentBlockParam = { type: 'document', source: { type: 'base64', media_type: mediaType, data } }
+					if (filename !== undefined) block.title = filename
+					return block
+				}
+				default: {
+					const unsupported: never = item
+					throw new Error(`Unsupported content item: ${JSON.stringify(unsupported)}`)
+				}
 			}
-			if (item.type === 'image_url') {
-				return this.mapImageContent(item.imageUrl.url)
-			}
-			return { type: 'text' as const, text: JSON.stringify(item) }
 		})
 	}
 

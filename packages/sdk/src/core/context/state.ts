@@ -34,6 +34,14 @@ const contentItemSchema = z4.discriminatedUnion('type', [
 			detail: z4.enum(['auto', 'low', 'high']).optional(),
 		}),
 	}),
+	z4.object({
+		type: z4.literal('document'),
+		document: z4.object({
+			mediaType: z4.literal('application/pdf'),
+			data: z4.string(),
+			filename: z4.string().optional(),
+		}),
+	}),
 ])
 
 const messageContentSchema = z4.union([

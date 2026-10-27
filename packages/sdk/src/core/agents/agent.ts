@@ -16,6 +16,7 @@ import { agentEvents } from '~/core/agents/state.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import { applyCacheBreakpoint, type CacheTtlConfig } from '~/core/llm/cache-breakpoints.js'
+import { omitMessageDocumentData } from '~/core/llm/document-content.js'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { InferenceRequest, InferenceResponse, LLMError, LLMMessage, LLMProvider } from '~/core/llm/provider.js'
 import { LLMCallId, ModelId } from '~/core/llm/schema.js'
@@ -689,12 +690,13 @@ export class Agent {
 			pendingMessages.push(...dequeued.messages)
 		}
 
-		// 3. Inference start - emit with pending messages
+		// 3. Inference start - emit with pending messages. The event keeps a placeholder for each
+		// document, so history sees it once; this inference still sends the local pendingMessages whole.
 		await this.store.emit(withSessionId(
 			this.store.sessionId,
 			llmEvents.create('inference_started', {
 				agentId: this.id,
-				messages: pendingMessages,
+				messages: await Promise.all(pendingMessages.map(omitMessageDocumentData)),
 				consumedMessageIds: [],
 			}),
 		))

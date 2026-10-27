@@ -21,6 +21,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Err, Ok } from '~/lib/utils/result.js'
+import { omitMessageDocumentData } from './document-content.js'
 import type { LLMMiddleware } from './middleware.js'
 import type { InferenceRequest, InferenceResponse } from './provider.js'
 
@@ -127,6 +128,8 @@ function stableStringify(value: unknown): string {
  *   - conversation-metadata fields on messages (`timestamp`, `isError`,
  *     `toolName`, `sourceMessageIds`) — not forwarded to the LLM, so they
  *     shouldn't bust the snapshot key either.
+ *   - document payloads, reduced to size and SHA-256 — the key still tells
+ *     documents apart, and the stored snapshot stays small.
  */
 function stripMessageMetadata(message: unknown): unknown {
 	if (!message || typeof message !== 'object') return message
@@ -134,11 +137,12 @@ function stripMessageMetadata(message: unknown): unknown {
 	return rest
 }
 
-function buildDigest(request: InferenceRequest): Record<string, unknown> {
+async function buildDigest(request: InferenceRequest): Promise<Record<string, unknown>> {
+	const messages = await Promise.all(request.messages.map(omitMessageDocumentData))
 	return {
 		model: String(request.model),
 		systemPrompt: request.systemPrompt,
-		messages: request.messages.map(stripMessageMetadata),
+		messages: messages.map(stripMessageMetadata),
 		tools: request.tools?.map((t) => ({ name: t.name, description: t.description })),
 		maxTokens: request.maxTokens,
 		temperature: request.temperature,
@@ -158,7 +162,7 @@ export function createSnapshotLLMMiddleware(options: SnapshotLLMMiddlewareOption
 
 	return async (request, context, next) => {
 		const forHashing = options.normalize ? options.normalize(request) : request
-		const digest = buildDigest(forHashing)
+		const digest = await buildDigest(forHashing)
 		const hash = hashDigest(digest)
 		const filePath = join(options.snapshotsDir, `${hash}.json`)
 		const hasSnapshot = existsSync(filePath)

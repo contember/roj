@@ -4,6 +4,15 @@
  */
 
 import { estimateTokenCount, sliceByTokens } from 'tokenx'
+import { base64ByteLength } from './document-content.js'
+
+/** Upper end of what a PDF page costs a native reader: its text plus the page image. */
+const DOCUMENT_TOKENS_PER_PAGE = 3_000
+/**
+ * Page count is not known without parsing the file, so it is derived from an assumed page size.
+ * Sized for text PDFs, so the estimate errs high: image-heavy and scanned pages are far larger and over-counted.
+ */
+const DOCUMENT_BYTES_PER_PAGE = 10 * 1024
 
 /**
  * Estimate token count for a text string.
@@ -50,12 +59,35 @@ export function truncateByTokens(text: string, maxTokens: number): TruncationRes
 }
 
 /**
+ * Estimate tokens of a base64 document: ~3,000 tokens per assumed 10 KB page, at least one page.
+ */
+export function estimateDocumentTokens(data: string): number {
+	return Math.max(1, Math.ceil(base64ByteLength(data) / DOCUMENT_BYTES_PER_PAGE)) * DOCUMENT_TOKENS_PER_PAGE
+}
+
+/** The base64 payload of a document content item, wherever it sits in a message. */
+function documentDataOf(value: unknown): string | undefined {
+	if (typeof value !== 'object' || value === null || !('type' in value) || value.type !== 'document') return undefined
+	if (!('document' in value) || typeof value.document !== 'object' || value.document === null) return undefined
+	return 'data' in value.document && typeof value.document.data === 'string' ? value.document.data : undefined
+}
+
+/**
  * Estimate total tokens for an array of messages.
  * Includes ~4 tokens overhead per message for role/formatting.
+ * A document counts by its size, not by the characters of its base64 payload.
  */
 export function estimateMessagesTokens(messages: TokenEstimationMessage[]): number {
 	return messages.reduce((sum, msg) => {
-		const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
-		return sum + estimateTokens(content) + 4 // 4 tokens overhead per message
+		let documentTokens = 0
+		const content = typeof msg.content === 'string'
+			? msg.content
+			: JSON.stringify(msg.content, (_key, value: unknown) => {
+				const data = documentDataOf(value)
+				if (data === undefined) return value
+				documentTokens += estimateDocumentTokens(data)
+				return { type: 'document' }
+			})
+		return sum + estimateTokens(content) + documentTokens + 4 // 4 tokens overhead per message
 	}, 0)
 }

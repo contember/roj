@@ -31,6 +31,16 @@ const bigOutputPlugin = definePlugin('big-output')
 					{ type: 'image_url' as const, imageUrl: { url: 'data:image/png;base64,AAAA' } },
 				]),
 		}),
+		createTool({
+			name: 'generate_document_result',
+			description: 'Generate a text + PDF document result of a given text size',
+			input: z.object({ size: z.number() }),
+			execute: async (input) =>
+				Ok([
+					{ type: 'text' as const, text: 'x'.repeat(input.size) },
+					{ type: 'document' as const, document: { mediaType: 'application/pdf' as const, data: 'JVBERi0xLjQK', filename: 'scan.pdf' } },
+				]),
+		}),
 	])
 	.build()
 
@@ -151,6 +161,38 @@ describe('result-eviction plugin', () => {
 		// ...and the image survives, because there is no partial image: the only
 		// alternative to keeping it is losing the observation.
 		expect(parts.filter((p) => p.type === 'image_url')).toHaveLength(1)
+
+		await harness.shutdown()
+	})
+
+	it('large output with a document → text evicted, document part kept whole', async () => {
+		const toolContents: unknown[] = []
+		const harness = createEvictionHarness({
+			presets: [createEvictionPreset()],
+			mockHandler: (request) => {
+				const callCount = harness.llmProvider.getCallCount()
+				if (callCount === 1) {
+					return {
+						content: null,
+						toolCalls: [{ id: ToolCallId('tc1'), name: 'generate_document_result', input: { size: 250_000 } }],
+						finishReason: 'stop',
+						metrics: MockLLMProvider.defaultMetrics(),
+					}
+				}
+				for (const msg of request.messages) {
+					if (msg.role === 'tool') toolContents.push(msg.content)
+				}
+				return { content: 'Done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			},
+		})
+
+		const session = await harness.createSession('test')
+		await session.sendAndWaitForIdle('Generate a large result with a document')
+
+		expect(toolContents).toEqual([[
+			{ type: 'text', text: expect.stringContaining('[Full output saved to: .results/tc1.txt]') },
+			{ type: 'document', document: { mediaType: 'application/pdf', data: 'JVBERi0xLjQK', filename: 'scan.pdf' } },
+		]])
 
 		await harness.shutdown()
 	})

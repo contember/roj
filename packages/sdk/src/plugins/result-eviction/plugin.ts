@@ -24,19 +24,19 @@ export interface EvictionAgentConfig {
 
 const DEFAULT_MAX_TOKENS = 20_000
 
-const isImage = (item: ChatMessageContentItem): boolean => item.type === 'image_url'
+const isKeptWhole = (item: ChatMessageContentItem): boolean => item.type === 'image_url' || item.type === 'document'
 
 /**
  * Rebuild a multi-part result with its text collapsed to `preview` and every
- * image part preserved in order.
+ * image and document part preserved in order.
  *
- * Images are kept rather than truncated because there is no partial image — the
- * alternative to keeping it is dropping the observation entirely. Text is the
- * part that both dominates the payload and survives being summarised.
+ * Images and documents are kept rather than truncated because there is no partial
+ * image or PDF — the alternative to keeping one is dropping the observation entirely.
+ * Text is the part that both dominates the payload and survives being summarised.
  */
 const withTextReplaced = (content: ChatMessageContentItem[], preview: string): ChatMessageContentItem[] => [
 	{ type: 'text', text: preview },
-	...content.filter(isImage),
+	...content.filter(isKeptWhole),
 ]
 
 export const resultEvictionPlugin = definePlugin('result-eviction')
@@ -54,7 +54,7 @@ export const resultEvictionPlugin = definePlugin('result-eviction')
 
 		// Multi-part results (e.g. a page snapshot returning JSON + a screenshot)
 		// used to bail out here, so no threshold could ever evict them however
-		// large the text grew. Measure the text, evict the text, keep the images.
+		// large the text grew. Measure the text, evict the text, keep images and documents.
 		const text = contentToString(content)
 		const truncation = truncateByTokens(text, maxTokens)
 		if (!truncation) {

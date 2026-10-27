@@ -154,6 +154,40 @@ describe('SnapshotLLMMiddleware', () => {
 		}
 	})
 
+	test('stores a document by base64 length and SHA-256 and still tells documents apart', async () => {
+		const downstream = new MockLLMProvider(() => fixedResponse)
+		const wrapped = applyMiddleware(downstream, [createSnapshotLLMMiddleware({ snapshotsDir: dir })])
+		const withDocument = (text: string): InferenceRequest => request({
+			messages: [{
+				role: 'user',
+				content: [{ type: 'document', document: { mediaType: 'application/pdf', data: Buffer.from(text).toString('base64') } }],
+			}],
+		})
+
+		await wrapped.inference(withDocument('%PDF-1.4 first'))
+		await wrapped.inference(withDocument('%PDF-1.4 second'))
+		await wrapped.inference(withDocument('%PDF-1.4 first'))
+
+		expect(downstream.getCallCount()).toBe(2)
+		const stored = readdirSync(dir).map((file) => readFileSync(join(dir, file), 'utf-8'))
+		expect(stored).toHaveLength(2)
+		for (const snapshot of stored) {
+			expect(snapshot).toMatch(/\[document application\/pdf, 20 base64 chars, base64 sha256 [0-9a-f]{64}; content omitted\]/)
+			expect(snapshot).not.toContain(Buffer.from('%PDF-1.4 first').toString('base64'))
+		}
+	})
+
+	test('a request without documents keeps the key it had before documents existed', async () => {
+		const downstream = new MockLLMProvider(() => fixedResponse)
+		const wrapped = applyMiddleware(downstream, [createSnapshotLLMMiddleware({ snapshotsDir: dir })])
+
+		await wrapped.inference(request({
+			messages: [{ role: 'user', content: [{ type: 'text', text: 'Look.' }, { type: 'image_url', imageUrl: { url: 'file:///shot.png' } }] }],
+		}))
+
+		expect(readdirSync(dir)).toEqual(['0d183018a779dfc6.json'])
+	})
+
 	test('does not persist error responses', async () => {
 		const downstream = new MockLLMProvider(() => {
 			const err = { type: 'rate_limit' as const, message: 'throttled' }
