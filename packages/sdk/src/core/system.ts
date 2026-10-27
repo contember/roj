@@ -14,6 +14,7 @@ import type { Platform } from '~/platform/index.js'
 import type { ServicePidRegistry } from '~/plugins/services/pid-registry.js'
 import type { PortPool } from '~/plugins/services/port-pool.js'
 import type { PreprocessorRegistry } from '~/plugins/uploads/preprocessor.js'
+import type { UploadBlobStore } from '~/plugins/uploads/source.js'
 import type { EventStore } from './events/event-store.js'
 import type { FileStore } from './file-store/types.js'
 import type { LLMLogger } from './llm/logger.js'
@@ -120,6 +121,8 @@ export interface CreateSystemOptions<TPlugins extends readonly PluginDefinition<
 	dataFileStore: FileStore
 	onUserOutput?: UserOutputCallback
 	preprocessorRegistry?: PreprocessorRegistry
+	uploadBlobStore?: UploadBlobStore
+	uploadProcessingTimeoutMs?: number
 	uploadArchiveLimits?: ArchiveLimitOverrides
 	uploadMaxFileSize?: number
 	resourceArchiveLimits?: ArchiveLimitOverrides
@@ -155,6 +158,8 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		dataFileStore,
 		onUserOutput,
 		preprocessorRegistry,
+		uploadBlobStore,
+		uploadProcessingTimeoutMs,
 		uploadArchiveLimits,
 		uploadMaxFileSize,
 		resourceArchiveLimits,
@@ -182,6 +187,8 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		dataFileStore,
 		onUserOutput,
 		preprocessorRegistry,
+		uploadBlobStore,
+		uploadProcessingTimeoutMs,
 		uploadArchiveLimits,
 		uploadMaxFileSize,
 		resourceArchiveLimits,

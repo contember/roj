@@ -17,9 +17,11 @@ import type { LLMProvider } from '~/core/llm/provider.js'
 import { RoutingLLMProvider } from '~/core/llm/routing-provider.js'
 import type { RoutableLLMProvider } from '~/core/llm/routing-provider.js'
 import type { Preset } from '~/core/preset/index.js'
+import type { FileSystem } from '~/platform/fs.js'
 import type { Platform } from '~/platform/index.js'
-import { PreprocessorRegistry } from '~/plugins/uploads/preprocessor.js'
+import { type Preprocessor, PreprocessorRegistry } from '~/plugins/uploads/preprocessor.js'
 import { ImageClassifierPreprocessor, MarkitdownPreprocessor, PdfPreprocessor, ZipPreprocessor } from '~/plugins/uploads/preprocessors/index.js'
+import type { UploadBlobStore } from '~/plugins/uploads/source.js'
 import type { Config } from './config.js'
 import { SessionFileStore } from './core/file-store/file-store.js'
 import type { SessionManager } from './core/sessions/session-manager.js'
@@ -107,6 +109,26 @@ export type BuiltinMethodSchemas = AllMethodSchemas<typeof fullPlugins>
 /** Method schemas the `isolate` profile actually registers */
 export type IsolateMethodSchemas = AllMethodSchemas<typeof isolatePlugins>
 
+/** What a host's {@link BootstrapUploadOptions.createPreprocessors} builds its preprocessors from. */
+export interface UploadPreprocessorDeps {
+	llmProvider: LLMProvider
+	imageResizer: ImageResizer
+	logger: Logger
+	fs: FileSystem
+	/** The default list (image classifier, pdf, markitdown, zip) so a host can keep some of them. */
+	builtins: () => Preprocessor[]
+}
+
+/** How uploads are processed and where host-stored upload bytes live. */
+export interface BootstrapUploadOptions {
+	/** Replaces the built-in preprocessor list. Order = match priority (first match wins). */
+	createPreprocessors?: (deps: UploadPreprocessorDeps) => Preprocessor[]
+	/** Required for registerStored. */
+	blobStore?: UploadBlobStore
+	/** Bound on one processing run in ms; defaults to 120 s. Hosts with slow conversions raise it. */
+	processingTimeoutMs?: number
+}
+
 /** Options for {@link bootstrap}. */
 export interface BootstrapOptions<TProfile extends PluginProfile = PluginProfile> {
 	/** Built-in plugin set to register. Defaults to `full`. */
@@ -118,6 +140,7 @@ export interface BootstrapOptions<TProfile extends PluginProfile = PluginProfile
 	 * here, rather than having the store it wants patched in after the fact.
 	 */
 	eventStore?: EventStore
+	uploads?: BootstrapUploadOptions
 }
 
 /**
@@ -142,6 +165,10 @@ export interface Services<TProfile extends PluginProfile = 'full'> {
 	pidRegistry: ServicePidRegistry
 	/** Preprocessor registry for upload content extraction */
 	preprocessorRegistry: PreprocessorRegistry
+	/** Where the host keeps upload bytes it stored itself. */
+	uploadBlobStore?: UploadBlobStore
+	/** Bound on one upload processing run in ms; absent keeps the plugin default. */
+	uploadProcessingTimeoutMs?: number
 	/** Host-environment adapters (filesystem, process, scheduler). */
 	platform: Platform
 	/** Built-in plugin set chosen at bootstrap — selects what createSystemFromServices registers. */
@@ -190,15 +217,27 @@ export function bootstrap(config: Config, userConfig: RojConfig, platform: Platf
 
 	const preprocessorRegistry = new PreprocessorRegistry()
 	const imageClassifierGate = new Semaphore(config.imageClassifierConcurrency ?? 10)
-	// Shares the LLM provider's resizer; the classifier asks it for 1024px images per call.
-	preprocessorRegistry.register(new ImageClassifierPreprocessor({ llmProvider, logger, fs: platform.fs, gate: imageClassifierGate, imageResizer }))
-	// PdfPreprocessor must come before MarkitdownPreprocessor — both could
-	// match `application/pdf` in principle, but the registry uses first-hit
-	// and PdfPreprocessor's `pdftotext + pdfimages -all + streaming` pipeline
-	// is dramatically faster than markitdown's pdfminer.six backend.
-	preprocessorRegistry.register(new PdfPreprocessor({ registry: preprocessorRegistry, logger, fs: platform.fs, process: platform.process }))
-	preprocessorRegistry.register(new MarkitdownPreprocessor({ registry: preprocessorRegistry, logger, fs: platform.fs, process: platform.process }))
-	preprocessorRegistry.register(new ZipPreprocessor({ registry: preprocessorRegistry, logger, process: platform.process }))
+	// Built-ins look nested files up in this registry, so they see whatever list the host chose.
+	const builtins = (): Preprocessor[] => [
+		// Shares the LLM provider's resizer; the classifier asks it for 1024px images per call.
+		new ImageClassifierPreprocessor({ llmProvider, logger, fs: platform.fs, gate: imageClassifierGate, imageResizer, tmpDir: platform.tmpDir }),
+		// PdfPreprocessor must come before MarkitdownPreprocessor — both could
+		// match `application/pdf` in principle, but the registry uses first-hit
+		// and PdfPreprocessor's `pdftotext + pdfimages -all + streaming` pipeline
+		// is dramatically faster than markitdown's pdfminer.six backend.
+		new PdfPreprocessor({ registry: preprocessorRegistry, logger, fs: platform.fs, process: platform.process }),
+		new MarkitdownPreprocessor({ registry: preprocessorRegistry, logger, fs: platform.fs, process: platform.process }),
+		new ZipPreprocessor({ registry: preprocessorRegistry, logger, fs: platform.fs, process: platform.process }),
+	]
+	const uploadProcessingTimeoutMs = options?.uploads?.processingTimeoutMs
+	if (uploadProcessingTimeoutMs !== undefined && (!Number.isSafeInteger(uploadProcessingTimeoutMs) || uploadProcessingTimeoutMs <= 0)) {
+		throw new Error(`Invalid uploads.processingTimeoutMs: ${uploadProcessingTimeoutMs}`)
+	}
+	const createPreprocessors = options?.uploads?.createPreprocessors
+	const preprocessors = createPreprocessors
+		? createPreprocessors({ llmProvider, imageResizer, logger, fs: platform.fs, builtins })
+		: builtins()
+	for (const preprocessor of preprocessors) preprocessorRegistry.register(preprocessor)
 
 	logger.info('Bootstrap complete')
 
@@ -215,6 +254,8 @@ export function bootstrap(config: Config, userConfig: RojConfig, platform: Platf
 		portPool,
 		pidRegistry,
 		preprocessorRegistry,
+		uploadBlobStore: options?.uploads?.blobStore,
+		uploadProcessingTimeoutMs,
 		platform,
 		pluginProfile,
 	}
@@ -313,6 +354,8 @@ function buildSystem(services: Services<PluginProfile>, options?: CreateSystemFr
 		dataFileStore: services.dataFileStore,
 		onUserOutput: options?.onUserOutput,
 		preprocessorRegistry: services.preprocessorRegistry,
+		uploadBlobStore: services.uploadBlobStore,
+		uploadProcessingTimeoutMs: services.uploadProcessingTimeoutMs,
 		uploadArchiveLimits: services.config.uploadArchiveLimits,
 		uploadMaxFileSize: services.config.uploadMaxFileSize,
 		resourceArchiveLimits: services.config.resourceArchiveLimits,

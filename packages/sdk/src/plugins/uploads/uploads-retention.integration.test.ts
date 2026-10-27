@@ -17,6 +17,7 @@ import { type UploadsPluginConfig, uploadsPlugin } from './plugin.js'
 import type { Preprocessor, PreprocessorContext } from './preprocessor.js'
 import { PreprocessorRegistry } from './preprocessor.js'
 import { generateUploadId, UploadId } from './schema.js'
+import type { UploadBlobContext, UploadBlobStore, UploadSource } from './source.js'
 import type { UploadsState } from './state.js'
 import { uploadEvents } from './state.js'
 
@@ -243,7 +244,7 @@ function abortablePreprocessor(
 	return {
 		name: 'abortable',
 		supportedMimeTypes: ['text/plain'],
-		process: async (_filePath: string, _mimeType: string, ctx: PreprocessorContext) => {
+		process: async (_source: UploadSource, _mimeType: string, ctx: PreprocessorContext) => {
 			started.resolve()
 			const signal = ctx.signal
 			if (!signal) throw new Error('Expected preprocessing signal')
@@ -537,7 +538,7 @@ describe('uploads runtime retention', () => {
 		}
 	})
 
-	it('persists terminal metadata during close without late events or notifications', async () => {
+	it('leaves an upload the close cut off processing, without late events or notifications, for the next runtime to re-run', async () => {
 		const basePath = `/tmp/roj-upload-close-${crypto.randomUUID()}`
 		const platform = createNodePlatform()
 		const dataFileStore = new SessionFileStore(basePath, undefined, false, platform.fs, 'session')
@@ -571,7 +572,7 @@ describe('uploads runtime retention', () => {
 			expect(metaResult.ok).toBe(true)
 			if (!metaResult.ok) throw new Error('Expected upload metadata')
 			const metadata = terminalMetadataSchema.parse(JSON.parse(metaResult.value))
-			expect(metadata.status).toBe('failed')
+			expect(metadata.status).toBe('processing')
 			expect(metadata.terminalEventPersisted).not.toBe(true)
 			const sourceEvents = await session.getEventsByType(uploadEvents, 'attachment_uploaded')
 			expect(sourceEvents.filter((event) => String(event.uploadId) === upload.uploadId && event.status === 'failed')).toHaveLength(0)
@@ -584,7 +585,9 @@ describe('uploads runtime retention', () => {
 			recovered = new TestHarness({ presets: [preset], eventStore })
 			const recoveredSession = await recovered.openSession(session.sessionId)
 			const recoveredEvents = await recoveredSession.getEventsByType(uploadEvents, 'attachment_uploaded')
-			expect(recoveredEvents.filter((event) => String(event.uploadId) === upload.uploadId && event.status === 'failed')).toHaveLength(1)
+			const forUpload = recoveredEvents.filter((event) => String(event.uploadId) === upload.uploadId)
+			expect(forUpload.filter((event) => event.status === 'failed')).toHaveLength(0)
+			expect(forUpload.filter((event) => event.status === 'processing').map((event) => event.attempt)).toEqual([1, 2])
 		} finally {
 			await source.shutdown()
 			await recovered?.shutdown()
@@ -1268,7 +1271,7 @@ describe('uploads runtime retention', () => {
 		const preprocessor: Preprocessor = {
 			name: 'ignores-abort',
 			supportedMimeTypes: ['text/plain'],
-			process: async (_filePath: string, _mimeType: string, ctx: PreprocessorContext) => {
+			process: async (_source: UploadSource, _mimeType: string, ctx: PreprocessorContext) => {
 				started.resolve()
 				ctx.signal?.addEventListener('abort', () => abortSeen.resolve(), { once: true })
 				await release.promise
@@ -1417,6 +1420,428 @@ describe('uploads runtime retention', () => {
 		} finally {
 			await harness.shutdown()
 			await rm(basePath, { recursive: true, force: true })
+		}
+	})
+})
+
+describe('uploads restart re-run', () => {
+	const restartMetadataSchema = z.object({
+		status: z.enum(['processing', 'ready', 'failed', 'deleted']),
+		attempts: z.number().optional(),
+		error: z.string().optional(),
+	})
+
+	/** Records each run, then waits for the abort a shutdown sends. */
+	function interruptiblePreprocessor(runs: Array<{ attempt: number; bytes: string }>, started: { current: ReturnType<typeof deferred> }): Preprocessor {
+		return {
+			name: 'interruptible',
+			supportedMimeTypes: ['text/plain'],
+			process: async (source: UploadSource, _mimeType: string, ctx: PreprocessorContext) => {
+				runs.push({ attempt: ctx.attempt, bytes: Buffer.from(await source.bytes()).toString() })
+				started.current.resolve()
+				const signal = ctx.signal
+				if (!signal) throw new Error('Expected preprocessing signal')
+				await new Promise<void>((resolve) => {
+					if (signal.aborted) resolve()
+					else signal.addEventListener('abort', () => resolve(), { once: true })
+				})
+				return Err(new Error('Processing cancelled'))
+			},
+		}
+	}
+
+	function restartFixture(config: Omit<UploadsPluginConfig, 'dataFileStore'>) {
+		const basePath = `/tmp/roj-upload-restart-${crypto.randomUUID()}`
+		const dataFileStore = new SelectiveFailureStore(new SessionFileStore(basePath, undefined, false, createNodePlatform().fs, 'session'))
+		const eventStore = new MemoryEventStore()
+		const preset = createTestPreset({ plugins: [uploadsPlugin.configure({ dataFileStore, ...config })] })
+		const harnesses: TestHarness[] = []
+		return {
+			dataFileStore,
+			open(): TestHarness {
+				const harness = new TestHarness({ presets: [preset], eventStore })
+				harnesses.push(harness)
+				return harness
+			},
+			/** Stops the runtime the way a crash leaves it: the terminal metadata write never lands. */
+			async crash(harness: TestHarness): Promise<void> {
+				dataFileStore.throwOnWrite('meta.json')
+				await harness.shutdown()
+				dataFileStore.faults.writeFaults.delete('meta.json')
+			},
+			async metadata(sessionId: SessionId, uploadId: string) {
+				const meta = await dataFileStore.read(`sessions/${sessionId}/uploads/${uploadId}/meta.json`)
+				if (!meta.ok) throw new Error(meta.error)
+				return restartMetadataSchema.parse(JSON.parse(meta.value))
+			},
+			async cleanup(): Promise<void> {
+				for (const harness of harnesses) await harness.shutdown()
+				await rm(basePath, { recursive: true, force: true })
+			},
+		}
+	}
+
+	it('re-runs an interrupted upload with the next attempt and fails it when the third attempt is interrupted', async () => {
+		const runs: Array<{ attempt: number; bytes: string }> = []
+		const started = { current: deferred() }
+		const fixture = restartFixture({ preprocessorRegistry: registryWith(interruptiblePreprocessor(runs, started)) })
+		try {
+			const source = fixture.open()
+			const session = await source.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.uploadAsync', {
+					sessionId: String(session.sessionId),
+					filename: 'restart.txt',
+					mimeType: 'text/plain',
+					size: 7,
+					fileBuffer: Buffer.from('restart'),
+				}),
+				asyncUploadSchema,
+			)
+			await started.current.promise
+			await fixture.crash(source)
+			expect(await fixture.metadata(session.sessionId, upload.uploadId)).toMatchObject({ status: 'processing', attempts: 1 })
+
+			for (const attempt of [2, 3]) {
+				started.current = deferred()
+				const recovered = fixture.open()
+				await recovered.openSession(session.sessionId)
+				await started.current.promise
+				expect(await fixture.metadata(session.sessionId, upload.uploadId)).toMatchObject({ status: 'processing', attempts: attempt })
+				expect(uploadLeaseCount(recovered, upload.uploadId)).toBe(1)
+				await fixture.crash(recovered)
+			}
+
+			const final = fixture.open()
+			const finalSession = await final.openSession(session.sessionId)
+			expect(runs).toEqual([
+				{ attempt: 1, bytes: 'restart' },
+				{ attempt: 2, bytes: 'restart' },
+				{ attempt: 3, bytes: 'restart' },
+			])
+			expect(await fixture.metadata(session.sessionId, upload.uploadId)).toMatchObject({
+				status: 'failed',
+				attempts: 3,
+				error: 'Processing interrupted by restart',
+			})
+			const events = await finalSession.getEventsByType(uploadEvents, 'attachment_uploaded')
+			expect(events.filter((event) => String(event.uploadId) === upload.uploadId && event.status === 'failed')).toHaveLength(1)
+			const state = finalSession.getPluginState<UploadsState>('uploads')
+			expect(state?.terminal[upload.uploadId]).toBe('failed')
+			expect(state?.processing[upload.uploadId]).toBeUndefined()
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+
+	it('re-runs a stored upload from the blob the log recorded, not from meta.json', async () => {
+		const runs: Array<{ attempt: number; bytes: string }> = []
+		const started = { current: deferred() }
+		const opened: string[] = []
+		const blobStore: UploadBlobStore = {
+			async open(blobRef) {
+				opened.push(blobRef)
+				const bytes = Buffer.from(blobRef === 'blob-original' ? 'original' : 'forged')
+				return Ok({
+					size: bytes.length,
+					stream: () => new Blob([bytes]).stream(),
+					bytes: async () => bytes,
+					range: async (offset, length) => bytes.subarray(offset, offset + length),
+				})
+			},
+		}
+		const fixture = restartFixture({ preprocessorRegistry: registryWith(interruptiblePreprocessor(runs, started)), blobStore })
+		try {
+			const source = fixture.open()
+			const session = await source.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.registerStored', {
+					sessionId: String(session.sessionId),
+					filename: 'stored.txt',
+					mimeType: 'text/plain',
+					size: 8,
+					blobRef: 'blob-original',
+				}),
+				asyncUploadSchema,
+			)
+			await started.current.promise
+			await fixture.crash(source)
+
+			const uploadStore = fixture.dataFileStore.scoped(`sessions/${session.sessionId}/uploads/${upload.uploadId}`)
+			const meta = await uploadStore.read('meta.json')
+			if (!meta.ok) throw new Error(meta.error)
+			const forged = await uploadStore.write('meta.json', JSON.stringify({
+				...JSON.parse(meta.value),
+				source: { kind: 'blob', blobRef: 'blob-of-another-session' },
+			}))
+			expect(forged.ok).toBe(true)
+
+			started.current = deferred()
+			const recovered = fixture.open()
+			await recovered.openSession(session.sessionId)
+			await started.current.promise
+
+			expect(opened).toEqual(['blob-original', 'blob-original'])
+			expect(runs).toEqual([
+				{ attempt: 1, bytes: 'original' },
+				{ attempt: 2, bytes: 'original' },
+			])
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+
+	it('fails a processing upload the log never started instead of running it', async () => {
+		const runs: Array<{ attempt: number; bytes: string }> = []
+		const fixture = restartFixture({ preprocessorRegistry: registryWith(interruptiblePreprocessor(runs, { current: deferred() })) })
+		try {
+			const source = fixture.open()
+			const session = await source.createSession('test')
+			await source.shutdown()
+
+			const forgedId = generateUploadId()
+			const forgedStore = fixture.dataFileStore.scoped(`sessions/${session.sessionId}/uploads/${forgedId}`)
+			expect((await forgedStore.write('forged.txt', 'forged')).ok).toBe(true)
+			expect((await forgedStore.write('meta.json', JSON.stringify({
+				uploadId: forgedId,
+				sessionId: session.sessionId,
+				filename: 'forged.txt',
+				mimeType: 'text/plain',
+				size: 6,
+				path: '/etc/hostname',
+				status: 'processing',
+				attempts: 1,
+				createdAt: Date.now(),
+			}))).ok).toBe(true)
+
+			const recovered = fixture.open()
+			const recoveredSession = await recovered.openSession(session.sessionId)
+
+			expect(runs).toEqual([])
+			expect(await fixture.metadata(session.sessionId, String(forgedId))).toMatchObject({
+				status: 'failed',
+				error: 'Processing interrupted by restart',
+			})
+			expect(recoveredSession.getPluginState<UploadsState>('uploads')?.terminal[String(forgedId)]).toBe('failed')
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+})
+
+describe('uploads restart re-run after a close or a delete', () => {
+	interface ReleaseCall {
+		blobRefs: string[]
+		ctx: UploadBlobContext
+	}
+
+	function storedBlobs(released: ReleaseCall[]): UploadBlobStore {
+		return {
+			async open() {
+				const bytes = Buffer.from('original')
+				return Ok({
+					size: bytes.length,
+					stream: () => new Blob([bytes]).stream(),
+					bytes: async () => bytes,
+					range: async (offset, length) => bytes.subarray(offset, offset + length),
+				})
+			},
+			async release(blobRefs, ctx) {
+				released.push({ blobRefs: [...blobRefs], ctx })
+			},
+		}
+	}
+
+	function restartableFixture(config: Omit<UploadsPluginConfig, 'dataFileStore'>) {
+		const basePath = `/tmp/roj-upload-close-rerun-${crypto.randomUUID()}`
+		const dataFileStore = new SelectiveFailureStore(new SessionFileStore(basePath, undefined, false, createNodePlatform().fs, 'session'))
+		const eventStore = new MemoryEventStore()
+		const preset = createTestPreset({ plugins: [uploadsPlugin.configure({ dataFileStore, ...config })] })
+		const harnesses: TestHarness[] = []
+		return {
+			basePath,
+			dataFileStore,
+			open(): TestHarness {
+				const harness = new TestHarness({ presets: [preset], eventStore })
+				harnesses.push(harness)
+				return harness
+			},
+			async crash(harness: TestHarness): Promise<void> {
+				dataFileStore.throwOnWrite('meta.json')
+				await harness.shutdown()
+				dataFileStore.faults.writeFaults.delete('meta.json')
+			},
+			async cleanup(): Promise<void> {
+				for (const harness of harnesses) await harness.shutdown()
+				await rm(basePath, { recursive: true, force: true })
+			},
+		}
+	}
+
+	/** Waits for the abort on the first run and succeeds on every later one. */
+	function succeedsOnRerun(attempts: number[], firstStarted: ReturnType<typeof deferred>): Preprocessor {
+		return {
+			name: 'succeeds-on-rerun',
+			supportedMimeTypes: ['text/plain'],
+			process: async (_source: UploadSource, _mimeType: string, ctx: PreprocessorContext) => {
+				attempts.push(ctx.attempt)
+				if (ctx.attempt > 1) return Ok({ extractedContent: `run ${ctx.attempt}` })
+				firstStarted.resolve()
+				const signal = ctx.signal
+				if (!signal) throw new Error('Expected preprocessing signal')
+				await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+				return Err(new Error('Processing cancelled'))
+			},
+		}
+	}
+
+	it('re-runs an upload a graceful close cut off and lets the re-run finish', async () => {
+		const attempts: number[] = []
+		const firstStarted = deferred()
+		const fixture = restartableFixture({ preprocessorRegistry: registryWith(succeedsOnRerun(attempts, firstStarted)) })
+		try {
+			const source = fixture.open()
+			const session = await source.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.uploadAsync', {
+					sessionId: String(session.sessionId),
+					filename: 'close.txt',
+					mimeType: 'text/plain',
+					size: 5,
+					fileBuffer: Buffer.from('close'),
+				}),
+				asyncUploadSchema,
+			)
+			await firstStarted.promise
+			await source.shutdown()
+
+			const recovered = fixture.open()
+			const recoveredSession = await recovered.openSession(session.sessionId)
+			await waitForTerminal(recovered, upload.uploadId, 'ready')
+
+			expect(attempts).toEqual([1, 2])
+			const meta = await fixture.dataFileStore.read(`sessions/${session.sessionId}/uploads/${upload.uploadId}/meta.json`)
+			if (!meta.ok) throw new Error(meta.error)
+			expect(JSON.parse(meta.value)).toMatchObject({ status: 'ready', attempts: 2, extractedContent: 'run 2' })
+			expect(recoveredSession.getPluginState<UploadsState>('uploads')?.pending.map((entry) => entry.extractedContent)).toEqual(['run 2'])
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+
+	it('takes the run count from the log, whatever meta.json claims', async () => {
+		const attempts: number[] = []
+		const firstStarted = deferred()
+		const fixture = restartableFixture({ preprocessorRegistry: registryWith(succeedsOnRerun(attempts, firstStarted)) })
+		try {
+			const source = fixture.open()
+			const session = await source.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.uploadAsync', {
+					sessionId: String(session.sessionId),
+					filename: 'forged-count.txt',
+					mimeType: 'text/plain',
+					size: 5,
+					fileBuffer: Buffer.from('count'),
+				}),
+				asyncUploadSchema,
+			)
+			await firstStarted.promise
+			await fixture.crash(source)
+
+			const uploadStore = fixture.dataFileStore.scoped(`sessions/${session.sessionId}/uploads/${upload.uploadId}`)
+			const meta = await uploadStore.read('meta.json')
+			if (!meta.ok) throw new Error(meta.error)
+			const forged = { ...JSON.parse(meta.value), attempts: -5, terminalEventPersisted: true }
+			expect((await uploadStore.write('meta.json', JSON.stringify(forged))).ok).toBe(true)
+
+			const recovered = fixture.open()
+			await recovered.openSession(session.sessionId)
+			await waitForTerminal(recovered, upload.uploadId, 'ready')
+
+			expect(attempts).toEqual([1, 2])
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+
+	it('never re-runs an upload whose delete was cut off, and finishes the delete', async () => {
+		const attempts: number[] = []
+		const released: ReleaseCall[] = []
+		const firstStarted = deferred()
+		const fixture = restartableFixture({
+			preprocessorRegistry: registryWith(succeedsOnRerun(attempts, firstStarted)),
+			blobStore: storedBlobs(released),
+		})
+		try {
+			const source = fixture.open()
+			const session = await source.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.registerStored', {
+					sessionId: String(session.sessionId),
+					filename: 'deleted.txt',
+					mimeType: 'text/plain',
+					size: 8,
+					blobRef: 'blob-original',
+				}),
+				asyncUploadSchema,
+			)
+			await firstStarted.promise
+			await fixture.crash(source)
+			// What a delete leaves when the process dies between marking the upload and its deletion event.
+			const uploadStore = fixture.dataFileStore.scoped(`sessions/${session.sessionId}/uploads/${upload.uploadId}`)
+			const meta = await uploadStore.read('meta.json')
+			if (!meta.ok) throw new Error(meta.error)
+			expect((await uploadStore.write('meta.json', JSON.stringify({ ...JSON.parse(meta.value), status: 'deleted' }))).ok).toBe(true)
+
+			const recovered = fixture.open()
+			const recoveredSession = await recovered.openSession(session.sessionId)
+
+			expect(attempts).toEqual([1])
+			const deletions = await recoveredSession.getEventsByType(uploadEvents, 'attachment_deletion_completed')
+			expect(deletions.map((event) => String(event.uploadId))).toEqual([upload.uploadId])
+			expect(released).toEqual([{ blobRefs: ['blob-original'], ctx: { sessionId: String(session.sessionId), uploadId: upload.uploadId } }])
+			const state = recoveredSession.getPluginState<UploadsState>('uploads')
+			expect(state?.processing[upload.uploadId]).toBeUndefined()
+			expect(state?.blobRefs[upload.uploadId]).toBeUndefined()
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+
+	it('releases the blobs of a processing upload whose directory is gone', async () => {
+		const released: ReleaseCall[] = []
+		const firstStarted = deferred()
+		const fixture = restartableFixture({
+			preprocessorRegistry: registryWith(succeedsOnRerun([], firstStarted)),
+			blobStore: storedBlobs(released),
+		})
+		try {
+			const source = fixture.open()
+			const session = await source.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.registerStored', {
+					sessionId: String(session.sessionId),
+					filename: 'orphan.txt',
+					mimeType: 'text/plain',
+					size: 8,
+					blobRef: 'blob-original',
+				}),
+				asyncUploadSchema,
+			)
+			await firstStarted.promise
+			await fixture.crash(source)
+			await rm(`${fixture.basePath}/sessions/${session.sessionId}/uploads/${upload.uploadId}`, { recursive: true, force: true })
+
+			const recovered = fixture.open()
+			const recoveredSession = await recovered.openSession(session.sessionId)
+
+			const deletions = await recoveredSession.getEventsByType(uploadEvents, 'attachment_deletion_completed')
+			expect(deletions.map((event) => String(event.uploadId))).toEqual([upload.uploadId])
+			expect(released).toEqual([{ blobRefs: ['blob-original'], ctx: { sessionId: String(session.sessionId), uploadId: upload.uploadId } }])
+			expect(recoveredSession.getPluginState<UploadsState>('uploads')?.processing[upload.uploadId]).toBeUndefined()
+		} finally {
+			await fixture.cleanup()
 		}
 	})
 })

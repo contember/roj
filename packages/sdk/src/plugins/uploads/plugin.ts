@@ -7,13 +7,24 @@ import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import type { SessionContext } from '~/core/sessions/context.js'
 import type { RuntimeLeaseRelease, SessionRuntimeActivity } from '~/core/sessions/runtime-activity.js'
 import { SessionId } from '~/core/sessions/schema.js'
+import { selectPluginState } from '~/core/sessions/reducer.js'
 import { getEntryAgentId } from '~/core/sessions/state.js'
 import { ArchiveBudget, type ArchiveLimitOverrides } from '~/lib/archive/index.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
-import type { PreprocessorRegistry, PreprocessorResult } from './preprocessor.js'
-import { generateUploadId, type MessageAttachment, parseUploadId, UploadId, type UploadMetadata, uploadIdSchema } from './schema.js'
-import { type PendingUpload, type UploadsState, uploadEvents } from './state.js'
+import type { FileSystem } from '~/platform/fs.js'
+import type { PreprocessorRegistry, PreprocessorResult, UploadArtifact, UploadCapabilities } from './preprocessor.js'
+import {
+	generateUploadId,
+	type MessageAttachment,
+	parseUploadId,
+	UploadId,
+	type UploadMetadata,
+	uploadIdSchema,
+	type UploadSourceRef,
+} from './schema.js'
+import { fileUploadSource, type UploadBlobContext, type UploadBlobStore, type UploadSource } from './source.js'
+import { type PendingUpload, type ProcessingUpload, type UploadsState, uploadEvents } from './state.js'
 
 // ============================================================================
 // Notification schemas
@@ -57,6 +68,9 @@ const PROCESSING_ABORT_GRACE_MS = 1_000
 const CLOSE_DRAIN_TIMEOUT_MS = 30_000
 const TERMINAL_APPEND_ATTEMPTS = 3
 const TERMINAL_APPEND_RETRY_DELAY_MS = 25
+/** Runs one upload may start; a restart that interrupts the last one fails the upload. */
+const MAX_PROCESSING_ATTEMPTS = 3
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/
 
 /** Store faults are internal: the client gets this fixed text, never the driver's own message. */
 const uploadStorageError = (): DomainError => createDomainError('upload_storage_error', 'Failed to write file', 500)
@@ -75,6 +89,8 @@ export interface UploadsPluginConfig {
 	/** Bound in ms on the close-time wait for in-flight uploads and mutations. Must be positive; anything else uses the 30s default. */
 	closeDrainTimeoutMs?: number
 	archiveLimits?: ArchiveLimitOverrides
+	/** Where the host keeps bytes it stored itself; required by `registerStored`. */
+	blobStore?: UploadBlobStore
 }
 
 interface UploadInput {
@@ -95,6 +111,8 @@ interface UploadResult {
 	status: 'ready' | 'failed'
 	extractedContent?: string
 	derivedPaths?: string[]
+	artifacts?: UploadArtifact[]
+	capabilities?: UploadCapabilities
 	error?: string
 }
 
@@ -120,7 +138,11 @@ interface PreparedUpload {
 	uploadStore: FileStore
 	/** The name as written. Callers report THIS, never their own input — see toStoredFilename. */
 	filename: string
+	/** Where the original sits in the upload dir; a `file` source is read from here. */
 	filePath: string
+	source: UploadSourceRef
+	/** 1-based run number, persisted as `attempts` before the run starts. */
+	attempt: number
 	createdAt: number
 	lifecycle: UploadLifecycle
 }
@@ -140,13 +162,75 @@ function isAllowedMimeType(mimeType: string): boolean {
 	return ALLOWED_MIME_TYPES.some((allowed) => (allowed.endsWith('/') ? mimeType.startsWith(allowed) : mimeType === allowed))
 }
 
+const CAPABILITY_KEYS = ['text', 'embeddedImages', 'captions', 'ocr', 'truncated', 'pagesProcessed', 'assetOnly'] as const satisfies readonly (keyof UploadCapabilities)[]
+
+function formatCapabilities(capabilities: UploadCapabilities | undefined): string | undefined {
+	if (!capabilities) return undefined
+	const parts: string[] = []
+	for (const key of CAPABILITY_KEYS) {
+		const value = capabilities[key]
+		if (value === undefined) continue
+		parts.push(value === true ? key : `${key}=${value}`)
+	}
+	return parts.length > 0 ? parts.join(',') : undefined
+}
+
+function formatSize(bytes: number): string {
+	if (bytes < 1024) return `${bytes}B`
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`
+	return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
+}
+
+const MARKUP_ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }
+
+/** Names and descriptions come from users and hosts; neither may close an attribute or the attachment element. */
+function escapeMarkup(value: string): string {
+	return value.replace(/[&<>"]/g, (char) => MARKUP_ESCAPES[char] ?? char)
+}
+
+/** True for a path that stays inside the upload dir: relative, no `..` segment, no NUL. */
+function isContainedArtifactPath(path: string): boolean {
+	if (path === '' || path.startsWith('/') || path.includes('\0')) return false
+	return path.split(/[/\\]/).every((segment) => segment !== '..')
+}
+
+function formatArtifact(artifact: UploadArtifact): string {
+	const description = artifact.description ? ` — ${escapeMarkup(artifact.description)}` : ''
+	const original = artifact.blobRef ? ' (original kept by host)' : ''
+	return `- ${escapeMarkup(artifact.path)} (${escapeMarkup(artifact.mimeType)}, ${formatSize(artifact.size)})${description}${original}`
+}
+
 function formatUploadsForLLM(uploads: PendingUpload[], sessionRoot: string): string {
 	const blocks = uploads.map((u) => {
 		const basePath = `${sessionRoot}/uploads/${u.uploadId}`
 		const content = u.extractedContent ?? `[File uploaded: ${u.filename}]`
-		return `<attachment uploadId="${u.uploadId}" filename="${u.filename}" type="${u.mimeType}" basePath="${basePath}">\n${content}\n</attachment>`
+		const capabilities = formatCapabilities(u.capabilities)
+		const capabilitiesAttribute = capabilities ? ` capabilities="${capabilities}"` : ''
+		const body = [content, ...(u.artifacts ?? []).map(formatArtifact)].join('\n')
+		const attributes = `uploadId="${u.uploadId}" filename="${escapeMarkup(u.filename)}" type="${escapeMarkup(u.mimeType)}" basePath="${escapeMarkup(basePath)}"`
+		return `<attachment ${attributes}${capabilitiesAttribute}>\n${body}\n</attachment>`
 	})
 	return blocks.join('\n')
+}
+
+/** Where a ready attachment can be read: the original, or for a stored upload its first artifact or the upload dir. */
+function attachmentPath(uploadBase: string, meta: UploadMetadata): string {
+	if (meta.source?.kind !== 'blob') return `${uploadBase}/${meta.filename}`
+	const firstArtifact = meta.artifacts?.find((artifact) => isContainedArtifactPath(artifact.path))
+	return firstArtifact ? `${uploadBase}/${firstArtifact.path}` : uploadBase
+}
+
+/** Artifacts rebuilt from meta.json, which the agent can rewrite: only contained paths, and no host blobs a delete would release. */
+function recoveredArtifacts(artifacts: UploadArtifact[] | undefined): UploadArtifact[] | undefined {
+	return artifacts
+		?.filter((artifact) => isContainedArtifactPath(artifact.path))
+		.map(({ path, mimeType, size, description }) => ({ path, mimeType, size, description }))
+}
+
+/** Adds blob refs to an upload's entry, keeping each once. */
+function withBlobRefs(blobRefs: Record<string, string[]>, uploadId: string, refs: readonly string[]): Record<string, string[]> {
+	if (refs.length === 0) return blobRefs
+	return { ...blobRefs, [uploadId]: [...new Set([...(blobRefs[uploadId] ?? []), ...refs])] }
 }
 
 function withoutKeys<T>(
@@ -322,6 +406,8 @@ async function prepareUpload(args: {
 			uploadStore,
 			filename,
 			filePath: writeResult.value.path,
+			source: { kind: 'file' },
+			attempt: 1,
 			createdAt: Date.now(),
 			lifecycle,
 		}
@@ -337,11 +423,74 @@ async function prepareUpload(args: {
 	}
 }
 
+interface StoredUploadInput {
+	sessionId: string
+	filename: string
+	mimeType: string
+	size: number
+	blobRef: string
+	sha256?: string
+}
+
+/** Twin of prepareUpload for bytes the host already stored: nothing is written to the upload dir. */
+function prepareStoredUpload(args: {
+	pluginContext: UploadsPluginContext
+	dataFileStore: FileStore
+	maxFileSize: number
+	input: StoredUploadInput
+}): Result<PreparedUpload, DomainError> {
+	const filename = toStoredFilename(args.input.filename)
+	const validationError = validateUploadInput({ ...args.input, filename }, args.maxFileSize)
+	if (validationError) return Err(ValidationErrors.invalid(validationError))
+	if (args.pluginContext.closing) return Err(ValidationErrors.invalid('Session is closing'))
+
+	const uploadId = generateUploadId()
+	const uploadIdStr = String(uploadId)
+	const uploadStore = args.dataFileStore.scoped(`sessions/${args.input.sessionId}/uploads/${uploadId}`)
+	const filePath = uploadStore.realPath('')
+	if (!filePath.ok) return Err(ValidationErrors.invalid('Invalid upload directory'))
+	return Ok({
+		uploadId,
+		uploadIdStr,
+		uploadStore,
+		filename,
+		filePath: filePath.value,
+		source: { kind: 'blob', blobRef: args.input.blobRef, sha256: args.input.sha256 },
+		attempt: 1,
+		createdAt: Date.now(),
+		lifecycle: reserveUploadLifecycle(args.pluginContext, uploadIdStr),
+	})
+}
+
+async function openUploadSource(args: {
+	prepared: PreparedUpload
+	upload: UploadDescriptor
+	sessionId: string
+	fs: FileSystem
+	blobStore?: UploadBlobStore
+	maxFileSize: number
+}): Promise<Result<UploadSource, Error>> {
+	const { source } = args.prepared
+	if (source.kind === 'file') return fileUploadSource(args.fs, args.prepared.filePath)
+	if (!args.blobStore) return Err(new Error('No upload blob store is configured'))
+	const opened = await args.blobStore.open(source.blobRef, { sessionId: args.sessionId, uploadId: args.prepared.uploadIdStr })
+	if (!opened.ok) return opened
+	if (opened.value.size !== args.upload.size) {
+		return Err(new Error(`Stored upload has ${opened.value.size} bytes, but ${args.upload.size} were registered`))
+	}
+	if (opened.value.size > args.maxFileSize) return Err(new Error(`File too large: max ${args.maxFileSize / (1024 * 1024)}MB`))
+	return opened
+}
+
 type PreprocessorOutcome = { kind: 'completed'; result: Result<PreprocessorResult, Error> } | { kind: 'threw'; error: unknown }
 
 async function runPreprocessor(args: {
 	uploadStore: FileStore
-	filePath: string
+	openSource: () => Promise<Result<UploadSource, Error>>
+	uploadId: string
+	sessionId: string
+	filename: string
+	attempt: number
 	mimeType: string
 	preprocessorRegistry?: PreprocessorRegistry
 	processingTimeoutMs?: number
@@ -356,10 +505,16 @@ async function runPreprocessor(args: {
 	let timedOut = false
 	const processPromise: Promise<PreprocessorOutcome> = (async () => {
 		try {
+			const source = await args.openSource()
+			if (!source.ok) return { kind: 'completed', result: Err(source.error) }
 			return {
 				kind: 'completed',
-				result: await preprocessor.process(args.filePath, args.mimeType, {
+				result: await preprocessor.process(source.value, args.mimeType, {
 					files: args.uploadStore,
+					uploadId: args.uploadId,
+					sessionId: args.sessionId,
+					filename: args.filename,
+					attempt: args.attempt,
 					signal: args.controller.signal,
 					inferenceContext: args.inferenceContext,
 					archiveBudget: new ArchiveBudget(args.archiveLimits),
@@ -418,11 +573,25 @@ async function runPreprocessor(args: {
 	}
 	if (!outcome) return { status: 'failed', error: 'Processing failed' }
 	if (!outcome.result.ok) return { status: 'failed', error: outcome.result.error.message }
+	const escaping = outcome.result.value.artifacts?.find((artifact) => !isContainedArtifactPath(artifact.path))
+	if (escaping) return { status: 'failed', error: `Preprocessor returned an artifact outside the upload directory: ${JSON.stringify(escaping.path)}` }
 	return {
 		status: 'ready',
 		extractedContent: outcome.result.value.extractedContent,
 		derivedPaths: outcome.result.value.derivedPaths,
+		artifacts: outcome.result.value.artifacts,
+		capabilities: outcome.result.value.capabilities,
 	}
+}
+
+const attemptsSchema = z.object({ attempts: z.number().optional() })
+
+/** True when meta.json records a later run than this one. */
+async function isSuperseded(prepared: PreparedUpload): Promise<boolean> {
+	const current = await prepared.uploadStore.read('meta.json')
+	if (!current.ok) return false
+	const parsed = attemptsSchema.safeParse(JSON.parse(current.value))
+	return parsed.success && parsed.data.attempts !== undefined && parsed.data.attempts > prepared.attempt
 }
 
 async function writeMetadata(uploadStore: FileStore, metadata: UploadMetadata): Promise<void> {
@@ -439,11 +608,30 @@ function createFinalMetadata(args: { prepared: PreparedUpload; sessionId: Sessio
 		size: args.upload.size,
 		path: args.prepared.filePath,
 		status: args.result.status,
+		source: args.prepared.source,
 		extractedContent: args.result.extractedContent,
 		derivedPaths: args.result.derivedPaths,
+		artifacts: args.result.artifacts,
+		capabilities: args.result.capabilities,
+		attempts: args.prepared.attempt,
 		error: args.result.error,
 		createdAt: args.prepared.createdAt,
 		completedAt: Date.now(),
+	}
+}
+
+function createProcessingMetadata(prepared: PreparedUpload, sessionId: SessionId, upload: UploadDescriptor): UploadMetadata {
+	return {
+		uploadId: prepared.uploadId,
+		sessionId,
+		filename: upload.filename,
+		mimeType: upload.mimeType,
+		size: upload.size,
+		path: prepared.filePath,
+		status: 'processing',
+		source: prepared.source,
+		attempts: prepared.attempt,
+		createdAt: prepared.createdAt,
 	}
 }
 
@@ -456,6 +644,8 @@ function createUploadResultEvent(upload: UploadDescriptor, uploadId: ReturnType<
 		status: result.status,
 		extractedContent: result.extractedContent,
 		derivedPaths: result.derivedPaths,
+		artifacts: result.artifacts,
+		capabilities: result.capabilities,
 		error: result.error,
 	})
 }
@@ -536,15 +726,30 @@ async function processUpload(args: {
 	sessionId: SessionId
 	upload: UploadDescriptor
 	config: UploadsPluginConfig
+	fs: FileSystem
 	logger: Logger
 	inferenceContext?: Omit<InferenceContext, 'signal'>
+	/** The log recorded the start of this run, so a later runtime can re-run it. */
+	resumable: boolean
 	onTerminal: (result: UploadResult) => Promise<void>
 	/** Runs once the terminal status is durable in metadata, even if its event append failed. */
 	onPersisted: (result: UploadResult) => Promise<void>
 }): Promise<UploadResult> {
 	const result = await runPreprocessor({
 		uploadStore: args.prepared.uploadStore,
-		filePath: args.prepared.filePath,
+		openSource: () =>
+			openUploadSource({
+				prepared: args.prepared,
+				upload: args.upload,
+				sessionId: String(args.sessionId),
+				fs: args.fs,
+				blobStore: args.config.blobStore,
+				maxFileSize: args.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
+			}),
+		uploadId: args.prepared.uploadIdStr,
+		sessionId: String(args.sessionId),
+		filename: args.prepared.filename,
+		attempt: args.prepared.attempt,
 		mimeType: args.upload.mimeType,
 		preprocessorRegistry: args.config.preprocessorRegistry,
 		processingTimeoutMs: args.config.processingTimeoutMs,
@@ -555,6 +760,12 @@ async function processUpload(args: {
 	})
 	await withUploadLock(args.pluginContext, args.prepared.uploadIdStr, async () => {
 		if (args.pluginContext.deletedUploads.has(args.prepared.uploadIdStr)) return
+		if (args.pluginContext.closing && args.resumable) {
+			// A run the close cut off stays `processing`, so the next runtime re-runs it.
+			if (result.status === 'failed' && args.prepared.lifecycle.controller.signal.aborted) return
+			// A run that outlived the close drain must not overwrite what a newer runtime's run wrote.
+			if (await isSuperseded(args.prepared)) return
+		}
 		const metadata = createFinalMetadata({
 			prepared: args.prepared,
 			sessionId: args.sessionId,
@@ -595,6 +806,7 @@ function startAsyncUpload(args: {
 	sessionId: SessionId
 	upload: UploadDescriptor
 	config: UploadsPluginConfig
+	fs: FileSystem
 	inferenceContext?: Omit<InferenceContext, 'signal'>
 	emitEvent: SessionContext['emitEvent']
 	notify: (type: 'uploadStatusChanged', payload: z.infer<typeof statusChangedSchema>) => void
@@ -611,8 +823,10 @@ function startAsyncUpload(args: {
 				sessionId: args.sessionId,
 				upload: args.upload,
 				config: args.config,
+				fs: args.fs,
 				logger: args.logger,
 				inferenceContext: args.inferenceContext,
+				resumable: true,
 				onTerminal: async (result) => {
 					await args.emitEvent(createUploadResultEvent(args.upload, args.prepared.uploadId, result))
 				},
@@ -640,6 +854,24 @@ function startAsyncUpload(args: {
 	})
 }
 
+/** The upload is already gone, so a host that cannot release its blobs leaves garbage, not a failed delete. */
+async function releaseBlobs(args: {
+	blobStore?: UploadBlobStore
+	blobRefs: readonly string[]
+	logger: Logger
+	upload: UploadBlobContext
+}): Promise<void> {
+	if (!args.blobStore?.release || args.blobRefs.length === 0) return
+	try {
+		await args.blobStore.release(args.blobRefs, args.upload)
+	} catch (error) {
+		args.logger.error('Could not release upload blobs', error instanceof Error ? error : undefined, {
+			uploadId: args.upload.uploadId,
+			blobRefs: [...args.blobRefs],
+		})
+	}
+}
+
 async function removeUploadFiles(uploadStore: FileStore, path = ''): Promise<Result<void, string>> {
 	const listResult = await uploadStore.list(path, { maxDepth: 1 })
 	if (!listResult.ok) return listResult
@@ -658,6 +890,161 @@ async function removeUploadFiles(uploadStore: FileStore, path = ''): Promise<Res
 	return Ok(undefined)
 }
 
+/** What starting background processing needs from a method or session-hook context. */
+interface AsyncUploadHost {
+	sessionId: SessionId
+	sessionState: SessionContext['sessionState']
+	files: FileStore
+	platform: { fs: FileSystem }
+	runtimeActivity: SessionRuntimeActivity
+	logger: Logger
+	emitEvent: SessionContext['emitEvent']
+	notify: (type: 'uploadStatusChanged', payload: z.infer<typeof statusChangedSchema>) => void
+	scheduleAgent: (agentId: AgentId) => void
+	pluginContext: UploadsPluginContext
+	pluginConfig: UploadsPluginConfig
+}
+
+function processingInferenceContext(host: AsyncUploadHost): Omit<InferenceContext, 'signal'> | undefined {
+	const entryAgentId = getEntryAgentId(host.sessionState)
+	return entryAgentId
+		? {
+				sessionId: String(host.sessionId),
+				agentId: String(entryAgentId),
+				fileStore: host.files,
+			}
+		: undefined
+}
+
+/** Hands a prepared upload, whose lease is already attached, to background processing. */
+function launchAsyncProcessing(host: AsyncUploadHost, prepared: PreparedUpload, upload: UploadDescriptor): void {
+	startAsyncUpload({
+		pluginContext: host.pluginContext,
+		prepared,
+		sessionId: host.sessionId,
+		upload,
+		config: host.pluginConfig,
+		fs: host.platform.fs,
+		inferenceContext: processingInferenceContext(host),
+		emitEvent: host.emitEvent,
+		notify: host.notify,
+		logger: host.logger,
+		entryAgentId: getEntryAgentId(host.sessionState),
+		scheduleAgent: host.scheduleAgent,
+	})
+}
+
+/** The shared tail of uploadAsync and registerStored: durable `processing` state, then background processing. */
+async function beginAsyncUpload(args: {
+	host: AsyncUploadHost
+	prepared: PreparedUpload
+	upload: UploadDescriptor
+	requestSessionId: string
+}): Promise<Result<{ uploadId: string; status: 'processing' }, DomainError>> {
+	const { host, prepared, upload } = args
+	try {
+		await writeMetadata(prepared.uploadStore, createProcessingMetadata(prepared, host.sessionId, upload))
+		await host.emitEvent(
+			uploadEvents.create('attachment_uploaded', {
+				uploadId: prepared.uploadId,
+				filename: upload.filename,
+				mimeType: upload.mimeType,
+				size: upload.size,
+				status: 'processing',
+				source: prepared.source,
+				attempt: prepared.attempt,
+			}),
+		)
+	} catch (error) {
+		prepared.lifecycle.abandon()
+		return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
+	}
+	try {
+		const releaseRuntimeLease = host.runtimeActivity.acquire(`upload:${prepared.uploadIdStr}:processing`)
+		prepared.lifecycle.attachRuntimeLease(releaseRuntimeLease)
+	} catch (error) {
+		prepared.lifecycle.abandon()
+		return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
+	}
+	// Everything from here to startAsyncUpload must be guarded: the lifecycle
+	// only settles once lifecycle.start() runs, so a throw before it leaks the
+	// runtime lease AND hangs onSessionClose, which awaits this completion.
+	// host.notify is the realistic trigger — it reaches embedder-supplied
+	// onUserOutput, which in standalone/sandbox writes to sockets.
+	try {
+		host.notify('uploadStatusChanged', {
+			sessionId: args.requestSessionId,
+			uploadId: prepared.uploadIdStr,
+			status: 'processing',
+		})
+		launchAsyncProcessing(host, prepared, upload)
+	} catch (error) {
+		prepared.lifecycle.abandon()
+		return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
+	}
+
+	return Ok({
+		uploadId: prepared.uploadIdStr,
+		status: 'processing',
+	})
+}
+
+/**
+ * Starts another run of an upload a restart interrupted.
+ *
+ * Source, name and run count come from the event log, not meta.json: the agent can write into the
+ * upload dir, and a forged source must not make the host read another blob or file. The run is
+ * recorded in the log before it starts, so a crash during it still counts against the limit.
+ */
+async function restartProcessing(args: {
+	host: AsyncUploadHost
+	uploadStore: FileStore
+	uploadId: UploadId
+	started: ProcessingUpload
+	metadata: UploadMetadata
+	attempt: number
+}): Promise<Result<void, Error>> {
+	const { started } = args
+	const filePath = started.source.kind === 'file'
+		? await args.uploadStore.containedPath(started.filename)
+		: args.uploadStore.realPath('')
+	if (!filePath.ok) return Err(new Error(`Cannot resolve the upload file: ${filePath.error}`))
+	const uploadIdStr = String(args.uploadId)
+	const lifecycle = reserveUploadLifecycle(args.host.pluginContext, uploadIdStr)
+	const prepared: PreparedUpload = {
+		uploadId: args.uploadId,
+		uploadIdStr,
+		uploadStore: args.uploadStore,
+		filename: started.filename,
+		filePath: filePath.value,
+		source: started.source,
+		attempt: args.attempt,
+		createdAt: args.metadata.createdAt,
+		lifecycle,
+	}
+	const upload: UploadDescriptor = { filename: started.filename, mimeType: started.mimeType, size: started.size }
+	try {
+		await args.host.emitEvent(
+			uploadEvents.create('attachment_uploaded', {
+				uploadId: args.uploadId,
+				filename: upload.filename,
+				mimeType: upload.mimeType,
+				size: upload.size,
+				status: 'processing',
+				source: started.source,
+				attempt: args.attempt,
+			}),
+		)
+		await writeMetadata(args.uploadStore, createProcessingMetadata(prepared, args.host.sessionId, upload))
+		prepared.lifecycle.attachRuntimeLease(args.host.runtimeActivity.acquire(`upload:${uploadIdStr}:processing`))
+		launchAsyncProcessing(args.host, prepared, upload)
+	} catch (error) {
+		lifecycle.abandon()
+		throw error
+	}
+	return Ok(undefined)
+}
+
 // ============================================================================
 // Plugin
 // ============================================================================
@@ -669,17 +1056,36 @@ export const uploadsPlugin = definePlugin('uploads')
 	.notification('uploadStatusChanged', { schema: statusChangedSchema })
 	.state<UploadsState>({
 		key: 'uploads',
-		initial: (): UploadsState => ({ pending: [], terminal: {} }),
+		initial: (): UploadsState => ({ pending: [], terminal: {}, processing: {}, blobRefs: {} }),
 		reduce: (state, event) => {
 			switch (event.type) {
 				case 'attachment_uploaded': {
-					const pending = state.pending.filter((upload) => String(upload.uploadId) !== String(event.uploadId))
-					if (event.status === 'processing') return { ...state, pending }
+					const uploadId = String(event.uploadId)
+					const pending = state.pending.filter((upload) => String(upload.uploadId) !== uploadId)
+					if (event.status === 'processing') {
+						const started: ProcessingUpload = {
+							filename: event.filename,
+							mimeType: event.mimeType,
+							size: event.size,
+							source: event.source ?? { kind: 'file' },
+							attempt: event.attempt ?? 1,
+						}
+						const sourceRefs = started.source.kind === 'blob' ? [started.source.blobRef] : []
+						return {
+							...state,
+							pending,
+							processing: { ...state.processing, [uploadId]: started },
+							blobRefs: withBlobRefs(state.blobRefs, uploadId, sourceRefs),
+						}
+					}
+					const processing = withoutKeys(state.processing, [uploadId])
+					const artifactRefs = (event.artifacts ?? []).flatMap((artifact) => (artifact.blobRef ? [artifact.blobRef] : []))
+					const blobRefs = withBlobRefs(state.blobRefs, uploadId, artifactRefs)
 					const terminal = {
 						...state.terminal,
-						[String(event.uploadId)]: event.status,
+						[uploadId]: event.status,
 					}
-					if (event.status !== 'ready') return { ...state, pending, terminal }
+					if (event.status !== 'ready') return { ...state, pending, terminal, processing, blobRefs }
 					const upload: PendingUpload = {
 						uploadId: event.uploadId,
 						filename: event.filename,
@@ -688,8 +1094,10 @@ export const uploadsPlugin = definePlugin('uploads')
 						status: event.status,
 						extractedContent: event.extractedContent,
 						derivedPaths: event.derivedPaths,
+						artifacts: event.artifacts,
+						capabilities: event.capabilities,
 					}
-					return { ...state, pending: [...pending, upload], terminal }
+					return { ...state, pending: [...pending, upload], terminal, processing, blobRefs }
 				}
 				case 'attachments_consumed': {
 					const consumedIds = new Set(event.uploadIds.map(String))
@@ -697,6 +1105,8 @@ export const uploadsPlugin = definePlugin('uploads')
 						...state,
 						pending: state.pending.filter((u) => !consumedIds.has(String(u.uploadId))),
 						terminal: withoutKeys(state.terminal, [...consumedIds]),
+						// A consumed upload can no longer be deleted, so nothing would release these.
+						blobRefs: withoutKeys(state.blobRefs, [...consumedIds]),
 					}
 				}
 				case 'attachment_deletion_completed': {
@@ -705,6 +1115,8 @@ export const uploadsPlugin = definePlugin('uploads')
 						...state,
 						pending: state.pending.filter((upload) => String(upload.uploadId) !== uploadId),
 						terminal: withoutKeys(state.terminal, [uploadId]),
+						processing: withoutKeys(state.processing, [uploadId]),
+						blobRefs: withoutKeys(state.blobRefs, [uploadId]),
 					}
 				}
 				default:
@@ -869,7 +1281,7 @@ export const uploadsPlugin = definePlugin('uploads')
 							if (!reservation.ok) return reservation
 							await reservation.value
 
-							return await withUploadLock(ctx.pluginContext, input.uploadId, async () => {
+							const deleted = await withUploadLock(ctx.pluginContext, input.uploadId, async () => {
 								const metaResult = await uploadStore.read('meta.json')
 								if (!metaResult.ok) return Err(ValidationErrors.invalid(`Upload not found: ${input.uploadId}`))
 								const meta: UploadMetadata = JSON.parse(metaResult.value)
@@ -877,13 +1289,23 @@ export const uploadsPlugin = definePlugin('uploads')
 								await writeMetadata(uploadStore, meta)
 								const cleanup = await removeUploadFiles(uploadStore)
 								if (!cleanup.ok) return Err(ValidationErrors.invalid(`Could not remove upload: ${input.uploadId}`))
+								// Read before the deletion event drops them, and never from meta.json, which the agent can rewrite.
+								const blobRefs = selectPluginState<UploadsState>(ctx.getSessionState(), 'uploads')?.blobRefs[input.uploadId] ?? []
 								await ctx.emitEvent(
 									uploadEvents.create('attachment_deletion_completed', {
 										uploadId: input.uploadId,
 									}),
 								)
-								return Ok({})
+								return Ok(blobRefs)
 							}, { allowDuringClose: true })
+							if (!deleted.ok) return Err(deleted.error)
+							await releaseBlobs({
+								blobStore: ctx.pluginConfig.blobStore,
+								blobRefs: deleted.value,
+								logger: ctx.logger,
+								upload: { sessionId: String(ctx.sessionId), uploadId: input.uploadId },
+							})
+							return Ok({})
 						} finally {
 							ctx.pluginContext.deletedUploads.delete(input.uploadId)
 							releaseTerminalHold?.()
@@ -929,7 +1351,7 @@ export const uploadsPlugin = definePlugin('uploads')
 					filename: meta.filename,
 					mimeType: meta.mimeType,
 					size: meta.size,
-					path: `${sessionRoot}/uploads/${uploadIdStr}/${meta.filename}`,
+					path: attachmentPath(`${sessionRoot}/uploads/${uploadIdStr}`, meta),
 					extractedContent: meta.extractedContent,
 					derivedPaths: meta.derivedPaths,
 				})
@@ -1038,7 +1460,9 @@ export const uploadsPlugin = definePlugin('uploads')
 						sessionId: ctx.sessionId,
 						upload,
 						config: ctx.pluginConfig,
+						fs: ctx.platform.fs,
 						logger: ctx.logger,
+						resumable: false,
 						inferenceContext: entryAgentId
 							? {
 									sessionId: String(ctx.sessionId),
@@ -1093,82 +1517,39 @@ export const uploadsPlugin = definePlugin('uploads')
 				mimeType: input.mimeType,
 				size: input.size,
 			}
-			const processingMeta: UploadMetadata = {
-				uploadId: prepared.uploadId,
-				sessionId: ctx.sessionId,
-				filename: upload.filename,
-				mimeType: upload.mimeType,
-				size: upload.size,
-				path: prepared.filePath,
-				status: 'processing',
-				createdAt: prepared.createdAt,
-			}
-			try {
-				await writeMetadata(prepared.uploadStore, processingMeta)
-				await ctx.emitEvent(
-					uploadEvents.create('attachment_uploaded', {
-						uploadId: prepared.uploadId,
-						filename: upload.filename,
-						mimeType: upload.mimeType,
-						size: upload.size,
-						status: 'processing',
-					}),
-				)
-			} catch (error) {
-				prepared.lifecycle.abandon()
-				return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
-			}
-			try {
-				const releaseRuntimeLease = ctx.runtimeActivity.acquire(`upload:${prepared.uploadIdStr}:processing`)
-				prepared.lifecycle.attachRuntimeLease(releaseRuntimeLease)
-			} catch (error) {
-				prepared.lifecycle.abandon()
-				return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
-			}
-			// Everything from here to startAsyncUpload must be guarded: the lifecycle
-			// only settles once lifecycle.start() runs, so a throw before it leaks the
-			// runtime lease AND hangs onSessionClose, which awaits this completion.
-			// ctx.notify is the realistic trigger — it reaches embedder-supplied
-			// onUserOutput, which in standalone/sandbox writes to sockets.
-			try {
-				ctx.notify('uploadStatusChanged', {
-					sessionId: input.sessionId,
-					uploadId: prepared.uploadIdStr,
-					status: 'processing',
-				})
-
-				const sessionId = ctx.sessionId
-				const sessionIdString = String(sessionId)
-				const entryAgentId = getEntryAgentId(ctx.sessionState)
-				const inferenceContext = entryAgentId
-					? {
-							sessionId: sessionIdString,
-							agentId: String(entryAgentId),
-							fileStore: ctx.files,
-						}
-					: undefined
-				startAsyncUpload({
-					pluginContext: ctx.pluginContext,
-					prepared,
-					sessionId,
-					upload,
-					config: ctx.pluginConfig,
-					inferenceContext,
-					emitEvent: ctx.emitEvent,
-					notify: ctx.notify,
-					logger: ctx.logger,
-					entryAgentId,
-					scheduleAgent: ctx.scheduleAgent,
-				})
-			} catch (error) {
-				prepared.lifecycle.abandon()
-				return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
-			}
-
-			return Ok({
-				uploadId: prepared.uploadIdStr,
-				status: 'processing',
+			return beginAsyncUpload({ host: ctx, prepared, upload, requestSessionId: input.sessionId })
+		},
+	})
+	.method('registerStored', {
+		input: z.object({
+			sessionId: z.string(),
+			filename: z.string(),
+			mimeType: z.string(),
+			size: z.number().int().nonnegative(),
+			/** Hex SHA-256 of the stored bytes, when the host computed it. */
+			sha256: z.string().regex(SHA256_HEX_PATTERN, 'Invalid sha256').optional(),
+			blobRef: z.string().min(1),
+		}),
+		output: z.object({
+			uploadId: z.string(),
+			status: z.enum(['processing']),
+		}),
+		handler: async (ctx, input) => {
+			if (!ctx.pluginConfig.blobStore) return Err(ValidationErrors.invalid('Stored uploads are not supported: no blob store is configured'))
+			const preparedResult = prepareStoredUpload({
+				pluginContext: ctx.pluginContext,
+				dataFileStore: ctx.pluginConfig.dataFileStore,
+				maxFileSize: ctx.pluginConfig.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
+				input,
 			})
+			if (!preparedResult.ok) return Err(preparedResult.error)
+			const prepared = preparedResult.value
+			const upload: UploadDescriptor = {
+				filename: prepared.filename,
+				mimeType: input.mimeType,
+				size: input.size,
+			}
+			return beginAsyncUpload({ host: ctx, prepared, upload, requestSessionId: input.sessionId })
 		},
 	})
 	.sessionHook('onSessionReady', async (ctx) => {
@@ -1176,6 +1557,17 @@ export const uploadsPlugin = definePlugin('uploads')
 		const listResult = await ctx.pluginConfig.dataFileStore.list(uploadsPath)
 		if (!listResult.ok) return
 		const seenUploadIds = new Set<string>()
+		/** Ends a deletion a crash cut short, or one whose upload dir is gone: the log learns of it and the host gets its blobs back. */
+		const completeDeletion = async (uploadId: string) => {
+			const blobRefs = ctx.pluginState.blobRefs[uploadId] ?? []
+			await ctx.emitEvent(uploadEvents.create('attachment_deletion_completed', { uploadId: UploadId(uploadId) }))
+			await releaseBlobs({
+				blobStore: ctx.pluginConfig.blobStore,
+				blobRefs,
+				logger: ctx.logger,
+				upload: { sessionId: String(ctx.sessionId), uploadId },
+			})
+		}
 
 		for (const entry of listResult.value) {
 			if (entry.type !== 'directory') continue
@@ -1205,9 +1597,7 @@ export const uploadsPlugin = definePlugin('uploads')
 					continue
 				}
 				if (metadata.status === 'deleted') {
-					if (projection) {
-						await ctx.emitEvent(uploadEvents.create('attachment_deletion_completed', { uploadId: metadata.uploadId }))
-					}
+					if (projection || ctx.pluginState.processing[uploadId] || ctx.pluginState.blobRefs[uploadId]) await completeDeletion(uploadId)
 					continue
 				}
 				if (projection) {
@@ -1220,9 +1610,13 @@ export const uploadsPlugin = definePlugin('uploads')
 							if (!pending) throw new Error('Ready terminal event has no pending projection')
 							metadata.extractedContent = pending.extractedContent
 							metadata.derivedPaths = pending.derivedPaths
+							metadata.artifacts = pending.artifacts
+							metadata.capabilities = pending.capabilities
 						} else {
 							metadata.extractedContent = undefined
 							metadata.derivedPaths = undefined
+							metadata.artifacts = undefined
+							metadata.capabilities = undefined
 						}
 						metadata.completedAt ??= Date.now()
 						metadata.terminalEventPersisted = true
@@ -1230,9 +1624,24 @@ export const uploadsPlugin = definePlugin('uploads')
 					}
 					continue
 				}
-				if (metadata.terminalEventPersisted) continue
+				// The log decides whether processing finished; meta.json, status and flags alike, may be forged.
+				const started = ctx.pluginState.processing[uploadId]
+				if (metadata.terminalEventPersisted && !started) continue
 
-				if (metadata.status === 'processing') {
+				if (metadata.status === 'processing' || (started && metadata.terminalEventPersisted)) {
+					// Only an upload the log says was started is re-run, and only as often as the log says it ran.
+					if (started && started.attempt < MAX_PROCESSING_ATTEMPTS) {
+						const restarted = await restartProcessing({
+							host: ctx,
+							uploadStore,
+							uploadId: parsedUploadId.value,
+							started,
+							metadata,
+							attempt: started.attempt + 1,
+						})
+						if (restarted.ok) continue
+						ctx.logger.warn('Could not re-run interrupted upload', { uploadId, error: restarted.error.message })
+					}
 					metadata.status = 'failed'
 					metadata.error = 'Processing interrupted by restart'
 					metadata.completedAt = Date.now()
@@ -1243,6 +1652,8 @@ export const uploadsPlugin = definePlugin('uploads')
 							status: 'ready',
 							extractedContent: metadata.extractedContent,
 							derivedPaths: metadata.derivedPaths,
+							artifacts: recoveredArtifacts(metadata.artifacts),
+							capabilities: metadata.capabilities,
 						}
 					: { status: 'failed', error: metadata.error }
 				const recoveredUpload: UploadDescriptor = {
@@ -1269,9 +1680,14 @@ export const uploadsPlugin = definePlugin('uploads')
 		// A fork copies the event log but not the uploads dir, so every inherited upload looks
 		// orphaned here — sweeping them would delete attachments the fork still shows.
 		if (ctx.sessionState.forkedFrom) return
-		for (const uploadId of Object.keys(ctx.pluginState.terminal)) {
+		const tracked = new Set([
+			...Object.keys(ctx.pluginState.terminal),
+			...Object.keys(ctx.pluginState.processing),
+			...Object.keys(ctx.pluginState.blobRefs),
+		])
+		for (const uploadId of tracked) {
 			if (seenUploadIds.has(uploadId)) continue
-			await ctx.emitEvent(uploadEvents.create('attachment_deletion_completed', { uploadId: UploadId(uploadId) }))
+			await completeDeletion(uploadId)
 		}
 	})
 	.sessionHook('onSessionClose', async (ctx) => {

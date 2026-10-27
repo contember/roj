@@ -44,6 +44,7 @@ import type { PortPool } from '~/plugins/services/port-pool.js'
 import type { ServiceConfig } from '~/plugins/services/schema.js'
 import { selectSessionStats, type SessionStatsState } from '~/plugins/session-stats/index.js'
 import type { PreprocessorRegistry } from '~/plugins/uploads/preprocessor.js'
+import type { UploadBlobStore } from '~/plugins/uploads/source.js'
 import { EventStore } from '../events/event-store.js'
 import { createApplyEvent } from './apply-event.js'
 import { rewriteEventsForFork } from './fork-utils.js'
@@ -82,6 +83,8 @@ export interface SessionManagerOptions {
 	dataFileStore: FileStore
 	onUserOutput?: UserOutputCallback
 	preprocessorRegistry?: PreprocessorRegistry
+	uploadBlobStore?: UploadBlobStore
+	uploadProcessingTimeoutMs?: number
 	uploadArchiveLimits?: ArchiveLimitOverrides
 	uploadMaxFileSize?: number
 	resourceArchiveLimits?: ArchiveLimitOverrides
@@ -142,6 +145,8 @@ export class SessionManager {
 	private readonly dataFileStore: FileStore
 	private readonly onUserOutput?: UserOutputCallback
 	private readonly preprocessorRegistry?: PreprocessorRegistry
+	private readonly uploadBlobStore?: UploadBlobStore
+	private readonly uploadProcessingTimeoutMs?: number
 	private readonly uploadArchiveLimits?: ArchiveLimitOverrides
 	private readonly uploadMaxFileSize?: number
 	private readonly resourceArchiveLimits?: ArchiveLimitOverrides
@@ -172,6 +177,8 @@ export class SessionManager {
 		this.dataFileStore = options.dataFileStore
 		this.onUserOutput = options.onUserOutput
 		this.preprocessorRegistry = options.preprocessorRegistry
+		this.uploadBlobStore = options.uploadBlobStore
+		this.uploadProcessingTimeoutMs = options.uploadProcessingTimeoutMs
 		this.uploadArchiveLimits = options.uploadArchiveLimits
 		this.uploadMaxFileSize = options.uploadMaxFileSize
 		this.resourceArchiveLimits = options.resourceArchiveLimits
@@ -1083,6 +1090,8 @@ export class SessionManager {
 			preprocessorRegistry: this.preprocessorRegistry,
 			archiveLimits: this.uploadArchiveLimits,
 			maxFileSize: this.uploadMaxFileSize,
+			blobStore: this.uploadBlobStore,
+			processingTimeoutMs: this.uploadProcessingTimeoutMs,
 		})
 
 		if (this.resourceArchiveLimits) {

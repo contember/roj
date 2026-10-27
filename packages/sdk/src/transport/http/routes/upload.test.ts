@@ -10,9 +10,13 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Hono } from 'hono'
-import { bootstrap, createSessionManager } from '~/bootstrap.js'
+import z from 'zod/v4'
+import { type BootstrapUploadOptions, bootstrap, createSessionManager, createSystemFromServices, type Services } from '~/bootstrap.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import type { SessionManager } from '~/core/sessions/session-manager.js'
+import { Ok } from '~/lib/utils/result.js'
+import type { Preprocessor } from '~/plugins/uploads/preprocessor.js'
+import type { UploadSource } from '~/plugins/uploads/source.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
 import { createNodePlatform } from '~/testing/node-platform.js'
 import { bootstrapForTesting } from '../../../testing/bootstrap-for-testing.js'
@@ -78,6 +82,20 @@ describe('upload routes', () => {
 		})
 
 		expect(res.status).toBe(400)
+		expect(httpLeaseReasons()).toEqual([])
+	})
+
+	it('releases the lease when the stored-upload body fails to parse', async () => {
+		const session = await harness.createSession('test')
+
+		const res = await app.request(`/sessions/${session.sessionId}/uploads/stored`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: 'not json',
+		})
+
+		expect(res.status).toBe(400)
+		expect(await res.json()).toMatchObject({ error: { type: 'parse_error' } })
 		expect(httpLeaseReasons()).toEqual([])
 	})
 
@@ -299,5 +317,205 @@ describe('upload download route', () => {
 		const res = await downloadApp.request(`/sessions/${sessionId}/uploads/${uploadId}/missing.txt`)
 
 		expect(res.status).toBe(404)
+	})
+})
+
+/**
+ * Stored uploads — the bytes live in the host's blob store, so the route goes through a
+ * system built by bootstrap to prove the store reaches the plugin.
+ */
+describe('stored upload route', () => {
+	interface StoredFixture {
+		app: Hono<AppEnv>
+		dataDir: string
+		services: Services
+		sessionRuntime: SessionManager
+	}
+
+	let fixture: StoredFixture | undefined
+
+	async function createStoredFixture(uploads?: BootstrapUploadOptions): Promise<StoredFixture> {
+		const dataDir = await mkdtemp(join(tmpdir(), 'roj-stored-upload-'))
+		const services = bootstrap({
+			port: 0,
+			host: 'localhost',
+			dataPath: dataDir,
+			persistence: 'memory',
+			logLevel: 'error',
+			logFormat: 'console',
+			llmMock: () => ({
+				content: 'Mock response',
+				toolCalls: [],
+				finishReason: 'stop',
+				metrics: { promptTokens: 0, completionTokens: 0, totalTokens: 0, latencyMs: 0, model: 'mock' },
+			}),
+		}, { presets: [createTestPreset()] }, createNodePlatform(), { uploads })
+		const sessionRuntime = createSystemFromServices(services).sessionManager
+
+		const storedApp = new Hono<AppEnv>()
+		storedApp.use('*', async (c, next) => {
+			c.set('services', { ...services, sessionRuntime })
+			await next()
+		})
+		storedApp.route('/sessions', createUploadRoutes())
+		fixture = { app: storedApp, dataDir, services, sessionRuntime }
+		return fixture
+	}
+
+	async function createSession(sessionRuntime: SessionManager): Promise<string> {
+		const session = await sessionRuntime.createSession('test')
+		if (!session.ok) throw new Error(session.error.message)
+		return String(session.value.id)
+	}
+
+	function postStored(app: Hono<AppEnv>, sessionId: string, body: unknown): Promise<Response> {
+		return Promise.resolve(app.request(`/sessions/${sessionId}/uploads/stored`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body),
+		}))
+	}
+
+	async function waitForStatus(services: Services, sessionId: string, uploadId: string, status: string): Promise<void> {
+		const deadline = Date.now() + 2_000
+		for (;;) {
+			const meta = await services.dataFileStore.read(`sessions/${sessionId}/uploads/${uploadId}/meta.json`)
+			if (meta.ok && z.object({ status: z.string() }).parse(JSON.parse(meta.value)).status === status) return
+			if (Date.now() >= deadline) throw new Error(`Upload ${uploadId} never reached ${status}`)
+			await new Promise((resolve) => setTimeout(resolve, 5))
+		}
+	}
+
+	afterEach(async () => {
+		if (!fixture) return
+		await fixture.sessionRuntime.shutdown()
+		await rm(fixture.dataDir, { recursive: true, force: true })
+		fixture = undefined
+	})
+
+	it('processes a stored upload from the host blob store with the host preprocessors', async () => {
+		const bytes = new Uint8Array([1, 2, 3])
+		const opened: string[] = []
+		const runs: Array<{ localPath?: string; bytes: number[] }> = []
+		const hostPreprocessor: Preprocessor = {
+			name: 'host-pdf',
+			supportedMimeTypes: ['application/pdf'],
+			async process(source) {
+				runs.push({ localPath: source.localPath, bytes: [...(await source.bytes())] })
+				return Ok({ extractedContent: 'scanned text', capabilities: { text: true } })
+			},
+		}
+		const blobSource: UploadSource = {
+			size: bytes.length,
+			stream: () => new Blob([bytes]).stream(),
+			bytes: async () => bytes,
+			range: async (offset, length) => bytes.subarray(offset, offset + length),
+		}
+		let builtinNames: string[] = []
+		const { app: storedApp, services, sessionRuntime, dataDir } = await createStoredFixture({
+			blobStore: {
+				async open(blobRef) {
+					opened.push(blobRef)
+					return Ok(blobSource)
+				},
+			},
+			createPreprocessors: (deps) => {
+				const builtins = deps.builtins()
+				builtinNames = builtins.map((preprocessor) => preprocessor.name)
+				return [hostPreprocessor, ...builtins]
+			},
+		})
+		expect(builtinNames).toEqual(['image-classifier', 'pdf', 'markitdown', 'zip'])
+		expect(services.preprocessorRegistry.getForMimeType('application/pdf')).toBe(hostPreprocessor)
+		const sessionId = await createSession(sessionRuntime)
+
+		const res = await postStored(storedApp, sessionId, {
+			filename: 'scan.pdf',
+			mimeType: 'application/pdf',
+			size: bytes.length,
+			sha256: 'b'.repeat(64),
+			blobRef: 'blob-1',
+		})
+
+		expect(res.status).toBe(202)
+		const accepted = z.object({ uploadId: z.string(), status: z.literal('processing') }).parse(await res.json())
+		await waitForStatus(services, sessionId, accepted.uploadId, 'ready')
+		expect(opened).toEqual(['blob-1'])
+		expect(runs).toEqual([{ localPath: undefined, bytes: [1, 2, 3] }])
+		expect(await createNodePlatform().fs.exists(join(dataDir, 'sessions', sessionId, 'uploads', accepted.uploadId, 'scan.pdf'))).toBe(false)
+	})
+
+	it('applies the host processing timeout instead of the plugin default', async () => {
+		const bytes = new Uint8Array([1, 2, 3])
+		const slow: Preprocessor = {
+			name: 'slow',
+			supportedMimeTypes: ['application/pdf'],
+			async process(_source, _mimeType, ctx) {
+				await new Promise<void>((resolve) => {
+					const timer = setTimeout(resolve, 2_000)
+					ctx.signal?.addEventListener('abort', () => {
+						clearTimeout(timer)
+						resolve()
+					}, { once: true })
+				})
+				return Ok({ extractedContent: 'too late' })
+			},
+		}
+		const { app: storedApp, services, sessionRuntime } = await createStoredFixture({
+			blobStore: {
+				open: async () =>
+					Ok({
+						size: bytes.length,
+						stream: () => new Blob([bytes]).stream(),
+						bytes: async () => bytes,
+						range: async (offset, length) => bytes.subarray(offset, offset + length),
+					}),
+			},
+			createPreprocessors: () => [slow],
+			processingTimeoutMs: 20,
+		})
+		const sessionId = await createSession(sessionRuntime)
+
+		const res = await postStored(storedApp, sessionId, { filename: 'scan.pdf', mimeType: 'application/pdf', size: 3, blobRef: 'blob-1' })
+
+		expect(res.status).toBe(202)
+		const accepted = z.object({ uploadId: z.string() }).parse(await res.json())
+		await waitForStatus(services, sessionId, accepted.uploadId, 'failed')
+		const meta = await services.dataFileStore.read(`sessions/${sessionId}/uploads/${accepted.uploadId}/meta.json`)
+		if (!meta.ok) throw new Error(meta.error)
+		expect(JSON.parse(meta.value)).toMatchObject({ status: 'failed', error: 'Processing timeout' })
+	})
+
+	it('refuses a processing timeout that is not a positive integer', async () => {
+		await expect(createStoredFixture({ processingTimeoutMs: 0 })).rejects.toThrow('Invalid uploads.processingTimeoutMs: 0')
+	})
+
+	it('answers 400 when the host configured no blob store', async () => {
+		const { app: storedApp, sessionRuntime } = await createStoredFixture()
+		const sessionId = await createSession(sessionRuntime)
+
+		const res = await postStored(storedApp, sessionId, { filename: 'scan.pdf', mimeType: 'application/pdf', size: 3, blobRef: 'blob-1' })
+
+		expect(res.status).toBe(400)
+		expect(await res.json()).toMatchObject({ error: { type: 'validation_error', message: expect.stringContaining('no blob store') } })
+	})
+
+	it('answers 400 for a body that does not describe a stored upload', async () => {
+		const opened: string[] = []
+		const { app: storedApp, sessionRuntime } = await createStoredFixture({
+			blobStore: {
+				async open(blobRef) {
+					opened.push(blobRef)
+					return Ok({ size: 0, stream: () => new Blob([]).stream(), bytes: async () => new Uint8Array(), range: async () => new Uint8Array() })
+				},
+			},
+		})
+		const sessionId = await createSession(sessionRuntime)
+
+		const res = await postStored(storedApp, sessionId, { filename: 'scan.pdf', mimeType: 'application/pdf', size: 3 })
+
+		expect(res.status).toBe(400)
+		expect(await res.json()).toMatchObject({ error: { type: 'validation_error' } })
+		expect(opened).toEqual([])
 	})
 })

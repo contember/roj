@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SessionFileStore } from '~/core/file-store/file-store.js'
+import type { FileStore } from '~/core/file-store/types.js'
 import type { ImageResizer } from '~/core/image/types.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import type { InferenceContext, LLMProvider } from '~/core/llm/provider.js'
@@ -10,6 +11,8 @@ import { Semaphore } from '~/lib/utils/concurrency.js'
 import { Ok } from '~/lib/utils/result.js'
 import { silentLogger } from '../../../lib/logger/logger.js'
 import { createNodePlatform } from '../../../testing/node-platform.js'
+import type { PreprocessorContext } from '../preprocessor.js'
+import { fileUploadSource, type UploadSource } from '../source.js'
 import { ImageClassifierPreprocessor } from './image-classifier.js'
 
 function defer<T = void>(): { promise: Promise<T>; resolve: (v: T) => void } {
@@ -20,8 +23,18 @@ function defer<T = void>(): { promise: Promise<T>; resolve: (v: T) => void } {
 	return { promise, resolve }
 }
 
+function preprocessorContext(files: FileStore, extra?: Omit<Partial<PreprocessorContext>, 'files'>): PreprocessorContext {
+	return { files, uploadId: 'upload', sessionId: 'session', filename: 'image.png', attempt: 1, ...extra }
+}
+
 describe('ImageClassifierPreprocessor.gate', () => {
 	const platform = createNodePlatform()
+
+	async function localSource(path: string): Promise<UploadSource> {
+		const source = await fileUploadSource(platform.fs, path)
+		if (!source.ok) throw source.error
+		return source.value
+	}
 	let workDir: string
 
 	beforeAll(async () => {
@@ -76,11 +89,9 @@ describe('ImageClassifierPreprocessor.gate', () => {
 		const fileStore = new SessionFileStore(workDir, undefined, false, platform.fs, 'session')
 		const signal = new AbortController().signal
 
-		const tasks = imagePaths.map((p, i) =>
-			classifier.process(p, 'image/png', {
-				files: fileStore.scoped(`img-${i}-meta`),
-				signal,
-			}),
+		const sources = await Promise.all(imagePaths.map(localSource))
+		const tasks = sources.map((source, i) =>
+			classifier.process(source, 'image/png', preprocessorContext(fileStore.scoped(`img-${i}-meta`), { signal })),
 		)
 
 		// Let the workers queue up; the first LIMIT should be in-flight.
@@ -135,10 +146,9 @@ describe('ImageClassifierPreprocessor.gate', () => {
 
 		const fileStore = new SessionFileStore(workDir, undefined, false, platform.fs, 'session')
 
-		const tasks = imagePaths.map((p, i) =>
-			classifier.process(p, 'image/png', {
-				files: fileStore.scoped(`nogate-${i}-meta`),
-			}),
+		const sources = await Promise.all(imagePaths.map(localSource))
+		const tasks = sources.map((source, i) =>
+			classifier.process(source, 'image/png', preprocessorContext(fileStore.scoped(`nogate-${i}-meta`))),
 		)
 
 		await new Promise(r => setTimeout(r, 20))
@@ -166,10 +176,10 @@ describe('ImageClassifierPreprocessor.gate', () => {
 		const controller = new AbortController()
 		const reason = new Error('cancel queued classifier')
 
-		const processing = classifier.process(imagePath, 'image/png', {
-			files: fileStore.scoped('queued-abort-meta'),
+		const source = await localSource(imagePath)
+		const processing = classifier.process(source, 'image/png', preprocessorContext(fileStore.scoped('queued-abort-meta'), {
 			signal: controller.signal,
-		})
+		}))
 		await new Promise(resolve => setTimeout(resolve, 0))
 		controller.abort(reason)
 		const result = await processing
@@ -201,10 +211,9 @@ describe('ImageClassifierPreprocessor.gate', () => {
 		})
 		const fileStore = new SessionFileStore(workDir, undefined, false, platform.fs, 'session')
 
-		const result = await classifier.process(imagePath, 'image/png', {
-			files: fileStore.scoped('cancel-after-resize-meta'),
+		const result = await classifier.process(await localSource(imagePath), 'image/png', preprocessorContext(fileStore.scoped('cancel-after-resize-meta'), {
 			signal: controller.signal,
-		})
+		}))
 
 		expect(result).toEqual({ ok: false, error: reason })
 		expect(await Bun.file(tempPath).exists()).toBe(false)
@@ -235,9 +244,7 @@ describe('ImageClassifierPreprocessor.gate', () => {
 		})
 		const fileStore = new SessionFileStore(workDir, undefined, false, platform.fs, 'session')
 
-		const result = await classifier.process(imagePath, 'image/png', {
-			files: fileStore.scoped('read-failure-meta'),
-		})
+		const result = await classifier.process(await localSource(imagePath), 'image/png', preprocessorContext(fileStore.scoped('read-failure-meta')))
 
 		expect(result.ok).toBe(true)
 		expect(await Bun.file(tempPath).exists()).toBe(false)
@@ -272,14 +279,104 @@ describe('ImageClassifierPreprocessor.gate', () => {
 			fileStore,
 		}
 
-		const result = await classifier.process(imagePath, 'image/png', {
-			files: fileStore.scoped('provider-signal-meta'),
+		const result = await classifier.process(await localSource(imagePath), 'image/png', preprocessorContext(fileStore.scoped('provider-signal-meta'), {
 			signal: controller.signal,
 			inferenceContext,
-		})
+		}))
 
 		expect(result.ok).toBe(true)
 		expect(contexts).toHaveLength(1)
 		expect(contexts[0]?.signal).toBe(controller.signal)
+	})
+})
+
+describe('ImageClassifierPreprocessor without a local file', () => {
+	const platform = createNodePlatform()
+	const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+	const bytesOnly: UploadSource = {
+		size: png.length,
+		stream: () => new Blob([png]).stream(),
+		bytes: async () => png,
+		range: async (offset, length) => png.subarray(offset, offset + length),
+	}
+	let workDir: string
+
+	beforeAll(async () => {
+		workDir = await mkdtemp(join(tmpdir(), 'roj-classifier-bytes-'))
+	})
+
+	afterAll(async () => {
+		await rm(workDir, { recursive: true, force: true }).catch(() => {})
+	})
+
+	function capturingProvider(urls: string[]): LLMProvider {
+		return {
+			name: 'url-capture',
+			async inference(request) {
+				for (const message of request.messages) {
+					if (typeof message.content === 'string') continue
+					for (const item of message.content) {
+						if (item.type === 'image_url') urls.push(item.imageUrl.url)
+					}
+				}
+				return Ok({ content: 'desc', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() })
+			},
+		}
+	}
+
+	it('sends the bytes as a data URL when there is nothing to resize them with', async () => {
+		const urls: string[] = []
+		const classifier = new ImageClassifierPreprocessor({ llmProvider: capturingProvider(urls), logger: silentLogger, fs: platform.fs })
+		const fileStore = new SessionFileStore(workDir, undefined, false, platform.fs, 'session')
+
+		const result = await classifier.process(bytesOnly, 'image/png', preprocessorContext(fileStore.scoped('data-url-meta')))
+
+		expect(result).toEqual(Ok({ extractedContent: '[Image: desc]', derivedPaths: ['description.txt'] }))
+		expect(urls).toEqual([`data:image/png;base64,${Buffer.from(png).toString('base64')}`])
+	})
+
+	it('writes the bytes to tmpDir for the resizer and removes them afterwards', async () => {
+		const urls: string[] = []
+		const resizedInputs: string[] = []
+		const resizedPath = join(workDir, 'resized.jpg')
+		const imageResizer: ImageResizer = {
+			async resize(filePath) {
+				resizedInputs.push(filePath)
+				expect(new Uint8Array(await Bun.file(filePath).arrayBuffer())).toEqual(png)
+				await writeFile(resizedPath, 'jpeg')
+				return { path: resizedPath, mimeType: 'image/jpeg', tempFile: resizedPath }
+			},
+		}
+		const classifier = new ImageClassifierPreprocessor({
+			llmProvider: capturingProvider(urls),
+			logger: silentLogger,
+			fs: platform.fs,
+			imageResizer,
+			tmpDir: workDir,
+		})
+		const fileStore = new SessionFileStore(workDir, undefined, false, platform.fs, 'session')
+
+		const result = await classifier.process(bytesOnly, 'image/png', preprocessorContext(fileStore.scoped('tmp-meta')))
+
+		expect(result.ok).toBe(true)
+		expect(resizedInputs).toHaveLength(1)
+		expect(resizedInputs[0]?.startsWith(`${workDir}/`)).toBe(true)
+		expect(await Bun.file(resizedInputs[0] ?? '').exists()).toBe(false)
+		expect(await Bun.file(resizedPath).exists()).toBe(false)
+		expect(urls).toEqual([`data:image/jpeg;base64,${Buffer.from('jpeg').toString('base64')}`])
+	})
+
+	it('names the image after the upload when vision is skipped', async () => {
+		const classifier = new ImageClassifierPreprocessor({
+			llmProvider: MockLLMProvider.withFixedResponse({ content: 'unused' }),
+			logger: silentLogger,
+			fs: platform.fs,
+			skipVision: true,
+		})
+		const fileStore = new SessionFileStore(workDir, undefined, false, platform.fs, 'session')
+
+		const result = await classifier.process(bytesOnly, 'image/png', preprocessorContext(fileStore.scoped('skip-meta'), { filename: 'photo.png' }))
+
+		expect(result).toEqual(Ok({ extractedContent: '[Image: photo.png, 4B, image/png]' }))
 	})
 })
