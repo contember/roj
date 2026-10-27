@@ -65,7 +65,7 @@ export type { AgentStatus as DomainAgentStatus, ProtocolAgentStatus, ProtocolAge
 // Event factories behind BuiltinEvent — a third-party plugin declares these in
 // .events([...]) to react to built-in events without reaching into src/.
 export { agentEvents } from '~/core/agents/state.js'
-export type { AgentPauseReason, AgentState, LLMMessage } from '~/core/agents/state.js'
+export type { AgentPauseReason, AgentState, LLMMessage, PreambleLLMMessage } from '~/core/agents/state.js'
 export { contextEvents } from '~/core/context/state.js'
 export type { DomainEvent } from '~/core/events/types.js'
 export type { FactoryEventType } from '~/core/events/types.js'
