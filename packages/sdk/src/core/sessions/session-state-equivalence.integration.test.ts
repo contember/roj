@@ -174,7 +174,7 @@ describe('session state equivalence across eviction', () => {
 			expect([...(session.getPluginState<Map<string, { status: string }>>('workers') ?? []).values()]).toEqual([
 				expect.objectContaining({ status: 'completed' }),
 			])
-			expect(session.getPluginState<Record<string, unknown>>('uploads')).toEqual({ pending: [], terminal: {} })
+			expect(session.getPluginState<Record<string, unknown>>('uploads')).toEqual({ pending: [], terminal: {}, processing: {}, blobRefs: {} })
 			expect(session.getPluginState<Record<string, unknown>>('sessionState')).toEqual(
 				expect.objectContaining({ state: { phase: 'building' } }),
 			)

@@ -17,6 +17,7 @@ import { type DomainError, PresetErrors, SessionErrors, ValidationErrors } from 
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import type { FileStore } from '~/core/file-store/types.js'
+import { DOCUMENTS_DIR } from '~/core/llm/document-content.js'
 import type { LLMLogger } from '~/core/llm/logger.js'
 import type { LLMProvider } from '~/core/llm/provider.js'
 import { DEFAULT_PLUGIN_ORDER } from '~/core/plugins/plugin-builder.js'
@@ -44,6 +45,7 @@ import type { PortPool } from '~/plugins/services/port-pool.js'
 import type { ServiceConfig } from '~/plugins/services/schema.js'
 import { selectSessionStats, type SessionStatsState } from '~/plugins/session-stats/index.js'
 import type { PreprocessorRegistry } from '~/plugins/uploads/preprocessor.js'
+import type { UploadBlobStore } from '~/plugins/uploads/source.js'
 import { EventStore } from '../events/event-store.js'
 import { createApplyEvent } from './apply-event.js'
 import { rewriteEventsForFork } from './fork-utils.js'
@@ -82,6 +84,8 @@ export interface SessionManagerOptions {
 	dataFileStore: FileStore
 	onUserOutput?: UserOutputCallback
 	preprocessorRegistry?: PreprocessorRegistry
+	uploadBlobStore?: UploadBlobStore
+	uploadProcessingTimeoutMs?: number
 	uploadArchiveLimits?: ArchiveLimitOverrides
 	uploadMaxFileSize?: number
 	resourceArchiveLimits?: ArchiveLimitOverrides
@@ -142,6 +146,8 @@ export class SessionManager {
 	private readonly dataFileStore: FileStore
 	private readonly onUserOutput?: UserOutputCallback
 	private readonly preprocessorRegistry?: PreprocessorRegistry
+	private readonly uploadBlobStore?: UploadBlobStore
+	private readonly uploadProcessingTimeoutMs?: number
 	private readonly uploadArchiveLimits?: ArchiveLimitOverrides
 	private readonly uploadMaxFileSize?: number
 	private readonly resourceArchiveLimits?: ArchiveLimitOverrides
@@ -172,6 +178,8 @@ export class SessionManager {
 		this.dataFileStore = options.dataFileStore
 		this.onUserOutput = options.onUserOutput
 		this.preprocessorRegistry = options.preprocessorRegistry
+		this.uploadBlobStore = options.uploadBlobStore
+		this.uploadProcessingTimeoutMs = options.uploadProcessingTimeoutMs
 		this.uploadArchiveLimits = options.uploadArchiveLimits
 		this.uploadMaxFileSize = options.uploadMaxFileSize
 		this.resourceArchiveLimits = options.resourceArchiveLimits
@@ -484,6 +492,7 @@ export class SessionManager {
 		let entry: SessionCacheEntry
 		const forkPromise = Promise.resolve().then(async () => {
 			await this.eventStore.appendBatch(newSessionId, forkedEvents)
+			await this.copyStoredDocuments(sourceSessionId, newSessionId)
 			const plugins = this.buildPlugins(preset)
 			const composedReducer = createApplyEvent(plugins)
 			const state = reconstructSessionState(forkedEvents, composedReducer)
@@ -1083,6 +1092,8 @@ export class SessionManager {
 			preprocessorRegistry: this.preprocessorRegistry,
 			archiveLimits: this.uploadArchiveLimits,
 			maxFileSize: this.uploadMaxFileSize,
+			blobStore: this.uploadBlobStore,
+			processingTimeoutMs: this.uploadProcessingTimeoutMs,
 		})
 
 		if (this.resourceArchiveLimits) {
@@ -1309,6 +1320,15 @@ export class SessionManager {
 				this.logger.debug('Session runtime evicted', { sessionId, reason })
 			})
 		return entry.unloadPromise
+	}
+
+	/** The forked history refers to documents in the source's store; they are content-addressed, so a copy never conflicts. */
+	private async copyStoredDocuments(sourceSessionId: SessionId, targetSessionId: SessionId): Promise<void> {
+		const sourceDir = join(this.getSessionDir(sourceSessionId), DOCUMENTS_DIR)
+		if (!(await this.platform.fs.exists(sourceDir))) return
+		const targetSessionDir = this.getSessionDir(targetSessionId)
+		await this.platform.fs.mkdir(targetSessionDir, { recursive: true })
+		await this.platform.fs.cp(sourceDir, join(targetSessionDir, DOCUMENTS_DIR), { recursive: true })
 	}
 
 	private getSessionDir(sessionId: SessionId): string {

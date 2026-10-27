@@ -12,6 +12,7 @@ import { ArchiveBudget, inspectZipArchive } from '~/lib/archive/index.js'
 import { mapWithConcurrency } from '~/lib/utils/concurrency.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err, Ok } from '~/lib/utils/result.js'
+import type { FileSystem } from '~/platform/fs.js'
 import type { ProcessRunner } from '~/platform/process.js'
 import type { Logger } from '../../../lib/logger/logger.js'
 import {
@@ -21,7 +22,9 @@ import {
 	type PreprocessorContext,
 	type PreprocessorRegistry,
 	type PreprocessorResult,
+	requireLocalPath,
 } from '../preprocessor.js'
+import { fileUploadSource, type UploadSource } from '../source.js'
 
 const MAX_DEPTH = 3
 const ZIP_FILE_CONCURRENCY = 10
@@ -73,6 +76,8 @@ function formatSize(bytes: number): string {
 export interface ZipPreprocessorConfig {
 	registry: PreprocessorRegistry
 	logger: Logger
+	/** Reads extracted entries for the preprocessors they are handed to. */
+	fs: FileSystem
 	process: ProcessRunner
 	depth?: number
 }
@@ -83,6 +88,7 @@ export class ZipPreprocessor implements Preprocessor {
 
 	private readonly registry: PreprocessorRegistry
 	private readonly logger: Logger
+	private readonly fs: FileSystem
 	private readonly processRunner: ProcessRunner
 	private readonly exec: (cmd: string, args: string[], signal?: AbortSignal) => Promise<{ stdout: string; stderr: string }>
 	private readonly depth: number
@@ -90,16 +96,20 @@ export class ZipPreprocessor implements Preprocessor {
 	constructor(config: ZipPreprocessorConfig) {
 		this.registry = config.registry
 		this.logger = config.logger
+		this.fs = config.fs
 		this.processRunner = config.process
 		this.exec = makeExec(config.process)
 		this.depth = config.depth ?? 0
 	}
 
 	async process(
-		filePath: string,
+		source: UploadSource,
 		_mimeType: string,
 		ctx: PreprocessorContext,
 	): Promise<Result<PreprocessorResult, Error>> {
+		const localPath = requireLocalPath(source, this.name)
+		if (!localPath.ok) return localPath
+		const filePath = localPath.value
 		const signal = getPreprocessingSignal(ctx)
 		if (signal.aborted) return Err(preprocessingAbortError(signal))
 		if (this.depth >= MAX_DEPTH) {
@@ -183,17 +193,22 @@ export class ZipPreprocessor implements Preprocessor {
 					preprocessor = new ZipPreprocessor({
 						registry: this.registry,
 						logger: this.logger,
+						fs: this.fs,
 						process: this.processRunner,
 						depth: this.depth + 1,
 					})
 				}
 
 				if (preprocessor) {
-					const subResult = await preprocessor.process(fileRealPath.value, mime, {
-						...ctx,
-						files: ctx.files.scoped(`extracted/${file.name}-content`),
-						archiveBudget,
-					})
+					const entrySource = await fileUploadSource(this.fs, fileRealPath.value)
+					const subResult = entrySource.ok
+						? await preprocessor.process(entrySource.value, mime, {
+								...ctx,
+								filename: file.name,
+								files: ctx.files.scoped(`extracted/${file.name}-content`),
+								archiveBudget,
+							})
+						: entrySource
 					if (subResult.ok) {
 						if (subResult.value.derivedPaths) {
 							for (const dp of subResult.value.derivedPaths) {

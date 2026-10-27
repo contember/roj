@@ -21,6 +21,7 @@ import {
 	type PreprocessorContext,
 	type PreprocessorResult,
 } from '../preprocessor.js'
+import type { UploadSource } from '../source.js'
 
 /**
  * Anthropic vision API internally downsamples images to ~1568px long side.
@@ -52,6 +53,11 @@ export interface ImageClassifierConfig {
 	 * full resolution).
 	 */
 	imageResizer?: ImageResizer
+	/**
+	 * Directory where an image without a local file is written so the resizer, which
+	 * takes a path, can read it. Without it such an image goes to the model unresized.
+	 */
+	tmpDir?: string
 	/** Whether to skip vision and just return metadata */
 	skipVision?: boolean
 	/**
@@ -80,6 +86,7 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 	private readonly logger: Logger
 	private readonly fs: FileSystem
 	private readonly imageResizer: ImageResizer | undefined
+	private readonly tmpDir: string | undefined
 	private readonly skipVision: boolean
 	private readonly gate: Semaphore | undefined
 
@@ -89,26 +96,22 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 		this.logger = config.logger
 		this.fs = config.fs
 		this.imageResizer = config.imageResizer
+		this.tmpDir = config.tmpDir
 		this.skipVision = config.skipVision ?? false
 		this.gate = config.gate
 	}
 
 	async process(
-		filePath: string,
+		source: UploadSource,
 		mimeType: string,
 		ctx: PreprocessorContext,
 	): Promise<Result<PreprocessorResult, Error>> {
 		const totalStart = Date.now()
 		const signal = getPreprocessingSignal(ctx)
+		const filename = source.localPath?.split('/').pop() || ctx.filename
 		try {
 			throwIfPreprocessingAborted(signal)
-			// Check + stat image file
-			if (!(await this.fs.exists(filePath))) {
-				return Err(new Error(`Image file not found: ${filePath}`))
-			}
-
-			const size = (await this.fs.stat(filePath)).size
-			const filename = filePath.split('/').pop() ?? 'image'
+			const size = source.size
 
 			// Skip vision if configured
 			if (this.skipVision) {
@@ -119,7 +122,7 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 
 			// Try vision inference
 			const inferenceStart = Date.now()
-			const description = await this.describeImage(filePath, mimeType, ctx, signal)
+			const description = await this.describeImage(source, mimeType, ctx, signal)
 			const inferenceDurationMs = Date.now() - inferenceStart
 
 			if (description) {
@@ -157,11 +160,10 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 			this.logger.error(
 				'Image classification failed',
 				error instanceof Error ? error : undefined,
-				{ filePath, durationMs: Date.now() - totalStart },
+				{ filePath: source.localPath ?? filename, durationMs: Date.now() - totalStart },
 			)
 
 			// Return basic info on error instead of failing
-			const filename = filePath.split('/').pop() ?? 'image'
 			return Ok({
 				extractedContent: `[Image: ${filename} (description unavailable)]`,
 			})
@@ -173,13 +175,13 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 	 * Returns null if vision is not available or fails.
 	 */
 	private async describeImage(
-		filePath: string,
+		source: UploadSource,
 		mimeType: string,
 		ctx: PreprocessorContext,
 		signal: AbortSignal,
 	): Promise<string | null> {
 		try {
-			const { url: imageUrl, cleanup } = await this.prepareImageUrl(filePath, mimeType, signal)
+			const { url: imageUrl, cleanup } = await this.prepareImageUrl(source, mimeType, signal)
 
 			try {
 				const inferenceCall = () => {
@@ -230,6 +232,43 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 	}
 
 	/**
+	 * The image as a URL the vision model can take.
+	 *
+	 * A local file goes through {@link prepareFileImageUrl}. Bytes without one are
+	 * written to `tmpDir` for the resizer when both exist, and sent as they are otherwise.
+	 */
+	private async prepareImageUrl(
+		source: UploadSource,
+		mimeType: string,
+		signal: AbortSignal,
+	): Promise<{ url: string; cleanup: () => Promise<void> }> {
+		throwIfPreprocessingAborted(signal)
+		if (source.localPath) return this.prepareFileImageUrl(source.localPath, mimeType, signal)
+		if (!this.imageResizer || !this.tmpDir) {
+			const bytes = Buffer.from(await source.bytes())
+			throwIfPreprocessingAborted(signal)
+			return { url: `data:${mimeType};base64,${bytes.toString('base64')}`, cleanup: async () => {} }
+		}
+
+		const inputPath = `${this.tmpDir}/roj-classify-${crypto.randomUUID()}`
+		const removeInput = () => this.fs.unlink(inputPath).catch(() => {})
+		try {
+			await this.fs.writeFile(inputPath, await source.bytes())
+			const prepared = await this.prepareFileImageUrl(inputPath, mimeType, signal)
+			return {
+				url: prepared.url,
+				cleanup: async () => {
+					await prepared.cleanup()
+					await removeInput()
+				},
+			}
+		} catch (error) {
+			await removeInput()
+			throw error
+		}
+	}
+
+	/**
 	 * Pre-resize the image for vision classification.
 	 *
 	 * Returns either a `data:` URL with the resized JPEG (when a resizer is
@@ -238,7 +277,7 @@ export class ImageClassifierPreprocessor implements Preprocessor {
 	 *
 	 * Cleanup removes any temp file produced by the resizer.
 	 */
-	private async prepareImageUrl(
+	private async prepareFileImageUrl(
 		filePath: string,
 		mimeType: string,
 		signal: AbortSignal,

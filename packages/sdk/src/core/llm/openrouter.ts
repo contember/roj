@@ -1,6 +1,6 @@
 import type { ReasoningDetails, ToolCall } from '~/core/agents/state.js'
 import type { ImageProcessor } from '~/core/image/types.js'
-import type { ChatMessageContentItem } from '~/core/llm/llm-log-types.js'
+import type { ResolvedContentItem } from '~/core/llm/llm-log-types.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import type { Result } from '~/lib/utils/result.js'
@@ -20,6 +20,7 @@ import type {
 } from './provider.js'
 import { mapProviderError } from './provider.js'
 import { DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS, ProviderRequestAbortError, runProviderRequest } from './provider-request.js'
+import { limitDocumentBytes, omitDocumentData, resolveDocuments } from './document-content.js'
 import { sanitizeProviderMessages } from './message-sanitization.js'
 
 // ============================================================================
@@ -105,6 +106,8 @@ interface OpenRouterContentItem {
 	type: string
 	text?: string
 	image_url?: { url: string; detail?: string }
+	/** PDF input: `file_data` is a base64 data URL. */
+	file?: { filename: string; file_data: string }
 	cache_control?: OpenRouterCacheControl
 }
 
@@ -287,7 +290,7 @@ export class OpenRouterProvider implements LLMProvider {
 	}
 
 	async buildHttpRequest(request: RawInferenceRequest, context?: InferenceContext): Promise<ProviderHttpRequest> {
-		const sanitizedMessages = sanitizeProviderMessages(request.messages, this.name, this.logger)
+		const sanitizedMessages = limitDocumentBytes(sanitizeProviderMessages(request.messages, this.name, this.logger))
 		const mappedMessages = await Promise.all(sanitizedMessages.map((m) => this.mapMessage(m, context)))
 
 		const systemTtl = longestCacheTtl(sanitizedMessages)
@@ -363,7 +366,9 @@ export class OpenRouterProvider implements LLMProvider {
 			case 'tool': {
 				const resolvedContent = await this.imageProcessor.resolveContent(msg.content, context?.fileStore)
 				if (msg.isError) {
-					const errorText = typeof resolvedContent === 'string' ? resolvedContent : JSON.stringify(resolvedContent)
+					// Error text is a plain string, so a document cannot travel as one and only its placeholder or reference is kept.
+					const withoutDocuments = await omitDocumentData(resolvedContent)
+					const errorText = typeof withoutDocuments === 'string' ? withoutDocuments : JSON.stringify(withoutDocuments)
 					return {
 						role: 'tool',
 						content: `[ERROR] ${errorText}`,
@@ -372,7 +377,7 @@ export class OpenRouterProvider implements LLMProvider {
 				}
 				return {
 					role: 'tool',
-					content: this.mapContentToOpenRouter(resolvedContent),
+					content: this.mapContentToOpenRouter(await resolveDocuments(resolvedContent, context?.fileStore)),
 					tool_call_id: msg.toolCallId,
 				}
 			}
@@ -397,7 +402,7 @@ export class OpenRouterProvider implements LLMProvider {
 			case 'user':
 				if (Array.isArray(msg.content)) {
 					const resolved = await this.imageProcessor.resolveContent(msg.content, context?.fileStore)
-					return { role: 'user', content: this.mapContentToOpenRouter(resolved) }
+					return { role: 'user', content: this.mapContentToOpenRouter(await resolveDocuments(resolved, context?.fileStore)) }
 				}
 				return { role: 'user', content: msg.content }
 		}
@@ -406,16 +411,27 @@ export class OpenRouterProvider implements LLMProvider {
 	/**
 	 * Map internal ChatMessageContentItem[] (camelCase imageUrl) to OpenRouter format (snake_case image_url).
 	 */
-	private mapContentToOpenRouter(content: string | ChatMessageContentItem[]): string | OpenRouterContentItem[] {
+	private mapContentToOpenRouter(content: string | ResolvedContentItem[]): string | OpenRouterContentItem[] {
 		if (typeof content === 'string') return content
 		return content.map((item): OpenRouterContentItem => {
-			if (item.type === 'text') {
-				return { type: 'text', text: item.text }
+			switch (item.type) {
+				case 'text':
+					return { type: 'text', text: item.text }
+				case 'image_url':
+					return { type: 'image_url', image_url: { url: item.imageUrl.url, detail: item.imageUrl.detail } }
+				case 'document':
+					return {
+						type: 'file',
+						file: {
+							filename: item.document.filename ?? 'document.pdf',
+							file_data: `data:${item.document.mediaType};base64,${item.document.data}`,
+						},
+					}
+				default: {
+					const unsupported: never = item
+					throw new Error(`Unsupported content item: ${JSON.stringify(unsupported)}`)
+				}
 			}
-			if (item.type === 'image_url') {
-				return { type: 'image_url', image_url: { url: item.imageUrl.url, detail: item.imageUrl.detail } }
-			}
-			return { type: 'text', text: JSON.stringify(item) }
 		})
 	}
 

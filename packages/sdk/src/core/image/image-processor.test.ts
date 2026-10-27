@@ -33,6 +33,15 @@ describe('DefaultImageProcessor', () => {
 		expect(result).toEqual([{ type: 'text', text: 'some text' }])
 	})
 
+	it('passes a document through untouched', async () => {
+		const processor = createProcessor()
+		const content: ToolResultContent = [
+			{ type: 'document', document: { mediaType: 'application/pdf', data: 'JVBERi0xLjQK', filename: 'scan.pdf' } },
+		]
+		const result = await processor.resolveContent(content)
+		expect(result).toEqual([{ type: 'document', document: { mediaType: 'application/pdf', data: 'JVBERi0xLjQK', filename: 'scan.pdf' } }])
+	})
+
 	it('passes through non-file:// image URLs unchanged', async () => {
 		const processor = createProcessor()
 		const content: ToolResultContent = [

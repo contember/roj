@@ -19,6 +19,7 @@ import type { SessionId } from '~/core/sessions/schema.js'
 import { readTextFilesOrUndefined } from '~/lib/utils/fs-batch.js'
 import type { FileSystem } from '~/platform/fs.js'
 import type { LLMCallRow, LLMCallStore } from '~/platform/llm-call-log.js'
+import { omitDocumentData } from './document-content.js'
 import type { LLMCallError, LLMCallLogEntry, LLMCallMessage, LLMCallMetrics, LLMCallRequest, LLMCallResponse } from './llm-log-types.js'
 import type { InferenceRequest, InferenceResponse, LLMError } from './provider.js'
 
@@ -162,11 +163,11 @@ export class LLMLogger {
 		const callId = generateLLMCallId()
 		const now = Date.now()
 
-		const logMessages: LLMCallMessage[] = request.messages.map((m) => {
+		const logMessages: LLMCallMessage[] = await Promise.all(request.messages.map(async (m): Promise<LLMCallMessage> => {
 			// Use discriminated union to access role-specific fields
 			switch (m.role) {
 				case 'user':
-					return { role: m.role, content: m.content, cacheControl: m.cacheControl }
+					return { role: m.role, content: await omitDocumentData(m.content), cacheControl: m.cacheControl }
 				case 'system':
 					return { role: m.role, content: m.content, cacheControl: m.cacheControl }
 				case 'assistant':
@@ -183,12 +184,12 @@ export class LLMLogger {
 				case 'tool':
 					return {
 						role: m.role,
-						content: m.content,
+						content: await omitDocumentData(m.content),
 						toolCallId: m.toolCallId,
 						cacheControl: m.cacheControl,
 					}
 			}
-		})
+		}))
 
 		const providerOptions: LLMCallRequest['providerOptions'] = request.openrouter || request.anthropic
 			? {

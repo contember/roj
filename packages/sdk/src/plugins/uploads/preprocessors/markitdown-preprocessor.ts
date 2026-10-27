@@ -31,7 +31,9 @@ import {
 	type PreprocessorContext,
 	type PreprocessorRegistry,
 	type PreprocessorResult,
+	requireLocalPath,
 } from '../preprocessor.js'
+import { fileUploadSource, type UploadSource } from '../source.js'
 
 const MAX_IMAGES = 20
 const IMAGE_CLASSIFY_CONCURRENCY = 10
@@ -116,10 +118,13 @@ export class MarkitdownPreprocessor implements Preprocessor {
 	}
 
 	async process(
-		filePath: string,
+		source: UploadSource,
 		mimeType: string,
 		ctx: PreprocessorContext,
 	): Promise<Result<PreprocessorResult, Error>> {
+		const localPath = requireLocalPath(source, this.name)
+		if (!localPath.ok) return localPath
+		const filePath = localPath.value
 		const totalStart = Date.now()
 		const signal = getPreprocessingSignal(ctx)
 		throwIfPreprocessingAborted(signal)
@@ -405,9 +410,11 @@ export async function classifyExtractedImages(
 		let description = imgMime
 
 		const classifier = registry.getForMimeType(imgMime)
-		if (classifier) {
-			const classifyResult = await classifier.process(imgPathResult.value, imgMime, {
+		const imageSource = classifier ? await fileUploadSource(fs, imgPathResult.value) : undefined
+		if (classifier && imageSource?.ok) {
+			const classifyResult = await classifier.process(imageSource.value, imgMime, {
 				...ctx,
+				filename: imgFile.name,
 				files: ctx.files.scoped(`${relativePrefix}/${imgFile.name}-meta`),
 			})
 			if (classifyResult.ok && classifyResult.value.extractedContent) {

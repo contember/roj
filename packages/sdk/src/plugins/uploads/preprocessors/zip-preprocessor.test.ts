@@ -8,8 +8,17 @@ import { SYMLINK_INFO_ZIP_6_FIXTURE } from '~/lib/archive/archive-inspection.fix
 import type { ProcessRunner } from '~/platform/process.js'
 import { silentLogger } from '../../../lib/logger/logger.js'
 import { createNodePlatform } from '../../../testing/node-platform.js'
-import { PreprocessorRegistry } from '../preprocessor.js'
+import { type PreprocessorContext, PreprocessorRegistry } from '../preprocessor.js'
+import type { UploadSource } from '../source.js'
 import { ZipPreprocessor } from './zip-preprocessor.js'
+
+/** Names a path the stubbed process runner answers for; the preprocessor never reads its bytes itself. */
+function localZip(path: string): UploadSource {
+	const unread = () => {
+		throw new Error('The zip preprocessor reads the archive through its tools')
+	}
+	return { size: 0, localPath: path, stream: unread, bytes: unread, range: unread }
+}
 
 interface ListingEntry {
 	name: string
@@ -52,9 +61,13 @@ describe('ZipPreprocessor archive inspection', () => {
 		await rm(workDir, { recursive: true, force: true })
 	})
 
-	function createContext() {
+	function createContext(): PreprocessorContext {
 		return {
 			files: new SessionFileStore(workDir, undefined, false, platform.fs, 'session'),
+			uploadId: 'upload',
+			sessionId: 'session',
+			filename: 'archive.zip',
+			attempt: 1,
 		}
 	}
 
@@ -86,10 +99,11 @@ describe('ZipPreprocessor archive inspection', () => {
 		const preprocessor = new ZipPreprocessor({
 			registry: new PreprocessorRegistry(),
 			logger: silentLogger,
+			fs: platform.fs,
 			process,
 		})
 
-		const result = await preprocessor.process('/unsafe.zip', 'application/zip', createContext())
+		const result = await preprocessor.process(localZip('/unsafe.zip'), 'application/zip', createContext())
 
 		expect(result.ok).toBe(false)
 		expect(calls).toEqual([['unzip', '-Z', '-v', '/unsafe.zip']])
@@ -111,10 +125,11 @@ describe('ZipPreprocessor archive inspection', () => {
 		const preprocessor = new ZipPreprocessor({
 			registry: new PreprocessorRegistry(),
 			logger: silentLogger,
+			fs: platform.fs,
 			process,
 		})
 
-		const result = await preprocessor.process('/warning.zip', 'application/zip', createContext())
+		const result = await preprocessor.process(localZip('/warning.zip'), 'application/zip', createContext())
 
 		expect(result.ok).toBe(false)
 		expect(callCount).toBe(1)
@@ -138,10 +153,11 @@ describe('ZipPreprocessor archive inspection', () => {
 		const preprocessor = new ZipPreprocessor({
 			registry: new PreprocessorRegistry(),
 			logger: silentLogger,
+			fs: platform.fs,
 			process,
 		})
 
-		const result = await preprocessor.process('/warning.zip', 'application/zip', createContext())
+		const result = await preprocessor.process(localZip('/warning.zip'), 'application/zip', createContext())
 
 		expect(result.ok).toBe(false)
 		expect(calls).toHaveLength(2)
@@ -168,10 +184,11 @@ describe('ZipPreprocessor archive inspection', () => {
 		const preprocessor = new ZipPreprocessor({
 			registry: new PreprocessorRegistry(),
 			logger: silentLogger,
+			fs: platform.fs,
 			process,
 		})
 
-		const result = await preprocessor.process('/aborted.zip', 'application/zip', {
+		const result = await preprocessor.process(localZip('/aborted.zip'), 'application/zip', {
 			...createContext(),
 			signal: controller.signal,
 		})
@@ -198,10 +215,11 @@ describe('ZipPreprocessor archive inspection', () => {
 		const preprocessor = new ZipPreprocessor({
 			registry: new PreprocessorRegistry(),
 			logger: silentLogger,
+			fs: platform.fs,
 			process,
 		})
 
-		const result = await preprocessor.process('/abort-after-listing.zip', 'application/zip', {
+		const result = await preprocessor.process(localZip('/abort-after-listing.zip'), 'application/zip', {
 			...createContext(),
 			signal: controller.signal,
 		})
@@ -247,10 +265,11 @@ describe('ZipPreprocessor archive inspection', () => {
 		const preprocessor = new ZipPreprocessor({
 			registry: new PreprocessorRegistry(),
 			logger: silentLogger,
+			fs: platform.fs,
 			process,
 		})
 
-		const result = await preprocessor.process('/outer.zip', 'application/zip', createContext())
+		const result = await preprocessor.process(localZip('/outer.zip'), 'application/zip', createContext())
 
 		expect(result.ok).toBe(true)
 		expect(calls).toEqual([
@@ -287,10 +306,11 @@ describe('ZipPreprocessor archive inspection', () => {
 		const preprocessor = new ZipPreprocessor({
 			registry: new PreprocessorRegistry(),
 			logger: silentLogger,
+			fs: platform.fs,
 			process,
 		})
 
-		const result = await preprocessor.process('/outer.zip', 'application/zip', {
+		const result = await preprocessor.process(localZip('/outer.zip'), 'application/zip', {
 			...createContext(),
 			archiveBudget: new ArchiveBudget({ maxEntries: 2, maxTotalUncompressedSize: 100 }),
 		})

@@ -12,6 +12,7 @@ import z from 'zod/v4'
 import { type DomainError, ValidationErrors } from '~/core/errors.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import type { SessionId } from '../../core/sessions/schema.js'
+import type { UploadArtifact, UploadCapabilities } from './preprocessor.js'
 
 // ============================================================================
 // UploadId - Branded type
@@ -53,8 +54,34 @@ export const parseUploadId = (value: string): Result<UploadId, DomainError> =>
 export const generateUploadId = (): UploadId => UploadId(uuidv7())
 
 // ============================================================================
-// UploadId - Zod schemas
+// Processing output - Zod schemas
 // ============================================================================
+
+export const uploadArtifactSchema = z.object({
+	path: z.string(),
+	mimeType: z.string(),
+	size: z.number(),
+	blobRef: z.string().optional(),
+	description: z.string().optional(),
+}) satisfies z.ZodType<UploadArtifact>
+
+export const uploadCapabilitiesSchema = z.object({
+	text: z.boolean().optional(),
+	embeddedImages: z.boolean().optional(),
+	captions: z.boolean().optional(),
+	ocr: z.boolean().optional(),
+	truncated: z.boolean().optional(),
+	pagesProcessed: z.number().optional(),
+	assetOnly: z.boolean().optional(),
+}) satisfies z.ZodType<UploadCapabilities>
+
+/** Where an upload's original bytes live: the upload dir, or a host-held blob store. */
+export const uploadSourceRefSchema = z.discriminatedUnion('kind', [
+	z.object({ kind: z.literal('file') }),
+	z.object({ kind: z.literal('blob'), blobRef: z.string(), sha256: z.string().optional() }),
+])
+
+export type UploadSourceRef = z.infer<typeof uploadSourceRefSchema>
 
 // ============================================================================
 // Upload types
@@ -87,7 +114,7 @@ export interface MessageAttachment {
 	mimeType: string
 	/** File size in bytes */
 	size: number
-	/** Absolute path to the original file */
+	/** Absolute path to the original file; for a stored upload, its first artifact or else the upload dir. */
 	path: string
 	/** Text content extracted by pre-processor (image description, PDF text, etc.) */
 	extractedContent?: string
@@ -105,10 +132,17 @@ export interface UploadMetadata {
 	filename: string
 	mimeType: string
 	size: number
+	/** Where the original sits in the upload dir; for a `blob` source, which writes no original there, the upload dir. */
 	path: string
 	status: 'processing' | 'ready' | 'failed' | 'deleted'
+	/** Absent in metadata written before sources existed, which always means `file`. */
+	source?: UploadSourceRef
 	extractedContent?: string
 	derivedPaths?: string[]
+	artifacts?: UploadArtifact[]
+	capabilities?: UploadCapabilities
+	/** Processing runs started so far, persisted before each run. */
+	attempts?: number
 	createdAt: number
 	completedAt?: number
 	error?: string

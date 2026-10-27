@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { LLMMessage } from '~/core/agents/state.js'
 import { isRetryableLLMError } from '~/core/agents/retry.js'
 import { ModelId } from '~/core/llm/schema.js'
@@ -716,5 +719,115 @@ describe('AnthropicProvider model routing', () => {
 	test('keeps model ID as-is when already in Anthropic format', () => {
 		expect(provider.normalizeModel('claude-sonnet-4-5-20250514')).toBe('claude-sonnet-4-5-20250514')
 		expect(provider.normalizeModel('claude-opus-4-6')).toBe('claude-opus-4-6')
+	})
+})
+
+// ============================================================================
+// PDF documents
+// ============================================================================
+
+describe('AnthropicProvider document mapping', () => {
+	const pdf = { mediaType: 'application/pdf' as const, data: 'JVBERi0xLjQK', filename: 'scan.pdf' }
+	const documentBlock = { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0xLjQK' }, title: 'scan.pdf' }
+
+	test('maps a user document to a base64 document block', async () => {
+		const http = await createProvider().buildHttpRequest(buildRequest([{
+			role: 'user',
+			content: [{ type: 'document', document: pdf }, { type: 'text', text: 'Transcribe it.' }],
+		}]))
+
+		expect(http.body).toMatchObject({
+			messages: [{ role: 'user', content: [documentBlock, { type: 'text', text: 'Transcribe it.' }] }],
+		})
+	})
+
+	test('a document without a filename gets no title', async () => {
+		const http = await createProvider().buildHttpRequest(buildRequest([{
+			role: 'user',
+			content: [{ type: 'document', document: { mediaType: 'application/pdf', data: 'JVBERi0xLjQK' } }],
+		}]))
+
+		expect(http.body).toMatchObject({
+			messages: [{ content: [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0xLjQK' } }] }],
+		})
+		expect(JSON.stringify(http.body)).not.toContain('"title"')
+	})
+
+	test('maps a document inside a tool result', async () => {
+		const result = await mapMessage({
+			role: 'tool',
+			content: [{ type: 'document', document: pdf }],
+			toolCallId: ToolCallId('tc_1'),
+		})
+
+		expect(result).toEqual({
+			role: 'user',
+			content: [{ type: 'tool_result', tool_use_id: 'tc_1', content: [documentBlock], is_error: undefined }],
+		})
+	})
+
+	test('reads a stored document from the file store for every request', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'roj-anthropic-document-'))
+		const path = '.documents/scan.pdf'
+		mkdirSync(join(dir, '.documents'))
+		writeFileSync(join(dir, path), Buffer.from('JVBERi0xLjQK', 'base64'))
+		const context: InferenceContext = {
+			sessionId: 'session-1',
+			agentId: 'agent-1',
+			fileStore: new SessionFileStore(dir, undefined, false, createNodeFileSystem()),
+		}
+		const request = buildRequest([{
+			role: 'user',
+			content: [{ type: 'document', document: { mediaType: 'application/pdf', path, byteLength: 9, filename: 'scan.pdf' } }],
+		}])
+
+		const first = await createProvider().buildHttpRequest(request, context)
+		const second = await createProvider().buildHttpRequest(request, context)
+		rmSync(dir, { recursive: true, force: true })
+
+		expect(first.body).toMatchObject({ messages: [{ role: 'user', content: [documentBlock] }] })
+		expect(second.body).toEqual(first.body)
+	})
+
+	test('a stored document without a file store to read it from is sent as a note', async () => {
+		const http = await createProvider().buildHttpRequest(buildRequest([{
+			role: 'user',
+			content: [{ type: 'document', document: { mediaType: 'application/pdf', path: '/gone/scan.pdf', byteLength: 9 } }],
+		}]))
+
+		expect(http.body).toMatchObject({
+			messages: [{ content: [{ type: 'text', text: '[Document unavailable: /gone/scan.pdf - no file store to read it from]' }] }],
+		})
+	})
+
+	test('sends only the newest documents that fit the request budget', async () => {
+		// 9 MB each: two exceed the 16 MB budget, so only the newer one is sent.
+		const data = 'A'.repeat(12 * 1024 * 1024)
+		const http = await createProvider().buildHttpRequest(buildRequest([
+			{ role: 'user', content: [{ type: 'document', document: { mediaType: 'application/pdf', data, filename: 'old.pdf' } }] },
+			{ role: 'assistant', content: 'Read it.' },
+			{ role: 'user', content: [{ type: 'document', document: { mediaType: 'application/pdf', data, filename: 'new.pdf' } }] },
+		]))
+
+		expect(http.body).toMatchObject({
+			messages: [
+				{ content: [{ type: 'text', text: expect.stringContaining('[Document omitted: application/pdf "old.pdf", 9437184 bytes, over the request budget') }] },
+				{ role: 'assistant' },
+				{ content: [{ type: 'document', title: 'new.pdf' }] },
+			],
+		})
+	})
+
+	test('a cache breakpoint on a message ending with a document lands on the document block', async () => {
+		const http = await createProvider().buildHttpRequest(buildRequest(applyCacheBreakpoint([{
+			role: 'user',
+			content: [{ type: 'text', text: 'Read this.' }, { type: 'document', document: pdf }],
+		}], 0)))
+
+		expect(http.body).toMatchObject({
+			messages: [{
+				content: [{ type: 'text', text: 'Read this.' }, { ...documentBlock, cache_control: { type: 'ephemeral' } }],
+			}],
+		})
 	})
 })

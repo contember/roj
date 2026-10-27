@@ -126,6 +126,8 @@ On next dequeue, pending uploads become a synthetic user message:
 
 Agent reads raw bytes from `<basePath>/<filename>`. Don't list `{{sessionDir}}/uploads/` — it returns UUID dirs.
 
+Stored uploads (`registerStored`, bytes the host keeps in its blob store) are the exception: the original is kept by the host and is not a file in the session, so `<basePath>/<filename>` does not exist. The block lists the files derived from it — artifacts and other derived files, paths relative to `basePath` — and ends with a line saying so; the agent reads those files, and `<basePath>/<filename>` is still the path to pass to a host tool that places or publishes the original.
+
 ---
 
 ## Session state

@@ -9,6 +9,7 @@
 import { invalidSessionId, parseError, sessionNotFound } from '../responses.js'
 import { Hono } from 'hono'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
+import z from 'zod/v4'
 import type { DomainError } from '~/core/errors.js'
 import { parseSessionId } from '~/core/sessions/schema.js'
 import { preventTraversal } from '~/plugins/filesystem/listing.js'
@@ -16,8 +17,22 @@ import { type AppContext, type AppEnv, getServices } from '../context.js'
 import { readBodyWithLimit, safeFetch } from '../fetch-guard.js'
 import { resolveCanonicalPath } from '../path-containment.js'
 
-/** A plugin error carries its own status; this route only ever speaks 400 or 500. */
-const pluginErrorStatus = (error: DomainError): ContentfulStatusCode => (error.httpStatus >= 500 ? 500 : 400)
+/**
+ * A plugin error keeps its own status. 400 is kept for a request that was refused, because a caller may drop
+ * what it sent on a 400 and retry anything else; a status this route does not speak becomes 500.
+ */
+function pluginErrorStatus(error: DomainError): ContentfulStatusCode {
+	switch (error.httpStatus) {
+		case 400:
+		case 403:
+		case 404:
+		case 409:
+		case 503:
+			return error.httpStatus
+		default:
+			return 500
+	}
+}
 
 // ============================================================================
 // Download helpers
@@ -79,6 +94,15 @@ const forbiddenPath = (c: AppContext, message: string) =>
 const uploadNotFound = (c: AppContext) =>
 	c.json({ error: { type: 'not_found', message: 'File not found' } }, 404)
 
+/** Body of `POST /sessions/:sessionId/uploads/stored`; the plugin method validates the values themselves. */
+const storedUploadBodySchema = z.object({
+	filename: z.string(),
+	mimeType: z.string(),
+	size: z.number(),
+	sha256: z.string().optional(),
+	blobRef: z.string(),
+})
+
 // ============================================================================
 // Routes
 // ============================================================================
@@ -102,7 +126,11 @@ export function createUploadRoutes(): Hono<AppEnv> {
 	 * Response:
 	 * - 201: { uploadId, status, extractedContent? }
 	 * - 400: Validation error
+	 * - 403: A plugin's method gate denied the call
 	 * - 404: Session not found
+	 * - 409: The session is closed
+	 * - 500: Internal failure, or the session has no uploads plugin
+	 * - 503: The session is closing
 	 */
 	app.post('/:sessionId/upload', async (c: AppContext) => {
 		const { sessionRuntime, logger } = getServices(c)
@@ -193,7 +221,11 @@ export function createUploadRoutes(): Hono<AppEnv> {
 	 * Response:
 	 * - 202: { uploadId, status: 'processing' }
 	 * - 400: Validation error
+	 * - 403: A plugin's method gate denied the call
 	 * - 404: Session not found
+	 * - 409: The session is closed
+	 * - 500: Internal failure, or the session has no uploads plugin
+	 * - 503: The session is closing
 	 */
 	app.post('/:sessionId/upload-async', async (c: AppContext) => {
 		const { sessionRuntime, logger } = getServices(c)
@@ -276,6 +308,15 @@ export function createUploadRoutes(): Hono<AppEnv> {
 	 * - url (required): URL to download the file from
 	 * - filename (required): Original filename
 	 * - mimeType (required): MIME type of the file
+	 *
+	 * Response:
+	 * - 201: { uploadId, status, extractedContent? }
+	 * - 400: Validation error, or the URL could not be fetched
+	 * - 403: A plugin's method gate denied the call
+	 * - 404: Session not found
+	 * - 409: The session is closed
+	 * - 500: Internal failure, or the session has no uploads plugin
+	 * - 503: The session is closing
 	 */
 	app.post('/:sessionId/upload-from-url', async (c: AppContext) => {
 		const { sessionRuntime, logger, config } = getServices(c)
@@ -378,6 +419,86 @@ export function createUploadRoutes(): Hono<AppEnv> {
 				},
 				201,
 			)
+		} finally {
+			leaseResult.value.release()
+		}
+	})
+
+	/**
+	 * POST /sessions/:sessionId/uploads/stored
+	 *
+	 * Registers an upload whose bytes the host already keeps in its blob store.
+	 * Nothing is written to the upload directory; processing reads the bytes
+	 * through the configured blob store and runs as for /upload-async.
+	 *
+	 * JSON body: { filename, mimeType, size, sha256?, blobRef }
+	 *
+	 * Response:
+	 * - 202: { uploadId, status: 'processing' }
+	 * - 400: The request is refused (body, filename, MIME type, size); the only status that is not worth retrying
+	 * - 403: A plugin's method gate denied the call
+	 * - 404: Session not found
+	 * - 409: The session is closed
+	 * - 500: No blob store is configured, the session has no uploads plugin, or the upload could not be started
+	 * - 503: The session is closing
+	 *
+	 * A 5xx can come after the upload was recorded, and a later runtime may still process it. This route
+	 * does not dedupe, so a caller that retries must dedupe by blobRef.
+	 */
+	app.post('/:sessionId/uploads/stored', async (c: AppContext) => {
+		const { sessionRuntime, logger } = getServices(c)
+		const sessionIdResult = parseSessionId(c.req.param('sessionId')!)
+		if (!sessionIdResult.ok) return invalidSessionId(c, sessionIdResult.error)
+		const sessionId = sessionIdResult.value
+
+		const leaseResult = await sessionRuntime.acquireSessionLease(sessionId, 'http:uploads-stored')
+		if (!leaseResult.ok) {
+			return sessionNotFound(c, sessionId)
+		}
+		try {
+			let json: unknown
+			try {
+				json = await c.req.json()
+			} catch {
+				return parseError(c, 'Failed to parse JSON body')
+			}
+			const body = storedUploadBodySchema.safeParse(json)
+			if (!body.success) {
+				return c.json(
+					{ error: { type: 'validation_error', message: 'Expected { filename, mimeType, size, sha256?, blobRef }' } },
+					400,
+				)
+			}
+
+			const result = await sessionRuntime.callPluginMethod(sessionId, 'uploads.registerStored', {
+				sessionId: String(sessionId),
+				...body.data,
+			})
+
+			if (!result.ok) {
+				return c.json(
+					{ error: { type: result.error.type, message: result.error.type === 'validation_error' ? result.error.message : 'Upload failed' } },
+					pluginErrorStatus(result.error),
+				)
+			}
+
+			const uploadResult = result.value
+			if (typeof uploadResult !== 'object' || uploadResult === null || !('uploadId' in uploadResult)) {
+				return c.json(
+					{ error: { type: 'internal_error', message: 'Plugin did not return expected result' } },
+					500,
+				)
+			}
+
+			logger.info('Stored upload registered', {
+				sessionId,
+				uploadId: uploadResult.uploadId,
+				filename: body.data.filename,
+				mimeType: body.data.mimeType,
+				size: body.data.size,
+			})
+
+			return c.json({ uploadId: uploadResult.uploadId, status: 'processing' }, 202)
 		} finally {
 			leaseResult.value.release()
 		}

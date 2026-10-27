@@ -1,6 +1,7 @@
 import z4 from 'zod/v4'
 import { createEventsFactory } from '~/core/events/types'
-import { uploadIdSchema } from './schema.js'
+import type { UploadArtifact, UploadCapabilities } from './preprocessor.js'
+import { uploadArtifactSchema, uploadCapabilitiesSchema, uploadIdSchema, type UploadSourceRef, uploadSourceRefSchema } from './schema.js'
 
 export const uploadEvents = createEventsFactory({
 	events: {
@@ -10,8 +11,14 @@ export const uploadEvents = createEventsFactory({
 			mimeType: z4.string(),
 			size: z4.number(),
 			status: z4.enum(['processing', 'ready', 'failed']),
+			/** Set on `processing`; the log, unlike meta.json, is out of the agent's reach, so a re-run reads it from here. */
+			source: uploadSourceRefSchema.optional(),
+			/** Set on `processing`: which run this is, so the restart limit does not trust meta.json. */
+			attempt: z4.number().int().positive().optional(),
 			extractedContent: z4.string().optional(),
 			derivedPaths: z4.array(z4.string()).optional(),
+			artifacts: z4.array(uploadArtifactSchema).optional(),
+			capabilities: uploadCapabilitiesSchema.optional(),
 			error: z4.string().optional(),
 		}),
 		attachments_consumed: z4.object({
@@ -37,6 +44,20 @@ export interface PendingUpload {
 	status: 'ready' | 'failed'
 	extractedContent?: string
 	derivedPaths?: string[]
+	artifacts?: UploadArtifact[]
+	capabilities?: UploadCapabilities
+	/** Set for a `blob` source: the original is in the host's blob store, not in the upload dir. */
+	originalHeldByHost?: true
+}
+
+/** An upload whose processing started and has not reached a terminal event. */
+export interface ProcessingUpload {
+	filename: string
+	mimeType: string
+	size: number
+	source: UploadSourceRef
+	/** The run the log last started; 1 for logs written before runs were counted. */
+	attempt: number
 }
 
 /** Uploads plugin state slice — tracks pending (unconsumed) uploads */
@@ -51,4 +72,11 @@ export interface UploadsState {
 	 * "awaiting materialization" projection is needed.
 	 */
 	terminal: Record<string, 'ready' | 'failed'>
+	/** Uploads a restart may re-run. */
+	processing: Record<string, ProcessingUpload>
+	/**
+	 * Host blobs each deletable upload references: its stored original and its artifacts' originals.
+	 * Read from the log because the agent can rewrite meta.json, and a delete releases these.
+	 */
+	blobRefs: Record<string, string[]>
 }

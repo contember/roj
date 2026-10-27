@@ -10,7 +10,15 @@ export type { Config } from './config.js'
 
 // Bootstrap
 export { bootstrap, createSystemFromServices, fullPlugins, isolatePlugins } from './bootstrap.js'
-export type { BootstrapOptions, BuiltinMethodSchemas, IsolateMethodSchemas, PluginProfile, Services } from './bootstrap.js'
+export type {
+	BootstrapOptions,
+	BootstrapUploadOptions,
+	BuiltinMethodSchemas,
+	IsolateMethodSchemas,
+	PluginProfile,
+	Services,
+	UploadPreprocessorDeps,
+} from './bootstrap.js'
 
 // Scheduler wake keys — a host delivering its own wakes mints and reads them
 export { agentWakeKey, parseAgentWakeKey, pluginWakeKey, parsePluginWakeKey } from './core/wake-key.js'
@@ -57,13 +65,13 @@ export type { AgentStatus as DomainAgentStatus, ProtocolAgentStatus, ProtocolAge
 // Event factories behind BuiltinEvent — a third-party plugin declares these in
 // .events([...]) to react to built-in events without reaching into src/.
 export { agentEvents } from '~/core/agents/state.js'
-export type { AgentPauseReason, AgentState, LLMMessage } from '~/core/agents/state.js'
+export type { AgentPauseReason, AgentState, LLMMessage, PreambleLLMMessage } from '~/core/agents/state.js'
 export { contextEvents } from '~/core/context/state.js'
 export type { DomainEvent } from '~/core/events/types.js'
 export type { FactoryEventType } from '~/core/events/types.js'
 export { isDomainEvent } from '~/core/events/types.js'
 export type { CacheTtl, CacheTtlConfig } from '~/core/llm/cache-breakpoints.js'
-export type { ChatMessageContentItem, LLMCallLogEntry, LLMCallMessage, ToolResultContent } from '~/core/llm/llm-log-types.js'
+export type { ChatMessageContentItem, ChatMessageContentItemDocument, LLMCallLogEntry, LLMCallMessage, ToolResultContent } from '~/core/llm/llm-log-types.js'
 export { contentToString } from '~/core/llm/llm-log-types.js'
 export { applyMiddleware, useProvider, withAnthropic, withMaxTokens, withOpenRouter, withTemperature } from '~/core/llm/middleware.js'
 export type { InferenceNext, LLMMiddleware } from '~/core/llm/middleware.js'
@@ -148,6 +156,30 @@ export type {
 export { RESOURCE_MANIFEST_FILENAME, ResourceManifestSchema } from '~/plugins/resources/manifest.js'
 export type { ResourceManifest } from '~/plugins/resources/manifest.js'
 export { uploadsPlugin } from '~/plugins/uploads/plugin.js'
+export type { UploadsPluginConfig } from '~/plugins/uploads/plugin.js'
+export { PreprocessorRegistry } from '~/plugins/uploads/preprocessor.js'
+export type {
+	Preprocessor,
+	PreprocessorContext,
+	PreprocessorResult,
+	UploadArtifact,
+	UploadCapabilities,
+} from '~/plugins/uploads/preprocessor.js'
+export {
+	ImageClassifierPreprocessor,
+	MarkitdownPreprocessor,
+	PdfPreprocessor,
+	ZipPreprocessor,
+} from '~/plugins/uploads/preprocessors/index.js'
+export type {
+	ImageClassifierConfig,
+	MarkitdownPreprocessorConfig,
+	PdfPreprocessorConfig,
+	ZipPreprocessorConfig,
+} from '~/plugins/uploads/preprocessors/index.js'
+export type { UploadMetadata, UploadSourceRef } from '~/plugins/uploads/schema.js'
+export { fileUploadSource } from '~/plugins/uploads/source.js'
+export type { UploadBlobContext, UploadBlobStore, UploadSource } from '~/plugins/uploads/source.js'
 export type { ArchiveLimitOverrides, ArchiveLimits } from '~/lib/archive/index.js'
 export { userChatEvents, userChatPlugin } from '~/plugins/user-chat/plugin.js'
 export type { UserChatAgentConfig, UserChatPresetConfig, UserCommunicationMode } from '~/plugins/user-chat/plugin.js'

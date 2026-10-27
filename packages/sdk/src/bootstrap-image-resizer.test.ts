@@ -9,6 +9,7 @@ import { SessionFileStore } from './core/file-store/file-store.js'
 import type { ImageResizeOptions, ImageResizer } from './core/image/types.js'
 import { ModelId } from './core/llm/schema.js'
 import type { Platform, ProcessRunner } from './platform/index.js'
+import { fileUploadSource } from './plugins/uploads/source.js'
 import { createTestPreset } from './testing/preset-helpers.js'
 
 const cleanups: Array<() => Promise<void> | void> = []
@@ -63,7 +64,15 @@ async function classifyImage(host: Awaited<ReturnType<typeof boot>>) {
 	const classifier = host.services.preprocessorRegistry.getForMimeType('image/png')
 	if (!classifier) throw new Error('No image preprocessor registered')
 	const files = new SessionFileStore(host.dataPath, undefined, false, host.services.platform.fs, 'session')
-	await classifier.process(host.imagePath, 'image/png', { files: files.scoped('upload') })
+	const source = await fileUploadSource(host.services.platform.fs, host.imagePath)
+	if (!source.ok) throw source.error
+	await classifier.process(source.value, 'image/png', {
+		files: files.scoped('upload'),
+		uploadId: 'upload',
+		sessionId: 'session',
+		filename: 'screenshot.png',
+		attempt: 1,
+	})
 }
 
 describe('bootstrap image resizer', () => {

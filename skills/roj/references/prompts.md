@@ -112,7 +112,7 @@ Multiple `ask_user` calls in the same assistant turn batch into a single questio
 
 ## Working with uploads
 
-Uploads arrive as `<attachment uploadId="…" filename="…" basePath="…">extracted text</attachment>` blocks in a synthetic user message (see `presets.md` and `paths-and-sandbox.md` for layout). In prompts: tell the agent to read raw bytes from `<basePath>/<filename>` when extracted text is insufficient; for agents that shouldn't see attachments (e.g. a coder consuming only the planner's spec), let the orchestrator forward only what's needed.
+Uploads arrive as `<attachment uploadId="…" filename="…" basePath="…">extracted text</attachment>` blocks in a synthetic user message (see `presets.md` and `paths-and-sandbox.md` for layout). In prompts: tell the agent to read raw bytes from `<basePath>/<filename>` when extracted text is insufficient — except for a stored upload, whose original is kept by the host and is not a file in the session: the agent reads the derived files the block lists, and passes `<basePath>/<filename>` only to a host tool that places or publishes the original; for agents that shouldn't see attachments (e.g. a coder consuming only the planner's spec), let the orchestrator forward only what's needed.
 
 ---
 

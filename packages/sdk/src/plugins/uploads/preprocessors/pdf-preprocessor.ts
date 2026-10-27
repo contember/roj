@@ -35,7 +35,9 @@ import {
 	type PreprocessorContext,
 	type PreprocessorRegistry,
 	type PreprocessorResult,
+	requireLocalPath,
 } from '../preprocessor.js'
+import { fileUploadSource, type UploadSource } from '../source.js'
 import {
 	getImageDimensions,
 	guessImageMime,
@@ -78,10 +80,13 @@ export class PdfPreprocessor implements Preprocessor {
 	}
 
 	async process(
-		filePath: string,
-		mimeType: string,
+		source: UploadSource,
+		_mimeType: string,
 		ctx: PreprocessorContext,
 	): Promise<Result<PreprocessorResult, Error>> {
+		const localPath = requireLocalPath(source, this.name)
+		if (!localPath.ok) return localPath
+		const filePath = localPath.value
 		const totalStart = Date.now()
 		const signal = getPreprocessingSignal(ctx)
 		throwIfPreprocessingAborted(signal)
@@ -224,9 +229,11 @@ export class PdfPreprocessor implements Preprocessor {
 				let description = mime
 
 				const classifier = this.registry.getForMimeType(mime)
-				if (classifier) {
-					const result = await classifier.process(fullPath, mime, {
+				const imageSource = classifier ? await fileUploadSource(this.fs, fullPath) : undefined
+				if (classifier && imageSource?.ok) {
+					const result = await classifier.process(imageSource.value, mime, {
 						...ctx,
+						filename: name,
 						files: ctx.files.scoped(`images/${name}-meta`),
 					})
 					if (result.ok && result.value.extractedContent) {
