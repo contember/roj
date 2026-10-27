@@ -67,6 +67,8 @@ extraBinds[]       → as configured
 
 Read raw bytes with `<basePath>/<filename>`. **Don't list `{{sessionDir}}/uploads/`** — it returns UUID directories.
 
+A stored upload (`registerStored`) writes no original there: it is kept by the host and is not a file in the session. Its upload dir holds `meta.json` and the files its preprocessor derived (artifacts and other derived files such as an image description); the attachment block lists them all (paths relative to `basePath`). Read those, and pass `<basePath>/<filename>` only to a host tool that places or publishes the original.
+
 ---
 
 ## Shell plugin & bwrap

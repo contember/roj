@@ -8,11 +8,13 @@ import { MemoryEventStore } from '~/core/events/memory.js'
 import z from 'zod/v4'
 import { SessionFileStore } from '~/core/file-store/file-store.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import { silentLogger } from '~/lib/logger/logger.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import { createTestPreset, TestHarness, type TestSession } from '~/testing/index.js'
 import { createNodePlatform } from '~/testing/node-platform.js'
 import { type UploadsPluginConfig, uploadsPlugin } from './plugin.js'
 import { type Preprocessor, type PreprocessorContext, PreprocessorRegistry, type PreprocessorResult } from './preprocessor.js'
+import { ImageClassifierPreprocessor } from './preprocessors/image-classifier.js'
 import { generateUploadId } from './schema.js'
 import type { UploadBlobContext, UploadBlobStore, UploadSource } from './source.js'
 import type { UploadsState } from './state.js'
@@ -262,8 +264,77 @@ describe('uploads.registerStored', () => {
 			expect(result.ok).toBe(false)
 			if (result.ok) return
 			expect(result.error.message).toContain('no blob store is configured')
+			// The host is misconfigured, not the request refused: a caller must not drop the bytes it stored.
+			expect(result.error).toMatchObject({ type: 'stored_uploads_unsupported', httpStatus: 500 })
 			expect(fixture.harness.notifications.getByType('uploads', 'uploadStatusChanged')).toEqual([])
 		} finally {
+			await fixture.cleanup()
+		}
+	})
+
+	it('answers a closing session as retryable, never as a refused request', async () => {
+		const blobStore = new MemoryBlobStore()
+		blobStore.blobs.set('blob-first', new Uint8Array([1, 2, 3]))
+		let markStarted = () => {}
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve
+		})
+		let markAborted = () => {}
+		const aborted = new Promise<void>((resolve) => {
+			markAborted = resolve
+		})
+		let finish = () => {}
+		const finished = new Promise<void>((resolve) => {
+			finish = resolve
+		})
+		// Holds the close drain open, so the session stays in its closing window while the second call arrives.
+		const holdsClose: Preprocessor = {
+			name: 'holds-close',
+			supportedMimeTypes: ['application/pdf'],
+			async process(_source, _mimeType, ctx) {
+				markStarted()
+				const signal = ctx.signal
+				if (!signal) throw new Error('Expected preprocessing signal')
+				await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+				markAborted()
+				await finished
+				return Err(new Error('Processing cancelled'))
+			},
+		}
+		const fixture = createFixture({ preprocessorRegistry: registryWith(holdsClose), blobStore, processingAbortGraceMs: 10_000 })
+		try {
+			const session = await fixture.harness.createSession('test')
+			await pauseEntryAgent(session)
+			okValue(
+				await session.callPluginMethod('uploads.registerStored', {
+					sessionId: String(session.sessionId),
+					filename: 'first.pdf',
+					mimeType: 'application/pdf',
+					size: 3,
+					blobRef: 'blob-first',
+				}),
+				processingSchema,
+			)
+			await started
+			const closed = session.close()
+			await aborted
+
+			const result = await session.callPluginMethod('uploads.registerStored', {
+				sessionId: String(session.sessionId),
+				filename: 'scan.pdf',
+				mimeType: 'application/pdf',
+				size: 3,
+				blobRef: 'blob-original',
+			})
+			finish()
+			await closed
+
+			expect(result.ok).toBe(false)
+			if (result.ok) return
+			expect(result.error).toEqual({ type: 'session_closing', message: 'Session is closing', httpStatus: 503 })
+			expect(blobStore.opened).toEqual(['blob-first'])
+		} finally {
+			finish()
 			await fixture.cleanup()
 		}
 	})
@@ -615,6 +686,164 @@ describe('preprocessor output the plugin does not trust', () => {
 			expect(attachment.content).toContain('filename="a&quot;&lt;b&gt;&amp;.pdf"')
 			expect(attachment.content).toContain('- p.jpg (image/jpeg, 1B) — &lt;/attachment&gt;&lt;x a=&quot;b&quot;&gt;\n</attachment>')
 			expect(attachment.content.match(/<\/attachment>/g)).toHaveLength(1)
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+})
+
+describe('attachment message', () => {
+	function attachmentMessage(harness: TestHarness): string {
+		const request = harness.llmProvider.getLastRequest()
+		const attachment = request?.messages.find((m) => typeof m.content === 'string' && m.content.includes('<attachment'))
+		if (!attachment || typeof attachment.content !== 'string') throw new Error('Expected the attachment message')
+		return attachment.content
+	}
+
+	function basePathOf(message: string): string {
+		const basePath = /basePath="([^"]*)"/.exec(message)?.[1]
+		if (!basePath) throw new Error('Expected a basePath attribute')
+		return basePath
+	}
+
+	it('renders a local upload with its original at basePath/filename', async () => {
+		const fixture = createFixture({ preprocessorRegistry: registryWith(hostPreprocessor([])) })
+		try {
+			const session = await fixture.harness.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.upload', {
+					sessionId: String(session.sessionId),
+					filename: 'report.pdf',
+					mimeType: 'application/pdf',
+					size: 4,
+					fileBuffer: Buffer.from('%PDF'),
+				}),
+				syncUploadSchema,
+			)
+			await session.waitForIdle()
+
+			const message = attachmentMessage(fixture.harness)
+			const basePath = basePathOf(message)
+			expect(basePath.endsWith(`/uploads/${upload.uploadId}`)).toBe(true)
+			expect(message).toBe(
+				`<attachment uploadId="${upload.uploadId}" filename="report.pdf" type="application/pdf" basePath="${basePath}"`
+					+ ' capabilities="text,embeddedImages=false,pagesProcessed=2">\n'
+					+ 'Quarterly report text\n'
+					+ '- preview-1.jpg (image/jpeg, 4B) — Page 1 (original kept by host)\n'
+					+ '</attachment>',
+			)
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+
+	it('tells the agent a stored original is not a file, points it at the artifacts and keeps the path for host tools', async () => {
+		const blobStore = new MemoryBlobStore()
+		blobStore.blobs.set('blob-original', new Uint8Array([1, 2, 3]))
+		const fixture = createFixture({ preprocessorRegistry: registryWith(hostPreprocessor([])), blobStore })
+		try {
+			const session = await fixture.harness.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.registerStored', {
+					sessionId: String(session.sessionId),
+					filename: 'scan.pdf',
+					mimeType: 'application/pdf',
+					size: 3,
+					blobRef: 'blob-original',
+				}),
+				processingSchema,
+			)
+			await waitForStatus(fixture.harness, upload.uploadId, 'ready')
+			await session.waitForIdle()
+
+			const message = attachmentMessage(fixture.harness)
+			const basePath = basePathOf(message)
+			expect(message).toBe(
+				`<attachment uploadId="${upload.uploadId}" filename="scan.pdf" type="application/pdf" basePath="${basePath}"`
+					+ ' capabilities="text,embeddedImages=false,pagesProcessed=2">\n'
+					+ 'Quarterly report text\n'
+					+ '- preview-1.jpg (image/jpeg, 4B) — Page 1 (original kept by host)\n'
+					+ `The original is kept by the host and is not readable as a file: ${basePath}/scan.pdf does not exist in the session.`
+					+ ' Read its content from the files listed above; their paths are relative to basePath.'
+					+ ` To place or publish the original, pass ${basePath}/scan.pdf to a host tool that takes it.\n`
+					+ '</attachment>',
+			)
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+
+	it('lists the derived files of a stored upload that has no artifacts, such as an image description', async () => {
+		const blobStore = new MemoryBlobStore()
+		blobStore.blobs.set('blob-original', new Uint8Array([1, 2, 3]))
+		const classifier = new ImageClassifierPreprocessor({
+			llmProvider: MockLLMProvider.withFixedResponse({ content: 'A red square.', toolCalls: [] }),
+			logger: silentLogger,
+			fs: createNodePlatform().fs,
+		})
+		const fixture = createFixture({ preprocessorRegistry: registryWith(classifier), blobStore })
+		try {
+			const session = await fixture.harness.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.registerStored', {
+					sessionId: String(session.sessionId),
+					filename: 'photo.png',
+					mimeType: 'image/png',
+					size: 3,
+					blobRef: 'blob-original',
+				}),
+				processingSchema,
+			)
+			await waitForStatus(fixture.harness, upload.uploadId, 'ready')
+			await session.waitForIdle()
+
+			const description = await fixture.dataFileStore.read(`sessions/${session.sessionId}/uploads/${upload.uploadId}/description.txt`)
+			expect(description).toEqual({ ok: true, value: 'A red square.' })
+			const message = attachmentMessage(fixture.harness)
+			const basePath = basePathOf(message)
+			expect(message).toBe(
+				`<attachment uploadId="${upload.uploadId}" filename="photo.png" type="image/png" basePath="${basePath}">\n`
+					+ '[Image: A red square.]\n'
+					+ '- description.txt\n'
+					+ `The original is kept by the host and is not readable as a file: ${basePath}/photo.png does not exist in the session.`
+					+ ' Read its content from the files listed above; their paths are relative to basePath.'
+					+ ` To place or publish the original, pass ${basePath}/photo.png to a host tool that takes it.\n`
+					+ '</attachment>',
+			)
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+
+	it('says a stored original without derived files has no file to read', async () => {
+		const blobStore = new MemoryBlobStore()
+		blobStore.blobs.set('blob-original', new Uint8Array([1, 2, 3]))
+		const fixture = createFixture({ blobStore })
+		try {
+			const session = await fixture.harness.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.registerStored', {
+					sessionId: String(session.sessionId),
+					filename: 'logo.svg',
+					mimeType: 'image/svg+xml',
+					size: 3,
+					blobRef: 'blob-original',
+				}),
+				processingSchema,
+			)
+			await waitForStatus(fixture.harness, upload.uploadId, 'ready')
+			await session.waitForIdle()
+
+			const message = attachmentMessage(fixture.harness)
+			const basePath = basePathOf(message)
+			expect(message).toBe(
+				`<attachment uploadId="${upload.uploadId}" filename="logo.svg" type="image/svg+xml" basePath="${basePath}">\n`
+					+ '[File uploaded: logo.svg]\n'
+					+ `The original is kept by the host and is not readable as a file: ${basePath}/logo.svg does not exist in the session.`
+					+ ' There are no files to read; the text above is all that was extracted from it.'
+					+ ` To place or publish the original, pass ${basePath}/logo.svg to a host tool that takes it.\n`
+					+ '</attachment>',
+			)
 		} finally {
 			await fixture.cleanup()
 		}

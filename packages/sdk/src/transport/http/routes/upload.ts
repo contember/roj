@@ -17,8 +17,22 @@ import { type AppContext, type AppEnv, getServices } from '../context.js'
 import { readBodyWithLimit, safeFetch } from '../fetch-guard.js'
 import { resolveCanonicalPath } from '../path-containment.js'
 
-/** A plugin error carries its own status; this route only ever speaks 400 or 500. */
-const pluginErrorStatus = (error: DomainError): ContentfulStatusCode => (error.httpStatus >= 500 ? 500 : 400)
+/**
+ * A plugin error keeps its own status. 400 is kept for a request that was refused, because a caller may drop
+ * what it sent on a 400 and retry anything else; a status this route does not speak becomes 500.
+ */
+function pluginErrorStatus(error: DomainError): ContentfulStatusCode {
+	switch (error.httpStatus) {
+		case 400:
+		case 403:
+		case 404:
+		case 409:
+		case 503:
+			return error.httpStatus
+		default:
+			return 500
+	}
+}
 
 // ============================================================================
 // Download helpers
@@ -112,7 +126,11 @@ export function createUploadRoutes(): Hono<AppEnv> {
 	 * Response:
 	 * - 201: { uploadId, status, extractedContent? }
 	 * - 400: Validation error
+	 * - 403: A plugin's method gate denied the call
 	 * - 404: Session not found
+	 * - 409: The session is closed
+	 * - 500: Internal failure, or the session has no uploads plugin
+	 * - 503: The session is closing
 	 */
 	app.post('/:sessionId/upload', async (c: AppContext) => {
 		const { sessionRuntime, logger } = getServices(c)
@@ -203,7 +221,11 @@ export function createUploadRoutes(): Hono<AppEnv> {
 	 * Response:
 	 * - 202: { uploadId, status: 'processing' }
 	 * - 400: Validation error
+	 * - 403: A plugin's method gate denied the call
 	 * - 404: Session not found
+	 * - 409: The session is closed
+	 * - 500: Internal failure, or the session has no uploads plugin
+	 * - 503: The session is closing
 	 */
 	app.post('/:sessionId/upload-async', async (c: AppContext) => {
 		const { sessionRuntime, logger } = getServices(c)
@@ -286,6 +308,15 @@ export function createUploadRoutes(): Hono<AppEnv> {
 	 * - url (required): URL to download the file from
 	 * - filename (required): Original filename
 	 * - mimeType (required): MIME type of the file
+	 *
+	 * Response:
+	 * - 201: { uploadId, status, extractedContent? }
+	 * - 400: Validation error, or the URL could not be fetched
+	 * - 403: A plugin's method gate denied the call
+	 * - 404: Session not found
+	 * - 409: The session is closed
+	 * - 500: Internal failure, or the session has no uploads plugin
+	 * - 503: The session is closing
 	 */
 	app.post('/:sessionId/upload-from-url', async (c: AppContext) => {
 		const { sessionRuntime, logger, config } = getServices(c)
@@ -404,8 +435,15 @@ export function createUploadRoutes(): Hono<AppEnv> {
 	 *
 	 * Response:
 	 * - 202: { uploadId, status: 'processing' }
-	 * - 400: Validation error, or no blob store is configured
+	 * - 400: The request is refused (body, filename, MIME type, size); the only status that is not worth retrying
+	 * - 403: A plugin's method gate denied the call
 	 * - 404: Session not found
+	 * - 409: The session is closed
+	 * - 500: No blob store is configured, the session has no uploads plugin, or the upload could not be started
+	 * - 503: The session is closing
+	 *
+	 * A 5xx can come after the upload was recorded, and a later runtime may still process it. This route
+	 * does not dedupe, so a caller that retries must dedupe by blobRef.
 	 */
 	app.post('/:sessionId/uploads/stored', async (c: AppContext) => {
 		const { sessionRuntime, logger } = getServices(c)

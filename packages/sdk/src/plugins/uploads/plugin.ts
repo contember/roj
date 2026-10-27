@@ -74,6 +74,10 @@ const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/
 
 /** Store faults are internal: the client gets this fixed text, never the driver's own message. */
 const uploadStorageError = (): DomainError => createDomainError('upload_storage_error', 'Failed to write file', 500)
+/** Not a refusal of the request: a caller may send it again once the session runs again. */
+const sessionClosingError = (): DomainError => createDomainError('session_closing', 'Session is closing', 503)
+/** A fault after validation passed; like a store fault, the client gets fixed text. */
+const uploadStartError = (): DomainError => createDomainError('upload_start_error', 'Could not start upload', 500)
 
 // ============================================================================
 // Config
@@ -200,13 +204,32 @@ function formatArtifact(artifact: UploadArtifact): string {
 	return `- ${escapeMarkup(artifact.path)} (${escapeMarkup(artifact.mimeType)}, ${formatSize(artifact.size)})${description}${original}`
 }
 
+/**
+ * Lists the derived files the artifacts do not already name, then says that `basePath/filename` is not a file,
+ * where the content is instead, and what the path is still good for.
+ */
+function formatHostHeldOriginal(upload: PendingUpload, basePath: string): string[] {
+	const artifactPaths = new Set((upload.artifacts ?? []).map((artifact) => artifact.path))
+	const derived = (upload.derivedPaths ?? []).filter((path) => isContainedArtifactPath(path) && !artifactPaths.has(path))
+	const originalPath = escapeMarkup(`${basePath}/${upload.filename}`)
+	const content = artifactPaths.size > 0 || derived.length > 0
+		? 'Read its content from the files listed above; their paths are relative to basePath.'
+		: 'There are no files to read; the text above is all that was extracted from it.'
+	return [
+		...derived.map((path) => `- ${escapeMarkup(path)}`),
+		`The original is kept by the host and is not readable as a file: ${originalPath} does not exist in the session. ${content}`
+			+ ` To place or publish the original, pass ${originalPath} to a host tool that takes it.`,
+	]
+}
+
 function formatUploadsForLLM(uploads: PendingUpload[], sessionRoot: string): string {
 	const blocks = uploads.map((u) => {
 		const basePath = `${sessionRoot}/uploads/${u.uploadId}`
 		const content = u.extractedContent ?? `[File uploaded: ${u.filename}]`
 		const capabilities = formatCapabilities(u.capabilities)
 		const capabilitiesAttribute = capabilities ? ` capabilities="${capabilities}"` : ''
-		const body = [content, ...(u.artifacts ?? []).map(formatArtifact)].join('\n')
+		const hostHeldOriginal = u.originalHeldByHost ? formatHostHeldOriginal(u, basePath) : []
+		const body = [content, ...(u.artifacts ?? []).map(formatArtifact), ...hostHeldOriginal].join('\n')
 		const attributes = `uploadId="${u.uploadId}" filename="${escapeMarkup(u.filename)}" type="${escapeMarkup(u.mimeType)}" basePath="${escapeMarkup(basePath)}"`
 		return `<attachment ${attributes}${capabilitiesAttribute}>\n${body}\n</attachment>`
 	})
@@ -389,7 +412,7 @@ async function prepareUpload(args: {
 	const lifecycle = reserveUploadLifecycle(args.pluginContext, uploadIdStr)
 	let prepared: PreparedUpload | undefined
 	try {
-		if (lifecycle.controller.signal.aborted) return Err(ValidationErrors.invalid('Session is closing'))
+		if (lifecycle.controller.signal.aborted) return Err(sessionClosingError())
 		const uploadStore = args.dataFileStore.scoped(`sessions/${args.input.sessionId}/uploads/${uploadId}`)
 		const writeResult = await uploadStore.write(filename, args.input.fileBuffer)
 		if (!writeResult.ok) {
@@ -398,7 +421,7 @@ async function prepareUpload(args: {
 		}
 		if (args.pluginContext.closing) {
 			await uploadStore.remove(filename)
-			return Err(ValidationErrors.invalid('Session is closing'))
+			return Err(sessionClosingError())
 		}
 		prepared = {
 			uploadId,
@@ -442,13 +465,13 @@ function prepareStoredUpload(args: {
 	const filename = toStoredFilename(args.input.filename)
 	const validationError = validateUploadInput({ ...args.input, filename }, args.maxFileSize)
 	if (validationError) return Err(ValidationErrors.invalid(validationError))
-	if (args.pluginContext.closing) return Err(ValidationErrors.invalid('Session is closing'))
+	if (args.pluginContext.closing) return Err(sessionClosingError())
 
 	const uploadId = generateUploadId()
 	const uploadIdStr = String(uploadId)
 	const uploadStore = args.dataFileStore.scoped(`sessions/${args.input.sessionId}/uploads/${uploadId}`)
 	const filePath = uploadStore.realPath('')
-	if (!filePath.ok) return Err(ValidationErrors.invalid('Invalid upload directory'))
+	if (!filePath.ok) return Err(uploadStartError())
 	return Ok({
 		uploadId,
 		uploadIdStr,
@@ -872,17 +895,18 @@ async function releaseBlobs(args: {
 	}
 }
 
-async function removeUploadFiles(uploadStore: FileStore, path = ''): Promise<Result<void, string>> {
+/** Removes every file in the upload dir except the `keep` paths, which are relative to it. */
+async function removeUploadFiles(uploadStore: FileStore, keep: ReadonlySet<string>, path = ''): Promise<Result<void, string>> {
 	const listResult = await uploadStore.list(path, { maxDepth: 1 })
 	if (!listResult.ok) return listResult
 	for (const entry of listResult.value) {
 		const entryPath = path ? `${path}/${entry.name}` : entry.name
 		if (entry.type === 'directory') {
-			const nested = await removeUploadFiles(uploadStore, entryPath)
+			const nested = await removeUploadFiles(uploadStore, keep, entryPath)
 			if (!nested.ok) return nested
 			continue
 		}
-		if (entryPath === 'meta.json') continue
+		if (keep.has(entryPath)) continue
 		if (entry.type !== 'file' && entry.type !== 'symlink') return Err(`Unsupported upload entry: ${entryPath}`)
 		const removed = await uploadStore.remove(entryPath)
 		if (!removed.ok) return removed
@@ -934,6 +958,14 @@ function launchAsyncProcessing(host: AsyncUploadHost, prepared: PreparedUpload, 
 	})
 }
 
+/** The request was valid, so a failed start is never a refusal: the session closing, or an internal fault whose text stays in the log. */
+function abandonStart(host: AsyncUploadHost, prepared: PreparedUpload, error: unknown): Result<never, DomainError> {
+	prepared.lifecycle.abandon()
+	if (host.pluginContext.closing) return Err(sessionClosingError())
+	host.logger.error('Could not start upload', error instanceof Error ? error : undefined, { uploadId: prepared.uploadIdStr, filename: prepared.filename })
+	return Err(uploadStartError())
+}
+
 /** The shared tail of uploadAsync and registerStored: durable `processing` state, then background processing. */
 async function beginAsyncUpload(args: {
 	host: AsyncUploadHost
@@ -956,15 +988,13 @@ async function beginAsyncUpload(args: {
 			}),
 		)
 	} catch (error) {
-		prepared.lifecycle.abandon()
-		return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
+		return abandonStart(host, prepared, error)
 	}
 	try {
 		const releaseRuntimeLease = host.runtimeActivity.acquire(`upload:${prepared.uploadIdStr}:processing`)
 		prepared.lifecycle.attachRuntimeLease(releaseRuntimeLease)
 	} catch (error) {
-		prepared.lifecycle.abandon()
-		return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
+		return abandonStart(host, prepared, error)
 	}
 	// Everything from here to startAsyncUpload must be guarded: the lifecycle
 	// only settles once lifecycle.start() runs, so a throw before it leaks the
@@ -979,8 +1009,7 @@ async function beginAsyncUpload(args: {
 		})
 		launchAsyncProcessing(host, prepared, upload)
 	} catch (error) {
-		prepared.lifecycle.abandon()
-		return Err(ValidationErrors.invalid(error instanceof Error ? error.message : 'Could not start upload'))
+		return abandonStart(host, prepared, error)
 	}
 
 	return Ok({
@@ -1035,6 +1064,14 @@ async function restartProcessing(args: {
 				attempt: args.attempt,
 			}),
 		)
+		// Only after the run is recorded, so a crash while clearing still counts against the limit.
+		// A cut-off run's derived files would read as input to this one: an archive preprocessor would re-process them as members.
+		const keep = new Set(started.source.kind === 'file' ? ['meta.json', started.filename] : ['meta.json'])
+		const cleared = await removeUploadFiles(args.uploadStore, keep)
+		if (!cleared.ok) {
+			lifecycle.abandon()
+			return Err(new Error(`Cannot clear the interrupted run's files: ${cleared.error}`))
+		}
 		await writeMetadata(args.uploadStore, createProcessingMetadata(prepared, args.host.sessionId, upload))
 		prepared.lifecycle.attachRuntimeLease(args.host.runtimeActivity.acquire(`upload:${uploadIdStr}:processing`))
 		launchAsyncProcessing(args.host, prepared, upload)
@@ -1096,6 +1133,7 @@ export const uploadsPlugin = definePlugin('uploads')
 						derivedPaths: event.derivedPaths,
 						artifacts: event.artifacts,
 						capabilities: event.capabilities,
+						...(state.processing[uploadId]?.source.kind === 'blob' ? { originalHeldByHost: true } : {}),
 					}
 					return { ...state, pending: [...pending, upload], terminal, processing, blobRefs }
 				}
@@ -1287,7 +1325,7 @@ export const uploadsPlugin = definePlugin('uploads')
 								const meta: UploadMetadata = JSON.parse(metaResult.value)
 								meta.status = 'deleted'
 								await writeMetadata(uploadStore, meta)
-								const cleanup = await removeUploadFiles(uploadStore)
+								const cleanup = await removeUploadFiles(uploadStore, new Set(['meta.json']))
 								if (!cleanup.ok) return Err(ValidationErrors.invalid(`Could not remove upload: ${input.uploadId}`))
 								// Read before the deletion event drops them, and never from meta.json, which the agent can rewrite.
 								const blobRefs = selectPluginState<UploadsState>(ctx.getSessionState(), 'uploads')?.blobRefs[input.uploadId] ?? []
@@ -1535,7 +1573,10 @@ export const uploadsPlugin = definePlugin('uploads')
 			status: z.enum(['processing']),
 		}),
 		handler: async (ctx, input) => {
-			if (!ctx.pluginConfig.blobStore) return Err(ValidationErrors.invalid('Stored uploads are not supported: no blob store is configured'))
+			// The host's configuration, not the request, is at fault, so the caller must not treat it as a refusal.
+			if (!ctx.pluginConfig.blobStore) {
+				return Err(createDomainError('stored_uploads_unsupported', 'Stored uploads are not supported: no blob store is configured', 500))
+			}
 			const preparedResult = prepareStoredUpload({
 				pluginContext: ctx.pluginContext,
 				dataFileStore: ctx.pluginConfig.dataFileStore,

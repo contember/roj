@@ -99,6 +99,17 @@ describe('upload routes', () => {
 		expect(httpLeaseReasons()).toEqual([])
 	})
 
+	// A caller drops what it stored on a 400; a preset without the method is the host's gap, not a refused request.
+	it('reports a plugin or method the session lacks as method_not_found, never as a validation error', async () => {
+		const session = await harness.createSession('test')
+
+		const missingPlugin = await session.callPluginMethod('no-such-plugin.registerStored', { sessionId: String(session.sessionId) })
+		const missingMethod = await session.callPluginMethod('uploads.noSuchMethod', { sessionId: String(session.sessionId) })
+
+		expect(missingPlugin).toEqual({ ok: false, error: { type: 'method_not_found', message: 'Unknown plugin: no-such-plugin', httpStatus: 501 } })
+		expect(missingMethod).toEqual({ ok: false, error: { type: 'method_not_found', message: 'Unknown method: uploads.noSuchMethod', httpStatus: 501 } })
+	})
+
 	it('rejects a session id that could escape the data root before loading anything', async () => {
 		const res = await app.request(`/sessions/${encodeURIComponent('../..')}/upload`, {
 			method: 'POST',
@@ -490,14 +501,37 @@ describe('stored upload route', () => {
 		await expect(createStoredFixture({ processingTimeoutMs: 0 })).rejects.toThrow('Invalid uploads.processingTimeoutMs: 0')
 	})
 
-	it('answers 400 when the host configured no blob store', async () => {
+	// A caller drops what it stored on a 400, so a host that cannot take stored uploads must not answer one.
+	it('answers 500 when the host configured no blob store', async () => {
 		const { app: storedApp, sessionRuntime } = await createStoredFixture()
 		const sessionId = await createSession(sessionRuntime)
 
 		const res = await postStored(storedApp, sessionId, { filename: 'scan.pdf', mimeType: 'application/pdf', size: 3, blobRef: 'blob-1' })
 
-		expect(res.status).toBe(400)
-		expect(await res.json()).toMatchObject({ error: { type: 'validation_error', message: expect.stringContaining('no blob store') } })
+		expect(res.status).toBe(500)
+		expect(await res.json()).toEqual({ error: { type: 'stored_uploads_unsupported', message: 'Upload failed' } })
+	})
+
+	it('answers 500 when the upload cannot be recorded, without the store fault in the body', async () => {
+		const opened: string[] = []
+		const { app: storedApp, sessionRuntime, dataDir } = await createStoredFixture({
+			blobStore: {
+				async open(blobRef) {
+					opened.push(blobRef)
+					return Ok({ size: 3, stream: () => new Blob([]).stream(), bytes: async () => new Uint8Array(3), range: async () => new Uint8Array() })
+				},
+			},
+		})
+		const sessionId = await createSession(sessionRuntime)
+		// A file where the uploads directory belongs makes writing the upload's metadata fail.
+		await mkdir(join(dataDir, 'sessions', sessionId), { recursive: true })
+		await writeFile(join(dataDir, 'sessions', sessionId, 'uploads'), 'not a directory')
+
+		const res = await postStored(storedApp, sessionId, { filename: 'scan.pdf', mimeType: 'application/pdf', size: 3, blobRef: 'blob-1' })
+
+		expect(res.status).toBe(500)
+		expect(await res.json()).toEqual({ error: { type: 'upload_start_error', message: 'Upload failed' } })
+		expect(opened).toEqual([])
 	})
 
 	it('answers 400 for a body that does not describe a stored upload', async () => {

@@ -75,10 +75,12 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 interface StoreFaults {
 	failedReads: Set<string>
 	writeFaults: Map<string, { mode: 'throw' | 'err'; message: string }>
+	/** File names whose removal returns Err. */
+	failedRemoves: Set<string>
 	writes: Array<{ path: string; content: string }>
 }
 
-const createStoreFaults = (): StoreFaults => ({ failedReads: new Set(), writeFaults: new Map(), writes: [] })
+const createStoreFaults = (): StoreFaults => ({ failedReads: new Set(), writeFaults: new Map(), failedRemoves: new Set(), writes: [] })
 
 class SelectiveFailureStore implements FileStore {
 	constructor(
@@ -136,6 +138,7 @@ class SelectiveFailureStore implements FileStore {
 	}
 
 	remove(path: string): Promise<Result<void, string>> {
+		if (this.faults.failedRemoves.has(path.split('/').pop() ?? path)) return Promise.resolve(Err(`Injected remove failure: ${path}`))
 		return this.delegate.remove(path)
 	}
 
@@ -1529,6 +1532,160 @@ describe('uploads restart re-run', () => {
 			const state = finalSession.getPluginState<UploadsState>('uploads')
 			expect(state?.terminal[upload.uploadId]).toBe('failed')
 			expect(state?.processing[upload.uploadId]).toBeUndefined()
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+
+	/** Records the files each run finds in the upload dir, writes a derived file, and waits for the abort on the first run only. */
+	function derivesFilesPreprocessor(seen: Array<{ attempt: number; files: string[] }>, started: { current: ReturnType<typeof deferred> }): Preprocessor {
+		return {
+			name: 'derives-files',
+			supportedMimeTypes: ['text/plain'],
+			process: async (_source: UploadSource, _mimeType: string, ctx: PreprocessorContext) => {
+				const listed = await ctx.files.list('', { maxDepth: 10 })
+				if (!listed.ok) return Err(new Error(listed.error))
+				seen.push({ attempt: ctx.attempt, files: listed.value.filter((entry) => entry.type === 'file').map((entry) => entry.name).sort() })
+				const written = await ctx.files.write(`extracted/entry.txt-content/run-${ctx.attempt}.md`, `run ${ctx.attempt}`)
+				if (!written.ok) return Err(new Error(written.error))
+				if (ctx.attempt > 1) return Ok({ extractedContent: `run ${ctx.attempt}` })
+				started.current.resolve()
+				const signal = ctx.signal
+				if (!signal) throw new Error('Expected preprocessing signal')
+				await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+				return Err(new Error('Processing cancelled'))
+			},
+		}
+	}
+
+	function storedText(bytes: Buffer): UploadBlobStore {
+		return {
+			open: async () => Ok({
+				size: bytes.length,
+				stream: () => new Blob([bytes]).stream(),
+				bytes: async () => bytes,
+				range: async (offset, length) => bytes.subarray(offset, offset + length),
+			}),
+		}
+	}
+
+	it('starts a re-run from the original alone, without the files the interrupted run derived', async () => {
+		const seen: Array<{ attempt: number; files: string[] }> = []
+		const started = { current: deferred() }
+		const fixture = restartFixture({ preprocessorRegistry: registryWith(derivesFilesPreprocessor(seen, started)) })
+		try {
+			const source = fixture.open()
+			const session = await source.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.uploadAsync', {
+					sessionId: String(session.sessionId),
+					filename: 'derive.txt',
+					mimeType: 'text/plain',
+					size: 6,
+					fileBuffer: Buffer.from('derive'),
+				}),
+				asyncUploadSchema,
+			)
+			await started.current.promise
+			await fixture.crash(source)
+
+			const recovered = fixture.open()
+			await recovered.openSession(session.sessionId)
+			await waitForTerminal(recovered, upload.uploadId, 'ready')
+
+			expect(seen).toEqual([
+				{ attempt: 1, files: ['derive.txt', 'meta.json'] },
+				{ attempt: 2, files: ['derive.txt', 'meta.json'] },
+			])
+			const remaining = await fixture.dataFileStore.list(`sessions/${session.sessionId}/uploads/${upload.uploadId}`, { maxDepth: 10 })
+			if (!remaining.ok) throw new Error(remaining.error)
+			expect(remaining.value.filter((entry) => entry.type === 'file').map((entry) => entry.name).sort()).toEqual([
+				'derive.txt',
+				'extracted/entry.txt-content/run-2.md',
+				'meta.json',
+			])
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+
+	it('starts a re-run of a stored upload from an upload dir holding only meta.json', async () => {
+		const seen: Array<{ attempt: number; files: string[] }> = []
+		const started = { current: deferred() }
+		const fixture = restartFixture({
+			preprocessorRegistry: registryWith(derivesFilesPreprocessor(seen, started)),
+			blobStore: storedText(Buffer.from('stored')),
+		})
+		try {
+			const source = fixture.open()
+			const session = await source.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.registerStored', {
+					sessionId: String(session.sessionId),
+					filename: 'stored.txt',
+					mimeType: 'text/plain',
+					size: 6,
+					blobRef: 'blob-original',
+				}),
+				asyncUploadSchema,
+			)
+			await started.current.promise
+			await fixture.crash(source)
+
+			const recovered = fixture.open()
+			await recovered.openSession(session.sessionId)
+			await waitForTerminal(recovered, upload.uploadId, 'ready')
+
+			expect(seen).toEqual([
+				{ attempt: 1, files: ['meta.json'] },
+				{ attempt: 2, files: ['meta.json'] },
+			])
+			const remaining = await fixture.dataFileStore.list(`sessions/${session.sessionId}/uploads/${upload.uploadId}`, { maxDepth: 10 })
+			if (!remaining.ok) throw new Error(remaining.error)
+			expect(remaining.value.filter((entry) => entry.type === 'file').map((entry) => entry.name).sort()).toEqual([
+				'extracted/entry.txt-content/run-2.md',
+				'meta.json',
+			])
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+
+	it('records the re-run before clearing, so a cleanup that fails still counts against the limit', async () => {
+		const seen: Array<{ attempt: number; files: string[] }> = []
+		const started = { current: deferred() }
+		const fixture = restartFixture({ preprocessorRegistry: registryWith(derivesFilesPreprocessor(seen, started)) })
+		try {
+			const source = fixture.open()
+			const session = await source.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.uploadAsync', {
+					sessionId: String(session.sessionId),
+					filename: 'stuck.txt',
+					mimeType: 'text/plain',
+					size: 5,
+					fileBuffer: Buffer.from('stuck'),
+				}),
+				asyncUploadSchema,
+			)
+			await started.current.promise
+			await fixture.crash(source)
+			fixture.dataFileStore.faults.failedRemoves.add('run-1.md')
+
+			const recovered = fixture.open()
+			const recoveredSession = await recovered.openSession(session.sessionId)
+
+			expect(seen.map((run) => run.attempt)).toEqual([1])
+			const events = await recoveredSession.getEventsByType(uploadEvents, 'attachment_uploaded')
+			expect(events.filter((event) => String(event.uploadId) === upload.uploadId).map((event) => [event.status, event.attempt])).toEqual([
+				['processing', 1],
+				['processing', 2],
+				['failed', undefined],
+			])
+			expect(await fixture.metadata(session.sessionId, upload.uploadId)).toMatchObject({
+				status: 'failed',
+				error: 'Processing interrupted by restart',
+			})
 		} finally {
 			await fixture.cleanup()
 		}

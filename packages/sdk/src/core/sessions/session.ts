@@ -12,7 +12,7 @@ import { COMMUNICATOR_ROLE, ORCHESTRATOR_ROLE } from '~/core/agents/agent-roles.
 import { AgentId, generateAgentId } from '~/core/agents/schema.js'
 import type { AgentState } from '~/core/agents/state.js'
 import { agentEvents, getChildren } from '~/core/agents/state.js'
-import { AgentErrors, type DomainError, MethodErrors, SessionErrors, ValidationErrors } from '~/core/errors.js'
+import { AgentErrors, createDomainError, type DomainError, MethodErrors, SessionErrors, ValidationErrors } from '~/core/errors.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import type { LLMLogger } from '~/core/llm/logger.js'
@@ -539,14 +539,15 @@ export class Session {
 		const pluginName = method.slice(0, dotIndex)
 		const methodName = method.slice(dotIndex + 1)
 
+		// The session's preset lacks the method, which says nothing about the input: a caller must not read it as a refused request.
 		const plugin = this.plugins.find((p) => p.name === pluginName)
 		if (!plugin) {
-			return Err(ValidationErrors.invalid(`Unknown plugin: ${pluginName}`))
+			return Err(createDomainError('method_not_found', `Unknown plugin: ${pluginName}`, 501))
 		}
 
 		const methodDef = plugin.methods[methodName]
 		if (!methodDef) {
-			return Err(ValidationErrors.invalid(`Unknown method: ${method}`))
+			return Err(createDomainError('method_not_found', `Unknown method: ${method}`, 501))
 		}
 
 		const callerContext = caller ?? DEFAULT_CALLER

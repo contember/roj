@@ -46,6 +46,8 @@ export interface PendingUpload {
 	derivedPaths?: string[]
 	artifacts?: UploadArtifact[]
 	capabilities?: UploadCapabilities
+	/** Set for a `blob` source: the original is in the host's blob store, not in the upload dir. */
+	originalHeldByHost?: true
 }
 
 /** An upload whose processing started and has not reached a terminal event. */
