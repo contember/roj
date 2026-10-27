@@ -1,6 +1,6 @@
 import type { ReasoningDetails, ToolCall } from '~/core/agents/state.js'
 import type { ImageProcessor } from '~/core/image/types.js'
-import type { ChatMessageContentItem } from '~/core/llm/llm-log-types.js'
+import type { ResolvedContentItem } from '~/core/llm/llm-log-types.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import type { Result } from '~/lib/utils/result.js'
@@ -20,7 +20,7 @@ import type {
 } from './provider.js'
 import { mapProviderError } from './provider.js'
 import { DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS, ProviderRequestAbortError, runProviderRequest } from './provider-request.js'
-import { omitDocumentData } from './document-content.js'
+import { limitDocumentBytes, omitDocumentData, resolveDocuments } from './document-content.js'
 import { sanitizeProviderMessages } from './message-sanitization.js'
 
 // ============================================================================
@@ -290,7 +290,7 @@ export class OpenRouterProvider implements LLMProvider {
 	}
 
 	async buildHttpRequest(request: RawInferenceRequest, context?: InferenceContext): Promise<ProviderHttpRequest> {
-		const sanitizedMessages = sanitizeProviderMessages(request.messages, this.name, this.logger)
+		const sanitizedMessages = limitDocumentBytes(sanitizeProviderMessages(request.messages, this.name, this.logger))
 		const mappedMessages = await Promise.all(sanitizedMessages.map((m) => this.mapMessage(m, context)))
 
 		const systemTtl = longestCacheTtl(sanitizedMessages)
@@ -366,7 +366,7 @@ export class OpenRouterProvider implements LLMProvider {
 			case 'tool': {
 				const resolvedContent = await this.imageProcessor.resolveContent(msg.content, context?.fileStore)
 				if (msg.isError) {
-					// Error text is a plain string, so a document cannot travel as one and only its placeholder is kept.
+					// Error text is a plain string, so a document cannot travel as one and only its placeholder or reference is kept.
 					const withoutDocuments = await omitDocumentData(resolvedContent)
 					const errorText = typeof withoutDocuments === 'string' ? withoutDocuments : JSON.stringify(withoutDocuments)
 					return {
@@ -377,7 +377,7 @@ export class OpenRouterProvider implements LLMProvider {
 				}
 				return {
 					role: 'tool',
-					content: this.mapContentToOpenRouter(resolvedContent),
+					content: this.mapContentToOpenRouter(await resolveDocuments(resolvedContent, context?.fileStore)),
 					tool_call_id: msg.toolCallId,
 				}
 			}
@@ -402,7 +402,7 @@ export class OpenRouterProvider implements LLMProvider {
 			case 'user':
 				if (Array.isArray(msg.content)) {
 					const resolved = await this.imageProcessor.resolveContent(msg.content, context?.fileStore)
-					return { role: 'user', content: this.mapContentToOpenRouter(resolved) }
+					return { role: 'user', content: this.mapContentToOpenRouter(await resolveDocuments(resolved, context?.fileStore)) }
 				}
 				return { role: 'user', content: msg.content }
 		}
@@ -411,7 +411,7 @@ export class OpenRouterProvider implements LLMProvider {
 	/**
 	 * Map internal ChatMessageContentItem[] (camelCase imageUrl) to OpenRouter format (snake_case image_url).
 	 */
-	private mapContentToOpenRouter(content: string | ChatMessageContentItem[]): string | OpenRouterContentItem[] {
+	private mapContentToOpenRouter(content: string | ResolvedContentItem[]): string | OpenRouterContentItem[] {
 		if (typeof content === 'string') return content
 		return content.map((item): OpenRouterContentItem => {
 			switch (item.type) {

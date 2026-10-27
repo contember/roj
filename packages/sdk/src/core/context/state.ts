@@ -36,11 +36,19 @@ const contentItemSchema = z4.discriminatedUnion('type', [
 	}),
 	z4.object({
 		type: z4.literal('document'),
-		document: z4.object({
-			mediaType: z4.literal('application/pdf'),
-			data: z4.string(),
-			filename: z4.string().optional(),
-		}),
+		document: z4.union([
+			z4.object({
+				mediaType: z4.literal('application/pdf'),
+				data: z4.string(),
+				filename: z4.string().optional(),
+			}),
+			z4.object({
+				mediaType: z4.literal('application/pdf'),
+				path: z4.string(),
+				byteLength: z4.number().int().min(0),
+				filename: z4.string().optional(),
+			}),
+		]),
 	}),
 ])
 

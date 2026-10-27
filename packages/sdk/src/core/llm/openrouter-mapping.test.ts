@@ -1,9 +1,14 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { LLMMessage } from '~/core/agents/state.js'
+import { SessionFileStore } from '~/core/file-store/file-store.js'
+import { createNodeFileSystem } from '~/testing/node-platform.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { applyCacheBreakpoint } from './cache-breakpoints.js'
 import { OpenRouterProvider } from './openrouter.js'
-import type { RawInferenceRequest } from './provider.js'
+import type { InferenceContext, RawInferenceRequest } from './provider.js'
 import { ModelId } from './schema.js'
 
 // ============================================================================
@@ -295,8 +300,9 @@ describe('OpenRouterProvider document mapping', () => {
 			},
 		]))
 
-		const sha256 = new Bun.CryptoHasher('sha256').update(data).digest('hex')
-		const placeholder = `[document application/pdf, ${data.length} base64 chars, base64 sha256 ${sha256}; content omitted]`
+		const bytes = Buffer.from(data, 'base64')
+		const sha256 = new Bun.CryptoHasher('sha256').update(bytes).digest('hex')
+		const placeholder = `[document application/pdf, ${bytes.length} bytes, sha256 ${sha256}; content omitted]`
 		expect(http.body).toMatchObject({
 			messages: [
 				{ role: 'system' },
@@ -309,6 +315,38 @@ describe('OpenRouterProvider document mapping', () => {
 			],
 		})
 		expect(JSON.stringify(http.body)).not.toContain(data)
+	})
+
+	test('reads a stored document from the file store into a file part', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'roj-openrouter-document-'))
+		const path = '.documents/scan.pdf'
+		mkdirSync(join(dir, '.documents'))
+		writeFileSync(join(dir, path), Buffer.from('JVBERi0xLjQK', 'base64'))
+		const context: InferenceContext = {
+			sessionId: 'session-1',
+			agentId: 'agent-1',
+			fileStore: new SessionFileStore(dir, undefined, false, createNodeFileSystem()),
+		}
+
+		const http = await createProvider().buildHttpRequest(buildRequest([
+			{ role: 'user', content: 'Read the file.' },
+			{ role: 'assistant', content: '', toolCalls: [{ id: ToolCallId('call_1'), name: 'read', input: {} }] },
+			{
+				role: 'tool',
+				toolCallId: ToolCallId('call_1'),
+				content: [{ type: 'document', document: { mediaType: 'application/pdf', path, byteLength: 9, filename: 'scan.pdf' } }],
+			},
+		]), context)
+		rmSync(dir, { recursive: true, force: true })
+
+		expect(http.body).toMatchObject({
+			messages: [
+				{ role: 'system' },
+				{ role: 'user' },
+				{ role: 'assistant' },
+				{ role: 'tool', content: [{ type: 'file', file: { filename: 'scan.pdf', file_data: 'data:application/pdf;base64,JVBERi0xLjQK' } }] },
+			],
+		})
 	})
 
 	test('an image part keeps its image_url shape', async () => {

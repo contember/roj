@@ -16,7 +16,7 @@ import { agentEvents } from '~/core/agents/state.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import { applyCacheBreakpoint, type CacheTtlConfig } from '~/core/llm/cache-breakpoints.js'
-import { omitMessageDocumentData } from '~/core/llm/document-content.js'
+import { storeDocuments, storeMessageDocuments } from '~/core/llm/document-content.js'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { InferenceRequest, InferenceResponse, LLMError, LLMMessage, LLMProvider } from '~/core/llm/provider.js'
 import { LLMCallId, ModelId } from '~/core/llm/schema.js'
@@ -683,20 +683,23 @@ export class Agent {
 		}
 
 		// 2. Build pending messages (tool results only)
-		const pendingMessages = this.buildPendingMessages(agentState)
+		const collectedMessages = this.buildPendingMessages(agentState)
 
 		// 2b. Append plugin dequeued messages (includes mailbox messages)
 		for (const dequeued of pluginDequeued) {
-			pendingMessages.push(...dequeued.messages)
+			collectedMessages.push(...dequeued.messages)
 		}
 
-		// 3. Inference start - emit with pending messages. The event keeps a placeholder for each
-		// document, so history sees it once; this inference still sends the local pendingMessages whole.
+		// 2c. Move inline documents to the session store: history keeps a reference the provider reads
+		// on every inference, and the event log never holds their bytes.
+		const pendingMessages = await Promise.all(collectedMessages.map((message) => storeMessageDocuments(message, this.fileStore)))
+
+		// 3. Inference start - emit with pending messages
 		await this.store.emit(withSessionId(
 			this.store.sessionId,
 			llmEvents.create('inference_started', {
 				agentId: this.id,
-				messages: await Promise.all(pendingMessages.map(omitMessageDocumentData)),
+				messages: pendingMessages,
 				consumedMessageIds: [],
 			}),
 		))
@@ -1109,9 +1112,9 @@ export class Agent {
 
 		const result = await this.toolExecutor.execute(tool, effectiveToolCall.input, context)
 
-		// Build initial tool result with ToolResultContent
+		// Build initial tool result with ToolResultContent; its documents go to the session store before any event records it
 		let toolResult: { isError: boolean; content: ToolResultContent } = result.ok
-			? { isError: false, content: result.value }
+			? { isError: false, content: await storeDocuments(result.value, this.fileStore) }
 			: { isError: true, content: result.error.message }
 
 		// afterToolCall handler - can modify result or pause.
@@ -1523,9 +1526,14 @@ export class Agent {
 					continue
 				}
 				switch (result.action) {
-					case 'modify':
-						await this.emitHandlerCompleted('afterToolCall', result)
-						return result
+					case 'modify': {
+						const modified: AfterToolCallResult = {
+							action: 'modify',
+							result: { ...result.result, content: await storeDocuments(result.result.content, this.fileStore) },
+						}
+						await this.emitHandlerCompleted('afterToolCall', modified)
+						return modified
+					}
 					case 'pause':
 						await this.emitHandlerCompleted('afterToolCall', result)
 						await this.emitHandlerPause(result.reason)

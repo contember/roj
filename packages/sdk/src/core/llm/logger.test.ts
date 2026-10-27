@@ -195,10 +195,11 @@ for (const sink of SINKS) {
 				await expectSinkUsed(sessionId, ['create', 'get'])
 			})
 
-			it('stores a document as a placeholder with its base64 length and SHA-256, never its base64', async () => {
+			it('stores a document as a placeholder with its size and the SHA-256 of its bytes, never its base64', async () => {
 				const sessionId = SessionId('test-session-doc')
-				const data = Buffer.from('%PDF-1.4\nnot really a pdf\n').toString('base64')
-				const sha256 = new Bun.CryptoHasher('sha256').update(data).digest('hex')
+				const bytes = Buffer.from('%PDF-1.4\nnot really a pdf\n')
+				const data = bytes.toString('base64')
+				const sha256 = new Bun.CryptoHasher('sha256').update(bytes).digest('hex')
 				const document = { mediaType: 'application/pdf' as const, data, filename: 'scan.pdf' }
 
 				const callId = await logger.createCall(sessionId, AgentId('test-agent-1'), {
@@ -213,11 +214,11 @@ for (const sink of SINKS) {
 				const call = await logger.getCall(sessionId, callId)
 				expect(call?.request.messages.map((m) => m.content)).toEqual([
 					[
-						{ type: 'text', text: `[document application/pdf "scan.pdf", ${data.length} base64 chars, base64 sha256 ${sha256}; content omitted]` },
+						{ type: 'text', text: `[document application/pdf "scan.pdf", ${bytes.length} bytes, sha256 ${sha256}; content omitted]` },
 						{ type: 'text', text: 'Transcribe it.' },
 					],
 					'',
-					[{ type: 'text', text: `[document application/pdf, ${data.length} base64 chars, base64 sha256 ${sha256}; content omitted]` }],
+					[{ type: 'text', text: `[document application/pdf, ${bytes.length} bytes, sha256 ${sha256}; content omitted]` }],
 				])
 				expect(JSON.stringify(call)).not.toContain(data)
 			})
@@ -225,7 +226,9 @@ for (const sink of SINKS) {
 			it('stores a placeholder for malformed base64 instead of throwing', async () => {
 				const sessionId = SessionId('test-session-bad-doc')
 				const data = '%%% not base64 %%%'
-				const sha256 = new Bun.CryptoHasher('sha256').update(data).digest('hex')
+				// Decoding skips the invalid characters, so the placeholder describes what is left.
+				const bytes = Buffer.from(data, 'base64')
+				const sha256 = new Bun.CryptoHasher('sha256').update(bytes).digest('hex')
 
 				const callId = await logger.createCall(sessionId, AgentId('test-agent-1'), {
 					...createTestRequest(),
@@ -234,7 +237,7 @@ for (const sink of SINKS) {
 
 				const call = await logger.getCall(sessionId, callId)
 				expect(call?.request.messages[0]?.content).toEqual([
-					{ type: 'text', text: `[document application/pdf, ${data.length} base64 chars, base64 sha256 ${sha256}; content omitted]` },
+					{ type: 'text', text: `[document application/pdf, ${bytes.length} bytes, sha256 ${sha256}; content omitted]` },
 				])
 			})
 

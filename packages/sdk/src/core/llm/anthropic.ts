@@ -1,6 +1,6 @@
 import type { ToolCall } from '~/core/agents/state.js'
 import type { ImageProcessor } from '~/core/image/types.js'
-import type { ChatMessageContentItem } from '~/core/llm/llm-log-types.js'
+import type { ResolvedContentItem, ToolResultContent } from '~/core/llm/llm-log-types.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import type { Result } from '~/lib/utils/result.js'
@@ -17,6 +17,7 @@ import type {
 	RawInferenceRequest,
 	RawToolSpec,
 } from './provider.js'
+import { limitDocumentBytes, resolveDocuments } from './document-content.js'
 import { mapProviderError } from './provider.js'
 import { DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS, ProviderRequestAbortError, runProviderRequest } from './provider-request.js'
 import { sanitizeProviderMessages } from './message-sanitization.js'
@@ -378,7 +379,7 @@ export class AnthropicProvider implements RoutableLLMProvider {
 	}
 
 	async buildHttpRequest(request: RawInferenceRequest, context?: InferenceContext): Promise<ProviderHttpRequest> {
-		const sanitizedMessages = sanitizeProviderMessages(request.messages, this.name, this.logger)
+		const sanitizedMessages = limitDocumentBytes(sanitizeProviderMessages(request.messages, this.name, this.logger))
 		const mappedMessages = await Promise.all(sanitizedMessages.map((m) => this.mapMessage(m, context)))
 		const mergedMessages = this.mergeConsecutiveMessages(mappedMessages)
 
@@ -445,7 +446,7 @@ export class AnthropicProvider implements RoutableLLMProvider {
 	private async mapMessageContent(msg: LLMMessage, context?: InferenceContext): Promise<AnthropicMessageParam> {
 		switch (msg.role) {
 			case 'tool': {
-				const resolvedContent = await this.imageProcessor.resolveContent(msg.content, context?.fileStore)
+				const resolvedContent = await this.resolveContent(msg.content, context)
 				const toolResult = this.mapToolResultContent(resolvedContent, msg.isError)
 				toolResult.tool_use_id = msg.toolCallId
 				return {
@@ -490,7 +491,7 @@ export class AnthropicProvider implements RoutableLLMProvider {
 				}
 			case 'user': {
 				if (Array.isArray(msg.content)) {
-					const resolved = await this.imageProcessor.resolveContent(msg.content, context?.fileStore)
+					const resolved = await this.resolveContent(msg.content, context)
 					const blocks = this.mapUserContentItems(Array.isArray(resolved) ? resolved : [{ type: 'text', text: String(resolved) }])
 					return { role: 'user', content: blocks }
 				}
@@ -499,7 +500,12 @@ export class AnthropicProvider implements RoutableLLMProvider {
 		}
 	}
 
-	private mapToolResultContent(content: string | ChatMessageContentItem[], isError?: boolean): AnthropicToolResultBlockParam {
+	/** Images by `file://` URL and stored documents, read into the bytes the API takes. */
+	private async resolveContent(content: ToolResultContent, context?: InferenceContext): Promise<string | ResolvedContentItem[]> {
+		return resolveDocuments(await this.imageProcessor.resolveContent(content, context?.fileStore), context?.fileStore)
+	}
+
+	private mapToolResultContent(content: string | ResolvedContentItem[], isError?: boolean): AnthropicToolResultBlockParam {
 		if (typeof content === 'string') {
 			const text = isError ? `[ERROR] ${content}` : content
 			return {
@@ -518,7 +524,7 @@ export class AnthropicProvider implements RoutableLLMProvider {
 		}
 	}
 
-	private mapUserContentItems(items: ChatMessageContentItem[]): AnthropicUserContentBlockParam[] {
+	private mapUserContentItems(items: ResolvedContentItem[]): AnthropicUserContentBlockParam[] {
 		return items.map((item): AnthropicUserContentBlockParam => {
 			switch (item.type) {
 				case 'text':

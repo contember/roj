@@ -5,13 +5,13 @@ const base64OfSize = (bytes: number): string => Buffer.alloc(bytes, 7).toString(
 
 describe('estimateDocumentTokens', () => {
 	test('counts 3,000 tokens per started 10 KB page', () => {
-		expect(estimateDocumentTokens(base64OfSize(10 * 1024))).toBe(3_000)
-		expect(estimateDocumentTokens(base64OfSize(10 * 1024 + 1))).toBe(6_000)
-		expect(estimateDocumentTokens(base64OfSize(100 * 1024))).toBe(30_000)
+		expect(estimateDocumentTokens(10 * 1024)).toBe(3_000)
+		expect(estimateDocumentTokens(10 * 1024 + 1)).toBe(6_000)
+		expect(estimateDocumentTokens(100 * 1024)).toBe(30_000)
 	})
 
 	test('a tiny document still costs a page', () => {
-		expect(estimateDocumentTokens(base64OfSize(1))).toBe(3_000)
+		expect(estimateDocumentTokens(1)).toBe(3_000)
 	})
 })
 
@@ -27,6 +27,14 @@ describe('estimateMessagesTokens', () => {
 			role: 'user',
 			content: [{ type: 'document' }, { type: 'text', text: 'Transcribe it.' }],
 		}])
+		expect(tokens).toBe(withoutDocument + 300_000)
+	})
+
+	test('counts a stored document by its recorded size', () => {
+		const document = { mediaType: 'application/pdf', path: '/home/user/session/.documents/abc.pdf', byteLength: 1_000 * 1024 }
+		const tokens = estimateMessagesTokens([{ role: 'user', content: [{ type: 'document', document }, { type: 'text', text: 'Transcribe it.' }] }])
+
+		const withoutDocument = estimateMessagesTokens([{ role: 'user', content: [{ type: 'document' }, { type: 'text', text: 'Transcribe it.' }] }])
 		expect(tokens).toBe(withoutDocument + 300_000)
 	})
 

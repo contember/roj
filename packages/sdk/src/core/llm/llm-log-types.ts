@@ -21,15 +21,37 @@ export type ChatMessageContentItemImage = {
 	}
 }
 
+/**
+ * A PDF carried in the message itself. An agent stores it in the session file store before its
+ * history or events keep the message, so it never lands in the event log.
+ */
+export type InlineDocument = {
+	mediaType: 'application/pdf'
+	/** Base64 of the file bytes, without a `data:` prefix. */
+	data: string
+	filename?: string
+}
+
+/** A PDF in the session file store, read again for every inference that sends it. */
+export type StoredDocument = {
+	mediaType: 'application/pdf'
+	/** Session-store path, `.documents/<sha256 of the bytes>.pdf`, read through the inference's file store. */
+	path: string
+	/** Decoded file size; the token estimate counts it in place of bytes it does not read. */
+	byteLength: number
+	filename?: string
+}
+
 /** A whole document handed to the model; providers that read PDFs natively see its pages, not extracted text. */
 export type ChatMessageContentItemDocument = {
 	type: 'document'
-	document: {
-		mediaType: 'application/pdf'
-		/** Base64 of the file bytes, without a `data:` prefix. */
-		data: string
-		filename?: string
-	}
+	document: InlineDocument | StoredDocument
+}
+
+/** A document with its bytes in hand, as a provider sends it. */
+export type ChatMessageContentItemInlineDocument = {
+	type: 'document'
+	document: InlineDocument
 }
 
 /**
@@ -40,6 +62,12 @@ export type ChatMessageContentItem =
 	| ChatMessageContentItemText
 	| ChatMessageContentItemImage
 	| ChatMessageContentItemDocument
+
+/** Content items once stored documents are read back — what a provider maps to its wire format. */
+export type ResolvedContentItem =
+	| ChatMessageContentItemText
+	| ChatMessageContentItemImage
+	| ChatMessageContentItemInlineDocument
 
 /**
  * Tool result content - string or array of content items.

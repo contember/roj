@@ -59,17 +59,18 @@ export function truncateByTokens(text: string, maxTokens: number): TruncationRes
 }
 
 /**
- * Estimate tokens of a base64 document: ~3,000 tokens per assumed 10 KB page, at least one page.
+ * Estimate tokens of a document of `byteLength` bytes: ~3,000 tokens per assumed 10 KB page, at least one page.
  */
-export function estimateDocumentTokens(data: string): number {
-	return Math.max(1, Math.ceil(base64ByteLength(data) / DOCUMENT_BYTES_PER_PAGE)) * DOCUMENT_TOKENS_PER_PAGE
+export function estimateDocumentTokens(byteLength: number): number {
+	return Math.max(1, Math.ceil(byteLength / DOCUMENT_BYTES_PER_PAGE)) * DOCUMENT_TOKENS_PER_PAGE
 }
 
-/** The base64 payload of a document content item, wherever it sits in a message. */
-function documentDataOf(value: unknown): string | undefined {
+/** File size of a document content item, inline or stored, wherever it sits in a message. */
+function documentByteLengthOf(value: unknown): number | undefined {
 	if (typeof value !== 'object' || value === null || !('type' in value) || value.type !== 'document') return undefined
 	if (!('document' in value) || typeof value.document !== 'object' || value.document === null) return undefined
-	return 'data' in value.document && typeof value.document.data === 'string' ? value.document.data : undefined
+	if ('data' in value.document && typeof value.document.data === 'string') return base64ByteLength(value.document.data)
+	return 'byteLength' in value.document && typeof value.document.byteLength === 'number' ? value.document.byteLength : undefined
 }
 
 /**
@@ -83,9 +84,9 @@ export function estimateMessagesTokens(messages: TokenEstimationMessage[]): numb
 		const content = typeof msg.content === 'string'
 			? msg.content
 			: JSON.stringify(msg.content, (_key, value: unknown) => {
-				const data = documentDataOf(value)
-				if (data === undefined) return value
-				documentTokens += estimateDocumentTokens(data)
+				const byteLength = documentByteLengthOf(value)
+				if (byteLength === undefined) return value
+				documentTokens += estimateDocumentTokens(byteLength)
 				return { type: 'document' }
 			})
 		return sum + estimateTokens(content) + documentTokens + 4 // 4 tokens overhead per message

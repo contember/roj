@@ -7,7 +7,7 @@ import type { AgentId } from '~/core/agents/schema.js'
 import { agentIdSchema } from '~/core/agents/schema.js'
 import { createEventsFactory } from '~/core/events/types'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
-import type { ChatMessageContentItem } from '~/core/llm/llm-log-types.js'
+import type { ChatMessageContentItem, ChatMessageContentItemDocument } from '~/core/llm/llm-log-types.js'
 import type { LLMMetrics } from '~/core/llm/state.js'
 import type { PendingToolResult, ToolCallId } from '~/core/tools/schema.js'
 import { MessageId } from '../../plugins/mailbox/schema.js'
@@ -55,7 +55,7 @@ export const agentEvents = createEventsFactory({
 		}),
 		preamble_added: z4.object({
 			agentId: agentIdSchema,
-			messages: z4.array(z4.custom<LLMMessage>()),
+			messages: z4.array(z4.custom<PreambleLLMMessage>()),
 		}),
 		agent_paused: z4.object({
 			agentId: agentIdSchema,
@@ -207,6 +207,18 @@ export type LLMMessage =
 	| UserLLMMessage
 	| AssistantLLMMessage
 	| ToolLLMMessage
+	| SystemLLMMessage
+
+type PreambleContentItem = Exclude<ChatMessageContentItem, ChatMessageContentItemDocument>
+
+/**
+ * A message a plugin adds to the preamble. It carries no document: preamble_added is emitted directly,
+ * never through the agent's document storing, so an inline document would land whole in the event log.
+ */
+export type PreambleLLMMessage =
+	| (Omit<UserLLMMessage, 'content'> & { content: string | PreambleContentItem[] })
+	| (Omit<ToolLLMMessage, 'content'> & { content: string | PreambleContentItem[] })
+	| AssistantLLMMessage
 	| SystemLLMMessage
 
 // ============================================================================

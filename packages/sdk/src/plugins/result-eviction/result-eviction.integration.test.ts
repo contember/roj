@@ -191,7 +191,11 @@ describe('result-eviction plugin', () => {
 
 		expect(toolContents).toEqual([[
 			{ type: 'text', text: expect.stringContaining('[Full output saved to: .results/tc1.txt]') },
-			{ type: 'document', document: { mediaType: 'application/pdf', data: 'JVBERi0xLjQK', filename: 'scan.pdf' } },
+			// The agent moves the document to the session store before eviction sees the result.
+			{
+				type: 'document',
+				document: { mediaType: 'application/pdf', path: expect.stringMatching(/^\.documents\/[0-9a-f]{64}\.pdf$/), byteLength: 9, filename: 'scan.pdf' },
+			},
 		]])
 
 		await harness.shutdown()

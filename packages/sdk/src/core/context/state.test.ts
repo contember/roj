@@ -13,6 +13,16 @@ describe('compactedConversationMessageSchema', () => {
 		expect(parsedTool).toEqual(tool)
 	})
 
+	test('accepts a stored document', () => {
+		const message = {
+			role: 'user',
+			content: [{ type: 'document', document: { mediaType: 'application/pdf', path: '/home/user/session/.documents/abc.pdf', byteLength: 9 } }],
+		}
+
+		const parsed: unknown = compactedConversationMessageSchema.parse(message)
+		expect(parsed).toEqual(message)
+	})
+
 	test('rejects a document of another media type', () => {
 		const result = compactedConversationMessageSchema.safeParse({
 			role: 'user',

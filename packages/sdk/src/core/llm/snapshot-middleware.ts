@@ -19,9 +19,11 @@
 
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { Err, Ok } from '~/lib/utils/result.js'
+import type { LLMMessage } from '~/core/agents/state.js'
 import { omitMessageDocumentData } from './document-content.js'
+import type { ChatMessageContentItem } from './llm-log-types.js'
 import type { LLMMiddleware } from './middleware.js'
 import type { InferenceRequest, InferenceResponse } from './provider.js'
 
@@ -128,8 +130,10 @@ function stableStringify(value: unknown): string {
  *   - conversation-metadata fields on messages (`timestamp`, `isError`,
  *     `toolName`, `sourceMessageIds`) — not forwarded to the LLM, so they
  *     shouldn't bust the snapshot key either.
- *   - document payloads, reduced to size and SHA-256 — the key still tells
- *     documents apart, and the stored snapshot stays small.
+ *   - inline document payloads, reduced to size and the SHA-256 of their bytes,
+ *     and stored documents, reduced to media type, size and file name (their
+ *     content hash) — the key still tells documents apart without depending on
+ *     where a session keeps them, and the stored snapshot stays small.
  */
 function stripMessageMetadata(message: unknown): unknown {
 	if (!message || typeof message !== 'object') return message
@@ -137,8 +141,20 @@ function stripMessageMetadata(message: unknown): unknown {
 	return rest
 }
 
+function digestContentItem(item: ChatMessageContentItem): unknown {
+	if (item.type !== 'document' || !('path' in item.document)) return item
+	const { mediaType, byteLength, path, filename } = item.document
+	return { type: 'document', document: { mediaType, byteLength, file: basename(path), filename } }
+}
+
+function digestStoredDocuments(message: LLMMessage): unknown {
+	if ((message.role !== 'user' && message.role !== 'tool') || typeof message.content === 'string') return message
+	return { ...message, content: message.content.map(digestContentItem) }
+}
+
 async function buildDigest(request: InferenceRequest): Promise<Record<string, unknown>> {
-	const messages = await Promise.all(request.messages.map(omitMessageDocumentData))
+	const omitted = await Promise.all(request.messages.map(omitMessageDocumentData))
+	const messages = omitted.map(digestStoredDocuments)
 	return {
 		model: String(request.model),
 		systemPrompt: request.systemPrompt,

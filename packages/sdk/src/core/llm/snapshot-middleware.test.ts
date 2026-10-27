@@ -154,7 +154,7 @@ describe('SnapshotLLMMiddleware', () => {
 		}
 	})
 
-	test('stores a document by base64 length and SHA-256 and still tells documents apart', async () => {
+	test('stores a document by its size and the SHA-256 of its bytes and still tells documents apart', async () => {
 		const downstream = new MockLLMProvider(() => fixedResponse)
 		const wrapped = applyMiddleware(downstream, [createSnapshotLLMMiddleware({ snapshotsDir: dir })])
 		const withDocument = (text: string): InferenceRequest => request({
@@ -172,9 +172,27 @@ describe('SnapshotLLMMiddleware', () => {
 		const stored = readdirSync(dir).map((file) => readFileSync(join(dir, file), 'utf-8'))
 		expect(stored).toHaveLength(2)
 		for (const snapshot of stored) {
-			expect(snapshot).toMatch(/\[document application\/pdf, 20 base64 chars, base64 sha256 [0-9a-f]{64}; content omitted\]/)
+			expect(snapshot).toMatch(/\[document application\/pdf, 1[45] bytes, sha256 [0-9a-f]{64}; content omitted\]/)
 			expect(snapshot).not.toContain(Buffer.from('%PDF-1.4 first').toString('base64'))
 		}
+	})
+
+	test('keys a stored document by media type, size and file name, not where the session keeps it', async () => {
+		const downstream = new MockLLMProvider(() => fixedResponse)
+		const wrapped = applyMiddleware(downstream, [createSnapshotLLMMiddleware({ snapshotsDir: dir })])
+		const withStored = (path: string, byteLength: number): InferenceRequest => request({
+			messages: [{ role: 'user', content: [{ type: 'document', document: { mediaType: 'application/pdf', path, byteLength } }] }],
+		})
+
+		await wrapped.inference(withStored('.documents/abc.pdf', 14))
+		await wrapped.inference(withStored('/home/user/session/.documents/abc.pdf', 14))
+		await wrapped.inference(withStored('.documents/abc.pdf', 15))
+		await wrapped.inference(withStored('.documents/def.pdf', 14))
+
+		expect(downstream.getCallCount()).toBe(3)
+		const stored = readdirSync(dir).map((file) => readFileSync(join(dir, file), 'utf-8'))
+		expect(stored.some((snapshot) => /"file": "abc\.pdf"/.test(snapshot))).toBe(true)
+		expect(stored.some((snapshot) => snapshot.includes('/home/user/session'))).toBe(false)
 	})
 
 	test('a request without documents keeps the key it had before documents existed', async () => {
