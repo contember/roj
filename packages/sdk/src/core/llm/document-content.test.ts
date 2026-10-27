@@ -7,7 +7,7 @@ import { SessionFileStore } from '~/core/file-store/file-store.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
 import { documentPlaceholder, limitDocumentBytes, resolveDocuments, storeDocuments } from './document-content.js'
-import type { ChatMessageContentItem } from './llm-log-types.js'
+import type { ChatMessageContentItem, ResolvedContentItem } from './llm-log-types.js'
 
 const BYTES = Buffer.from('%PDF-1.4\nscanned pages\n')
 const DATA = BYTES.toString('base64')
@@ -72,14 +72,14 @@ describe('storeDocuments', () => {
 	})
 
 	test('keeps a reference to a document the agent stored, and refuses any other reference', async () => {
-		const [reference] = await storeDocuments([inline(DATA)], files)
+		const stored = await storeDocuments([inline(DATA)], files)
 		writeFileSync(join(dir, 'elsewhere.pdf'), BYTES)
 		const foreign: ChatMessageContentItem[] = [
 			{ type: 'document', document: { mediaType: 'application/pdf', path: 'elsewhere.pdf', byteLength: BYTES.length } },
 			{ type: 'document', document: { mediaType: 'application/pdf', path: STORED_PATH, byteLength: BYTES.length + 1 } },
 		]
 
-		expect(await storeDocuments(reference === undefined ? [] : [reference], files)).toEqual([reference])
+		expect(await storeDocuments(stored, files)).toEqual(stored)
 		expect(await storeDocuments(foreign, files)).toEqual([
 			{ type: 'text', text: `[Document unavailable: elsewhere.pdf - no stored document of ${BYTES.length} bytes at this path]` },
 			{ type: 'text', text: `[Document unavailable: ${STORED_PATH} - no stored document of ${BYTES.length + 1} bytes at this path]` },
@@ -103,7 +103,7 @@ describe('resolveDocuments', () => {
 	test('reads a stored document back into base64 every time it is resolved', async () => {
 		const stored = await storeDocuments([inline(DATA, 'scan.pdf')], files)
 
-		const expected = [{ type: 'document', document: { mediaType: 'application/pdf', data: DATA, filename: 'scan.pdf' } }]
+		const expected: ResolvedContentItem[] = [{ type: 'document', document: { mediaType: 'application/pdf', data: DATA, filename: 'scan.pdf' } }]
 		expect(await resolveDocuments(stored, files)).toEqual(expected)
 		expect(await resolveDocuments(stored, files)).toEqual(expected)
 	})
@@ -140,10 +140,10 @@ describe('resolveDocuments', () => {
 	})
 
 	test('keeps inline documents, text and images as they are', async () => {
-		const content: ChatMessageContentItem[] = [
+		const content: ResolvedContentItem[] = [
 			{ type: 'text', text: 'Look.' },
 			{ type: 'image_url', imageUrl: { url: 'file:///shot.png' } },
-			inline(DATA),
+			{ type: 'document', document: { mediaType: 'application/pdf', data: DATA } },
 		]
 
 		expect(await resolveDocuments(content, files)).toEqual(content)

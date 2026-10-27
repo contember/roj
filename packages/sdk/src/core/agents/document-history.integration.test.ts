@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test'
 import z from 'zod/v4'
 import { agentEvents } from '~/core/agents/state.js'
 import type { LLMMessage } from '~/core/agents/state.js'
+import type { ChatMessageContentItem } from '~/core/llm/llm-log-types.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import type { InferenceResponse } from '~/core/llm/provider.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
@@ -19,7 +20,7 @@ const STORED_PATH = `.documents/${DOCUMENT_SHA256}.pdf`
 const READ_BACK = `read ${DOCUMENT_BYTES.length} bytes, sha256 ${DOCUMENT_SHA256}`
 
 const inlineDocument = { type: 'document' as const, document: { mediaType: 'application/pdf' as const, data: DOCUMENT_DATA, filename: 'scan.pdf' } }
-const storedDocumentItem = {
+const storedDocumentItem: ChatMessageContentItem = {
 	type: 'document',
 	document: { mediaType: 'application/pdf', path: STORED_PATH, byteLength: DOCUMENT_BYTES.length, filename: 'scan.pdf' },
 }
