@@ -19,31 +19,10 @@
  * step is skipped.
  */
 
-import { resolve, dirname, join } from 'node:path'
-import { symlink, mkdir, rm } from 'node:fs/promises'
-import { createRequire } from 'node:module'
+import { resolve, dirname } from 'node:path'
+import { ensureSdkResolvable } from './sdk-link.js'
 import { startServer } from './server.js'
 import { loadUserConfig } from './user-config-loader.js'
-
-async function ensureSdkResolvable(bundleDir: string): Promise<void> {
-	const userReq = createRequire(join(bundleDir, '__roj_anchor__'))
-	try {
-		userReq.resolve('@roj-ai/sdk/package.json')
-		return
-	} catch {
-		// Not resolvable — fall through to symlink path.
-	}
-
-	const runtimeReq = createRequire(import.meta.url)
-	const sdkPkgPath = runtimeReq.resolve('@roj-ai/sdk/package.json')
-	const runtimeRojDir = resolve(sdkPkgPath, '..', '..')
-
-	const linkPath = join(bundleDir, 'node_modules', '@roj-ai')
-	await rm(linkPath, { recursive: true, force: true })
-	await mkdir(dirname(linkPath), { recursive: true })
-	await symlink(runtimeRojDir, linkPath, 'dir')
-	console.log(`[sandbox-runtime] linked ${linkPath} → ${runtimeRojDir}`)
-}
 
 async function main() {
 	const configPath = process.argv[2] ?? 'roj.config.ts'
