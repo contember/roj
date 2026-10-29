@@ -428,6 +428,9 @@ export class Agent {
 				// Not scheduleProcessing(): that arms a fresh delay and the turn never runs.
 				this.scheduled = false
 				await this.continue()
+				// continue() returns at once while another turn runs (one a session load started); a host that
+				// drops its retry once this resolves must not do so before that turn is done.
+				await this.waitForIdle()
 				return
 
 			case 'retry':

@@ -116,10 +116,7 @@ async function rpc(runtime: IsolateRuntime, method: string, input: Record<string
 
 /** What the host's alarm() does: deliver whatever is due, until nothing is armed. */
 async function runAlarms(runtime: IsolateRuntime, host: TestHost) {
-	for (let round = 0; round < 20; round++) {
-		// Agent work can arm its next step after the delivery that ran it has returned.
-		await Bun.sleep(10)
-		if (host.alarm === null) return
+	for (let round = 0; round < 20 && host.alarm !== null; round++) {
 		setSystemTime(host.alarm)
 		await runtime.deliverWakes()
 	}
