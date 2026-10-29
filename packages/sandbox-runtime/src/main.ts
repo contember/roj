@@ -14,13 +14,14 @@
  * `runtime.external = true`, so its `import "@roj-ai/*"` calls need to
  * resolve to the runtime's installed copy. This entry point ensures
  * `<bundleDir>/node_modules/@roj-ai` points at the runtime's `@roj-ai`
- * dir before dynamic-importing the bundle. Idempotent: workspace dev
- * setups already have `@roj-ai/*` resolvable upward, so the symlink
- * step is skipped.
+ * dir before dynamic-importing the bundle. When it has to create the
+ * link, it runs itself once more so Bun sees the link (see sdk-link.ts).
+ * Idempotent: workspace dev setups already have `@roj-ai/*` resolvable
+ * upward, so the symlink step is skipped.
  */
 
 import { resolve, dirname } from 'node:path'
-import { ensureSdkResolvable } from './sdk-link.js'
+import { linkSdkOrRelaunch } from './sdk-link.js'
 import { startServer } from './server.js'
 import { loadUserConfig } from './user-config-loader.js'
 
@@ -29,7 +30,8 @@ async function main() {
 	const absoluteConfigPath = resolve(process.cwd(), configPath)
 	const bundleDir = dirname(absoluteConfigPath)
 
-	await ensureSdkResolvable(bundleDir)
+	const relaunchedExitCode = await linkSdkOrRelaunch(bundleDir)
+	if (relaunchedExitCode !== null) process.exit(relaunchedExitCode)
 
 	let userConfig: Awaited<ReturnType<typeof loadUserConfig>>
 	try {
