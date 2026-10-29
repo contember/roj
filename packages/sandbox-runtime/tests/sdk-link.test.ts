@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -12,7 +12,8 @@ afterEach(async () => {
 
 /**
  * A bundle outside any workspace and an entry that links the SDK and imports the bundle, as the
- * runtime's main does. The entry exits with 3 once the bundle loaded the SDK, or waits when told to.
+ * runtime's main does. Once the bundle loaded the SDK, the entry records in `loaded-in` whether it ran in
+ * the relaunched process, then exits with 3, or waits when told to.
  */
 async function createBundleDir(): Promise<{ dir: string; entry: string }> {
 	const dir = await mkdtemp(join(tmpdir(), 'roj-sdk-link-'))
@@ -27,6 +28,7 @@ async function createBundleDir(): Promise<{ dir: string; entry: string }> {
 		if (relaunchedExitCode !== null) process.exit(relaunchedExitCode)
 		const mod = await import(${JSON.stringify(join(dir, 'agent-bundle.js'))})
 		if (typeof mod.defineConfig !== 'function') throw new Error('bundle did not load the SDK')
+		await Bun.write(${JSON.stringify(join(dir, 'loaded-in'))}, process.env.ROJ_SANDBOX_RUNTIME_RELAUNCHED ? 'relaunched' : 'first')
 		if (process.argv[2] === 'wait') {
 			console.log('ready')
 			setInterval(() => {}, 1000)
@@ -49,8 +51,11 @@ async function run(dir: string, entry: string): Promise<{ exitCode: number; outp
 	return { exitCode, output: stdout + stderr }
 }
 
-function count(text: string, needle: string): number {
-	return text.split(needle).length - 1
+/** Where the bundle loaded, and whether the SDK link exists. */
+async function state(dir: string): Promise<{ loadedIn: string; linked: boolean }> {
+	const loadedIn = await readFile(join(dir, 'loaded-in'), 'utf8').catch(() => 'nowhere')
+	const linked = await lstat(join(dir, 'node_modules', '@roj-ai')).then(stat => stat.isSymbolicLink(), () => false)
+	return { loadedIn, linked }
 }
 
 describe('linkSdkOrRelaunch', () => {
@@ -59,18 +64,17 @@ describe('linkSdkOrRelaunch', () => {
 		const { exitCode, output } = await run(dir, entry)
 
 		expect({ exitCode, output }).toMatchObject({ exitCode: 3 })
-		expect(count(output, '[sandbox-runtime] linked')).toBe(1)
-		expect(count(output, '[sandbox-runtime] restarting')).toBe(1)
+		expect(await state(dir)).toEqual({ loadedIn: 'relaunched', linked: true })
 	})
 
 	it('loads the bundle in the same process once the link exists', async () => {
 		const { dir, entry } = await createBundleDir()
 		await run(dir, entry)
+		await rm(join(dir, 'loaded-in'))
 		const { exitCode, output } = await run(dir, entry)
 
 		expect({ exitCode, output }).toMatchObject({ exitCode: 3 })
-		expect(output).not.toContain('[sandbox-runtime] linked')
-		expect(output).not.toContain('[sandbox-runtime] restarting')
+		expect(await state(dir)).toEqual({ loadedIn: 'first', linked: true })
 	})
 
 	it('passes a termination signal to the relaunched process', async () => {
