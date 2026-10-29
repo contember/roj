@@ -6,6 +6,7 @@ import type { LLMMessage } from '~/core/agents/state.js'
 import { SessionFileStore } from '~/core/file-store/file-store.js'
 import { DefaultImageProcessor } from '~/core/image/image-processor.js'
 import { NoopImageResizer } from '~/core/image/noop-resizer.js'
+import type { ImageResizer } from '~/core/image/types.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
 import { documentPlaceholder, limitDocumentBytes, resolveDocuments, storeInlineData } from './document-content.js'
@@ -115,6 +116,18 @@ describe('storeInlineData with images', () => {
 		expect(readFileSync(join(dir, IMAGE_PATH))).toEqual(IMAGE_BYTES)
 	})
 
+	test('the image processor reads a stored image back into the same data URL without resizing it', async () => {
+		const resizer: ImageResizer = {
+			resize: () => Promise.reject(new Error('a stored image must not be resized')),
+		}
+		const stored = await storeInlineData([{ type: 'image_url', imageUrl: { url: IMAGE_URL, detail: 'low' } }], files)
+		if (typeof stored === 'string') throw new Error('expected content items')
+
+		expect(await new DefaultImageProcessor(resizer, createNodeFileSystem()).resolveContent(stored, files)).toEqual([
+			{ type: 'image_url', imageUrl: { url: IMAGE_URL, detail: 'low' } },
+		])
+	})
+
 	test('the image processor reads a stored image back into the same data URL, plain and sandboxed', async () => {
 		for (const store of [files, new SessionFileStore(dir, undefined, true, createNodeFileSystem())]) {
 			const stored = await storeInlineData([{ type: 'image_url', imageUrl: { url: IMAGE_URL } }], store)
@@ -124,14 +137,42 @@ describe('storeInlineData with images', () => {
 		}
 	})
 
-	test('leaves a URL, a file:// path and an unsupported data URL as they are', async () => {
+	test('leaves a URL and a file:// path as they are', async () => {
 		const content: ChatMessageContentItem[] = [
 			{ type: 'image_url', imageUrl: { url: 'https://example.com/a.png' } },
 			{ type: 'image_url', imageUrl: { url: 'file:///session/shot.png' } },
-			{ type: 'image_url', imageUrl: { url: 'data:image/svg+xml;base64,PHN2Zy8+' } },
 		]
 
 		expect(await storeInlineData(content, files)).toEqual(content)
+		expect(existsSync(join(dir, '.images'))).toBe(false)
+	})
+
+	test('stores a data URL whatever the case of its type, an image/jpg alias or parameters before base64', async () => {
+		const payload = IMAGE_BYTES.toString('base64')
+		const jpegPath = IMAGE_PATH.replace(/\.png$/, '.jpg')
+		const stored = await storeInlineData([
+			{ type: 'image_url', imageUrl: { url: `DATA:IMAGE/PNG;BASE64,${payload}` } },
+			{ type: 'image_url', imageUrl: { url: `data:image/jpg;base64,${payload}` } },
+			{ type: 'image_url', imageUrl: { url: `data:image/jpeg;name=a.jpg;base64,${payload}` } },
+		], files)
+
+		expect(stored).toEqual([
+			{ type: 'image_url', imageUrl: { url: `file://${IMAGE_PATH}` } },
+			{ type: 'image_url', imageUrl: { url: `file://${jpegPath}` } },
+			{ type: 'image_url', imageUrl: { url: `file://${jpegPath}` } },
+		])
+	})
+
+	test('a data URL it cannot store becomes a note, never its payload', async () => {
+		const stored = await storeInlineData([
+			{ type: 'image_url', imageUrl: { url: 'data:image/svg+xml;base64,PHN2Zy8+' } },
+			{ type: 'image_url', imageUrl: { url: 'data:image/png,rawbytes' } },
+		], files)
+
+		expect(stored).toEqual([
+			{ type: 'text', text: '[Image unavailable: image/svg+xml - unsupported format]' },
+			{ type: 'text', text: '[Image unavailable: image/png - not base64-encoded]' },
+		])
 		expect(existsSync(join(dir, '.images'))).toBe(false)
 	})
 

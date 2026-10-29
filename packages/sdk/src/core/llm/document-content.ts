@@ -22,8 +22,17 @@ export const IMAGES_DIR = '.images'
 /** The `file://` path of an image an agent stored: session-relative, so a fork resolves it in its own store. */
 export const STORED_IMAGE_PATH = /^\.images\/[0-9a-f]{64}\.(?:png|jpg|gif|webp)$/
 
-/** A base64 `data:` URL of an image type the providers take; any other URL is left as it is. */
-const INLINE_IMAGE_URL = /^data:image\/(png|jpeg|gif|webp);base64,/
+/** A `data:` URL's media type and parameters (`;base64` among them), up to the comma its payload follows. */
+const DATA_URL = /^data:([^;,]*)((?:;[^;,]*)*),/i
+
+/** The stored file's extension for each image type the providers take. */
+const IMAGE_FORMATS: ReadonlyMap<string, string> = new Map([
+	['image/png', 'png'],
+	['image/jpeg', 'jpg'],
+	['image/jpg', 'jpg'],
+	['image/gif', 'gif'],
+	['image/webp', 'webp'],
+])
 
 /**
  * Most document bytes one request reads back and sends. A request holds each document about four times
@@ -111,20 +120,25 @@ async function storeDocument(document: InlineDocument, files: FileStore): Promis
 
 /**
  * Writes an inline image to the session store under the hash of its bytes and refers to it by a
- * `file://` URL, which the providers' image processor reads back on each inference.
+ * `file://` URL, which the providers' image processor reads back on each inference. A `data:` URL
+ * that cannot be stored becomes a note, so its payload never reaches an event.
  */
 async function storeImage(item: ChatMessageContentItemImage, files: FileStore): Promise<ChatMessageContentItemImage | ChatMessageContentItemText> {
 	const { url } = item.imageUrl
-	const match = INLINE_IMAGE_URL.exec(url)
+	const match = DATA_URL.exec(url)
 	if (match === null) return item
-	const format = match[1] === 'jpeg' ? 'jpg' : match[1]
+	const mediaType = (match[1] ?? '').toLowerCase()
+	const unavailable = (reason: string): ChatMessageContentItemText => ({ type: 'text', text: `[Image unavailable: ${mediaType || 'data URL'} - ${reason}]` })
+	const format = IMAGE_FORMATS.get(mediaType)
+	if (format === undefined) return unavailable('unsupported format')
+	if (!(match[2] ?? '').toLowerCase().split(';').includes('base64')) return unavailable('not base64-encoded')
 	const bytes = Buffer.from(url.slice(match[0].length), 'base64')
-	if (bytes.length === 0) return { type: 'text', text: `[Image unavailable: image/${match[1]} - empty file]` }
+	if (bytes.length === 0) return unavailable('empty file')
 
 	const path = `${IMAGES_DIR}/${await sha256Hex(bytes)}.${format}`
 	if (!(await isStored(path, bytes.length, files))) {
 		const written = await files.session.write(path, bytes)
-		if (!written.ok) return { type: 'text', text: `[Image unavailable: image/${match[1]} - ${written.error}]` }
+		if (!written.ok) return unavailable(written.error)
 	}
 	return { type: 'image_url', imageUrl: { ...item.imageUrl, url: `file://${path}` } }
 }
