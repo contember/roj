@@ -428,16 +428,17 @@ export class Agent {
 				// Not scheduleProcessing(): that arms a fresh delay and the turn never runs.
 				this.scheduled = false
 				await this.continue()
-				// continue() returns at once while another turn runs (one a session load started); a host that
-				// drops its retry once this resolves must not do so before that turn is done.
-				await this.waitForIdle()
-				return
+				break
 
 			case 'retry':
 				this.errorRetryArmed = false
+				// While a turn runs this arms nothing, only a reschedule for when it ends.
 				this.scheduleProcessing()
-				return
+				break
 		}
+		// A turn may already be running (one a session load started); a host that drops its retry once
+		// this resolves must not do so before that turn is done.
+		await this.waitForIdle()
 	}
 
 	/** One debounce-callback check. Never rejects: on error it cancels the schedule. */

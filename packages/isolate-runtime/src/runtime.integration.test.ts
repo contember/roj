@@ -229,6 +229,33 @@ describe('isolate runtime', () => {
 		expect(await eventTypes(next, sessionId)).toContain('inference_completed')
 	})
 
+	test('a retry wake delivered during the recovery turn keeps its retry until that turn is done', async () => {
+		setSystemTime(T0)
+		const object = createObject()
+		// First isolate: the first turn fails for good, and the next message waits out the error backoff on a retry wake.
+		const failed = boot(object, () => {
+			throw { type: 'invalid_request', message: 'rejected' }
+		})
+		await failed.start()
+		const sessionId = createdSchema.parse(await rpc(failed, 'sessions.create', { presetId: 'test' })).value.sessionId
+		await rpc(failed, 'user-chat.sendMessage', { sessionId, content: 'First.' })
+		await runAlarms(failed, object.host)
+		await rpc(failed, 'user-chat.sendMessage', { sessionId, content: 'Second.' })
+		setSystemTime(object.host.alarm ?? T0)
+		await failed.deliverWakes()
+		const retryAt = object.host.alarm
+		expect(retryAt).toBeGreaterThan(Date.now())
+
+		// Evicted before the retry fires. The next isolate's load starts the recovery turn, which hangs on the provider.
+		setSystemTime(retryAt ?? T0)
+		const recovering = boot(object, () => new Promise(() => {}))
+		await recovering.start()
+		void recovering.deliverWakes()
+		await Bun.sleep(50)
+
+		expect(object.host.alarm).toBe(Date.now() + RETRY_MS)
+	})
+
 	test('start does not wait on the host, which cannot answer a facet that is still starting', async () => {
 		setSystemTime(T0)
 		const object = createObject()
