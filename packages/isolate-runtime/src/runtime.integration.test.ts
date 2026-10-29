@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, setSystemTime, test } from 'bun:test'
 import { BunSqliteStorage } from '@roj-ai/kompjutr-platform/testing'
-import { definePlugin, type LLMMessage, MockLLMProvider, type MockInferenceHandler, Ok, ToolCallId, z } from '@roj-ai/sdk'
+import { createEventsFactory, definePlugin, Err, type LLMMessage, MockLLMProvider, type MockInferenceHandler, Ok, ToolCallId, z } from '@roj-ai/sdk'
 import { createTool } from '@roj-ai/sdk/tools'
 import { createTestPreset } from '@roj-ai/sdk/testing'
 import type { RuntimeBroadcast, RuntimeHost } from './host-contract.js'
@@ -49,9 +49,53 @@ const photosPlugin = definePlugin('photos')
 	])
 	.build()
 
+const callbackEvents = createEventsFactory({
+	events: {
+		callback_registered: z.object({ endpoint: z.string(), token: z.string() }),
+	},
+})
+
+/**
+ * A third-party plugin, built from public exports only, that a host hands a callback over RPC.
+ * Its state is reduced from its own events, so the next isolate rebuilds it from the log.
+ */
+const callbackPlugin = definePlugin('callback')
+	.events([callbackEvents])
+	.state({
+		key: 'callback',
+		initial: (): { endpoint: string; token: string } | null => null,
+		reduce: (state, event) => event.type === 'callback_registered' ? { endpoint: event.endpoint, token: event.token } : state,
+	})
+	.method('register', {
+		input: z.object({ endpoint: z.string(), token: z.string() }),
+		output: z.object({}),
+		handler: async (ctx, input) => {
+			await ctx.emitEvent(callbackEvents.create('callback_registered', input))
+			return Ok({})
+		},
+	})
+	.method('get', {
+		input: z.object({}),
+		output: z.object({ endpoint: z.string(), token: z.string() }).nullable(),
+		handler: async (ctx) => Ok(ctx.pluginState),
+	})
+	.tools((ctx) => [
+		createTool({
+			name: 'call_back',
+			description: 'Report to the host',
+			input: z.object({}),
+			execute: async () => {
+				const callback = await ctx.self.get({})
+				if (!callback.ok || callback.value === null) return Err({ message: 'no callback registered', recoverable: false })
+				return Ok(`${callback.value.endpoint} ${callback.value.token}`)
+			},
+		}),
+	])
+	.build()
+
 const boot = (object: ReturnType<typeof createObject>, llmMock: MockInferenceHandler) =>
 	createIsolateRuntime({
-		userConfig: { presets: [createTestPreset({ id: 'test', plugins: [photosPlugin.configure()] })] },
+		userConfig: { presets: [createTestPreset({ id: 'test', plugins: [photosPlugin.configure(), callbackPlugin.configure()] })] },
 		host: object.host,
 		state: { storage: object.storage, waitUntil: () => {} },
 		config: { llmMock, logLevel: 'error' },
@@ -72,7 +116,10 @@ async function rpc(runtime: IsolateRuntime, method: string, input: Record<string
 
 /** What the host's alarm() does: deliver whatever is due, until nothing is armed. */
 async function runAlarms(runtime: IsolateRuntime, host: TestHost) {
-	for (let round = 0; round < 20 && host.alarm !== null; round++) {
+	for (let round = 0; round < 20; round++) {
+		// Agent work can arm its next step after the delivery that ran it has returned.
+		await Bun.sleep(10)
+		if (host.alarm === null) return
 		setSystemTime(host.alarm)
 		await runtime.deliverWakes()
 	}
@@ -154,6 +201,34 @@ describe('isolate runtime', () => {
 		await runAlarms(next, object.host)
 
 		expect(object.host.alarm).toBeNull()
+		expect(await eventTypes(next, sessionId)).toContain('inference_completed')
+	})
+
+	test('plugin state a host set over RPC survives an eviction and reaches a tool in the next isolate', async () => {
+		setSystemTime(T0)
+		const object = createObject()
+		const evicted = boot(object, () => new Promise(() => {}))
+		await evicted.start()
+		const sessionId = createdSchema.parse(await rpc(evicted, 'sessions.create', { presetId: 'test' })).value.sessionId
+		expect(await rpc(evicted, 'callback.register', { sessionId, endpoint: 'https://host.example/hook', token: 't-123' })).toMatchObject({ ok: true })
+		await rpc(evicted, 'user-chat.sendMessage', { sessionId, content: 'Report back.' })
+		setSystemTime(object.host.alarm ?? T0)
+		void evicted.deliverWakes()
+		await Bun.sleep(50)
+
+		const results: string[] = []
+		const next = boot(object, (request) => {
+			const last = request.messages[request.messages.length - 1]
+			if (last?.role === 'tool') {
+				results.push(typeof last.content === 'string' ? last.content : JSON.stringify(last.content))
+				return answering(request)
+			}
+			return { content: null, toolCalls: [{ id: ToolCallId('tc1'), name: 'call_back', input: {} }], finishReason: 'tool_calls', metrics: MockLLMProvider.defaultMetrics() }
+		})
+		await next.start()
+		await runAlarms(next, object.host)
+
+		expect(results).toEqual(['https://host.example/hook t-123'])
 		expect(await eventTypes(next, sessionId)).toContain('inference_completed')
 	})
 
