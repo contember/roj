@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module'
+import { existsSync } from 'node:fs'
 import { mkdir, rm, symlink } from 'node:fs/promises'
 import { constants } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -10,16 +11,10 @@ const FORWARDED_SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP'] as const
  * Makes `import "@roj-ai/*"` in a bundle built with `runtime.external = true` resolve to the
  * runtime's installed copy, by linking `<bundleDir>/node_modules/@roj-ai` to it.
  *
- * @returns true when it created the link, false when the SDK was already resolvable.
+ * @returns true when it created the link, false when an installed SDK was already above the bundle.
  */
 async function ensureSdkResolvable(bundleDir: string): Promise<boolean> {
-	const userReq = createRequire(join(bundleDir, '__roj_anchor__'))
-	try {
-		userReq.resolve('@roj-ai/sdk/package.json')
-		return false
-	} catch {
-		// Not resolvable — fall through to symlink path.
-	}
+	if (hasInstalledSdk(bundleDir)) return false
 
 	const runtimeReq = createRequire(import.meta.url)
 	const sdkPkgPath = runtimeReq.resolve('@roj-ai/sdk/package.json')
@@ -31,6 +26,17 @@ async function ensureSdkResolvable(bundleDir: string): Promise<boolean> {
 	await symlink(runtimeRojDir, linkPath, 'dir')
 	console.log(`[sandbox-runtime] linked ${linkPath} → ${runtimeRojDir}`)
 	return true
+}
+
+/**
+ * Looks for `node_modules/@roj-ai/sdk` in the bundle's directory and above, without the resolver: with no
+ * `node_modules` above the bundle, Bun auto-installs a missing package, which would load a second SDK.
+ */
+function hasInstalledSdk(fromDir: string): boolean {
+	for (let dir = resolve(fromDir); ; dir = dirname(dir)) {
+		if (existsSync(join(dir, 'node_modules', '@roj-ai', 'sdk', 'package.json'))) return true
+		if (dirname(dir) === dir) return false
+	}
 }
 
 /**
