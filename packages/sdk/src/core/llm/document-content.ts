@@ -3,6 +3,7 @@ import type { FileStore } from '~/core/file-store/types.js'
 import type {
 	ChatMessageContentItem,
 	ChatMessageContentItemDocument,
+	ChatMessageContentItemImage,
 	ChatMessageContentItemText,
 	InlineDocument,
 	ResolvedContentItem,
@@ -14,6 +15,15 @@ import type {
 export const DOCUMENTS_DIR = '.documents'
 
 const STORED_DOCUMENT_PATH = /^\.documents\/[0-9a-f]{64}\.pdf$/
+
+/** Session-store directory that keeps the images an agent's history refers to; a fork copies it. */
+export const IMAGES_DIR = '.images'
+
+/** The `file://` path of an image an agent stored: session-relative, so a fork resolves it in its own store. */
+export const STORED_IMAGE_PATH = /^\.images\/[0-9a-f]{64}\.(?:png|jpg|gif|webp)$/
+
+/** A base64 `data:` URL of an image type the providers take; any other URL is left as it is. */
+const INLINE_IMAGE_URL = /^data:image\/(png|jpeg|gif|webp);base64,/
 
 /**
  * Most document bytes one request reads back and sends. A request holds each document about four times
@@ -99,6 +109,26 @@ async function storeDocument(document: InlineDocument, files: FileStore): Promis
 	return { type: 'document', document: stored }
 }
 
+/**
+ * Writes an inline image to the session store under the hash of its bytes and refers to it by a
+ * `file://` URL, which the providers' image processor reads back on each inference.
+ */
+async function storeImage(item: ChatMessageContentItemImage, files: FileStore): Promise<ChatMessageContentItemImage | ChatMessageContentItemText> {
+	const { url } = item.imageUrl
+	const match = INLINE_IMAGE_URL.exec(url)
+	if (match === null) return item
+	const format = match[1] === 'jpeg' ? 'jpg' : match[1]
+	const bytes = Buffer.from(url.slice(match[0].length), 'base64')
+	if (bytes.length === 0) return { type: 'text', text: `[Image unavailable: image/${match[1]} - empty file]` }
+
+	const path = `${IMAGES_DIR}/${await sha256Hex(bytes)}.${format}`
+	if (!(await isStored(path, bytes.length, files))) {
+		const written = await files.session.write(path, bytes)
+		if (!written.ok) return { type: 'text', text: `[Image unavailable: image/${match[1]} - ${written.error}]` }
+	}
+	return { type: 'image_url', imageUrl: { ...item.imageUrl, url: `file://${path}` } }
+}
+
 /** A reference the agent did not create itself is kept only if it names a document the agent stored. */
 async function checkStoredDocument(document: StoredDocument, files: FileStore): Promise<ChatMessageContentItemDocument | ChatMessageContentItemText> {
 	if (STORED_DOCUMENT_PATH.test(document.path) && await isStored(document.path, document.byteLength, files)) {
@@ -108,23 +138,29 @@ async function checkStoredDocument(document: StoredDocument, files: FileStore): 
 }
 
 /**
- * Content with every inline document moved to the session store and replaced by a reference, which
- * a provider reads back on each inference — the way an image is kept as a `file://` URL.
+ * Content with every inline document and image moved to the session store and replaced by a reference,
+ * which a provider reads back on each inference, so an event never holds their bytes.
  */
-export async function storeDocuments(content: ToolResultContent, files: FileStore): Promise<ToolResultContent> {
+export async function storeInlineData(content: ToolResultContent, files: FileStore): Promise<ToolResultContent> {
 	if (typeof content === 'string') return content
 	return Promise.all(content.map((item) => {
-		if (item.type !== 'document') return item
-		return 'data' in item.document ? storeDocument(item.document, files) : checkStoredDocument(item.document, files)
+		switch (item.type) {
+			case 'text':
+				return item
+			case 'image_url':
+				return storeImage(item, files)
+			case 'document':
+				return 'data' in item.document ? storeDocument(item.document, files) : checkStoredDocument(item.document, files)
+		}
 	}))
 }
 
-/** A message with its inline documents moved to the session store; only user and tool messages carry content items. */
-export async function storeMessageDocuments(message: LLMMessage, files: FileStore): Promise<LLMMessage> {
+/** A message with its inline documents and images moved to the session store; only user and tool messages carry content items. */
+export async function storeMessageInlineData(message: LLMMessage, files: FileStore): Promise<LLMMessage> {
 	switch (message.role) {
 		case 'user':
 		case 'tool':
-			return { ...message, content: await storeDocuments(message.content, files) }
+			return { ...message, content: await storeInlineData(message.content, files) }
 		case 'assistant':
 		case 'system':
 			return message

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, setSystemTime, test } from 'bun:test'
 import { BunSqliteStorage } from '@roj-ai/kompjutr-platform/testing'
-import { MockLLMProvider, type MockInferenceHandler, z } from '@roj-ai/sdk'
+import { definePlugin, type LLMMessage, MockLLMProvider, type MockInferenceHandler, Ok, ToolCallId, z } from '@roj-ai/sdk'
+import { createTool } from '@roj-ai/sdk/tools'
 import { createTestPreset } from '@roj-ai/sdk/testing'
 import type { RuntimeBroadcast, RuntimeHost } from './host-contract.js'
 import { createIsolateRuntime, type IsolateRuntime } from './runtime.js'
@@ -34,9 +35,23 @@ class TestHost implements RuntimeHost {
 /** One Durable Object's storage, shared by every runtime booted on it — as across evictions. */
 const createObject = () => ({ storage: Object.assign(new BunSqliteStorage(), { kv: new MemoryKv() }), host: new TestHost() })
 
+/** Four photos of ~1.5 MB base64 each, as a camera upload hands them over: together far past one 2 MB row. */
+const PHOTOS = Array.from({ length: 4 }, (_, index) => `data:image/jpeg;base64,${Buffer.alloc(1_100_000, index + 1).toString('base64')}`)
+
+const photosPlugin = definePlugin('photos')
+	.tools(() => [
+		createTool({
+			name: 'take_photos',
+			description: 'Return the photos',
+			input: z.object({}),
+			execute: async () => Ok(PHOTOS.map((url) => ({ type: 'image_url' as const, imageUrl: { url } }))),
+		}),
+	])
+	.build()
+
 const boot = (object: ReturnType<typeof createObject>, llmMock: MockInferenceHandler) =>
 	createIsolateRuntime({
-		userConfig: { presets: [createTestPreset({ id: 'test' })] },
+		userConfig: { presets: [createTestPreset({ id: 'test', plugins: [photosPlugin.configure()] })] },
 		host: object.host,
 		state: { storage: object.storage, waitUntil: () => {} },
 		config: { llmMock, logLevel: 'error' },
@@ -98,6 +113,34 @@ describe('isolate runtime', () => {
 		expect(object.host.broadcasts.length).toBeGreaterThan(0)
 		const status = await (await runtime.fetch(new Request('http://runtime/status'))).json()
 		expect(status).toMatchObject({ versions: { runtime: { name: '@roj-ai/isolate-runtime' } }, sessions: [{ id: sessionId, presetId: 'test' }] })
+	})
+
+	test('a turn whose tool returns large inline photos completes, and no event row holds them', async () => {
+		setSystemTime(T0)
+		const object = createObject()
+		const requests: LLMMessage[][] = []
+		const runtime = boot(object, (request) => {
+			requests.push(request.messages)
+			if (requests.length > 1) return answering(request)
+			return {
+				content: null,
+				toolCalls: [{ id: ToolCallId('tc1'), name: 'take_photos', input: {} }],
+				finishReason: 'tool_calls',
+				metrics: MockLLMProvider.defaultMetrics(),
+			}
+		})
+		await runtime.start()
+
+		const sessionId = createdSchema.parse(await rpc(runtime, 'sessions.create', { presetId: 'test' })).value.sessionId
+		await rpc(runtime, 'user-chat.sendMessage', { sessionId, content: 'Take the photos.' })
+		await runAlarms(runtime, object.host)
+
+		expect(await eventTypes(runtime, sessionId)).toContain('inference_completed')
+		expect(requests).toHaveLength(2)
+		const toolMessage = requests[1]?.find((message) => message.role === 'tool')
+		expect(toolMessage?.content).toEqual(PHOTOS.map(() => ({ type: 'image_url', imageUrl: { url: expect.stringMatching(/^file:\/\/\.images\/[0-9a-f]{64}\.jpg$/) } })))
+		const largest = object.storage.db.query<{ size: number }, []>('SELECT MAX(length(payload)) AS size FROM roj_events').get()
+		expect(largest?.size).toBeLessThan(64 * 1024)
 	})
 
 	test('a turn lost to an eviction is retried by the alarm and finished by the next isolate', async () => {
