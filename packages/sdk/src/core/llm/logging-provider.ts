@@ -46,9 +46,10 @@ export class LoggingLLMProvider implements LLMProvider {
 		const agentId = AgentId(context.agentId)
 
 		// Create call entry and notify caller of the call ID
+		const planned = context.claimLLMCall?.()
 		const callId = await this.logger.createCall(sessionId, agentId, request, {
-			callId: context.llmCallId === undefined ? undefined : LLMCallId(context.llmCallId),
-			retried: context.retried,
+			callId: planned === undefined ? undefined : LLMCallId(planned.llmCallId),
+			retried: planned?.retried,
 		})
 		context.onLLMCallCreated?.(callId)
 

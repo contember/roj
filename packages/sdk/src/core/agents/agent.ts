@@ -791,22 +791,22 @@ export class Agent {
 				replayedResponse = undefined
 			} else {
 				llmResponse = await withLLMRetry(
-					() => {
-						const callId = plannedCallId
-						plannedCallId = undefined
-						return this.llmProvider.inference(request, {
+					() =>
+						this.llmProvider.inference(request, {
 							sessionId: this.store.sessionId,
 							agentId: this.id,
 							onLLMCallCreated: (createdId) => {
 								llmCallId = LLMCallId(createdId)
 							},
-							llmCallId: callId,
-							retried: callId !== undefined && retried,
+							claimLLMCall: () => {
+								const callId = plannedCallId
+								plannedCallId = undefined
+								return callId === undefined ? undefined : { llmCallId: callId, retried }
+							},
 							signal: this.abortController.signal,
 							fileStore: this.fileStore,
 							providers: this.llmProviders,
-						})
-					},
+						}),
 					{ logger: this.logger, signal: this.abortController.signal },
 				)
 			}

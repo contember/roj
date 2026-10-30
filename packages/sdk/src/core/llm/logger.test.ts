@@ -562,3 +562,34 @@ describe('LoggingLLMProvider with a malformed document', () => {
 		expect(provider.getLastRequest()?.messages).toEqual(request.messages)
 	})
 })
+
+describe('LoggingLLMProvider with a planned call id', () => {
+	it('logs the planned id once when middleware sends the same context twice', async () => {
+		const store = new MemoryLLMCallStore()
+		const logger = new LLMLogger(createTestConfig({ store }))
+		const logged = new LoggingLLMProvider(new MockLLMProvider(() => createTestResponse()), logger)
+		const sessionId = SessionId('planned-session')
+		let planned: string | undefined = '0198e9c0-0000-7000-8000-000000000001'
+		const context: InferenceContext = {
+			sessionId,
+			agentId: 'a1',
+			fileStore: new SessionFileStore(tmpdir(), undefined, false, createNodeFileSystem(), 'session'),
+			claimLLMCall: () => {
+				const llmCallId = planned
+				planned = undefined
+				return llmCallId === undefined ? undefined : { llmCallId, retried: true }
+			},
+		}
+
+		await logged.inference(createTestRequest(), context)
+		await logged.inference(createTestRequest(), context)
+
+		const { calls } = await logger.listCalls(sessionId)
+		expect(calls).toHaveLength(2)
+		const [second, first] = calls
+		expect(first.id).toBe(LLMCallId('0198e9c0-0000-7000-8000-000000000001'))
+		expect(first.retried).toBe(true)
+		expect(second.id).not.toBe(first.id)
+		expect(second.retried).toBeUndefined()
+	})
+})
