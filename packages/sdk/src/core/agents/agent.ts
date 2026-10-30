@@ -16,7 +16,7 @@ import { agentEvents } from '~/core/agents/state.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import { applyCacheBreakpoint, type CacheTtlConfig } from '~/core/llm/cache-breakpoints.js'
-import { storeDocuments, storeMessageDocuments } from '~/core/llm/document-content.js'
+import { storeInlineData, storeMessageInlineData } from '~/core/llm/document-content.js'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { InferenceRequest, InferenceResponse, LLMError, LLMMessage, LLMProvider } from '~/core/llm/provider.js'
 import { LLMCallId, ModelId } from '~/core/llm/schema.js'
@@ -690,9 +690,9 @@ export class Agent {
 			collectedMessages.push(...dequeued.messages)
 		}
 
-		// 2c. Move inline documents to the session store: history keeps a reference the provider reads
-		// on every inference, and the event log never holds their bytes.
-		const pendingMessages = await Promise.all(collectedMessages.map((message) => storeMessageDocuments(message, this.fileStore)))
+		// 2c. Move inline documents and images to the session store: history keeps a reference the provider
+		// reads on every inference, and the event log never holds their bytes.
+		const pendingMessages = await Promise.all(collectedMessages.map((message) => storeMessageInlineData(message, this.fileStore)))
 
 		// 3. Inference start - emit with pending messages
 		await this.store.emit(withSessionId(
@@ -1112,9 +1112,9 @@ export class Agent {
 
 		const result = await this.toolExecutor.execute(tool, effectiveToolCall.input, context)
 
-		// Build initial tool result with ToolResultContent; its documents go to the session store before any event records it
+		// Build initial tool result with ToolResultContent; its documents and images go to the session store before any event records it
 		let toolResult: { isError: boolean; content: ToolResultContent } = result.ok
-			? { isError: false, content: await storeDocuments(result.value, this.fileStore) }
+			? { isError: false, content: await storeInlineData(result.value, this.fileStore) }
 			: { isError: true, content: result.error.message }
 
 		// afterToolCall handler - can modify result or pause.
@@ -1529,7 +1529,7 @@ export class Agent {
 					case 'modify': {
 						const modified: AfterToolCallResult = {
 							action: 'modify',
-							result: { ...result.result, content: await storeDocuments(result.result.content, this.fileStore) },
+							result: { ...result.result, content: await storeInlineData(result.result.content, this.fileStore) },
 						}
 						await this.emitHandlerCompleted('afterToolCall', modified)
 						return modified

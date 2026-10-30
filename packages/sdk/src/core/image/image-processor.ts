@@ -1,5 +1,6 @@
 import { resolve } from 'node:path'
 import type { FileStore } from '~/core/file-store/types.js'
+import { STORED_IMAGE_PATH } from '~/core/llm/document-content.js'
 import type { ChatMessageContentItem, ChatMessageContentItemImage, ChatMessageContentItemText, ToolResultContent } from '~/core/llm/llm-log-types.js'
 import { getImageMimeType } from '~/lib/mime.js'
 import type { FileSystem } from '~/platform/fs.js'
@@ -29,6 +30,8 @@ export class DefaultImageProcessor implements ImageProcessor {
 
 				const rawPath = item.imageUrl.url.slice(7)
 
+				if (fileStore && STORED_IMAGE_PATH.test(rawPath)) return this.readStored(rawPath, item.imageUrl.detail, fileStore)
+
 				if (fileStore) {
 					const result = await this.resolveViaStore(rawPath, item.imageUrl.detail, fileStore)
 					if (result.type === 'image_url') {
@@ -50,6 +53,18 @@ export class DefaultImageProcessor implements ImageProcessor {
 				return result
 			}),
 		)
+	}
+
+	/**
+	 * An image an agent stored from a `data:` URL, read back as it arrived: not resized, which would
+	 * re-encode it, and from the session store, so a fork reads its own copy.
+	 */
+	private async readStored(path: string, detail: 'auto' | 'low' | 'high' | undefined, fileStore: FileStore): Promise<ResolvedImage> {
+		const mimeType = getImageMimeType(path)
+		if (!mimeType) return { type: 'text', text: `[Image unavailable: ${path} - unsupported format]` }
+		const read = await fileStore.session.read(path, { type: 'buffer' })
+		if (!read.ok) return { type: 'text', text: `[Image unavailable: ${path} - ${read.error}]` }
+		return { type: 'image_url', imageUrl: { url: `data:${mimeType};base64,${read.value.toString('base64')}`, detail } }
 	}
 
 	private async resolveDirect(

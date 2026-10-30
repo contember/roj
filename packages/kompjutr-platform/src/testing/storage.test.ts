@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import { createGit, Workspace } from '@kompjutr/do'
 import { createShell } from '@kompjutr/do/shell'
-import { BunSqliteStorage, MAX_BIND_PARAMETERS } from './storage.js'
+import { BunSqliteStorage, MAX_BIND_PARAMETERS, MAX_VALUE_BYTES } from './storage.js'
 
 function workspace(): Workspace {
 	return new Workspace({
@@ -75,6 +75,15 @@ test('binding past what a Durable Object allows raises, as workerd does', () => 
 	const placeholders = values.map(() => '(?)').join(',')
 
 	expect(() => storage.sql.exec(`INSERT INTO t VALUES ${placeholders}`, ...values)).toThrow(/too many SQL variables/)
+})
+
+test('a string or BLOB past what a Durable Object stores raises, as workerd does', () => {
+	const storage = new BunSqliteStorage()
+	storage.sql.exec('CREATE TABLE t (a)')
+
+	storage.sql.exec('INSERT INTO t VALUES (?)', 'x'.repeat(MAX_VALUE_BYTES))
+	expect(() => storage.sql.exec('INSERT INTO t VALUES (?)', 'x'.repeat(MAX_VALUE_BYTES + 1))).toThrow(/string or blob too big/)
+	expect(() => storage.sql.exec('INSERT INTO t VALUES (?)', new Uint8Array(MAX_VALUE_BYTES + 1))).toThrow(/string or blob too big/)
 })
 
 test('a failed transaction leaves nothing behind', () => {

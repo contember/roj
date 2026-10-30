@@ -17,7 +17,7 @@ import { type DomainError, PresetErrors, SessionErrors, ValidationErrors } from 
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import type { FileStore } from '~/core/file-store/types.js'
-import { DOCUMENTS_DIR } from '~/core/llm/document-content.js'
+import { DOCUMENTS_DIR, IMAGES_DIR } from '~/core/llm/document-content.js'
 import type { LLMLogger } from '~/core/llm/logger.js'
 import type { LLMProvider } from '~/core/llm/provider.js'
 import { DEFAULT_PLUGIN_ORDER } from '~/core/plugins/plugin-builder.js'
@@ -492,7 +492,7 @@ export class SessionManager {
 		let entry: SessionCacheEntry
 		const forkPromise = Promise.resolve().then(async () => {
 			await this.eventStore.appendBatch(newSessionId, forkedEvents)
-			await this.copyStoredDocuments(sourceSessionId, newSessionId)
+			await this.copyStoredContent(sourceSessionId, newSessionId)
 			const plugins = this.buildPlugins(preset)
 			const composedReducer = createApplyEvent(plugins)
 			const state = reconstructSessionState(forkedEvents, composedReducer)
@@ -1322,13 +1322,15 @@ export class SessionManager {
 		return entry.unloadPromise
 	}
 
-	/** The forked history refers to documents in the source's store; they are content-addressed, so a copy never conflicts. */
-	private async copyStoredDocuments(sourceSessionId: SessionId, targetSessionId: SessionId): Promise<void> {
-		const sourceDir = join(this.getSessionDir(sourceSessionId), DOCUMENTS_DIR)
-		if (!(await this.platform.fs.exists(sourceDir))) return
+	/** The forked history refers to documents and images in the source's store; they are content-addressed, so a copy never conflicts. */
+	private async copyStoredContent(sourceSessionId: SessionId, targetSessionId: SessionId): Promise<void> {
 		const targetSessionDir = this.getSessionDir(targetSessionId)
-		await this.platform.fs.mkdir(targetSessionDir, { recursive: true })
-		await this.platform.fs.cp(sourceDir, join(targetSessionDir, DOCUMENTS_DIR), { recursive: true })
+		for (const dir of [DOCUMENTS_DIR, IMAGES_DIR]) {
+			const sourceDir = join(this.getSessionDir(sourceSessionId), dir)
+			if (!(await this.platform.fs.exists(sourceDir))) continue
+			await this.platform.fs.mkdir(targetSessionDir, { recursive: true })
+			await this.platform.fs.cp(sourceDir, join(targetSessionDir, dir), { recursive: true })
+		}
 	}
 
 	private getSessionDir(sessionId: SessionId): string {
