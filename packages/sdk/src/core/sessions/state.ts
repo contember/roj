@@ -442,8 +442,8 @@ export const coreReducer = createTypedReducer(
 							lastInferenceFailureAt: undefined,
 						}
 						changed = true
-					} else if (agent.status === 'paused' && agent.inferenceCall !== undefined) {
-						// Paused while its call was in flight: the call is gone, and the turn is restaged after resume.
+					} else if (agent.inferenceCall !== undefined) {
+						// Paused (and maybe resumed) while its call was in flight: the call is gone, and the turn is restaged.
 						updated = { ...updated, pendingMessages: [], inferenceCall: undefined, interruptedInference: agent.inferenceCall }
 						changed = true
 					}
@@ -594,7 +594,7 @@ export const checkRecoveryNeeded = (state: SessionState): {
 	const clearedToolAgentIds: AgentId[] = []
 
 	for (const [agentId, agent] of state.agents) {
-		if (agent.status === 'inferring' || agent.status === 'errored' || (agent.status === 'paused' && agent.inferenceCall !== undefined)) {
+		if (agent.status === 'inferring' || agent.status === 'errored' || agent.inferenceCall !== undefined) {
 			resetAgentIds.push(agentId)
 		}
 		if (agent.executingToolCall !== undefined) {
