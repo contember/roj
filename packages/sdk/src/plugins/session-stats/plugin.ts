@@ -37,6 +37,8 @@ export interface SessionStatsState {
 	totalCost: number
 	llmCalls: number
 	llmErrors: number
+	/** Turns that sent their request again because a restart lost the first call's response — each billed twice. */
+	retriedInferences: number
 	toolCalls: number
 	toolErrors: number
 	/** Chat messages received from the user */
@@ -61,6 +63,7 @@ const createInitialStats = (): SessionStatsState => ({
 	totalCost: 0,
 	llmCalls: 0,
 	llmErrors: 0,
+	retriedInferences: 0,
 	toolCalls: 0,
 	toolErrors: 0,
 	userMessages: 0,
@@ -150,6 +153,9 @@ export const sessionStatsPlugin = definePlugin('session-stats')
 
 				case 'inference_failed':
 					return withTimestamp({ llmErrors: stats.llmErrors + 1 })
+
+				case 'inference_started':
+					return event.retried === true ? withTimestamp({ retriedInferences: stats.retriedInferences + 1 }) : stats
 
 				case 'tool_started':
 					return withTimestamp({ toolCalls: stats.toolCalls + 1 })

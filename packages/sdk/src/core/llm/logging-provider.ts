@@ -3,6 +3,7 @@
  */
 
 import { AgentId } from '~/core/agents/schema.js'
+import { LLMCallId } from '~/core/llm/schema.js'
 import { SessionId } from '~/core/sessions/schema.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import type { Result } from '~/lib/utils/result.js'
@@ -45,7 +46,11 @@ export class LoggingLLMProvider implements LLMProvider {
 		const agentId = AgentId(context.agentId)
 
 		// Create call entry and notify caller of the call ID
-		const callId = await this.logger.createCall(sessionId, agentId, request)
+		const planned = context.claimLLMCall?.()
+		const callId = await this.logger.createCall(sessionId, agentId, request, {
+			callId: planned === undefined ? undefined : LLMCallId(planned.llmCallId),
+			retried: planned?.retried,
+		})
 		context.onLLMCallCreated?.(callId)
 
 		const result = await this.provider.inference(request, context)

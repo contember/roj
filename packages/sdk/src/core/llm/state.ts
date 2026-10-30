@@ -69,6 +69,15 @@ export const llmEvents = createEventsFactory({
 			agentId: agentIdSchema,
 			messages: z4.array(z4.custom<LLMMessage>()),
 			consumedMessageIds: z4.array(messageIdSchema),
+			/**
+			 * Call-log id of the request this turn sends first, recorded before it is
+			 * sent so a run interrupted mid-call can find the logged response.
+			 */
+			llmCallId: llmCallIdSchema.optional(),
+			/** What the turn answers (tool results and dequeued input), to tell whether a logged response still fits after a restart. */
+			inputKey: z4.string().optional(),
+			/** The turn repeats a request an interrupted run already sent and did not commit. */
+			retried: z4.boolean().optional(),
 		}),
 		inference_completed: z4.object({
 			agentId: agentIdSchema,

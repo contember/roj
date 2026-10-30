@@ -39,6 +39,9 @@ export type InferenceNext = (
  * - Modify the request and call `next` (pass-through with modifications)
  * - Call a provider directly from `context.providers` (terminal — bypasses routing)
  * - Implement retry, fallback, or A/B logic around `next`
+ *
+ * A turn interrupted by a restart commits its first logged response without running the
+ * chain again, so a middleware that rewrites or discards a successful response is skipped.
  */
 export type LLMMiddleware = (
 	request: InferenceRequest,

@@ -26,6 +26,8 @@ export interface LLMCallRow {
 	model: string
 	/** Serialized `LLMCallRequest`. Written once and never rewritten. */
 	request: string
+	/** The call repeats a request an interrupted run already sent. Absent on rows written before it existed. */
+	retried?: boolean
 	completedAt?: number
 	durationMs?: number
 	providerRequestId?: string

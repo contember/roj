@@ -251,6 +251,10 @@ export const coreReducer = createTypedReducer(
 					...agent,
 					status: 'inferring',
 					pendingMessages: [...agent.pendingMessages, ...event.messages],
+					inferenceCall: event.llmCallId !== undefined && event.inputKey !== undefined
+						? { llmCallId: event.llmCallId, inputKey: event.inputKey }
+						: undefined,
+					interruptedInference: undefined,
 				}))
 
 			case 'inference_completed': {
@@ -280,6 +284,9 @@ export const coreReducer = createTypedReducer(
 						consecutiveInferenceFailures: 0,
 						lastInferenceFailureAt: undefined,
 						turnNumber: (agent.turnNumber ?? 0) + 1,
+						inferenceCall: undefined,
+						// Only the staged turn may consume it; one committed without a call (a skip) must not leave it for the next.
+						interruptedInference: undefined,
 					}
 				})
 			}
@@ -293,6 +300,7 @@ export const coreReducer = createTypedReducer(
 					...agent,
 					status: 'errored',
 					pendingMessages: [],
+					inferenceCall: undefined,
 					consecutiveInferenceFailures: (agent.consecutiveInferenceFailures ?? 0) + 1,
 					lastInferenceFailureAt: event.timestamp,
 				}))
@@ -306,6 +314,7 @@ export const coreReducer = createTypedReducer(
 					...agent,
 					status: agent.status === 'paused' ? 'paused' : 'pending',
 					pendingMessages: [],
+					inferenceCall: undefined,
 				}))
 
 			case 'tool_completed': {
@@ -424,11 +433,18 @@ export const coreReducer = createTypedReducer(
 							...updated,
 							status: 'pending' as const,
 							pendingMessages: [],
+							inferenceCall: undefined,
+							// Its response may already be in the call log; the next inference looks there first.
+							interruptedInference: agent.status === 'inferring' ? agent.inferenceCall : undefined,
 							// Restart is an explicit external trigger — start a fresh error episode
 							// so the outer error-resume backoff doesn't delay the first attempt.
 							consecutiveInferenceFailures: 0,
 							lastInferenceFailureAt: undefined,
 						}
+						changed = true
+					} else if (agent.inferenceCall !== undefined) {
+						// Paused (and maybe resumed) while its call was in flight: the call is gone, and the turn is restaged.
+						updated = { ...updated, pendingMessages: [], inferenceCall: undefined, interruptedInference: agent.inferenceCall }
 						changed = true
 					}
 
@@ -456,6 +472,9 @@ export const coreReducer = createTypedReducer(
 						pendingToolResults: [],
 						pendingMessages: [],
 						executingToolCall: undefined,
+						inferenceCall: undefined,
+						// The rewritten history is not what an interrupted call answered.
+						interruptedInference: undefined,
 						status: 'pending' as const,
 					}
 				})
@@ -575,7 +594,7 @@ export const checkRecoveryNeeded = (state: SessionState): {
 	const clearedToolAgentIds: AgentId[] = []
 
 	for (const [agentId, agent] of state.agents) {
-		if (agent.status === 'inferring' || agent.status === 'errored') {
+		if (agent.status === 'inferring' || agent.status === 'errored' || agent.inferenceCall !== undefined) {
 			resetAgentIds.push(agentId)
 		}
 		if (agent.executingToolCall !== undefined) {

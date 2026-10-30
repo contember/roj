@@ -1348,6 +1348,7 @@ function statsFromMetadata(metadata: SessionMetadata): SessionStatsState {
 		totalCost: metadata.metrics?.totalCost ?? 0,
 		llmCalls: metadata.metrics?.totalLLMCalls ?? 0,
 		llmErrors: 0,
+		retriedInferences: 0,
 		toolCalls: metadata.metrics?.totalToolCalls ?? 0,
 		toolErrors: 0,
 		userMessages: metadata.metrics?.totalMessages ?? 0,

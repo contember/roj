@@ -10,6 +10,7 @@ import type { LLMMessage } from '../llm/provider.js'
  */
 export interface PluginPendingMessages<TToken = unknown> {
 	messages: LLMMessage[]
+	/** Identifies what was dequeued. Compared by its JSON to recognise the same input after a restart. */
 	token: TToken
 }
 

@@ -1483,6 +1483,22 @@ const llmCallLogChecks: ConformanceCheck[] = [
 	},
 	{
 		port: 'llmCallLog',
+		name: 'create keeps the retried flag through complete',
+		async run({ platform }) {
+			const store = platform.llmCallLog
+			if (!store) throw new Error('llmCallLog checks need platform.llmCallLog')
+
+			const retried = { ...callRow(1), retried: true }
+			await store.create(SESSION_A, retried)
+			await store.create(SESSION_A, callRow(2))
+			await store.complete(SESSION_A, retried.callId, { status: 'success', completedAt: 1_700_000_005_000, durationMs: 5000 })
+
+			expect((await store.get(SESSION_A, retried.callId))?.retried).toBe(true)
+			expect((await store.get(SESSION_A, callId(2)))?.retried).toBeUndefined()
+		},
+	},
+	{
+		port: 'llmCallLog',
 		name: 'complete attaches the outcome and leaves the request alone',
 		async run({ platform }) {
 			const store = platform.llmCallLog

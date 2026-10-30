@@ -9,6 +9,7 @@ import { createEventsFactory } from '~/core/events/types'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { ChatMessageContentItem, ChatMessageContentItemDocument } from '~/core/llm/llm-log-types.js'
 import type { LLMMetrics } from '~/core/llm/state.js'
+import type { LLMCallId } from '~/core/llm/schema.js'
 import type { PendingToolResult, ToolCallId } from '~/core/tools/schema.js'
 import { MessageId } from '../../plugins/mailbox/schema.js'
 
@@ -260,6 +261,19 @@ export interface AgentState {
 	consecutiveInferenceFailures?: number
 	/** Timestamp of the most recent inference_failed — drives the outer error-resume backoff. */
 	lastInferenceFailureAt?: number
+	/** The staged turn's first call, as its inference_started recorded it; cleared when the turn ends. */
+	inferenceCall?: InferenceCallRef
+	/**
+	 * The call a restart caught in flight. The next inference_started consumes it:
+	 * the turn either commits the logged response or sends the request again.
+	 */
+	interruptedInference?: InferenceCallRef
+}
+
+export interface InferenceCallRef {
+	llmCallId: LLMCallId
+	/** See inference_started.inputKey. */
+	inputKey: string
 }
 
 // ============================================================================

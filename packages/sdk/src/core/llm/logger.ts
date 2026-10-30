@@ -13,9 +13,11 @@
  */
 
 import { join } from 'node:path'
+import z from 'zod/v4'
 import { AgentId } from '~/core/agents/schema.js'
 import { generateLLMCallId, LLMCallId } from '~/core/llm/schema.js'
 import type { SessionId } from '~/core/sessions/schema.js'
+import { ToolCallId } from '~/core/tools/schema.js'
 import { readTextFilesOrUndefined } from '~/lib/utils/fs-batch.js'
 import type { FileSystem } from '~/platform/fs.js'
 import type { LLMCallRow, LLMCallStore } from '~/platform/llm-call-log.js'
@@ -81,6 +83,39 @@ function clampRequest(request: LLMCallRequest, maxBytes: number | undefined): st
 		toolsCount: request.tools?.length ?? 0,
 	}
 	return JSON.stringify(minimal)
+}
+
+/**
+ * What a replay reads back from a logged success. The row is stored data, so it is
+ * parsed here before it can become an `inference_completed` event.
+ */
+const loggedResponseSchema = z.object({
+	content: z.string().nullable(),
+	toolCalls: z.array(z.object({ id: z.string(), name: z.string(), input: z.unknown() })),
+	finishReason: z.enum(['stop', 'tool_calls', 'length', 'error']),
+	reasoning: z.string().optional(),
+	reasoningDetails: z.array(z.unknown()).optional(),
+	thinkingBlocks: z.array(z.unknown()).optional(),
+})
+
+const loggedMetricsSchema = z.object({
+	promptTokens: z.number(),
+	completionTokens: z.number(),
+	totalTokens: z.number(),
+	latencyMs: z.number(),
+	model: z.string(),
+	provider: z.string().optional(),
+	cost: z.number().optional(),
+	cachedTokens: z.number().optional(),
+	cacheWriteTokens: z.number().optional(),
+	reasoningTokens: z.number().optional(),
+})
+
+/** Where a call's row comes from: the caller's id, and whether it repeats an interrupted call. */
+export interface CreateCallOptions {
+	/** Chosen by the caller so it can be recorded before the request is sent; generated when absent. */
+	callId?: LLMCallId
+	retried?: boolean
 }
 
 /** JSON this logger wrote itself; annotated rather than cast, and never validated on read. */
@@ -159,8 +194,10 @@ export class LLMLogger {
 		sessionId: SessionId,
 		agentId: AgentId,
 		request: InferenceRequest,
+		options: CreateCallOptions = {},
 	): Promise<LLMCallId> {
-		const callId = generateLLMCallId()
+		const callId = options.callId ?? generateLLMCallId()
+		const retried = options.retried === true ? true : undefined
 		const now = Date.now()
 
 		const logMessages: LLMCallMessage[] = await Promise.all(request.messages.map(async (m): Promise<LLMCallMessage> => {
@@ -221,6 +258,7 @@ export class LLMLogger {
 				status: 'running',
 				model: request.model,
 				request: clampRequest(callRequest, this.store.maxBlobBytes),
+				retried,
 			})
 			return callId
 		}
@@ -231,6 +269,7 @@ export class LLMLogger {
 			agentId,
 			createdAt: now,
 			status: 'running',
+			retried,
 			request: callRequest,
 		}
 
@@ -259,6 +298,8 @@ export class LLMLogger {
 			})),
 			finishReason: response.finishReason,
 			reasoning: response.reasoning,
+			reasoningDetails: response.reasoningDetails,
+			thinkingBlocks: response.thinkingBlocks,
 		}
 
 		// Map metrics to extended format
@@ -359,6 +400,34 @@ export class LLMLogger {
 		return this.readEntry(this.getCallFilePath(sessionId, callId))
 	}
 
+	/**
+	 * The response a call logged on success, as the provider returned it, so an
+	 * interrupted run can commit it instead of paying for the request again. Null
+	 * when the call has no row, has not succeeded, or its row does not parse.
+	 */
+	async getLoggedResponse(sessionId: SessionId, callId: LLMCallId): Promise<InferenceResponse | null> {
+		let entry: LLMCallLogEntry | null
+		try {
+			entry = await this.getCall(sessionId, callId)
+		} catch {
+			return null
+		}
+		if (entry === null || entry.status !== 'success') return null
+		const response = loggedResponseSchema.safeParse(entry.response)
+		const metrics = loggedMetricsSchema.safeParse(entry.metrics)
+		if (!response.success || !metrics.success) return null
+		return {
+			content: response.data.content,
+			toolCalls: response.data.toolCalls.map((tc) => ({ id: ToolCallId(tc.id), name: tc.name, input: tc.input })),
+			finishReason: response.data.finishReason,
+			metrics: metrics.data,
+			providerRequestId: entry.providerRequestId,
+			reasoning: response.data.reasoning,
+			reasoningDetails: response.data.reasoningDetails,
+			thinkingBlocks: response.data.thinkingBlocks,
+		}
+	}
+
 	/** One stored entry, or null when the file has gone or stopped being JSON. */
 	private async readEntry(filePath: string): Promise<LLMCallLogEntry | null> {
 		try {
@@ -436,6 +505,7 @@ function toEntry(sessionId: SessionId, row: LLMCallRow): LLMCallLogEntry {
 		completedAt: row.completedAt,
 		durationMs: row.durationMs,
 		status: row.status,
+		retried: row.retried,
 		request: parseJson<LLMCallRequest>(row.request),
 		response: parseOptionalJson<LLMCallResponse>(row.response),
 		metrics: parseOptionalJson<LLMCallMetrics>(row.metrics),

@@ -137,6 +137,10 @@ export type LLMCallResponse = {
 	finishReason: 'stop' | 'tool_calls' | 'length' | 'error'
 	/** Assistant reasoning (for models that support extended thinking) */
 	reasoning?: string
+	/** Opaque provider reasoning blocks, kept so a logged response can be replayed as the model sent it. */
+	reasoningDetails?: unknown[]
+	/** Anthropic thinking blocks, kept for the same reason. */
+	thinkingBlocks?: unknown[]
 }
 
 /**
@@ -188,6 +192,8 @@ export type LLMCallLogEntry = {
 	completedAt?: number
 	durationMs?: number
 	status: 'running' | 'success' | 'error'
+	/** Sent again because a run that had already sent this request was interrupted before it committed the response. */
+	retried?: boolean
 
 	request: LLMCallRequest
 	response?: LLMCallResponse

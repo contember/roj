@@ -313,6 +313,33 @@ for (const sink of SINKS) {
 			})
 		})
 
+		describe('getLoggedResponse', () => {
+			it('gives back a logged success as the provider returned it, under the caller\'s id', async () => {
+				const sessionId = SessionId('test-session-replay')
+				const callId = LLMCallId('0198e9c0-0000-7000-8000-000000000001')
+				const thinkingBlocks = [{ type: 'thinking', thinking: 'Hm.', signature: 'sig' }]
+
+				expect(await logger.createCall(sessionId, AgentId('test-agent-1'), createTestRequest(), { callId, retried: true })).toBe(callId)
+				await logger.completeCall(sessionId, callId, { ...createTestResponse(), providerRequestId: 'req-1', thinkingBlocks }, 150)
+
+				expect((await logger.getCall(sessionId, callId))?.retried).toBe(true)
+				expect(await logger.getLoggedResponse(sessionId, callId)).toEqual({ ...createTestResponse(), providerRequestId: 'req-1', thinkingBlocks })
+			})
+
+			it('has nothing for a call that is still running, failed, or was never logged', async () => {
+				const sessionId = SessionId('test-session-replay-none')
+				const agentId = AgentId('test-agent-1')
+				const running = await logger.createCall(sessionId, agentId, createTestRequest())
+				const failed = await logger.createCall(sessionId, agentId, createTestRequest())
+				await logger.failCall(sessionId, failed, createTestError(), 50)
+
+				expect((await logger.getCall(sessionId, running))?.retried).toBeUndefined()
+				expect(await logger.getLoggedResponse(sessionId, running)).toBeNull()
+				expect(await logger.getLoggedResponse(sessionId, failed)).toBeNull()
+				expect(await logger.getLoggedResponse(sessionId, LLMCallId('never-logged'))).toBeNull()
+			})
+		})
+
 		describe('getCall', () => {
 			it('returns null for non-existent call', async () => {
 				const sessionId = SessionId('test-session-6')
@@ -533,5 +560,36 @@ describe('LoggingLLMProvider with a malformed document', () => {
 		expect(withLog).toEqual(unlogged)
 		expect(withLog.ok).toBe(true)
 		expect(provider.getLastRequest()?.messages).toEqual(request.messages)
+	})
+})
+
+describe('LoggingLLMProvider with a planned call id', () => {
+	it('logs the planned id once when middleware sends the same context twice', async () => {
+		const store = new MemoryLLMCallStore()
+		const logger = new LLMLogger(createTestConfig({ store }))
+		const logged = new LoggingLLMProvider(new MockLLMProvider(() => createTestResponse()), logger)
+		const sessionId = SessionId('planned-session')
+		let planned: string | undefined = '0198e9c0-0000-7000-8000-000000000001'
+		const context: InferenceContext = {
+			sessionId,
+			agentId: 'a1',
+			fileStore: new SessionFileStore(tmpdir(), undefined, false, createNodeFileSystem(), 'session'),
+			claimLLMCall: () => {
+				const llmCallId = planned
+				planned = undefined
+				return llmCallId === undefined ? undefined : { llmCallId, retried: true }
+			},
+		}
+
+		await logged.inference(createTestRequest(), context)
+		await logged.inference(createTestRequest(), context)
+
+		const { calls } = await logger.listCalls(sessionId)
+		expect(calls).toHaveLength(2)
+		const [second, first] = calls
+		expect(first.id).toBe(LLMCallId('0198e9c0-0000-7000-8000-000000000001'))
+		expect(first.retried).toBe(true)
+		expect(second.id).not.toBe(first.id)
+		expect(second.retried).toBeUndefined()
 	})
 })

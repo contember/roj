@@ -74,6 +74,13 @@ describe('session-stats plugin', () => {
 		expect(stats.userMessages).toBe(2)
 	})
 
+	it('counts turns that sent their request again after a restart, and only those', () => {
+		const started = (retried?: boolean) =>
+			withSessionId(sessionId, llmEvents.create('inference_started', { agentId: orchestrator, messages: [], consumedMessageIds: [], retried }))
+		const stats = reduce([spawn(orchestrator, 'orchestrator'), started(), started(true), started()])
+		expect(stats.retriedInferences).toBe(1)
+	})
+
 	it('counts context compactions', () => {
 		const stats = reduce([
 			spawn(orchestrator, 'orchestrator'),

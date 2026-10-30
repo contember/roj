@@ -135,6 +135,13 @@ export interface RawInferenceRequest {
 	anthropic?: AnthropicRequestOptions
 }
 
+/** A call-log row the caller named before sending the request. */
+export interface PlannedLLMCall {
+	llmCallId: string
+	/** The request repeats one an interrupted run already sent; the call log marks its row. */
+	retried: boolean
+}
+
 /**
  * Context for inference (for logging and call tracking).
  */
@@ -143,6 +150,11 @@ export interface InferenceContext {
 	agentId: string
 	/** Callback invoked when an LLM call entry is created, providing the call ID */
 	onLLMCallCreated?: (callId: string) => void
+	/**
+	 * Hands over the call-log id the caller recorded before sending, once: middleware may call
+	 * the provider more than once with this context, and every later row gets its own id.
+	 */
+	claimLLMCall?: () => PlannedLLMCall | undefined
 	/** Signal to abort the inference request */
 	signal?: AbortSignal
 	/** FileStore for resolving file:// URLs in message content */
