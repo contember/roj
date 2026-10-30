@@ -1740,11 +1740,10 @@ describe('the call a restart interrupts', () => {
 	const agentId = generateTestAgentId()
 	const call = { llmCallId: LLMCallId('call-1'), inputKey: '{"toolResults":[]}' }
 	const metrics = { promptTokens: 1, completionTokens: 1, totalTokens: 2, latencyMs: 1, model: 'test' }
-	const event = (domainEvent: DomainEvent) => withSessionId(SESSION_ID, domainEvent)
-	const spawned = event(agentEvents.create('agent_spawned', { agentId, definitionName: 'test', parentId: null }))
-	const started = event(llmEvents.create('inference_started', { agentId, messages: [], consumedMessageIds: [], ...call }))
-	const restarted = event(sessionEvents.create('session_restarted', { resetAgentIds: [agentId], clearedToolAgentIds: [] }))
-	const completed = event(llmEvents.create('inference_completed', { agentId, consumedMessageIds: [], response: { content: 'ok', toolCalls: [] }, metrics }))
+	const spawned = withSessionId(SESSION_ID, agentEvents.create('agent_spawned', { agentId, definitionName: 'test', parentId: null }))
+	const started = withSessionId(SESSION_ID, llmEvents.create('inference_started', { agentId, messages: [], consumedMessageIds: [], ...call }))
+	const restarted = withSessionId(SESSION_ID, sessionEvents.create('session_restarted', { resetAgentIds: [agentId], clearedToolAgentIds: [] }))
+	const completed = withSessionId(SESSION_ID, llmEvents.create('inference_completed', { agentId, consumedMessageIds: [], response: { content: 'ok', toolCalls: [] }, metrics }))
 	const replay = (events: DomainEvent[]) => events.reduce(applyEvent, createSessionState(SESSION_ID, 'test', TIMESTAMP))
 	const agentAfter = (events: DomainEvent[]) => getAgentState(replay(events), agentId)!
 
@@ -1754,7 +1753,7 @@ describe('the call a restart interrupts', () => {
 	})
 
 	it('is kept for an agent paused while its call was in flight', () => {
-		const paused = event(agentEvents.create('agent_paused', { agentId, reason: 'manual' }))
+		const paused = withSessionId(SESSION_ID, agentEvents.create('agent_paused', { agentId, reason: 'manual' }))
 		expect(checkRecoveryNeeded(replay([spawned, started, paused]))?.resetAgentIds).toEqual([agentId])
 
 		const agent = agentAfter([spawned, started, paused, restarted])
@@ -1763,12 +1762,12 @@ describe('the call a restart interrupts', () => {
 	})
 
 	it('is not set for an agent whose call already failed', () => {
-		const failed = event(llmEvents.create('inference_failed', { agentId, error: 'boom' }))
+		const failed = withSessionId(SESSION_ID, llmEvents.create('inference_failed', { agentId, error: 'boom' }))
 		expect(agentAfter([spawned, started, failed, restarted]).interruptedInference).toBeUndefined()
 	})
 
 	it('is dropped by a turn committed without a call, and by a spliced history', () => {
-		const spliced = event(agentEvents.create('agent_conversation_spliced', { agentId, start: 0, deleteCount: 0 }))
+		const spliced = withSessionId(SESSION_ID, agentEvents.create('agent_conversation_spliced', { agentId, start: 0, deleteCount: 0 }))
 		expect(agentAfter([spawned, started, restarted, completed]).interruptedInference).toBeUndefined()
 		expect(agentAfter([spawned, started, restarted, spliced]).interruptedInference).toBeUndefined()
 	})
