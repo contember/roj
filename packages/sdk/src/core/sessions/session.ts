@@ -656,6 +656,7 @@ export class Session {
 			store: this.store,
 			llmProvider,
 			llmProviders: this.llmProviders,
+			llmLogger: this.llmLogger,
 			toolExecutor: this.toolExecutor,
 			logger: this.logger.child({ agentId: agentState.id }),
 			config,

@@ -11,15 +11,16 @@ import z from 'zod/v4'
 import { DebounceCallback } from '~/core/agents/debounce.js'
 import { AgentId } from '~/core/agents/schema.js'
 import { agentWakeKey, type AgentWakeKind } from '~/core/wake-key.js'
-import type { AgentState, HandlerResult, ReasoningDetails, ThinkingBlocks } from '~/core/agents/state.js'
+import type { AgentState, HandlerResult, InferenceCallRef, ReasoningDetails, ThinkingBlocks } from '~/core/agents/state.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import { applyCacheBreakpoint, type CacheTtlConfig } from '~/core/llm/cache-breakpoints.js'
 import { storeInlineData, storeMessageInlineData } from '~/core/llm/document-content.js'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
+import type { LLMLogger } from '~/core/llm/logger.js'
 import type { InferenceRequest, InferenceResponse, LLMError, LLMMessage, LLMProvider } from '~/core/llm/provider.js'
-import { LLMCallId, ModelId } from '~/core/llm/schema.js'
+import { generateLLMCallId, LLMCallId, ModelId } from '~/core/llm/schema.js'
 import type { LLMResponse } from '~/core/llm/state.js'
 import { llmEvents } from '~/core/llm/state.js'
 import type {
@@ -111,6 +112,8 @@ export interface AgentDependencies {
 	llmProvider: LLMProvider
 	/** Named provider instances, passed to InferenceContext for middleware routing */
 	llmProviders?: ReadonlyMap<string, LLMProvider>
+	/** The call log `llmProvider` writes to; a turn interrupted by a restart reads its response back from it. */
+	llmLogger?: LLMLogger
 	toolExecutor: ToolExecutor
 	logger: Logger
 	config: AgentConfig
@@ -150,6 +153,7 @@ export class Agent {
 	private readonly logger: Logger
 	private readonly llmProvider: LLMProvider
 	private readonly llmProviders: ReadonlyMap<string, LLMProvider>
+	private readonly llmLogger?: LLMLogger
 	private readonly toolExecutor: ToolExecutor
 	private readonly plugins: ConfiguredPlugin[]
 	private readonly environment: SessionEnvironment
@@ -185,6 +189,7 @@ export class Agent {
 		this.logger = deps.logger
 		this.llmProvider = deps.llmProvider
 		this.llmProviders = deps.llmProviders ?? new Map()
+		this.llmLogger = deps.llmLogger
 		this.toolExecutor = deps.toolExecutor
 		this.plugins = deps.plugins
 		this.environment = deps.environment
@@ -698,6 +703,15 @@ export class Agent {
 		// reads on every inference, and the event log never holds their bytes.
 		const pendingMessages = await Promise.all(collectedMessages.map((message) => storeMessageInlineData(message, this.fileStore)))
 
+		// 2d. A turn a restart caught in flight: when its response reached the call log and the
+		// turn still answers the same input, commit that response instead of paying for it again.
+		const inputKey = inferenceInputKey(agentState, pluginDequeued)
+		const interrupted = agentState.interruptedInference
+		const replayed = interrupted === undefined ? null : await this.readInterruptedResponse(interrupted, inputKey)
+		const retried = interrupted !== undefined && replayed === null
+		// Chosen before the request so inference_started records it; without a call log it would name no row.
+		const firstCallId = replayed !== null ? interrupted?.llmCallId : this.llmLogger === undefined ? undefined : generateLLMCallId()
+
 		// 3. Inference start - emit with pending messages
 		await this.store.emit(withSessionId(
 			this.store.sessionId,
@@ -705,6 +719,9 @@ export class Agent {
 				agentId: this.id,
 				messages: pendingMessages,
 				consumedMessageIds: [],
+				llmCallId: firstCallId,
+				inputKey: firstCallId === undefined ? undefined : inputKey,
+				retried: retried ? true : undefined,
 			}),
 		))
 
@@ -755,7 +772,10 @@ export class Agent {
 		})
 
 		// Capture llmCallId from the logging provider
-		let llmCallId: LLMCallId | undefined
+		let llmCallId: LLMCallId | undefined = replayed === null ? undefined : firstCallId
+		// Only the first request goes under the recorded id; later attempts get their own rows.
+		let plannedCallId = replayed === null ? firstCallId : undefined
+		let replayedResponse = replayed ?? undefined
 
 		// Inference with empty-response retry. Providers occasionally return
 		// content: null + toolCalls: [] + finishReason: 'stop' (no signal at all);
@@ -766,20 +786,30 @@ export class Agent {
 		let emptyAttempts = 0
 		let nudgeInjected = false
 		while (true) {
-			llmResponse = await withLLMRetry(
-				() =>
-					this.llmProvider.inference(request, {
-						sessionId: this.store.sessionId,
-						agentId: this.id,
-						onLLMCallCreated: (callId) => {
-							llmCallId = LLMCallId(callId)
-						},
-						signal: this.abortController.signal,
-						fileStore: this.fileStore,
-						providers: this.llmProviders,
-					}),
-				{ logger: this.logger, signal: this.abortController.signal },
-			)
+			if (replayedResponse !== undefined) {
+				llmResponse = Ok(replayedResponse)
+				replayedResponse = undefined
+			} else {
+				llmResponse = await withLLMRetry(
+					() => {
+						const callId = plannedCallId
+						plannedCallId = undefined
+						return this.llmProvider.inference(request, {
+							sessionId: this.store.sessionId,
+							agentId: this.id,
+							onLLMCallCreated: (createdId) => {
+								llmCallId = LLMCallId(createdId)
+							},
+							llmCallId: callId,
+							retried: callId !== undefined && retried,
+							signal: this.abortController.signal,
+							fileStore: this.fileStore,
+							providers: this.llmProviders,
+						})
+					},
+					{ logger: this.logger, signal: this.abortController.signal },
+				)
+			}
 
 			if (!llmResponse.ok) break
 
@@ -946,6 +976,23 @@ export class Agent {
 		// message on restart (at-least-once) instead of dropping it (consume-first
 		// would lose the message — session_restarted wipes the staged pendingMessages).
 		await this.consumeDequeuedTokens(pluginDequeued)
+	}
+
+	/**
+	 * The logged response of a call a restart interrupted, when the turn about to start
+	 * answers the same input. A message that arrived since would otherwise be committed
+	 * as answered by a response that never saw it.
+	 */
+	private async readInterruptedResponse(interrupted: InferenceCallRef, inputKey: string): Promise<InferenceResponse | null> {
+		if (this.llmLogger === undefined || interrupted.inputKey !== inputKey) return null
+		const response = await this.llmLogger.getLoggedResponse(this.store.sessionId, interrupted.llmCallId)
+		if (response !== null) {
+			this.logger.info('Committing the logged response of an interrupted inference', {
+				agentId: this.id,
+				llmCallId: interrupted.llmCallId,
+			})
+		}
+		return response
 	}
 
 	/**
@@ -1921,6 +1968,17 @@ export class Agent {
 // ============================================================================
 // Local helpers (inlined from @roj-ai/core)
 // ============================================================================
+
+/** What a turn answers: the tool results it carries and each plugin's dequeue token. */
+function inferenceInputKey(
+	agentState: AgentState,
+	pluginDequeued: ReadonlyArray<{ plugin: ConfiguredPlugin; token: unknown }>,
+): string {
+	return JSON.stringify({
+		toolResults: agentState.pendingToolResults.map((result) => result.toolCallId),
+		dequeued: pluginDequeued.map((dequeued) => [dequeued.plugin.name, dequeued.token]),
+	})
+}
 
 function getUnconsumedMessages(sessionState: SessionState, agentId: AgentId) {
 	return getAgentUnconsumedMailbox(selectMailboxState(sessionState), agentId)
