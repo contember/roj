@@ -135,9 +135,6 @@ export interface RawInferenceRequest {
 	anthropic?: AnthropicRequestOptions
 }
 
-/**
- * Context for inference (for logging and call tracking).
- */
 /** A call-log row the caller named before sending the request. */
 export interface PlannedLLMCall {
 	llmCallId: string
@@ -145,6 +142,9 @@ export interface PlannedLLMCall {
 	retried: boolean
 }
 
+/**
+ * Context for inference (for logging and call tracking).
+ */
 export interface InferenceContext {
 	sessionId: string
 	agentId: string
