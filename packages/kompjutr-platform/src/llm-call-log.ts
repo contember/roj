@@ -28,10 +28,11 @@ interface CallRecord {
 	response: unknown
 	metrics: unknown
 	error: unknown
+	retried: unknown
 }
 
 const COLUMNS = 'call_id, agent_id, created_at, status, model, request, completed_at, duration_ms, provider_request_id, response, metrics, error'
-const READ_COLUMNS = `rowid AS call_rowid, payload_format, ${COLUMNS}`
+const READ_COLUMNS = `rowid AS call_rowid, payload_format, retried, ${COLUMNS}`
 
 function toStatus(value: unknown): LLMCallStatus {
 	if (value === 'running' || value === 'success' || value === 'error') return value
@@ -66,11 +67,15 @@ export class KompjutrLLMCallLog implements LLMCallStore {
 			this.db.run(`CREATE TABLE IF NOT EXISTS ${CALLS_TABLE} (
 				session_id TEXT NOT NULL, call_id TEXT NOT NULL, agent_id TEXT NOT NULL, created_at INTEGER NOT NULL,
 				status TEXT NOT NULL, model TEXT NOT NULL, request TEXT NOT NULL, completed_at INTEGER, duration_ms INTEGER,
-				provider_request_id TEXT, response TEXT, metrics TEXT, error TEXT, payload_format INTEGER NOT NULL DEFAULT 0
+				provider_request_id TEXT, response TEXT, metrics TEXT, error TEXT, payload_format INTEGER NOT NULL DEFAULT 0,
+				retried INTEGER NOT NULL DEFAULT 0
 			)`)
 			const columns = this.db.all<{ name: unknown }>(`PRAGMA table_info(${CALLS_TABLE})`)
 			if (!columns.some((column) => storedString(column.name) === 'payload_format')) {
 				this.db.run(`ALTER TABLE ${CALLS_TABLE} ADD COLUMN payload_format INTEGER NOT NULL DEFAULT 0`)
+			}
+			if (!columns.some((column) => storedString(column.name) === 'retried')) {
+				this.db.run(`ALTER TABLE ${CALLS_TABLE} ADD COLUMN retried INTEGER NOT NULL DEFAULT 0`)
 			}
 			this.db.run(`CREATE UNIQUE INDEX IF NOT EXISTS ${CALLS_TABLE}_by_id ON ${CALLS_TABLE} (session_id, call_id)`)
 			return new LLMCallPayloads(db)
@@ -80,8 +85,8 @@ export class KompjutrLLMCallLog implements LLMCallStore {
 	async create(sessionId: string, row: LLMCallRow): Promise<void> {
 		this.db.transactionSync(() => {
 			const record = this.db.one<{ call_rowid: unknown }>(
-				`INSERT INTO ${CALLS_TABLE} (session_id, ${COLUMNS}, payload_format)
-				 VALUES (?, ?, '', ?, ?, '', '', ?, ?, NULL, NULL, NULL, NULL, ?) RETURNING rowid AS call_rowid`,
+				`INSERT INTO ${CALLS_TABLE} (session_id, ${COLUMNS}, payload_format, retried)
+				 VALUES (?, ?, '', ?, ?, '', '', ?, ?, NULL, NULL, NULL, NULL, ?, ?) RETURNING rowid AS call_rowid`,
 				sessionId,
 				row.callId,
 				row.createdAt,
@@ -89,6 +94,7 @@ export class KompjutrLLMCallLog implements LLMCallStore {
 				row.completedAt ?? null,
 				row.durationMs ?? null,
 				PAYLOAD_FORMAT,
+				row.retried === true ? 1 : 0,
 			)
 			if (record === undefined) throw new Error('Missing inserted LLM call')
 			const rowid = storedNumber(record.call_rowid)
@@ -163,6 +169,7 @@ export class KompjutrLLMCallLog implements LLMCallStore {
 			agentId: storedString(chunked ? this.#payloads.read(rowid, 'agent_id') : record.agent_id),
 			createdAt: storedNumber(record.created_at),
 			status: toStatus(record.status),
+			retried: storedNumber(record.retried) === 1 ? true : undefined,
 			model: storedString(chunked ? this.#payloads.read(rowid, 'model') : record.model),
 			request: storedString(chunked ? this.#payloads.read(rowid, 'request') : record.request),
 			completedAt: optionalNumber(record.completed_at),

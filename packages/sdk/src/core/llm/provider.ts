@@ -143,6 +143,10 @@ export interface InferenceContext {
 	agentId: string
 	/** Callback invoked when an LLM call entry is created, providing the call ID */
 	onLLMCallCreated?: (callId: string) => void
+	/** Call-log id for this request, chosen by the caller so it is recorded before the request is sent. */
+	llmCallId?: string
+	/** The request repeats one an interrupted run already sent; the call log marks its row. */
+	retried?: boolean
 	/** Signal to abort the inference request */
 	signal?: AbortSignal
 	/** FileStore for resolving file:// URLs in message content */

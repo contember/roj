@@ -313,6 +313,33 @@ for (const sink of SINKS) {
 			})
 		})
 
+		describe('getLoggedResponse', () => {
+			it('gives back a logged success as the provider returned it, under the caller\'s id', async () => {
+				const sessionId = SessionId('test-session-replay')
+				const callId = LLMCallId('0198e9c0-0000-7000-8000-000000000001')
+				const thinkingBlocks = [{ type: 'thinking', thinking: 'Hm.', signature: 'sig' }]
+
+				expect(await logger.createCall(sessionId, AgentId('test-agent-1'), createTestRequest(), { callId, retried: true })).toBe(callId)
+				await logger.completeCall(sessionId, callId, { ...createTestResponse(), providerRequestId: 'req-1', thinkingBlocks }, 150)
+
+				expect((await logger.getCall(sessionId, callId))?.retried).toBe(true)
+				expect(await logger.getLoggedResponse(sessionId, callId)).toEqual({ ...createTestResponse(), providerRequestId: 'req-1', thinkingBlocks })
+			})
+
+			it('has nothing for a call that is still running, failed, or was never logged', async () => {
+				const sessionId = SessionId('test-session-replay-none')
+				const agentId = AgentId('test-agent-1')
+				const running = await logger.createCall(sessionId, agentId, createTestRequest())
+				const failed = await logger.createCall(sessionId, agentId, createTestRequest())
+				await logger.failCall(sessionId, failed, createTestError(), 50)
+
+				expect((await logger.getCall(sessionId, running))?.retried).toBeUndefined()
+				expect(await logger.getLoggedResponse(sessionId, running)).toBeNull()
+				expect(await logger.getLoggedResponse(sessionId, failed)).toBeNull()
+				expect(await logger.getLoggedResponse(sessionId, LLMCallId('never-logged'))).toBeNull()
+			})
+		})
+
 		describe('getCall', () => {
 			it('returns null for non-existent call', async () => {
 				const sessionId = SessionId('test-session-6')
