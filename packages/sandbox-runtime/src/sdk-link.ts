@@ -55,15 +55,15 @@ function hasInstalledSdk(fromDir: string): boolean {
  * @returns the relaunched process's exit code, or null when this process can load the bundle itself.
  */
 export async function linkSdkOrRelaunch(bundleDir: string): Promise<number | null> {
-	const relaunched = process.env[RELAUNCHED_ENV] === '1'
-	// Processes the agent starts must not inherit it, or a runtime among them would skip its own relaunch.
-	delete process.env[RELAUNCHED_ENV]
+	// The marker holds the relaunching parent's pid: processes the agent starts inherit the env, and a runtime
+	// among them must still relaunch for its own bundle.
+	const relaunched = process.env[RELAUNCHED_ENV] === String(process.ppid)
 	const linked = await ensureSdkResolvable(bundleDir)
 	if (!linked || relaunched) return null
 
 	console.log('[sandbox-runtime] restarting so the new link is resolvable')
 	const child = Bun.spawn([process.execPath, ...process.execArgv, ...process.argv.slice(1)], {
-		env: { ...process.env, [RELAUNCHED_ENV]: '1' },
+		env: { ...process.env, [RELAUNCHED_ENV]: String(process.pid) },
 		stdio: ['inherit', 'inherit', 'inherit'],
 	})
 	for (const signal of FORWARDED_SIGNALS) {
