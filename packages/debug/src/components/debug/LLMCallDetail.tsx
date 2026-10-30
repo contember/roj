@@ -355,7 +355,7 @@ export function CollapsibleSection({
 /**
  * Convert a file:// URL to the session file proxy endpoint.
  * Handles both real paths (file:///.../.roj/data/sessions/{id}/foo.png)
- * and virtual/sandboxed paths (file:///home/user/session/foo.png).
+ * virtual/sandboxed paths (file:///home/user/session/foo.png) and session-relative ones (file://.images/{sha256}.png).
  */
 function fileUrlToProxyUrl(fileUrl: string, sessionId: string): string {
 	const baseUrl = getApiBaseUrl()
@@ -373,6 +373,12 @@ function fileUrlToProxyUrl(fileUrl: string, sessionId: string): string {
 	if (fileUrl.startsWith(virtualPrefix)) {
 		const relativePath = fileUrl.slice(virtualPrefix.length)
 		return `${baseUrl}/sessions/${sessionId}/files/${relativePath}`
+	}
+
+	// Session-relative path: an inline image the agent stored
+	const storedPrefix = 'file://.images/'
+	if (fileUrl.startsWith(storedPrefix)) {
+		return `${baseUrl}/sessions/${sessionId}/files/${fileUrl.slice('file://'.length)}`
 	}
 
 	return fileUrl

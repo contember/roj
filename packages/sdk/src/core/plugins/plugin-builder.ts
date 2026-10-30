@@ -576,6 +576,7 @@ export class PluginBuilder<
 		return this as unknown as PluginBuilder<TName, TConfig, TContext, S, TMethods, TManagerMethods, TAgentConfig, TFactories, TNotifications, TDeps>
 	}
 
+	/** In memory only: rebuilt each time the session loads, so what must survive a resume belongs in `.state()`. */
 	context<C>(
 		factory: (ctx: SessionContext, pluginConfig: TConfig) => Promise<C>,
 	): PluginBuilder<TName, TConfig, C, TState, TMethods, TManagerMethods, TAgentConfig, TFactories, TNotifications, TDeps> {

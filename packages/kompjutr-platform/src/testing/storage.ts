@@ -7,7 +7,8 @@
  * and an earlier attempt at this port shipped a batch insert that passed every
  * test and failed in production for exactly that reason. A fake that is more
  * permissive than the thing it stands for hides the bugs worth catching, so the
- * limit is enforced here rather than discovered on a deploy.
+ * limit is enforced here rather than discovered on a deploy. So is the 2 MB
+ * size of one string or BLOB, which bun:sqlite stores at any size.
  */
 
 import { Database as BunDatabase, type SQLQueryBindings } from 'bun:sqlite'
@@ -15,6 +16,18 @@ import type { DurableObjectStorageLike, SQLCursorLike, SQLStorageLike } from '@k
 
 /** What a Durable Object binds per statement. The 101st raises, as workerd does. */
 export const MAX_BIND_PARAMETERS = 100
+
+/** A Durable Object stores at most 2 MB in one string or BLOB; read as decimal, the stricter reading. */
+export const MAX_VALUE_BYTES = 2_000_000
+
+const encoder = new TextEncoder()
+
+function checkValueSize(value: SQLQueryBindings): void {
+	const size = typeof value === 'string' ? encoder.encode(value).byteLength : value instanceof Uint8Array ? value.byteLength : 0
+	if (size > MAX_VALUE_BYTES) {
+		throw new Error(`string or blob too big: ${size} bytes exceeds the ${MAX_VALUE_BYTES} a Durable Object stores`)
+	}
+}
 
 /** SQLite takes bytes, numbers, strings and null; everything else is converted or refused. */
 function toBinding(value: unknown): SQLQueryBindings {
@@ -107,7 +120,9 @@ export class BunSqliteStorage implements DurableObjectStorageLike {
 				this.statementCount++
 				// Not `query()`: it caches by SQL text, and a nested cursor over the same SQL would share one statement.
 				const statement = this.db.prepare<Row, SQLQueryBindings[]>(query)
-				const rows = statement.iterate(...bindings.map(toBinding))
+				const values = bindings.map(toBinding)
+				for (const value of values) checkValueSize(value)
+				const rows = statement.iterate(...values)
 				return new Cursor<Row>(rows, () => {
 					this.rowCount++
 				})

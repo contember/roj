@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, setSystemTime, test } from 'bun:test'
 import { BunSqliteStorage } from '@roj-ai/kompjutr-platform/testing'
-import { MockLLMProvider, type MockInferenceHandler, z } from '@roj-ai/sdk'
+import { createEventsFactory, definePlugin, Err, type LLMMessage, MockLLMProvider, type MockInferenceHandler, Ok, ToolCallId, z } from '@roj-ai/sdk'
+import { createTool } from '@roj-ai/sdk/tools'
 import { createTestPreset } from '@roj-ai/sdk/testing'
 import type { RuntimeBroadcast, RuntimeHost } from './host-contract.js'
 import { createIsolateRuntime, type IsolateRuntime } from './runtime.js'
@@ -34,9 +35,67 @@ class TestHost implements RuntimeHost {
 /** One Durable Object's storage, shared by every runtime booted on it — as across evictions. */
 const createObject = () => ({ storage: Object.assign(new BunSqliteStorage(), { kv: new MemoryKv() }), host: new TestHost() })
 
+/** Four photos of ~1.5 MB base64 each, as a camera upload hands them over: together far past one 2 MB row. */
+const PHOTOS = Array.from({ length: 4 }, (_, index) => `data:image/jpeg;base64,${Buffer.alloc(1_100_000, index + 1).toString('base64')}`)
+
+const photosPlugin = definePlugin('photos')
+	.tools(() => [
+		createTool({
+			name: 'take_photos',
+			description: 'Return the photos',
+			input: z.object({}),
+			execute: async () => Ok(PHOTOS.map((url) => ({ type: 'image_url' as const, imageUrl: { url } }))),
+		}),
+	])
+	.build()
+
+const callbackEvents = createEventsFactory({
+	events: {
+		callback_registered: z.object({ endpoint: z.string(), token: z.string() }),
+	},
+})
+
+/**
+ * A third-party plugin, built from public exports only, that a host hands a callback over RPC.
+ * Its state is reduced from its own events, so the next isolate rebuilds it from the log.
+ */
+const callbackPlugin = definePlugin('callback')
+	.events([callbackEvents])
+	.state({
+		key: 'callback',
+		initial: (): { endpoint: string; token: string } | null => null,
+		reduce: (state, event) => event.type === 'callback_registered' ? { endpoint: event.endpoint, token: event.token } : state,
+	})
+	.method('register', {
+		input: z.object({ endpoint: z.string(), token: z.string() }),
+		output: z.object({}),
+		handler: async (ctx, input) => {
+			await ctx.emitEvent(callbackEvents.create('callback_registered', input))
+			return Ok({})
+		},
+	})
+	.method('get', {
+		input: z.object({}),
+		output: z.object({ endpoint: z.string(), token: z.string() }).nullable(),
+		handler: async (ctx) => Ok(ctx.pluginState),
+	})
+	.tools((ctx) => [
+		createTool({
+			name: 'call_back',
+			description: 'Report to the host',
+			input: z.object({}),
+			execute: async () => {
+				const callback = await ctx.self.get({})
+				if (!callback.ok || callback.value === null) return Err({ message: 'no callback registered', recoverable: false })
+				return Ok(`${callback.value.endpoint} ${callback.value.token}`)
+			},
+		}),
+	])
+	.build()
+
 const boot = (object: ReturnType<typeof createObject>, llmMock: MockInferenceHandler) =>
 	createIsolateRuntime({
-		userConfig: { presets: [createTestPreset({ id: 'test' })] },
+		userConfig: { presets: [createTestPreset({ id: 'test', plugins: [photosPlugin.configure(), callbackPlugin.configure()] })] },
 		host: object.host,
 		state: { storage: object.storage, waitUntil: () => {} },
 		config: { llmMock, logLevel: 'error' },
@@ -100,6 +159,34 @@ describe('isolate runtime', () => {
 		expect(status).toMatchObject({ versions: { runtime: { name: '@roj-ai/isolate-runtime' } }, sessions: [{ id: sessionId, presetId: 'test' }] })
 	})
 
+	test('a turn whose tool returns large inline photos completes, and no event row holds them', async () => {
+		setSystemTime(T0)
+		const object = createObject()
+		const requests: LLMMessage[][] = []
+		const runtime = boot(object, (request) => {
+			requests.push(request.messages)
+			if (requests.length > 1) return answering(request)
+			return {
+				content: null,
+				toolCalls: [{ id: ToolCallId('tc1'), name: 'take_photos', input: {} }],
+				finishReason: 'tool_calls',
+				metrics: MockLLMProvider.defaultMetrics(),
+			}
+		})
+		await runtime.start()
+
+		const sessionId = createdSchema.parse(await rpc(runtime, 'sessions.create', { presetId: 'test' })).value.sessionId
+		await rpc(runtime, 'user-chat.sendMessage', { sessionId, content: 'Take the photos.' })
+		await runAlarms(runtime, object.host)
+
+		expect(await eventTypes(runtime, sessionId)).toContain('inference_completed')
+		expect(requests).toHaveLength(2)
+		const toolMessage = requests[1]?.find((message) => message.role === 'tool')
+		expect(toolMessage?.content).toEqual(PHOTOS.map(() => ({ type: 'image_url', imageUrl: { url: expect.stringMatching(/^file:\/\/\.images\/[0-9a-f]{64}\.jpg$/) } })))
+		const largest = object.storage.db.query<{ size: number }, []>('SELECT MAX(length(payload)) AS size FROM roj_events').get()
+		expect(largest?.size).toBeLessThan(64 * 1024)
+	})
+
 	test('a turn lost to an eviction is retried by the alarm and finished by the next isolate', async () => {
 		setSystemTime(T0)
 		const object = createObject()
@@ -112,6 +199,61 @@ describe('isolate runtime', () => {
 
 		expect(object.host.alarm).toBeNull()
 		expect(await eventTypes(next, sessionId)).toContain('inference_completed')
+	})
+
+	test('plugin state a host set over RPC survives an eviction and reaches a tool in the next isolate', async () => {
+		setSystemTime(T0)
+		const object = createObject()
+		const evicted = boot(object, () => new Promise(() => {}))
+		await evicted.start()
+		const sessionId = createdSchema.parse(await rpc(evicted, 'sessions.create', { presetId: 'test' })).value.sessionId
+		expect(await rpc(evicted, 'callback.register', { sessionId, endpoint: 'https://host.example/hook', token: 't-123' })).toMatchObject({ ok: true })
+		await rpc(evicted, 'user-chat.sendMessage', { sessionId, content: 'Report back.' })
+		setSystemTime(object.host.alarm ?? T0)
+		void evicted.deliverWakes()
+		await Bun.sleep(50)
+
+		const results: string[] = []
+		const next = boot(object, (request) => {
+			const last = request.messages[request.messages.length - 1]
+			if (last?.role === 'tool') {
+				results.push(typeof last.content === 'string' ? last.content : JSON.stringify(last.content))
+				return answering(request)
+			}
+			return { content: null, toolCalls: [{ id: ToolCallId('tc1'), name: 'call_back', input: {} }], finishReason: 'tool_calls', metrics: MockLLMProvider.defaultMetrics() }
+		})
+		await next.start()
+		await runAlarms(next, object.host)
+
+		expect(results).toEqual(['https://host.example/hook t-123'])
+		expect(await eventTypes(next, sessionId)).toContain('inference_completed')
+	})
+
+	test('a retry wake delivered during the recovery turn keeps its retry until that turn is done', async () => {
+		setSystemTime(T0)
+		const object = createObject()
+		// First isolate: the first turn fails for good, and the next message waits out the error backoff on a retry wake.
+		const failed = boot(object, () => {
+			throw { type: 'invalid_request', message: 'rejected' }
+		})
+		await failed.start()
+		const sessionId = createdSchema.parse(await rpc(failed, 'sessions.create', { presetId: 'test' })).value.sessionId
+		await rpc(failed, 'user-chat.sendMessage', { sessionId, content: 'First.' })
+		await runAlarms(failed, object.host)
+		await rpc(failed, 'user-chat.sendMessage', { sessionId, content: 'Second.' })
+		setSystemTime(object.host.alarm ?? T0)
+		await failed.deliverWakes()
+		const retryAt = object.host.alarm
+		expect(retryAt).toBeGreaterThan(Date.now())
+
+		// Evicted before the retry fires. The next isolate's load starts the recovery turn, which hangs on the provider.
+		setSystemTime(retryAt ?? T0)
+		const recovering = boot(object, () => new Promise(() => {}))
+		await recovering.start()
+		void recovering.deliverWakes()
+		await Bun.sleep(50)
+
+		expect(object.host.alarm).toBe(Date.now() + RETRY_MS)
 	})
 
 	test('start does not wait on the host, which cannot answer a facet that is still starting', async () => {

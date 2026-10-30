@@ -55,7 +55,11 @@ async function canonicalize(fs: FileSystem, path: string): Promise<string | null
 			const real = await fs.realpath(current)
 			return missing.length > 0 ? join(real, ...missing) : real
 		} catch {
-			if (await entryExists(fs, current)) return null
+			if (await entryExists(fs, current)) {
+				// A concurrent writer may have created it since realpath failed; only a second failure is a dangling link.
+				const real = await fs.realpath(current).catch(() => null)
+				return real === null ? null : join(real, ...missing)
+			}
 			const parent = dirname(current)
 			if (parent === current) return null
 			missing.unshift(basename(current))
