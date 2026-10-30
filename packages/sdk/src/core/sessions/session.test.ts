@@ -4,6 +4,7 @@ import { generateTestAgentId } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { DomainEvent } from '~/core/events/types.js'
+import { LLMCallId } from '~/core/llm/schema.js'
 import { llmEvents } from '~/core/llm/state.js'
 import { generateSessionId } from '~/core/sessions/schema.js'
 import { sessionEvents } from '~/core/sessions/state.js'
@@ -14,7 +15,7 @@ import { getAgentMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
 import { generateTestMessageId } from '~/plugins/mailbox/schema.js'
 import { mailboxEvents } from '~/plugins/mailbox/state.js'
 import { createApplyEvent } from './apply-event.js'
-import { createSessionState, getAgentState, getCommunicatorId, getEntryAgentId, getOrchestratorId, reconstructSessionState } from './state.js'
+import { checkRecoveryNeeded, createSessionState, getAgentState, getCommunicatorId, getEntryAgentId, getOrchestratorId, reconstructSessionState } from './state.js'
 
 const applyEvent = createApplyEvent([mailboxPlugin.create({})])
 
@@ -1732,5 +1733,43 @@ describe('Immutability', () => {
 		expect(session.agents.size).toBe(0)
 		expect(newSession.agents.size).toBe(1)
 		expect(session).not.toBe(newSession)
+	})
+})
+
+describe('the call a restart interrupts', () => {
+	const agentId = generateTestAgentId()
+	const call = { llmCallId: LLMCallId('call-1'), inputKey: '{"toolResults":[]}' }
+	const metrics = { promptTokens: 1, completionTokens: 1, totalTokens: 2, latencyMs: 1, model: 'test' }
+	const event = (domainEvent: DomainEvent) => withSessionId(SESSION_ID, domainEvent)
+	const spawned = event(agentEvents.create('agent_spawned', { agentId, definitionName: 'test', parentId: null }))
+	const started = event(llmEvents.create('inference_started', { agentId, messages: [], consumedMessageIds: [], ...call }))
+	const restarted = event(sessionEvents.create('session_restarted', { resetAgentIds: [agentId], clearedToolAgentIds: [] }))
+	const completed = event(llmEvents.create('inference_completed', { agentId, consumedMessageIds: [], response: { content: 'ok', toolCalls: [] }, metrics }))
+	const replay = (events: DomainEvent[]) => events.reduce(applyEvent, createSessionState(SESSION_ID, 'test', TIMESTAMP))
+	const agentAfter = (events: DomainEvent[]) => getAgentState(replay(events), agentId)!
+
+	it('is kept for an agent caught inferring, and consumed by the next inference_started', () => {
+		expect(agentAfter([spawned, started, restarted]).interruptedInference).toEqual(call)
+		expect(agentAfter([spawned, started, restarted, started]).interruptedInference).toBeUndefined()
+	})
+
+	it('is kept for an agent paused while its call was in flight', () => {
+		const paused = event(agentEvents.create('agent_paused', { agentId, reason: 'manual' }))
+		expect(checkRecoveryNeeded(replay([spawned, started, paused]))?.resetAgentIds).toEqual([agentId])
+
+		const agent = agentAfter([spawned, started, paused, restarted])
+		expect(agent.status).toBe('paused')
+		expect(agent.interruptedInference).toEqual(call)
+	})
+
+	it('is not set for an agent whose call already failed', () => {
+		const failed = event(llmEvents.create('inference_failed', { agentId, error: 'boom' }))
+		expect(agentAfter([spawned, started, failed, restarted]).interruptedInference).toBeUndefined()
+	})
+
+	it('is dropped by a turn committed without a call, and by a spliced history', () => {
+		const spliced = event(agentEvents.create('agent_conversation_spliced', { agentId, start: 0, deleteCount: 0 }))
+		expect(agentAfter([spawned, started, restarted, completed]).interruptedInference).toBeUndefined()
+		expect(agentAfter([spawned, started, restarted, spliced]).interruptedInference).toBeUndefined()
 	})
 })

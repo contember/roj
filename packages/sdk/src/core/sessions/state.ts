@@ -285,6 +285,8 @@ export const coreReducer = createTypedReducer(
 						lastInferenceFailureAt: undefined,
 						turnNumber: (agent.turnNumber ?? 0) + 1,
 						inferenceCall: undefined,
+						// Only the staged turn may consume it; one committed without a call (a skip) must not leave it for the next.
+						interruptedInference: undefined,
 					}
 				})
 			}
@@ -440,6 +442,10 @@ export const coreReducer = createTypedReducer(
 							lastInferenceFailureAt: undefined,
 						}
 						changed = true
+					} else if (agent.status === 'paused' && agent.inferenceCall !== undefined) {
+						// Paused while its call was in flight: the call is gone, and the turn is restaged after resume.
+						updated = { ...updated, pendingMessages: [], inferenceCall: undefined, interruptedInference: agent.inferenceCall }
+						changed = true
 					}
 
 					if (agent.executingToolCall !== undefined) {
@@ -588,7 +594,7 @@ export const checkRecoveryNeeded = (state: SessionState): {
 	const clearedToolAgentIds: AgentId[] = []
 
 	for (const [agentId, agent] of state.agents) {
-		if (agent.status === 'inferring' || agent.status === 'errored') {
+		if (agent.status === 'inferring' || agent.status === 'errored' || (agent.status === 'paused' && agent.inferenceCall !== undefined)) {
 			resetAgentIds.push(agentId)
 		}
 		if (agent.executingToolCall !== undefined) {
