@@ -5,8 +5,10 @@ import { join } from 'node:path'
 import { MemoryEventStore } from '~/core/events/memory.js'
 import { LLMLogger } from '~/core/llm/logger.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import type { AssistantLLMMessage } from '~/core/agents/state.js'
 import type { InferenceResponse } from '~/core/llm/provider.js'
 import { llmEvents } from '~/core/llm/state.js'
+import { ToolCallId } from '~/core/tools/schema.js'
 import { selectSessionStats } from '~/plugins/session-stats/index.js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
@@ -84,8 +86,48 @@ describe('an inference interrupted by a restart', () => {
 		expect(completed.llmCallId).toBe(started.llmCallId)
 		expect(selectSessionStats(session2.state).retriedInferences).toBe(0)
 
-		dying.release.resolve()
+		// The dead run drains its turn on shutdown, so it is let go only once the resumed one is down.
 		await second.shutdown()
+		dying.release.resolve()
+		await first.shutdown()
+	})
+
+	it('replays a logged tool call with its thinking blocks, and carries on from it', async () => {
+		const thinkingBlocks = [{ type: 'thinking', thinking: 'Greet them.', signature: 'sig' }]
+		const eventStore = new MemoryEventStore()
+		const basePath = callLogPath()
+		const dying = new DyingAfterLog(loggerConfig(basePath))
+		const first = new TestHarness({
+			eventStore,
+			presets: [createTestPreset()],
+			llmLogger: dying,
+			mockHandler: () => ({
+				content: null,
+				toolCalls: [{ id: ToolCallId('tc1'), name: 'tell_user', input: { message: 'Hi!' } }],
+				finishReason: 'tool_calls',
+				metrics: MockLLMProvider.defaultMetrics(),
+				thinkingBlocks,
+			}),
+		})
+		const session1 = await first.createSession('test')
+		await session1.sendMessage('Hi')
+		await dying.logged.promise
+
+		const resumed = new MockLLMProvider(() => answer('Done.'))
+		const second = new TestHarness({ eventStore, presets: [createTestPreset()], llmLogger: new LLMLogger(loggerConfig(basePath)), llmProvider: resumed })
+		const session2 = await second.openSession(session1.sessionId)
+		await session2.waitForIdle()
+
+		const [replayed] = await session2.getEventsByType(llmEvents, 'inference_completed')
+		expect(replayed.response.toolCalls.map((toolCall) => toolCall.name)).toEqual(['tell_user'])
+		expect(replayed.response.thinkingBlocks).toEqual(thinkingBlocks)
+		// The only provider call is the turn after the replayed tool call ran.
+		expect(resumed.getCallHistory()).toHaveLength(1)
+		const assistants = resumed.getCallHistory()[0].messages.filter((m): m is AssistantLLMMessage => m.role === 'assistant')
+		expect(assistants[0].thinkingBlocks).toEqual(thinkingBlocks)
+
+		await second.shutdown()
+		dying.release.resolve()
 		await first.shutdown()
 	})
 
@@ -115,8 +157,8 @@ describe('an inference interrupted by a restart', () => {
 		expect((await llmLogger.getCall(session2.sessionId, retried.llmCallId))?.retried).toBe(true)
 		expect(selectSessionStats(session2.state).retriedInferences).toBe(1)
 
-		cutOff.release()
 		await second.shutdown()
+		cutOff.release()
 		await first.shutdown()
 	})
 
@@ -140,8 +182,8 @@ describe('an inference interrupted by a restart', () => {
 		expect(completed.response.content).toBe('Fresh answer.')
 		expect(selectSessionStats(session2.state).retriedInferences).toBe(1)
 
-		dying.release.resolve()
 		await second.shutdown()
+		dying.release.resolve()
 		await first.shutdown()
 	})
 })
