@@ -198,8 +198,7 @@ export class FileEventStore extends BaseEventStore {
 		if (events.length === 0) return
 
 		const path = this.getEventsPath(sessionId)
-		const content = events.map((event) => `${JSON.stringify(event)}\n`).join('')
-		const contentSize = Buffer.byteLength(content, 'utf8')
+		const content = Buffer.from(events.map((event) => `${JSON.stringify(event)}\n`).join(''), 'utf8')
 		let committed: number | undefined
 		try {
 			await this.fs.mkdir(dirname(path), { recursive: true })
@@ -207,9 +206,9 @@ export class FileEventStore extends BaseEventStore {
 			await this.fs.appendFile(path, content)
 		} catch (cause) {
 			if (committed === undefined) throw new EventAppendError(sessionId, cause)
-			await this.rollBack(sessionId, committed, contentSize, cause)
+			await this.rollBack(sessionId, committed, content, cause)
 		}
-		this.committedSizes.set(sessionId, committed + contentSize)
+		this.committedSizes.set(sessionId, committed + content.length)
 
 		// meta.json is derived from the log, so a failure to update it cannot undo a committed append.
 		if (this.staleMetadata.has(sessionId)) {
@@ -262,14 +261,15 @@ export class FileEventStore extends BaseEventStore {
 	}
 
 	/** Restore the log to what was committed before a failed append, so the append definitely did not commit. */
-	private async rollBack(sessionId: SessionId, committed: number, appended: number, cause: unknown): Promise<never> {
+	private async rollBack(sessionId: SessionId, committed: number, appended: Buffer, cause: unknown): Promise<never> {
 		this.committedSizes.delete(sessionId)
 		try {
 			const bytes = await this.readLogOrEmpty(sessionId)
 			if (bytes.length < committed) throw new Error('Event log shrank below its committed length')
-			// More bytes than this append could have written belong to another writer, and truncating would delete them.
-			if (bytes.length > committed + appended) throw new Error('Event log grew beyond the failed append')
-			if (bytes.length > committed) await this.replaceLog(sessionId, bytes.subarray(0, committed))
+			// Bytes this append did not write belong to another writer, and truncating would delete them.
+			const tail = bytes.subarray(committed)
+			if (!tail.equals(appended.subarray(0, tail.length))) throw new Error('Event log holds bytes the failed append did not write')
+			if (tail.length > 0) await this.replaceLog(sessionId, bytes.subarray(0, committed))
 		} catch {
 			// Whatever the append wrote may still be there, and the next load will replay it.
 			this.staleMetadata.add(sessionId)

@@ -188,6 +188,23 @@ describe('FileEventStore recovery', () => {
 			await expect(store.append(id, spawned())).rejects.toBeInstanceOf(EventAppendOutcomeUnknownError)
 			expect(await fresh().load(id)).toHaveLength(3)
 		})
+		test('a failed append keeps a shorter line another host wrote, rather than truncating it as its own', async () => {
+			let fail = false
+			const store = fresh(instrument(native, {
+				async appendFile(_path, _data, append) {
+					if (fail) throw failure
+					await append()
+				},
+			}))
+			await store.append(id, events[0])
+			// Shorter than the failed append below, so a size check alone takes it for that append's partial write.
+			await fresh().append(id, withSessionId(id, sessionEvents.create('session_closed', {})))
+
+			fail = true
+			const large = withSessionId(id, agentEvents.create('agent_spawned', { agentId: generateTestAgentId(), definitionName: 'x'.repeat(200), parentId: null }))
+			await expect(store.append(id, large)).rejects.toBeInstanceOf(EventAppendOutcomeUnknownError)
+			expect(await fresh().load(id)).toHaveLength(2)
+		})
 	})
 
 	test('an append whose rollback failed leaves the counters to be rebuilt from the log', async () => {
