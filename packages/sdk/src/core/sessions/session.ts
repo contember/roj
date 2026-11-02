@@ -52,7 +52,7 @@ import { type RuntimeLeaseRelease, type SessionRuntimeActivity, SessionRuntimeAc
 const MAILBOX_MESSAGE_SEQUENCE = 'mailbox.message'
 
 /** Disposal waits for aborted turns to unwind, but never pins on a wedged one. */
-const AGENT_DRAIN_TIMEOUT_MS = 5_000
+const DISPOSAL_DRAIN_TIMEOUT_MS = 5_000
 
 /**
  * Callback for user-facing output.
@@ -942,7 +942,7 @@ export class Session {
 			// The shutdown above only aborts; a turn still inside a tool call keeps
 			// running against the agents and plugin contexts cleared below.
 			await this.drainAgents()
-			await this.schedulerTail
+			await this.drainScheduler()
 		} finally {
 			// Clean up references to prevent memory leaks
 			this.agents.clear()
@@ -963,19 +963,27 @@ export class Session {
 
 	/** Await every in-flight turn, bounded — a wedged one must not hold disposal open. */
 	private async drainAgents(): Promise<void> {
-		const drains = [...this.agents.values()].map((agent) => agent.waitForIdle())
+		await this.drainBounded([...this.agents.values()].map((agent) => agent.waitForIdle()), 'Agent turns did not settle before disposal')
+	}
+
+	/** A host scheduler call that never settles must not hold disposal open either. */
+	private async drainScheduler(): Promise<void> {
+		await this.drainBounded([this.schedulerTail], 'Scheduler operations did not settle before disposal')
+	}
+
+	private async drainBounded(drains: Promise<unknown>[], expiredMessage: string): Promise<void> {
 		if (drains.length === 0) return
 
 		let timer: ReturnType<typeof setTimeout> | undefined
 		const expiry = new Promise<'expired'>((resolve) => {
-			timer = setTimeout(() => resolve('expired'), AGENT_DRAIN_TIMEOUT_MS)
+			timer = setTimeout(() => resolve('expired'), DISPOSAL_DRAIN_TIMEOUT_MS)
 		})
 		try {
 			const outcome = await Promise.race([Promise.all(drains).then(() => 'drained' as const), expiry])
 			if (outcome === 'expired') {
-				this.logger.warn('Agent turns did not settle before disposal', {
+				this.logger.warn(expiredMessage, {
 					sessionId: this.id,
-					timeoutMs: AGENT_DRAIN_TIMEOUT_MS,
+					timeoutMs: DISPOSAL_DRAIN_TIMEOUT_MS,
 				})
 			}
 		} finally {

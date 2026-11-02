@@ -194,6 +194,18 @@ describe('scheduler handoff', () => {
 		host.manager.revokeSession(activation.value)
 	})
 
+	it('disposes a runtime whose scheduler call never settles', async () => {
+		class HangingScheduler extends RecordingScheduler {
+			override wake(): Promise<void> { return new Promise(() => {}) }
+		}
+		const host = createHost({ scheduler: new HangingScheduler() })
+		const session = await createSession(host)
+		await sendMessage(session, entryAgentId(session), 'arm a wake that never settles')
+		const started = performance.now()
+		await host.manager.shutdown()
+		expect(performance.now() - started).toBeLessThan(12_000)
+	}, 15_000)
+
 	it('rejects park when an admitted scheduler operation failed', async () => {
 		class FailingScheduler extends RecordingScheduler {
 			override async wake(): Promise<void> { throw new Error('Scheduler unavailable') }
