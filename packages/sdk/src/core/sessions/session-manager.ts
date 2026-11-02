@@ -121,6 +121,8 @@ interface SessionCacheEntry {
 	lastAccessAt: number
 	unloadPromise?: Promise<void>
 	listenerCleanup?: () => void
+	/** Set once a load built its store, so a write the load started still blocks a reload after the load failed. */
+	store?: SessionStore
 }
 
 export interface SessionActivation {
@@ -213,13 +215,13 @@ export class SessionManager {
 	private beginPark(handle: SessionActivation): Promise<void> {
 		const tenure = this.activations.get(handle)
 		if (!tenure) return Promise.reject(new SessionRuntimeUnavailableError(handle.sessionId, 'revoked'))
+		if (tenure.state === 'lost') return Promise.reject(new SessionOwnershipLostError(handle.sessionId))
 		if (tenure.parkPromise) return tenure.parkPromise
 		if ([...tenure.entries].some((entry) => (entry.activity.getSnapshot().state === 'disposed' || tenure.state === 'revoked') && entry.runtime?.hasUnsafeResources())) {
 			if (tenure.state === 'active') tenure.state = 'parking'
 			tenure.parkPromise = Promise.reject(new SessionRuntimeUnavailableError(handle.sessionId, 'unloading'))
 			return tenure.parkPromise
 		}
-		if (tenure.state === 'lost') return Promise.reject(new SessionOwnershipLostError(handle.sessionId))
 		if (this.tenures.get(handle.sessionId) !== tenure || tenure.state === 'released' || tenure.state === 'revoked') return Promise.resolve()
 		tenure.state = 'parking'
 		const entries = [...tenure.entries].filter((entry) => entry.activity.getSnapshot().state !== 'disposed')
@@ -233,12 +235,18 @@ export class SessionManager {
 			if (entry.activity.getSnapshot().state === 'ready') entry.activity.beginParking()
 		}
 		const parking: Promise<void> = Promise.all(entries.map((entry) => this.parkEntry(entry))).then(() => {
+			if (tenure.state === 'lost') throw new SessionOwnershipLostError(handle.sessionId)
 			if (tenure.state === 'revoked') throw new SessionRuntimeUnavailableError(handle.sessionId, 'revoked')
 			if ([...tenure.entries].some((entry) => entry.runtime?.hasUnsafeResources())) throw new SessionRuntimeUnavailableError(handle.sessionId, 'unloading')
 			tenure.state = 'released'
 			tenure.entries.clear()
 			tenure.entry = undefined
 		}).catch((error: unknown) => {
+			// A write that found another owner stopped the runtime mid-drain; only activateSession recovers.
+			if (tenure.state === 'lost') {
+				if (tenure.parkPromise === parking) tenure.parkPromise = undefined
+				throw new SessionOwnershipLostError(handle.sessionId)
+			}
 			// A drain that reported a failure stays retryable; one that found the runtime
 			// gone is terminal, and the host has to revoke instead.
 			const terminal = error instanceof SessionRuntimeUnavailableError
@@ -300,7 +308,7 @@ export class SessionManager {
 		}
 		if (!tenure) return Err(SessionErrors.runtimeUnavailable(String(sessionId), 'revoked'))
 		if (tenure.state !== 'active') return Err(this.refusal(tenure))
-		if (!this.sessions.has(sessionId) && tenure.entry?.runtime?.hasUnsafeResources()) return Err(SessionErrors.runtimeUnavailable(String(sessionId), 'unloading'))
+		if (!this.sessions.has(sessionId) && tenure.entry && this.isUnsafe(tenure.entry)) return Err(SessionErrors.runtimeUnavailable(String(sessionId), 'unloading'))
 		return Ok(tenure)
 	}
 
@@ -697,6 +705,7 @@ export class SessionManager {
 			const state = reconstructSessionState(forkedEvents, composedReducer)
 			if (!state) throw new SessionLoadError(ValidationErrors.invalid('Failed to reconstruct forked session'))
 			const store = new SessionStore(newSessionId, this.eventStore, state, composedReducer, this.storeOptions)
+			entry.store = store
 			const recoveryData = checkRecoveryNeeded(state)
 			if (recoveryData) {
 				await store.emit(withSessionId(
@@ -729,6 +738,7 @@ export class SessionManager {
 		} catch (error) {
 			if (this.sessions.get(newSessionId) === entry) this.sessions.delete(newSessionId)
 			entry.listenerCleanup?.()
+			if (error instanceof SessionOwnershipLostError) this.markOwnershipLost(tenure)
 			this.forgetEntry(entry, entry.runtime)
 			if (tenure.state !== 'active') return Err(this.refusal(tenure))
 			if (error instanceof SessionLoadError) return Err(error.domainError)
@@ -805,6 +815,8 @@ export class SessionManager {
 				return Ok(session)
 			} catch (error) {
 				if (this.sessions.get(sessionId) === entry) this.sessions.delete(sessionId)
+				// A recovery write can lose ownership before the runtime exists to report it.
+				if (error instanceof SessionOwnershipLostError) this.markOwnershipLost(tenure)
 				this.forgetEntry(entry, entry.runtime)
 				if (tenure.state !== 'active') return Err(this.refusal(tenure))
 				if (error instanceof SessionLoadError) {
@@ -856,6 +868,7 @@ export class SessionManager {
 		if (!store) {
 			throw new SessionLoadError(SessionErrors.notFound(String(sessionId)))
 		}
+		entry.store = store
 
 		const state = store.getState()
 
@@ -1400,10 +1413,7 @@ export class SessionManager {
 			registerReopenedSession: (reopenedSession) => this.registerReopenedSession(reopenedSession, entry.activity, entry.tenure),
 			onStoreFenced: (error) => {
 				this.dropStoppedRuntime(entry.tenure, session)
-				// The log has another owner, so reloading here would replay it and restart
-				// its work just to fence again. Refuse access until the host reactivates.
-				const tenure = entry.tenure
-				if (error instanceof SessionOwnershipLostError && tenure.state === 'active' && this.tenures.get(tenure.handle.sessionId) === tenure) tenure.state = 'lost'
+				if (error instanceof SessionOwnershipLostError) this.markOwnershipLost(entry.tenure)
 			},
 		})
 		entry.runtime = session
@@ -1649,9 +1659,23 @@ export class SessionManager {
 			})
 			return
 		}
+		// A load that failed before its runtime existed may still have a write in flight.
+		if (!session && entry.store?.hasPendingWrites()) {
+			void entry.store.whenSettled().then(() => this.forgetEntry(entry, session))
+			return
+		}
 		if (!session) entry.activity.markDisposed()
 		entry.tenure.entries.delete(entry)
 		if (entry.tenure.entry === entry) entry.tenure.entry = undefined
+	}
+
+	private isUnsafe(entry: SessionCacheEntry): boolean {
+		return entry.runtime ? entry.runtime.hasUnsafeResources() : entry.store?.hasPendingWrites() === true
+	}
+
+	/** The log has another owner, so reloading here would replay it and restart its work just to fence again. */
+	private markOwnershipLost(tenure: SessionTenure): void {
+		if ((tenure.state === 'active' || tenure.state === 'parking') && this.tenures.get(tenure.handle.sessionId) === tenure) tenure.state = 'lost'
 	}
 
 	private getSessionDir(sessionId: SessionId): string {

@@ -124,6 +124,7 @@ function host(f: Awaited<ReturnType<typeof fixture>>, options: {
 	tool?: (value: string) => Promise<void>
 	fs?: FileSystem
 	eventStore?: EventStore
+	writeQueueTimeoutMs?: number
 } = {}) {
 	const platform: Platform = { ...createNodePlatform(), scheduler: f.scheduler }
 	const eventStore = options.eventStore ?? new FileEventStore(f.directory, options.fs ?? platform.fs)
@@ -154,6 +155,7 @@ function host(f: Awaited<ReturnType<typeof fixture>>, options: {
 		dataFileStore: new SessionFileStore(f.directory, undefined, false, platform.fs, 'session'),
 		platform,
 		systemPlugins: [sessionLifecyclePlugin, presetsPlugin, mailboxPlugin, agentsPlugin, agentStatusPlugin, userChatPlugin, plugin],
+		writeQueueTimeoutMs: options.writeQueueTimeoutMs,
 	})
 	managers.push(manager)
 	if (!f.scheduler.owner) f.scheduler.transfer(manager)
@@ -386,6 +388,97 @@ describe('cross-host file-backed handoff', () => {
 		}
 		expect(a.manager.getRuntimeCacheStats().misses).toBe(misses)
 		await expect(a.manager.parkSession(tenure)).rejects.toBeInstanceOf(SessionOwnershipLostError)
+		expect(a.manager.activateSession(session.id).ok).toBe(true)
+	})
+
+	it('refuses access when the recovery write of a load finds another host owning the log', async () => {
+		const f = await fixture()
+		const held = gate()
+		const backing = new EpochBacking()
+		const a = host(f, { eventStore: backing.adapter(1), provider: async () => {
+			held.entered.resolve()
+			await held.release.promise
+			return response()
+		} })
+		const session = await create(a)
+		await send(session, 'interrupted')
+		track(f.scheduler.deliver(a.manager, key(session)))
+		await held.entered.promise
+		// A dies mid-inference, so a load has to record the restart before the runtime exists.
+		await backing.transfer(session.id)
+
+		const stale = host(f, { eventStore: backing.adapter(1) })
+		const tenure = activate(stale, session.id)
+		expect(await stale.manager.getSession(session.id)).toMatchObject({ ok: false, error: { type: 'session_ownership_lost' } })
+		const misses = stale.manager.getRuntimeCacheStats().misses
+		expect(await stale.manager.getSession(session.id)).toMatchObject({ ok: false, error: { type: 'session_ownership_lost' } })
+		expect(stale.manager.getRuntimeCacheStats().misses).toBe(misses)
+		await expect(stale.manager.parkSession(tenure)).rejects.toBeInstanceOf(SessionOwnershipLostError)
+	})
+
+	it('refuses a reload while the recovery write of a failed load may still land', async () => {
+		const f = await fixture()
+		const inference = gate()
+		const backing = new EpochBacking()
+		const a = host(f, { eventStore: backing.adapter(1), provider: async () => {
+			inference.entered.resolve()
+			await inference.release.promise
+			return response()
+		} })
+		const session = await create(a)
+		await send(session, 'interrupted')
+		track(f.scheduler.deliver(a.manager, key(session)))
+		await inference.entered.promise
+
+		const commit = gate()
+		let hold = true
+		const b = host(f, {
+			eventStore: backing.adapter(1, async () => {
+				if (hold) { commit.entered.resolve(); await commit.release.promise }
+			}),
+			writeQueueTimeoutMs: 10,
+		})
+		activate(b, session.id)
+		// The recovery append outlives its bound, so its outcome is unknown and the load fails.
+		await expect(b.manager.getSession(session.id)).rejects.toThrow()
+		await commit.entered.promise
+		expect(await b.manager.getSession(session.id)).toMatchObject({ ok: false, error: { type: 'session_runtime_unavailable' } })
+
+		hold = false
+		commit.release.resolve()
+		let reloaded = await b.manager.getSession(session.id)
+		for (let attempt = 0; !reloaded.ok && attempt < 50; attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 10))
+			reloaded = await b.manager.getSession(session.id)
+		}
+		expect(reloaded.ok).toBe(true)
+		// The reload replayed the write that landed late instead of recording the restart a second time.
+		expect((await backing.load(session.id)).filter((event) => event.type === 'session_restarted')).toHaveLength(1)
+	})
+
+	it('reports a park whose drain lost ownership as lost, until the host activates again', async () => {
+		const f = await fixture()
+		const held = gate()
+		const backing = new EpochBacking()
+		let hold = false
+		const a = host(f, { eventStore: backing.adapter(1, async () => {
+			if (hold) { held.entered.resolve(); await held.release.promise }
+		}) })
+		const session = await create(a)
+		const tenure = activate(a, session.id)
+		hold = true
+		const admitted = track(session.callPluginMethod('host-test.mark', { value: 'admitted' }))
+		await held.entered.promise
+		await backing.transfer(session.id)
+		const parking = track(a.manager.parkSession(tenure))
+		hold = false
+		held.release.resolve()
+
+		await expect(admitted).rejects.toBeInstanceOf(SessionOwnershipLostError)
+		await expect(parking).rejects.toBeInstanceOf(SessionOwnershipLostError)
+		await expect(a.manager.parkSession(tenure)).rejects.toBeInstanceOf(SessionOwnershipLostError)
+		expect(await a.manager.getSession(session.id)).toMatchObject({ ok: false, error: { type: 'session_ownership_lost' } })
+		await session.whenSafe()
 		expect(a.manager.activateSession(session.id).ok).toBe(true)
 	})
 
