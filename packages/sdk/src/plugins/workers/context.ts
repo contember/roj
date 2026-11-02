@@ -125,6 +125,8 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 	private readonly inFlightEffects = new Set<Promise<void>>()
 	private readonly effectLeases = new Set<() => void>()
 	private localState: TState
+	/** Emits run one at a time, so each is checked against the state every earlier one produced; a terminal event follows them. */
+	private emitTail: Promise<unknown> = Promise.resolve()
 
 	/**
 	 * Local cancellation flag - provides immediate signal before event is persisted.
@@ -191,22 +193,28 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 	 * and applies the event to local state once the append commits.
 	 */
 	async emit(event: TSubEvent): Promise<void> {
-		await this.runEffect(async () => {
+		const previous = this.emitTail
+		// The effect registers synchronously, so the drain after a terminal result covers an emit its worker did not await.
+		const emitting = this.runEffect(async () => {
+			await previous.catch(() => {})
 			// A logged event the reducer throws on would fail every replay of the session.
-			this.reducer(this.localState, event)
+			const next = this.reducer(this.localState, event)
 			await this.emitEvent(workerEvents.create('worker_sub_event', {
 				workerId: this.workerId,
 				workerType: this.workerType,
 				subEvent: event,
 			}))
-			// Reduced again from the current state: a concurrent emit may have committed meanwhile.
-			this.localState = this.reducer(this.localState, event)
+			this.localState = next
 		})
+		this.emitTail = emitting
+		await emitting
 	}
 
 	/** Persist a terminal worker event within the context effect lifecycle. */
 	async persistTerminal(event: Parameters<EmitEvent>[0]): Promise<boolean> {
+		const previous = this.emitTail
 		return this.runEffect(async () => {
+			await previous.catch(() => {})
 			await this.emitEvent(event)
 		})
 	}

@@ -841,6 +841,52 @@ describe('workers plugin', () => {
 			await harness.shutdown()
 		})
 
+		it('checks concurrent sub-events against the state the earlier ones produce', async () => {
+			let emitResults: PromiseSettledResult<void>[] | undefined
+			const onceWorker = createWorkerDefinition(
+				'once',
+				'Emits the same one-time transition twice at once',
+				z.object({}),
+				{
+					initialState: () => ({ ticked: false }),
+					reduce: (state: { ticked: boolean }, event: { type: string }) => {
+						if (event.type === 'tick' && state.ticked) throw new Error('already ticked')
+						return { ticked: state.ticked || event.type === 'tick' }
+					},
+					execute: async (_config, ctx) => {
+						emitResults = await Promise.allSettled([ctx.emit({ type: 'tick' }), ctx.emit({ type: 'tick' })])
+						return Ok({ status: 'done', summary: 'Emits settled' })
+					},
+				},
+			)
+			const eventStore = new MemoryEventStore()
+			const preset = createTestPreset({ plugins: [workerPlugin.configure({ workers: [onceWorker] })] })
+			const harness = createWorkersHarness({
+				presets: [preset],
+				eventStore,
+				llmProvider: MockLLMProvider.withSequence([
+					{ toolCalls: [{ id: ToolCallId('tc1'), name: 'worker_once_start', input: {} }] },
+					{ content: 'Done', toolCalls: [] },
+				]),
+			})
+			let reloaded: TestHarness | undefined
+			try {
+				const session = await harness.createSession('test')
+				await session.sendAndWaitForIdle('Start worker')
+				await waitFor(() => emitResults !== undefined)
+				expect(emitResults?.map((result) => result.status)).toEqual(['fulfilled', 'rejected'])
+				expect(await session.getEventsByType(workerEvents, 'worker_sub_event')).toHaveLength(1)
+				await harness.shutdown()
+
+				reloaded = createWorkersHarness({ presets: [preset], eventStore })
+				const reopened = await reloaded.openSession(session.sessionId)
+				expect(reopened.sessionId).toBe(session.sessionId)
+			} finally {
+				await harness.shutdown()
+				await reloaded?.shutdown()
+			}
+		})
+
 		it('rejects a sub-event its reducer throws on without logging it', async () => {
 			let emitFailure: unknown
 			const rejectingWorker = createWorkerDefinition(
