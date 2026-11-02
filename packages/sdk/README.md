@@ -151,8 +151,14 @@ drops it by replacing the log through a rename.
 
 An append that fails is rolled back to the last committed line, so a retry
 cannot duplicate it (`EventAppendError`). When the rollback fails too, or the
-log holds lines this store did not write, the outcome is unknown
-(`EventAppendOutcomeUnknownError`) and the next load of the log decides it. A complete line that does not parse is `EventLogCorruptionError`.
+log holds bytes this append did not write, the outcome is unknown
+(`EventAppendOutcomeUnknownError`) and the next load of the log decides it.
+
+**Known gap.** `appendBatch` is all-or-none only while the rollback works. A
+batch cut short by a crash, or by a failure the rollback cannot repair (the
+rollback rewrites the log, so a full disk defeats it), leaves its complete lines
+in the log, and the next load replays that prefix of the batch. Closing this
+needs a batch commit marker in the log format, which older SDKs could not read. A complete line that does not parse is `EventLogCorruptionError`.
 
 `meta.json` is derived from the log and may lag it: a failed metadata write does
 not undo a committed append, and the counters are rebuilt from the log on the
@@ -188,7 +194,7 @@ and releases residency without ending the session. `parkSession(handle,
 { timeoutMs })` bounds the caller's wait, not the drain;
 `writeQueueTimeoutMs` (on `SessionManagerOptions` and `createSystem`, or
 `SESSION_WRITE_QUEUE_TIMEOUT_MS`) bounds each append once it reaches the head of
-the write queue; an append that does not settle in time has an unknown outcome. Neither caps the drain as a whole, and four of its waits are unbounded
+the write queue; an append that does not settle in time has an unknown outcome. Neither caps the drain as a whole, and five of its waits are unbounded
 — so size `timeoutMs` to the host's shutdown budget and treat revoke as the
 fallback when it fires. `SESSION-LIFECYCLE.md` lists every wait a drain spends,
 with its bound and default.

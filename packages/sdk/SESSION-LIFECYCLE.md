@@ -63,9 +63,12 @@ from the host's deadline and they add up — none of them caps the whole drain.
 | — each service stop hook | `hookTimeoutMs` | 30 s |
 | The scheduler tail | unbounded | — |
 
-Three of those have no bound at all: admitted operations, the in-flight agent
-turn (which contains a provider request), and the scheduler tail. Tuning the
-knobs alone therefore cannot make a park fit a budget.
+Five of those rows have no bound: the two hook aggregates, admitted operations,
+the in-flight agent turn (which contains a provider request), and the scheduler
+tail. Tuning the knobs alone therefore cannot make a park fit a budget. Disposal
+(eviction, close, shutdown) waits on the agent turns and the scheduler tail for
+at most 5 s each, so a host scheduler call that never settles cannot hold it
+open.
 
 `parkSession(handle, { timeoutMs })` bounds the caller's wait, not the drain.
 The park keeps running past the timeout and a later call races the same one, so
@@ -106,7 +109,14 @@ A fenced runtime cannot write, so it has nothing to drain. It revokes itself and
 the manager drops the residency. Plugin close hooks run with reason `revoked`.
 While a write the store has not answered is still in flight, the id refuses new
 access as `unloading`. After that the next access reloads from the log, which
-decides whether the uncertain write landed.
+decides whether the uncertain write landed. A load whose own recovery write
+fences behaves the same way, although no runtime exists yet.
+
+An async upload whose `processing` event committed while the runtime could not
+start it — parking, unloading — is re-run by the next load from the log, and
+that run counts as an attempt. An upload that is admitted during several parks
+in a row can therefore fail with "Processing interrupted by restart" without
+ever having run.
 
 ## Losing the session to another host
 
