@@ -889,13 +889,16 @@ function startAsyncUpload(args: {
 	})
 }
 
-/** Removes an upload whose 'processing' event definitely did not commit, so no later load turns it into an attachment. */
-async function discardUnrecordedUpload(prepared: PreparedUpload, logger: Logger): Promise<void> {
+/**
+ * Removes an upload whose 'processing' event definitely did not commit, so no later load turns it into an attachment.
+ * `uploadStore` is not scoped to the runtime: a refusal that stopped it must still clean up, and the log never named this id.
+ */
+async function discardUnrecordedUpload(uploadStore: FileStore, prepared: PreparedUpload, logger: Logger): Promise<void> {
 	try {
-		const removedMetadata = await prepared.uploadStore.remove('meta.json')
+		const removedMetadata = await uploadStore.remove('meta.json')
 		if (!removedMetadata.ok) throw new Error(removedMetadata.error)
 		if (prepared.source.kind === 'file') {
-			const removedFile = await prepared.uploadStore.remove(prepared.filename)
+			const removedFile = await uploadStore.remove(prepared.filename)
 			if (!removedFile.ok) throw new Error(removedFile.error)
 		}
 	} catch (error) {
@@ -1018,7 +1021,10 @@ async function beginAsyncUpload(args: {
 		)
 	} catch (error) {
 		// An unknown outcome keeps the metadata: if the event landed, the next load must still run the upload.
-		if (error instanceof EventAppendError) await discardUnrecordedUpload(prepared, host.logger)
+		if (error instanceof EventAppendError) {
+			const uploadStore = host.pluginConfig.dataFileStore.scoped(`sessions/${args.requestSessionId}/uploads/${prepared.uploadIdStr}`)
+			await discardUnrecordedUpload(uploadStore, prepared, host.logger)
+		}
 		return abandonStart(host, prepared, error)
 	}
 	const processing = host.runtimeActivity.getSnapshot().state === 'ready'

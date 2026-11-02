@@ -3,7 +3,7 @@ import { rm } from 'node:fs/promises'
 import z from 'zod/v4'
 import { MemoryEventStore } from '~/core/events/memory.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
-import { EventAppendError } from '~/core/events/event-store.js'
+import { EventAppendError, SessionOwnershipLostError } from '~/core/events/event-store.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import { SessionFileStore } from '~/core/file-store/file-store.js'
 import type { FileEntry, FileStore } from '~/core/file-store/types.js'
@@ -452,13 +452,14 @@ describe('uploads runtime retention', () => {
 		}
 	})
 
-	it('does not start an upload on the next load when its processing event definitely did not commit', async () => {
+	// Ownership loss also stops the runtime before the handler sees the refusal.
+	for (const refusal of [EventAppendError, SessionOwnershipLostError]) it(`does not start an upload on the next load when its processing event definitely did not commit (${refusal.name})`, async () => {
 		let refuseProcessing = true
 		class RefuseProcessingStore extends MemoryEventStore {
 			protected override async doAppend(sessionId: SessionId, event: DomainEvent): Promise<void> {
 				const parsed = z.object({ status: z.string() }).safeParse(event)
 				if (refuseProcessing && event.type === 'attachment_uploaded' && parsed.success && parsed.data.status === 'processing') {
-					throw new EventAppendError(sessionId, new Error('Injected processing append failure'))
+					throw new refusal(sessionId, new Error('Injected processing append failure'))
 				}
 				await super.doAppend(sessionId, event)
 			}
