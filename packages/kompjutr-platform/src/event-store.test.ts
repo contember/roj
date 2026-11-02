@@ -81,6 +81,26 @@ test('a batch that fails part way through leaves nothing behind', async () => {
 	expect((await failing.getMetadata(SESSION))?.metrics?.totalEvents).toBe(2)
 })
 
+test('a metadata failure after the events committed does not report them as a noncommit', async () => {
+	await store.append(SESSION, created(SESSION))
+	const failing = new KompjutrEventStore({
+		...db,
+		run: (query: string, ...bindings: unknown[]) => {
+			if (query.includes('roj_session_metadata') && query.includes('INSERT')) throw new Error('metadata write failed')
+			db.run(query, ...bindings)
+		},
+		all: db.all.bind(db),
+		one: db.one.bind(db),
+		scalar: db.scalar.bind(db),
+		iterate: db.iterate.bind(db),
+		transactionSync: db.transactionSync.bind(db),
+	})
+
+	// EventAppendError would tell the session the event is not in the log, and a retry would write it twice.
+	await failing.append(SESSION, event(SESSION, 'committed'))
+	expect((await store.load(SESSION)).map((entry) => entry.type)).toEqual(['session_created', 'committed'])
+})
+
 test('loadRange returns what followed the cursor, and holds it when nothing did', async () => {
 	await store.appendBatch(SESSION, [created(SESSION), event(SESSION, 'a'), event(SESSION, 'b')])
 
