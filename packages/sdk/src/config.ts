@@ -4,6 +4,7 @@
 
 import { resolve } from 'node:path'
 import type { MockInferenceHandler } from './core/llm/mock.js'
+import { isValidWriteQueueTimeoutMs } from './core/sessions/session-store.js'
 import type { ArchiveLimitOverrides } from './lib/archive/index.js'
 import type { LogLevel } from './lib/logger/logger.js'
 
@@ -133,9 +134,6 @@ export const loadConfig = (): Config => {
 	}
 }
 
-/** The largest delay setTimeout honours; a longer one fires after 1 ms. */
-const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
-
 /**
  * Validate configuration and return errors if any.
  */
@@ -182,7 +180,7 @@ export const validateConfig = (config: Config): string[] => {
 	}
 	// Zero would fence the first write that has to wait.
 	const writeQueueTimeoutMs = config.writeQueueTimeoutMs
-	if (writeQueueTimeoutMs !== undefined && (!Number.isSafeInteger(writeQueueTimeoutMs) || writeQueueTimeoutMs <= 0 || writeQueueTimeoutMs > MAX_TIMER_DELAY_MS)) {
+	if (writeQueueTimeoutMs !== undefined && !isValidWriteQueueTimeoutMs(writeQueueTimeoutMs)) {
 		errors.push(`Invalid writeQueueTimeoutMs: ${writeQueueTimeoutMs}`)
 	}
 

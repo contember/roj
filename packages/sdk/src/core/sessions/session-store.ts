@@ -31,6 +31,14 @@ import { getAgentState, reconstructSessionState } from '~/core/sessions/state.js
  */
 export const SESSION_WRITE_QUEUE_TIMEOUT_MS = 30_000
 
+/** The largest delay setTimeout honours; a longer one fires after 1 ms. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
+
+/** A bound setTimeout can keep: a zero, negative or oversized one would fire at once and fence nearly every write. */
+export function isValidWriteQueueTimeoutMs(value: number): boolean {
+	return Number.isSafeInteger(value) && value > 0 && value <= MAX_TIMER_DELAY_MS
+}
+
 export interface SessionStoreOptions {
 	/** Bound on one append at the head of the write queue. Defaults to {@link SESSION_WRITE_QUEUE_TIMEOUT_MS}. */
 	queueTimeoutMs?: number

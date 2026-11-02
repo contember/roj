@@ -50,7 +50,7 @@ import type { UploadBlobStore } from '~/plugins/uploads/source.js'
 import { EventStore, SessionOwnershipLostError } from '../events/event-store.js'
 import { createApplyEvent } from './apply-event.js'
 import { rewriteEventsForFork } from './fork-utils.js'
-import { SessionStore } from './session-store.js'
+import { isValidWriteQueueTimeoutMs, SessionStore } from './session-store.js'
 import type { SessionStoreOptions } from './session-store.js'
 import { Session, type SessionReopenRegistration, type UserOutputCallback } from './session.js'
 import { SessionRuntimeActivityController, SessionRuntimeUnavailableError } from './runtime-activity.js'
@@ -355,6 +355,9 @@ export class SessionManager {
 	constructor(options: SessionManagerOptions) {
 		if (options.sessionIdleTimeoutMs !== undefined && (!Number.isSafeInteger(options.sessionIdleTimeoutMs) || options.sessionIdleTimeoutMs < 0)) {
 			throw new Error(`Invalid sessionIdleTimeoutMs: ${options.sessionIdleTimeoutMs}`)
+		}
+		if (options.writeQueueTimeoutMs !== undefined && !isValidWriteQueueTimeoutMs(options.writeQueueTimeoutMs)) {
+			throw new Error(`Invalid writeQueueTimeoutMs: ${options.writeQueueTimeoutMs}`)
 		}
 		this.eventStore = options.eventStore
 		this.llmProvider = options.llmProvider

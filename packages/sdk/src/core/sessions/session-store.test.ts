@@ -6,6 +6,7 @@ import { withSessionId } from '../events/test-helpers.js'
 import { SessionId } from './schema.js'
 import { SessionRuntimeDetachedError, SessionStore } from './session-store.js'
 import { createSessionState, sessionEvents } from './state.js'
+import { TestHarness } from '~/testing/test-harness.js'
 
 const id = SessionId('store-ordering')
 const event = (timestamp: number) => ({ ...withSessionId(id, sessionEvents.create('session_overrides_set', {})), timestamp })
@@ -154,6 +155,12 @@ describe('SessionStore write lifetime', () => {
 		await store.whenSettled()
 		expect(store.hasPendingWrites()).toBe(false)
 		expect(applied).toEqual([])
+	})
+
+	it('refuses a write queue bound the host cannot keep, rather than fencing nearly every write', () => {
+		for (const writeQueueTimeoutMs of [0, -1, Number.NaN, 1.5, 2 ** 31]) {
+			expect(() => new TestHarness({ presets: [], writeQueueTimeoutMs })).toThrow(`Invalid writeQueueTimeoutMs: ${writeQueueTimeoutMs}`)
+		}
 	})
 
 	it('suppresses late projection and notification after detach', async () => {
