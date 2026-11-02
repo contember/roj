@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import z from 'zod/v4'
@@ -9,6 +9,8 @@ import { MemoryEventStore } from '~/core/events/memory.js'
 import { createEventsFactory, type DomainEvent } from '~/core/events/types.js'
 import { SessionFileStore } from '~/core/file-store/file-store.js'
 import { MockLLMProvider, type MockInferenceHandler } from '~/core/llm/mock.js'
+import { IMAGES_DIR } from '~/core/llm/document-content.js'
+import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { InferenceContext, InferenceRequest, InferenceResponse } from '~/core/llm/provider.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
@@ -122,6 +124,7 @@ async function fixture() {
 function host(f: Awaited<ReturnType<typeof fixture>>, options: {
 	provider?: MockInferenceHandler
 	tool?: (value: string) => Promise<void>
+	toolResult?: (value: string) => ToolResultContent
 	fs?: FileSystem
 	eventStore?: EventStore
 	writeQueueTimeoutMs?: number
@@ -144,7 +147,7 @@ function host(f: Awaited<ReturnType<typeof fixture>>, options: {
 				executions.push(input.value)
 				await options.tool?.(input.value)
 				await ctx.self.mark(input)
-				return Ok(input.value)
+				return Ok(options.toolResult?.(input.value) ?? input.value)
 			},
 		})]).build()
 	const provider = new ContextMock(options.provider ?? (() => response()))
@@ -480,6 +483,37 @@ describe('cross-host file-backed handoff', () => {
 		expect(await a.manager.getSession(session.id)).toMatchObject({ ok: false, error: { type: 'session_ownership_lost' } })
 		await session.whenSafe()
 		expect(a.manager.activateSession(session.id).ok).toBe(true)
+	})
+
+	it('does not store the inline image of a tool result that returns after revoke', async () => {
+		const f = await fixture()
+		const held = gate()
+		let first = true
+		const a = host(f, {
+			provider: () => {
+				const tools = first
+				first = false
+				return response(tools)
+			},
+			tool: async (value) => {
+				if (value !== 'first') return
+				held.entered.resolve()
+				await held.release.promise
+			},
+			// Not a valid PNG, but the store keys images by bytes and format alone.
+			toolResult: () => [{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${Buffer.from('late image').toString('base64')}` } }],
+		})
+		const session = await create(a)
+		const tenure = activate(a, session.id)
+		await send(session, 'd1')
+		const processing = track(f.scheduler.deliver(a.manager, key(session)).catch((error: unknown) => error))
+		await held.entered.promise
+		a.manager.revokeSession(tenure)
+		held.release.resolve()
+		await processing
+		await session.whenSafe()
+		const written = await readdir(f.directory, { recursive: true })
+		expect(written.filter((path) => path.includes(IMAGES_DIR))).toEqual([])
 	})
 
 	it('revokes inference synchronously and discards a noncooperative provider result without executing tools', async () => {

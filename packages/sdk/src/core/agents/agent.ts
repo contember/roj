@@ -736,7 +736,7 @@ export class Agent {
 
 		// 2c. Move inline documents and images to the session store: history keeps a reference the provider
 		// reads on every inference, and the event log never holds their bytes.
-		const pendingMessages = await Promise.all(collectedMessages.map((message) => storeMessageInlineData(message, this.fileStore)))
+		const pendingMessages = await Promise.all(collectedMessages.map((message) => storeMessageInlineData(message, this.stepFileStore())))
 
 		// 2d. A turn a restart caught in flight: when its response reached the call log and the
 		// turn still answers the same input, commit that response instead of paying for it again.
@@ -839,7 +839,7 @@ export class Agent {
 								return callId === undefined ? undefined : { llmCallId: callId, retried }
 							},
 							signal: this.abortController.signal,
-							fileStore: new RuntimeFileStore(this.fileStore, this.getSessionContext(this.stepOperation?.activity).runtimeActivity),
+							fileStore: this.stepFileStore(),
 							providers: this.llmProviders,
 						}),
 					{ logger: this.logger, signal: this.abortController.signal },
@@ -1229,7 +1229,7 @@ export class Agent {
 
 		// Build initial tool result with ToolResultContent; its documents and images go to the session store before any event records it
 		let toolResult: { isError: boolean; content: ToolResultContent } = result.ok
-			? { isError: false, content: await storeInlineData(result.value, this.fileStore) }
+			? { isError: false, content: await storeInlineData(result.value, this.stepFileStore()) }
 			: { isError: true, content: result.error.message }
 
 		// afterToolCall handler - can modify result or pause.
@@ -1307,6 +1307,11 @@ export class Agent {
 	/**
 	 * Build base AgentContext for handler/hook calls.
 	 */
+	/** The session store scoped to the running step, so a revoked runtime cannot write behind its replacement. */
+	private stepFileStore(): FileStore {
+		return new RuntimeFileStore(this.fileStore, this.getSessionContext(this.stepOperation?.activity).runtimeActivity)
+	}
+
 	private buildAgentContext(agentState: AgentState, activity: SessionRuntimeActivity | undefined = this.stepOperation?.activity): AgentContext {
 		const sessionContext = this.getSessionContext(activity)
 		return {
@@ -1655,7 +1660,7 @@ export class Agent {
 					case 'modify': {
 						const modified: AfterToolCallResult = {
 							action: 'modify',
-							result: { ...result.result, content: await storeInlineData(result.result.content, this.fileStore) },
+							result: { ...result.result, content: await storeInlineData(result.result.content, this.stepFileStore()) },
 						}
 						await this.emitHandlerCompleted('afterToolCall', modified)
 						return modified
