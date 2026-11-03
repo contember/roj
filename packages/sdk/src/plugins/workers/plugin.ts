@@ -4,6 +4,7 @@ import { ValidationErrors } from '~/core/errors.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import type { SessionRuntimeActivity } from '~/core/sessions/runtime-activity.js'
+import { RuntimeFileStore } from '~/core/sessions/context.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import type { SessionState } from '~/core/sessions/state.js'
 import { createTool, type ToolDefinition } from '~/core/tools/definition.js'
@@ -83,6 +84,10 @@ async function executeWorker(
 	effectDrainTimeoutMs: number,
 ): Promise<void> {
 	try {
+		if (!context.resumed) {
+			if (!await context.persistTerminal(workerEvents.create('worker_execution_started', { workerId }))) return
+		}
+		if (!context.shouldContinue()) return
 		const result = await definition.execute(config, context)
 		if (executionControl.suppressTerminalEvent) return
 
@@ -92,6 +97,7 @@ async function executeWorker(
 				result: result.value,
 			}))
 			if (persisted) logger.info('Worker completed', { workerId, result: result.value.summary })
+			else logger.warn('Worker terminal event not persisted', { workerId, type: 'worker_completed' })
 		} else {
 			const persisted = await context.persistTerminal(workerEvents.create('worker_failed', {
 				workerId,
@@ -99,6 +105,7 @@ async function executeWorker(
 				resumable: result.error.resumable,
 			}))
 			if (persisted) logger.warn('Worker failed', { workerId, error: result.error.message, resumable: result.error.resumable })
+			else logger.warn('Worker terminal event not persisted', { workerId, type: 'worker_failed' })
 		}
 	} catch (error) {
 		if (executionControl.suppressTerminalEvent) return
@@ -109,6 +116,7 @@ async function executeWorker(
 			resumable: false,
 		}))
 		if (persisted) logger.error('Worker threw exception', error instanceof Error ? error : undefined, { workerId })
+		else logger.warn('Worker terminal event not persisted', { workerId, type: 'worker_failed' })
 	} finally {
 		// Bounded like the stop path: a stalled append must not hold the runtime lease forever.
 		const drained = await awaitWithin(context.waitForEffects(), effectDrainTimeoutMs)
@@ -219,7 +227,7 @@ interface LaunchWorkerParams {
 	files: FileStore
 	emitEvent: EmitEvent
 	getSessionState: () => SessionState
-	reserveMailboxMessageSequence: () => number
+	reserveMailboxMessageSequence: (activity?: SessionRuntimeActivity) => number
 	scheduleAgent: (agentId: AgentId) => void
 	runtimeActivity: SessionRuntimeActivity
 	runningWorkers: Map<WorkerIdType, RunningWorker>
@@ -252,11 +260,14 @@ function launchWorker({
 	effectDrainTimeoutMs,
 	logger,
 }: LaunchWorkerParams): Result<void, string> {
+	if (runtimeActivity.getSnapshot().state === 'parking') return Ok(undefined)
+	if (runtimeActivity.getSnapshot().state !== 'ready') return Err('Session runtime is no longer accepting workers')
 	if (runningWorkers.size >= MAX_CONCURRENT_WORKERS) {
 		return Err(`Max concurrent workers reached (${MAX_CONCURRENT_WORKERS})`)
 	}
-	const releaseLease = runtimeActivity.tryAcquire(`worker:${workerId}`)
-	if (!releaseLease) return Err('Session runtime is no longer accepting workers')
+	const operation = runtimeActivity.tryOperation(`worker:${workerId}`)
+	if (!operation) return Err('Session runtime is no longer accepting workers')
+	const releaseLease = () => operation.release()
 
 	const workerLogger = logger.child({ workerId, workerType: definition.type })
 	const workerContext = new WorkerContextImpl({
@@ -264,11 +275,14 @@ function launchWorker({
 		workerId,
 		agentId,
 		workerType: definition.type,
-		files,
-		emitEvent,
+		files: new RuntimeFileStore(files, operation.activity),
+		emitEvent: (event) => emitEvent(event, operation.activity),
 		getSessionState,
-		reserveMailboxMessageSequence,
-		acquireEffectLease: () => runtimeActivity.tryAcquire(`worker:${workerId}:effect`),
+		reserveMailboxMessageSequence: () => reserveMailboxMessageSequence(operation.activity),
+		acquireEffectLease: () => operation.activity.tryAcquire(`worker:${workerId}:effect`),
+		isRuntimeAvailable: () => {
+			try { operation.activity.assertAvailable(); return true } catch { return false }
+		},
 		reducer: definition.reduce,
 		initialState,
 		resumed,
@@ -340,6 +354,7 @@ export const workerPlugin = definePlugin('workers')
 						agentId: event.agentId,
 						workerType: event.workerType,
 						status: 'running',
+						pendingStart: event.pendingStart ?? false,
 						state: initialState,
 						config: event.config,
 						createdAt: event.timestamp,
@@ -349,6 +364,14 @@ export const workerPlugin = definePlugin('workers')
 					const newWorkers = new Map(workers)
 					newWorkers.set(event.workerId, workerEntry)
 					return newWorkers
+				}
+
+				case 'worker_execution_started': {
+					const worker = workers.get(event.workerId)
+					if (!worker) return workers
+					const next = new Map(workers)
+					next.set(worker.id, { ...worker, pendingStart: false })
+					return next
 				}
 
 				case 'worker_sub_event': {
@@ -483,6 +506,7 @@ export const workerPlugin = definePlugin('workers')
 				agentId: input.agentId,
 				workerType: definition.type,
 				config: validConfig,
+				pendingStart: true,
 			}))
 
 			const sessionId = ctx.sessionId
@@ -567,7 +591,7 @@ export const workerPlugin = definePlugin('workers')
 				definition,
 				config: worker.config,
 				initialState: worker.state,
-				resumed: true,
+				resumed: !worker.pendingStart,
 				files,
 				emitEvent,
 				getSessionState,
@@ -770,7 +794,7 @@ export const workerPlugin = definePlugin('workers')
 					definition,
 					config: workerEntry.config,
 					initialState: workerEntry.state,
-					resumed: true,
+					resumed: !workerEntry.pendingStart,
 					files: ctx.files.session,
 					emitEvent: ctx.emitEvent,
 					getSessionState: ctx.getSessionState,
@@ -798,6 +822,16 @@ export const workerPlugin = definePlugin('workers')
 				pendingLaunches.delete(workerId)
 			}
 		},
+	})
+	.sessionHook('onSessionPark', async (ctx) => {
+		const { runningWorkers, abandonedWorkers, logger } = ctx.pluginContext
+		const workers = [...runningWorkers.values()]
+		const timeouts = resolveStopTimeouts(ctx.pluginConfig)
+		const exited = await awaitWithin(Promise.allSettled(workers.map((worker) => worker.promise)), timeouts.stopTimeoutMs)
+		if (exited) return
+		const stragglers = workers.filter((worker) => runningWorkers.get(worker.workerId) === worker)
+		logger.warn('Stopping workers that outlived the park drain', { count: stragglers.length })
+		await stopWorkers(stragglers, runningWorkers, abandonedWorkers, timeouts)
 	})
 	.sessionHook('onSessionClose', async (ctx) => {
 		const { runningWorkers, abandonedWorkers, logger } = ctx.pluginContext

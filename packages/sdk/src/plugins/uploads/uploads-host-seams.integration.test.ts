@@ -331,7 +331,8 @@ describe('uploads.registerStored', () => {
 
 			expect(result.ok).toBe(false)
 			if (result.ok) return
-			expect(result.error).toEqual({ type: 'session_closing', message: 'Session is closing', httpStatus: 503 })
+			// A closing runtime refuses the call before its handler runs, so the caller retries against the next one.
+			expect(result.error).toMatchObject({ type: 'session_runtime_unavailable', httpStatus: 409 })
 			expect(blobStore.opened).toEqual(['blob-first'])
 		} finally {
 			finish()

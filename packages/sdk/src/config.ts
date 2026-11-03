@@ -4,6 +4,7 @@
 
 import { resolve } from 'node:path'
 import type { MockInferenceHandler } from './core/llm/mock.js'
+import { isValidWriteQueueTimeoutMs } from './core/sessions/session-store.js'
 import type { ArchiveLimitOverrides } from './lib/archive/index.js'
 import type { LogLevel } from './lib/logger/logger.js'
 
@@ -56,6 +57,12 @@ export interface Config {
 	 * each runtime picks its own default (standalone-server uses 10 minutes).
 	 */
 	sessionIdleTimeoutMs?: number
+	/**
+	 * Bound on one append once it reaches the head of a session's write queue, from
+	 * SESSION_WRITE_QUEUE_TIMEOUT_MS. Absent uses the SDK default (30 seconds).
+	 * A host that drains on a deadline should keep this under its own budget.
+	 */
+	writeQueueTimeoutMs?: number
 
 	/**
 	 * Identity of the application embedding this SDK. Reported via `/status`
@@ -90,6 +97,7 @@ export interface Config {
  */
 export const loadConfig = (): Config => {
 	const sessionIdleTimeout = process.env.SESSION_IDLE_TIMEOUT_MS
+	const writeQueueTimeout = process.env.SESSION_WRITE_QUEUE_TIMEOUT_MS
 	return {
 		port: parseInt(process.env.PORT ?? '2486', 10),
 		host: process.env.HOST ?? '0.0.0.0',
@@ -112,6 +120,9 @@ export const loadConfig = (): Config => {
 		sessionIdleTimeoutMs: sessionIdleTimeout === undefined
 			? undefined
 			: sessionIdleTimeout.trim() === '' ? Number.NaN : Number(sessionIdleTimeout),
+		writeQueueTimeoutMs: writeQueueTimeout === undefined
+			? undefined
+			: writeQueueTimeout.trim() === '' ? Number.NaN : Number(writeQueueTimeout),
 		logLevel: (process.env.LOG_LEVEL ?? 'info') as LogLevel,
 		logFormat: (process.env.LOG_FORMAT ?? 'console') as 'console' | 'json',
 		workerUrl: process.env.WORKER_URL,
@@ -166,6 +177,11 @@ export const validateConfig = (config: Config): string[] => {
 	}
 	if (config.sessionIdleTimeoutMs !== undefined && (!Number.isSafeInteger(config.sessionIdleTimeoutMs) || config.sessionIdleTimeoutMs < 0)) {
 		errors.push(`Invalid sessionIdleTimeoutMs: ${config.sessionIdleTimeoutMs}`)
+	}
+	// Zero would fence the first write that has to wait.
+	const writeQueueTimeoutMs = config.writeQueueTimeoutMs
+	if (writeQueueTimeoutMs !== undefined && !isValidWriteQueueTimeoutMs(writeQueueTimeoutMs)) {
+		errors.push(`Invalid writeQueueTimeoutMs: ${writeQueueTimeoutMs}`)
 	}
 
 	return errors

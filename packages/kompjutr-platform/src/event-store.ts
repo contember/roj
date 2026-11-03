@@ -72,10 +72,18 @@ export class KompjutrEventStore extends BaseEventStore {
 						this.db.run(`INSERT INTO ${EVENTS_TABLE} (session_id, seq, payload) VALUES ${tuples}`, ...bindings)
 					}
 				})
-
+			} catch (error) {
+				// The transaction rolled back, so none of the batch committed.
+				throw new EventAppendError(sessionId, error)
+			}
+			// The events committed: a failed metadata write must not report them as a noncommit, or a caller retries them.
+			try {
 				await this.updateMetadataFromEvents(sessionId, events)
 			} catch (error) {
-				throw new EventAppendError(sessionId, error)
+				this.logger?.warn('Session metadata update failed after the events committed', {
+					sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				})
 			}
 		})
 	}

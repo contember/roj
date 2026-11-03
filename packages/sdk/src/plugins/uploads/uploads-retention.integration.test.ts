@@ -2,6 +2,8 @@ import { describe, expect, it } from 'bun:test'
 import { rm } from 'node:fs/promises'
 import z from 'zod/v4'
 import { MemoryEventStore } from '~/core/events/memory.js'
+import { definePlugin } from '~/core/plugins/plugin-builder.js'
+import { EventAppendError, SessionOwnershipLostError } from '~/core/events/event-store.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import { SessionFileStore } from '~/core/file-store/file-store.js'
 import type { FileEntry, FileStore } from '~/core/file-store/types.js'
@@ -74,6 +76,7 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 /** Fault injection and the write journal, shared by every store derived from one root via scoped()/session. */
 interface StoreFaults {
 	failedReads: Set<string>
+	beforeWrite?: (path: string, content: string | Buffer) => Promise<void>
 	writeFaults: Map<string, { mode: 'throw' | 'err'; message: string }>
 	/** File names whose removal returns Err. */
 	failedRemoves: Set<string>
@@ -113,6 +116,7 @@ class SelectiveFailureStore implements FileStore {
 		if (fault?.mode === 'throw') throw new Error(fault.message)
 		if (fault?.mode === 'err') return Promise.resolve(Err(fault.message))
 		this.faults.writes.push({ path: this.prefix ? `${this.prefix}/${path}` : path, content: content.toString() })
+		if (this.faults.beforeWrite) return this.faults.beforeWrite(path, content).then(() => this.delegate.write(path, content))
 		return this.delegate.write(path, content)
 	}
 
@@ -196,7 +200,7 @@ class FailTerminalEventStore extends MemoryEventStore {
 		const parsed = z.object({ status: z.string() }).safeParse(event)
 		if (this.terminalFailuresLeft > 0 && event.type === 'attachment_uploaded' && parsed.success && parsed.data.status !== 'processing') {
 			this.terminalFailuresLeft--
-			throw new Error('Injected terminal append failure')
+			throw new EventAppendError(sessionId, new Error('Injected terminal append failure'))
 		}
 		await super.doAppend(sessionId, event)
 	}
@@ -266,6 +270,228 @@ function abortablePreprocessor(
 }
 
 describe('uploads runtime retention', () => {
+	it('does not invoke preprocessing after revoke while its source is still opening', async () => {
+		const entered = deferred()
+		const release = deferred()
+		const bytes = Buffer.from('data')
+		const blobStore: UploadBlobStore = {
+			open: async () => {
+				entered.resolve()
+				await release.promise
+				return Ok({
+					size: bytes.length,
+					stream: () => new Blob([bytes]).stream(),
+					bytes: async () => bytes,
+					range: async (offset, length) => bytes.subarray(offset, offset + length),
+				})
+			},
+		}
+		const basePath = `/tmp/roj-upload-revoke-open-${crypto.randomUUID()}`
+		const dataFileStore = new SelectiveFailureStore(new SessionFileStore(basePath, undefined, false, createNodePlatform().fs, 'session'))
+		let bodies = 0
+		const preprocessor: Preprocessor = {
+			name: 'revoked-open', supportedMimeTypes: ['text/plain'],
+			process: async (_source, _mimeType, ctx) => {
+				bodies++
+				await ctx.files.write('unexpected.txt', 'late output')
+				return Ok({ extractedContent: 'late output' })
+			},
+		}
+		const host = new TestHarness({
+			presets: [createTestPreset({ plugins: [uploadsPlugin.configure({ dataFileStore, blobStore, preprocessorRegistry: registryWith(preprocessor) })] })],
+		})
+		try {
+			const session = await host.createSession('test')
+			const loaded = await host.sessionManager.getSession(session.sessionId)
+			const activation = host.sessionManager.activateSession(session.sessionId)
+			if (!loaded.ok || !activation.ok) throw new Error('Session unavailable')
+			const upload = okValue(await session.callPluginMethod('uploads.registerStored', {
+				sessionId: String(session.sessionId), filename: 'pending.txt', mimeType: 'text/plain', size: 4, blobRef: 'blob-original',
+			}), asyncUploadSchema)
+			await entered.promise
+			const events = await host.eventStore.load(session.sessionId)
+			const notifications = host.notifications.getByType('uploads', 'uploadStatusChanged')
+			const writes = [...dataFileStore.faults.writes]
+			host.sessionManager.revokeSession(activation.value)
+			expect(host.sessionManager.activateSession(session.sessionId).ok).toBe(false)
+			release.resolve()
+			await loaded.value.waitForLocalCleanup()
+			expect(bodies).toBe(0)
+			expect(dataFileStore.faults.writes).toEqual(writes)
+			expect(await host.eventStore.load(session.sessionId)).toEqual(events)
+			expect(host.notifications.getByType('uploads', 'uploadStatusChanged')).toEqual(notifications)
+			const store = dataFileStore.scoped(`sessions/${session.sessionId}/uploads/${upload.uploadId}`)
+			expect(await store.exists('unexpected.txt')).toMatchObject({ ok: true, value: false })
+			const metadata = await store.read('meta.json')
+			if (!metadata.ok) throw new Error(metadata.error)
+			expect(JSON.parse(metadata.value)).toMatchObject({ status: 'processing' })
+			expect(loaded.value.hasUnsafeResources()).toBe(false)
+		} finally {
+			release.resolve()
+			await host.shutdown()
+			await rm(basePath, { recursive: true, force: true })
+		}
+	})
+
+	it('defers an admitted upload during park and first processes its retained file on B', async () => {
+		const entered = deferred()
+		const release = deferred()
+		const started = deferred()
+		const finish = deferred()
+		let bodies = 0
+		let bodyRead: Result<string, string> | undefined
+		let bodyPath: string | undefined
+		const gate = definePlugin('upload-handoff-gate').sessionHook('beforeMethod', async (ctx) => {
+			if (ctx.method !== 'uploads.uploadAsync') return null
+			entered.resolve()
+			await release.promise
+			return null
+		}).build()
+		const basePath = `/tmp/roj-upload-handoff-${crypto.randomUUID()}`
+		const dataFileStore = new SessionFileStore(basePath, undefined, false, createNodePlatform().fs, 'session')
+		const preprocessor: Preprocessor = {
+			name: 'handoff', supportedMimeTypes: ['text/plain'],
+			process: async (source, _mimeType, ctx) => {
+				bodies++
+				bodyPath = source.localPath
+				try { bodyRead = await ctx.files.read('pending.txt') } finally { started.resolve() }
+				await finish.promise
+				return Ok({ extractedContent: 'processed on B' })
+			},
+		}
+		const host = new TestHarness({
+			presets: [createTestPreset({ plugins: [uploadsPlugin.configure({ dataFileStore, preprocessorRegistry: registryWith(preprocessor) })] })],
+			systemPlugins: [gate],
+		})
+		try {
+			const session = await host.createSession('test')
+			const entryAgentId = session.getEntryAgentId()
+			if (!entryAgentId) throw new Error('Missing agent')
+			await session.pauseAgent(entryAgentId, 'Keep upload pending')
+			const activation = host.sessionManager.activateSession(session.sessionId)
+			if (!activation.ok) throw new Error(activation.error.message)
+			const uploading = session.callPluginMethod('uploads.uploadAsync', {
+				sessionId: String(session.sessionId), filename: 'pending.txt', mimeType: 'text/plain', size: 4, fileBuffer: Buffer.from('data'),
+			})
+			await entered.promise
+			const parking = host.sessionManager.parkSession(activation.value)
+			release.resolve()
+			const upload = okValue(await uploading, asyncUploadSchema)
+			await parking
+			expect(bodies).toBe(0)
+			const store = dataFileStore.scoped(`sessions/${session.sessionId}/uploads/${upload.uploadId}`)
+			const metadata = await store.read('meta.json')
+			if (!metadata.ok) throw new Error(metadata.error)
+			expect(JSON.parse(metadata.value)).toMatchObject({ status: 'processing', attempts: 1 })
+			expect(await store.read('pending.txt')).toMatchObject({ ok: true, value: 'data' })
+			expect(await session.getEventsByType(uploadEvents, 'attachment_uploaded')).toHaveLength(1)
+			expect(host.sessionManager.activateSession(session.sessionId).ok).toBe(true)
+			const loaded = await host.sessionManager.getSession(session.sessionId)
+			if (!loaded.ok) throw new Error(loaded.error.message)
+			await started.promise
+			expect(bodyRead).toMatchObject({ ok: true, value: 'data' })
+			expect(bodyPath).toBe(`${store.getRoots().session}/pending.txt`)
+			const runningMetadata = await store.read('meta.json')
+			if (!runningMetadata.ok) throw new Error(runningMetadata.error)
+			// B re-runs it from the log, as the run A recorded but never started.
+			expect(JSON.parse(runningMetadata.value)).toMatchObject({ status: 'processing', attempts: 2 })
+			const next = host.sessionManager.activateSession(session.sessionId)
+			if (!next.ok) throw new Error(next.error.message)
+			const drain = host.sessionManager.parkSession(next.value)
+			finish.resolve()
+			await drain
+			expect(bodies).toBe(1)
+			const terminal = await store.read('meta.json')
+			if (!terminal.ok) throw new Error(terminal.error)
+			expect(JSON.parse(terminal.value)).toMatchObject({ status: 'ready', terminalEventPersisted: true, extractedContent: 'processed on B' })
+		} finally {
+			release.resolve(); finish.resolve()
+			await host.shutdown()
+			await rm(basePath, { recursive: true, force: true })
+		}
+	})
+
+	it('reports a committed upload as processing when the runtime stops before it can start', async () => {
+		const held = deferred()
+		const release = deferred()
+		class HoldUploadStore extends MemoryEventStore {
+			override async append(sessionId: SessionId, event: DomainEvent): Promise<void> {
+				if (event.type === 'attachment_uploaded') {
+					held.resolve()
+					await release.promise
+				}
+				await super.append(sessionId, event)
+			}
+		}
+		const basePath = `/tmp/roj-upload-stopped-${crypto.randomUUID()}`
+		const dataFileStore = new SessionFileStore(basePath, undefined, false, createNodePlatform().fs, 'session')
+		const host = new TestHarness({
+			presets: [createTestPreset({ plugins: [uploadsPlugin.configure({ dataFileStore })] })],
+			eventStore: new HoldUploadStore(),
+		})
+		try {
+			const session = await host.createSession('test')
+			const uploading = session.callPluginMethod('uploads.uploadAsync', {
+				sessionId: String(session.sessionId), filename: 'late.txt', mimeType: 'text/plain', size: 4, fileBuffer: Buffer.from('data'),
+			})
+			await held.promise
+			const shutdown = host.sessionManager.shutdown()
+			release.resolve()
+			// The event committed, so the next load starts the upload; an error would make the client upload it again.
+			const upload = okValue(await uploading, asyncUploadSchema)
+			await shutdown
+			expect(upload.status).toBe('processing')
+			expect(await session.getEventsByType(uploadEvents, 'attachment_uploaded')).toHaveLength(1)
+			const metadata = await dataFileStore.scoped(`sessions/${session.sessionId}/uploads/${upload.uploadId}`).read('meta.json')
+			if (!metadata.ok) throw new Error(metadata.error)
+			expect(JSON.parse(metadata.value)).toMatchObject({ status: 'processing', attempts: 1 })
+		} finally {
+			release.resolve()
+			await host.shutdown()
+			await rm(basePath, { recursive: true, force: true })
+		}
+	})
+
+	// Ownership loss also stops the runtime before the handler sees the refusal.
+	for (const refusal of [EventAppendError, SessionOwnershipLostError]) it(`does not start an upload on the next load when its processing event definitely did not commit (${refusal.name})`, async () => {
+		let refuseProcessing = true
+		class RefuseProcessingStore extends MemoryEventStore {
+			protected override async doAppend(sessionId: SessionId, event: DomainEvent): Promise<void> {
+				const parsed = z.object({ status: z.string() }).safeParse(event)
+				if (refuseProcessing && event.type === 'attachment_uploaded' && parsed.success && parsed.data.status === 'processing') {
+					throw new refusal(sessionId, new Error('Injected processing append failure'))
+				}
+				await super.doAppend(sessionId, event)
+			}
+		}
+		const eventStore = new RefuseProcessingStore()
+		const basePath = `/tmp/roj-upload-noncommit-${crypto.randomUUID()}`
+		const dataFileStore = new SessionFileStore(basePath, undefined, false, createNodePlatform().fs, 'session')
+		const preset = createTestPreset({ plugins: [uploadsPlugin.configure({ dataFileStore })] })
+		const source = new TestHarness({ presets: [preset], eventStore })
+		let reloaded: TestHarness | undefined
+		try {
+			const session = await source.createSession('test')
+			const result = await session.callPluginMethod('uploads.uploadAsync', {
+				sessionId: String(session.sessionId), filename: 'refused.txt', mimeType: 'text/plain', size: 4, fileBuffer: Buffer.from('data'),
+			})
+			expect(result.ok).toBe(false)
+			await source.shutdown()
+
+			refuseProcessing = false
+			reloaded = new TestHarness({ presets: [preset], eventStore })
+			const reloadedSession = await reloaded.openSession(session.sessionId)
+			// The client got an error and uploads again; a start from the stale metadata would deliver the file twice.
+			// Without a preprocessor that start reaches the log within milliseconds, before shutdown could abort it.
+			await new Promise((resolve) => setTimeout(resolve, 50))
+			expect(await reloadedSession.getEventsByType(uploadEvents, 'attachment_uploaded')).toHaveLength(0)
+		} finally {
+			await source.shutdown()
+			await reloaded?.shutdown()
+			await rm(basePath, { recursive: true, force: true })
+		}
+	})
+
 	it('holds one runtime lease during async preprocessing and releases it after ready materialization', async () => {
 		const started = deferred()
 		const processingGate = deferred()
@@ -1267,7 +1493,7 @@ describe('uploads runtime retention', () => {
 		}
 	})
 
-	it('keeps the delete guard when the close drain expires with an upload still processing', async () => {
+	it('refuses late deletion writes when the close drain expires with an upload still processing', async () => {
 		const started = deferred()
 		const abortSeen = deferred()
 		const release = deferred()
@@ -1323,14 +1549,13 @@ describe('uploads runtime retention', () => {
 			await abortSeen.promise
 
 			await harness.shutdown()
-			await deletion
+			expect(await deletion).toMatchObject({ ok: false })
 
-			// Nothing may re-materialize the upload after the delete claimed it: 'processing' is the
-			// pre-delete write, 'deleted' the delete's own.
+			// Detached runtimes cannot finish filesystem mutations behind their replacement.
 			const statuses = dataFileStore
 				.writtenPaths('meta.json')
 				.map((write) => terminalMetadataSchema.parse(JSON.parse(write.content)).status)
-			expect(statuses).toEqual(['processing', 'deleted'])
+			expect(statuses).toEqual(['processing'])
 		} finally {
 			release.resolve()
 			await deletion

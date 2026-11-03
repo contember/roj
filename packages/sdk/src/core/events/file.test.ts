@@ -642,7 +642,7 @@ describe('FileEventStore', () => {
 	})
 
 	describe('metadata coherence', () => {
-		test('a write that lands during a slow read survives it', async () => {
+		test('a write waits for a slow reader and uses the fresh counters', async () => {
 			await createSession(store, testSessionId)
 			await appendAgentSpawned(store, testSessionId)
 
@@ -652,11 +652,13 @@ describe('FileEventStore', () => {
 			// The read holds the two-event record while two further events are appended.
 			const slow = cold.getMetadata(testSessionId)
 			await held.captured
-			await appendAgentSpawned(cold, testSessionId)
-			await appendAgentSpawned(cold, testSessionId)
+			const firstAppend = appendAgentSpawned(cold, testSessionId)
+			const secondAppend = appendAgentSpawned(cold, testSessionId)
 			held.release()
 
-			expect((await slow)?.metrics?.totalEvents).toBe(4)
+			expect((await slow)?.metrics?.totalEvents).toBe(2)
+			await Promise.all([firstAppend, secondAppend])
+			expect((await cold.getMetadata(testSessionId))?.metrics?.totalEvents).toBe(4)
 
 			// The stale record must not become the base the next append counts from.
 			await appendAgentSpawned(cold, testSessionId)

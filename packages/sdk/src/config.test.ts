@@ -28,6 +28,7 @@ describe('config', () => {
 			delete process.env.RESOURCE_ARCHIVE_MAX_ENTRIES
 			delete process.env.RESOURCE_ARCHIVE_MAX_UNCOMPRESSED_BYTES
 			delete process.env.SESSION_IDLE_TIMEOUT_MS
+			delete process.env.SESSION_WRITE_QUEUE_TIMEOUT_MS
 
 			const config = loadConfig()
 
@@ -45,6 +46,7 @@ describe('config', () => {
 			expect(config.resourceArchiveLimits).toBeUndefined()
 			// Unset means unset — the default belongs to whichever runtime wants eviction.
 			expect(config.sessionIdleTimeoutMs).toBeUndefined()
+			expect(config.writeQueueTimeoutMs).toBeUndefined()
 		})
 
 		test('loads values from environment', () => {
@@ -63,6 +65,7 @@ describe('config', () => {
 			process.env.RESOURCE_ARCHIVE_MAX_ENTRIES = '2500'
 			process.env.RESOURCE_ARCHIVE_MAX_UNCOMPRESSED_BYTES = '1073741824'
 			process.env.SESSION_IDLE_TIMEOUT_MS = '0'
+			process.env.SESSION_WRITE_QUEUE_TIMEOUT_MS = '5000'
 
 			const config = loadConfig()
 
@@ -85,6 +88,7 @@ describe('config', () => {
 				maxTotalUncompressedSize: 1073741824,
 			})
 			expect(config.sessionIdleTimeoutMs).toBe(0)
+			expect(config.writeQueueTimeoutMs).toBe(5000)
 		})
 
 		test('preserves invalid idle timeout input for validation', () => {
@@ -97,6 +101,18 @@ describe('config', () => {
 			const emptyConfig = loadConfig()
 			expect(emptyConfig.sessionIdleTimeoutMs).toBeNaN()
 			expect(validateConfig(emptyConfig)).toContain('Invalid sessionIdleTimeoutMs: NaN')
+		})
+
+		test('preserves invalid write queue timeout input for validation', () => {
+			process.env.SESSION_WRITE_QUEUE_TIMEOUT_MS = 'soon'
+			const config = loadConfig()
+			expect(config.writeQueueTimeoutMs).toBeNaN()
+			expect(validateConfig(config)).toContain('Invalid writeQueueTimeoutMs: NaN')
+
+			process.env.SESSION_WRITE_QUEUE_TIMEOUT_MS = ''
+			const emptyConfig = loadConfig()
+			expect(emptyConfig.writeQueueTimeoutMs).toBeNaN()
+			expect(validateConfig(emptyConfig)).toContain('Invalid writeQueueTimeoutMs: NaN')
 		})
 
 		test('parses REMOTE_FETCH_ALLOWED_HOSTS into trimmed entries', () => {
@@ -275,6 +291,15 @@ describe('config', () => {
 					`Invalid sessionIdleTimeoutMs: ${sessionIdleTimeoutMs}`,
 				)
 			}
+		})
+
+		test('rejects write queue timeouts setTimeout cannot honour', () => {
+			for (const writeQueueTimeoutMs of [0, -1, Number.NaN, 1.5, Number.POSITIVE_INFINITY, 2 ** 31]) {
+				expect(validateConfig({ ...validConfig, writeQueueTimeoutMs })).toContain(
+					`Invalid writeQueueTimeoutMs: ${writeQueueTimeoutMs}`,
+				)
+			}
+			expect(validateConfig({ ...validConfig, writeQueueTimeoutMs: 2 ** 31 - 1 })).toEqual([])
 		})
 	})
 })

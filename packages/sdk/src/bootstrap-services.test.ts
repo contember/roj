@@ -202,6 +202,8 @@ describe('bootstrap services executor selection', () => {
 				expect(started.ok).toBe(true)
 				await waitFor(() => store.blocked)
 				expect(host.system.sessionManager.getRuntimeCacheStats().sessions.find((session) => session.id === first.id)?.leaseReasons).toEqual({
+					// The blocked append holds its own lease next to the service's.
+					event: 1,
 					'service:preview': 1,
 				})
 				expect(await store.getEventsByType(first.id, 'service_status_changed')).toHaveLength(0)

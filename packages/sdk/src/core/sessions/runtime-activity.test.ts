@@ -1,7 +1,54 @@
 import { describe, expect, test } from 'bun:test'
-import { SessionRuntimeActivityController } from '~/core/sessions/runtime-activity.js'
+import { SessionRuntimeActivityController, SessionRuntimeUnavailableError } from '~/core/sessions/runtime-activity.js'
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+describe('operation-scoped parking', () => {
+	test('expires the parent without expiring a previously admitted child', async () => {
+		const controller = new SessionRuntimeActivityController()
+		const parent = controller.tryOperation('parent')
+		if (!parent) throw new Error('Admission failed')
+		controller.beginParking()
+		expect(controller.tryOperation('external')).toBeNull()
+		const child = parent.activity.tryOperation('child')
+		if (!child) throw new Error('Continuation failed')
+		parent.release()
+		expect(parent.activity.tryOperation('expired')).toBeNull()
+		const grandchild = child.activity.tryOperation('grandchild')
+		if (!grandchild) throw new Error('Child lifetime was lost')
+		let idle = false
+		const drain = controller.waitForIdle().then(() => { idle = true })
+		child.release()
+		expect(idle).toBe(false)
+		grandchild.release()
+		await drain
+		expect(idle).toBe(true)
+	})
+
+	test('revokes all scopes and rejects the graceful drain', async () => {
+		const controller = new SessionRuntimeActivityController()
+		const parent = controller.tryOperation('hung')
+		if (!parent) throw new Error('Admission failed')
+		controller.beginParking()
+		const drain = controller.waitForIdle().catch((error: unknown) => error)
+		controller.revoke()
+		expect(await drain).toBeInstanceOf(SessionRuntimeUnavailableError)
+		expect(parent.activity.tryOperation('late')).toBeNull()
+		expect(() => parent.activity.assertAvailable()).toThrow(SessionRuntimeUnavailableError)
+		parent.release()
+	})
+
+	test('keeps issued resource work unsafe until it actually settles after revoke', async () => {
+		const controller = new SessionRuntimeActivityController()
+		const resource = Promise.withResolvers<void>()
+		const work = controller.trackResource(() => resource.promise)
+		controller.revoke()
+		expect(controller.hasPendingResources()).toBe(true)
+		resource.resolve()
+		await work
+		expect(controller.hasPendingResources()).toBe(false)
+	})
+})
 
 describe('SessionRuntimeActivityController leases', () => {
 	test('acquire holds the runtime and release lets it go', () => {
@@ -83,7 +130,7 @@ describe('SessionRuntimeActivityController state transitions', () => {
 		c.beginForcedUnload()
 		expect(c.getSnapshot().state).toBe('unloading')
 		expect(c.tryAcquire('late')).toBeNull()
-		expect(() => c.acquire('late')).toThrow('Session runtime is unloading')
+		expect(() => c.acquire('late')).toThrow('is unloading')
 	})
 
 	test('disposed refuses new work and says so', () => {
@@ -91,7 +138,7 @@ describe('SessionRuntimeActivityController state transitions', () => {
 		c.markDisposed()
 		expect(c.getSnapshot().state).toBe('disposed')
 		expect(c.tryAcquire('late')).toBeNull()
-		expect(() => c.acquire('late')).toThrow('Session runtime is disposed')
+		expect(() => c.acquire('late')).toThrow('is disposed')
 	})
 
 	test('tryBeginUnload only wins once, and only from idle ready', () => {

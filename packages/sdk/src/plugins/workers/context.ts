@@ -121,9 +121,12 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 	private readonly reducer: (state: TState, event: TSubEvent) => TState
 	private readonly reserveMailboxMessageSequence: () => number
 	private readonly acquireEffectLease: () => (() => void) | null
+	private readonly isRuntimeAvailable: () => boolean
 	private readonly inFlightEffects = new Set<Promise<void>>()
 	private readonly effectLeases = new Set<() => void>()
 	private localState: TState
+	/** Emits run one at a time, so each is checked against the state every earlier one produced; a terminal event follows them. */
+	private emitTail: Promise<unknown> = Promise.resolve()
 
 	/**
 	 * Local cancellation flag - provides immediate signal before event is persisted.
@@ -153,6 +156,7 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 		getSessionState: () => SessionState
 		reserveMailboxMessageSequence: () => number
 		acquireEffectLease: () => (() => void) | null
+		isRuntimeAvailable?: () => boolean
 		reducer: (state: TState, event: TSubEvent) => TState
 		initialState: TState
 		resumed: boolean
@@ -168,6 +172,7 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 		this.getSessionStateCallback = params.getSessionState
 		this.reserveMailboxMessageSequence = params.reserveMailboxMessageSequence
 		this.acquireEffectLease = params.acquireEffectLease
+		this.isRuntimeAvailable = params.isRuntimeAvailable ?? (() => true)
 		this.reducer = params.reducer
 		this.localState = params.initialState
 		this.resumed = params.resumed
@@ -184,22 +189,32 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 
 	/**
 	 * Emit a worker-specific event.
-	 * Applies the event to local state before persisting.
+	 * Runs the reducer before persisting, so an event it rejects never reaches the log,
+	 * and applies the event to local state once the append commits.
 	 */
 	async emit(event: TSubEvent): Promise<void> {
-		await this.runEffect(async () => {
-			this.localState = this.reducer(this.localState, event)
+		const previous = this.emitTail
+		// The effect registers synchronously, so the drain after a terminal result covers an emit its worker did not await.
+		const emitting = this.runEffect(async () => {
+			await previous.catch(() => {})
+			// A logged event the reducer throws on would fail every replay of the session.
+			const next = this.reducer(this.localState, event)
 			await this.emitEvent(workerEvents.create('worker_sub_event', {
 				workerId: this.workerId,
 				workerType: this.workerType,
 				subEvent: event,
 			}))
+			this.localState = next
 		})
+		this.emitTail = emitting
+		await emitting
 	}
 
 	/** Persist a terminal worker event within the context effect lifecycle. */
 	async persistTerminal(event: Parameters<EmitEvent>[0]): Promise<boolean> {
+		const previous = this.emitTail
 		return this.runEffect(async () => {
+			await previous.catch(() => {})
 			await this.emitEvent(event)
 		})
 	}
@@ -209,7 +224,7 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 	 * Returns false if cancelled.
 	 */
 	shouldContinue(): boolean {
-		return this.active && !this._cancelled
+		return this.active && !this._cancelled && this.isRuntimeAvailable()
 	}
 
 	/**
@@ -297,6 +312,9 @@ export class WorkerContextImpl<TState, TSubEvent extends WorkerSubEvent> impleme
 			promise = effect()
 			this.inFlightEffects.add(promise)
 			await promise
+		} catch (error) {
+			if (!this.shouldContinue()) return false
+			throw error
 		} finally {
 			if (promise) this.inFlightEffects.delete(promise)
 			this.effectLeases.delete(releaseLease)
