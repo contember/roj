@@ -1107,6 +1107,14 @@ export class Agent {
 		}
 	}
 
+	/** Whether `continue()` would act on its own: run its start, pending tools, an inference or an error retry. */
+	hasWorkToResume(): boolean {
+		const state = this.state
+		if (!state) return false
+		const decision = this.decide(state)
+		return decision === 'on_start' || decision === 'tool_exec' || decision === 'infer' || decision === 'resume_from_error'
+	}
+
 	stopLocalScheduling(): void {
 		this.locallyStopped = true
 		if (this.debounceCheckTimer) clearTimeout(this.debounceCheckTimer)

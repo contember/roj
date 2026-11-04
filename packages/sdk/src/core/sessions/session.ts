@@ -382,6 +382,21 @@ export class Session {
 	}
 
 	/**
+	 * Pause every agent that would pick up work on its own, and return their ids. The pause is an
+	 * event, so it holds across later loads; an agent that only waits for input is left alone.
+	 */
+	async pauseAgentsWithWork(message: string): Promise<Result<AgentId[], DomainError>> {
+		const paused: AgentId[] = []
+		for (const agent of this.agents.values()) {
+			if (!agent.hasWorkToResume()) continue
+			const result = await this.pauseAgent(agent.id, message)
+			if (!result.ok) return result
+			paused.push(agent.id)
+		}
+		return Ok(paused)
+	}
+
+	/**
 	 * Pause an agent manually via API.
 	 */
 	async pauseAgent(agentId: AgentId, message?: string): Promise<Result<void, DomainError>> {
