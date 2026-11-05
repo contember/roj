@@ -802,6 +802,47 @@ describe('workers plugin', () => {
 				await restored.shutdown()
 			})
 
+			it('refuses an agent that answers a host notice its resume of a worker the hold parked', async () => {
+				const gated = createGatedWorker()
+				const eventStore = new MemoryEventStore()
+				const preset = createTestPreset({ plugins: [workerPlugin.configure({ workers: [gated.worker] })] })
+				const first = createWorkersHarness({ presets: [preset], eventStore, llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }) })
+				const firstSession = await first.createSession('test')
+				const sessionId = firstSession.sessionId
+				const agentId = firstSession.getEntryAgentId()
+				if (!agentId) throw new Error('Expected entry agent')
+				// Answered before the restore, so the owner is idle rather than held.
+				await firstSession.sendAndWaitForIdle('Hi')
+				await first.shutdown()
+				await eventStore.append(sessionId, withSessionId(sessionId, workerEvents.create('worker_started', {
+					workerId,
+					agentId,
+					workerType: 'gated',
+					config: { input: 'restored' },
+				})))
+
+				const restored = createWorkersHarness({
+					presets: [preset],
+					eventStore,
+					llmProvider: MockLLMProvider.withSequence([
+						{ toolCalls: [{ id: ToolCallId('tc1'), name: 'worker_resume', input: { workerId: String(workerId) } }] },
+						{ content: 'Done', toolCalls: [] },
+					]),
+				})
+				await restored.sessionManager.loadAllSessions({ resume: false })
+				const reopened = await restored.openSession(sessionId)
+				const live = await restored.sessionManager.getSession(sessionId)
+				if (!live.ok) throw new Error(live.error.message)
+
+				const notice = await live.value.callPluginMethod('user-chat.sendMessage', { sessionId, content: 'The publish finished', keepHold: true })
+				expect(notice.ok).toBe(true)
+				await waitFor(() => restored.llmProvider.getCallCount() === 2)
+				expect(JSON.stringify(restored.llmProvider.getLastRequest()?.messages)).toContain('it resumes when the user writes')
+				expect(gated.resumedRuns).toEqual([])
+				expect(workersOf(reopened)?.get(workerId)).toMatchObject({ status: 'paused', pauseResumesOnInput: true })
+				await restored.shutdown()
+			})
+
 			it('keeps the worker held through a later default load, until its user writes', async () => {
 				const { gated, sessionId, harnessFor } = await interruptedWorker()
 				const holding = harnessFor()

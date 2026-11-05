@@ -191,8 +191,11 @@ async function deliveryFingerprint(
 	content: string,
 	context: string | undefined,
 	agentId: AgentId | undefined,
+	keepHold: boolean | undefined,
 ): Promise<string> {
-	const bytes = new TextEncoder().encode(JSON.stringify([content, context ?? null, agentId ?? null]));
+	// `keepHold` only when set, so every receipt written before it existed keeps its identity.
+	const fields = [content, context ?? null, agentId ?? null, ...(keepHold === true ? [true] : [])];
+	const bytes = new TextEncoder().encode(JSON.stringify(fields));
 	const digest = await crypto.subtle.digest("SHA-256", bytes);
 	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -743,7 +746,7 @@ export const userChatPlugin = definePlugin("user-chat")
 			const releaseHold = async (): Promise<Result<void, DomainError>> => input.keepHold === true ? Ok(undefined) : ctx.releaseHold();
 			const fingerprint = input.deliveryId === undefined
 				? undefined
-				: await deliveryFingerprint(input.content, input.context, input.agentId);
+				: await deliveryFingerprint(input.content, input.context, input.agentId, input.keepHold);
 			if (input.deliveryId !== undefined) {
 				const state = selectPluginState<UserChatState>(ctx.getSessionState(), "messages");
 				const receipt = state?.acceptedDeliveries?.get(input.deliveryId);

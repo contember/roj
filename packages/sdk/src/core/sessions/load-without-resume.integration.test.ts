@@ -3,10 +3,12 @@ import type { AgentId } from '~/core/agents/schema.js'
 import { ValidationErrors } from '~/core/errors.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { MemoryEventStore } from '~/core/events/memory.js'
+import { MockLLMProvider } from '~/core/llm/mock.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import { Session } from '~/core/sessions/session.js'
+import { ToolCallId } from '~/core/tools/schema.js'
 import { Err } from '~/lib/utils/result.js'
 import { createTestPreset, TestHarness, type TestSession } from '~/testing/index.js'
 
@@ -15,9 +17,9 @@ afterEach(async () => {
 	for (const harness of harnesses.splice(0)) await harness.shutdown()
 })
 
-function harness(eventStore?: MemoryEventStore): TestHarness {
+function harness(eventStore?: MemoryEventStore, llmProvider?: MockLLMProvider): TestHarness {
 	const preset = createTestPreset({ agents: [{ name: 'child', system: 'Finish the task', tools: [], agents: [] }] })
-	const result = new TestHarness({ presets: [preset], eventStore })
+	const result = new TestHarness({ presets: [preset], eventStore, llmProvider })
 	harnesses.push(result)
 	return result
 }
@@ -235,7 +237,9 @@ describe('loadAllSessions without resume', () => {
 	})
 
 	/** A restored session whose entry agent is idle and whose child is held. */
-	async function heldChildSession(): Promise<{ restored: TestHarness; session: Session; sessionId: SessionId; entryId: AgentId; childId: AgentId }> {
+	async function heldChildSession(
+		restoredLlm?: (childId: AgentId) => MockLLMProvider,
+	): Promise<{ restored: TestHarness; session: Session; sessionId: SessionId; entryId: AgentId; childId: AgentId }> {
 		const source = harness()
 		const created = await source.createSession('test')
 		const entryId = created.getEntryAgentId()
@@ -249,7 +253,7 @@ describe('loadAllSessions without resume', () => {
 		await waitUntil(() => source.llmProvider.getCallCount() === before + 1)
 		await source.shutdown()
 
-		const restored = harness(source.eventStore)
+		const restored = harness(source.eventStore, restoredLlm?.(spawned.value))
 		await restored.sessionManager.loadAllSessions({ resume: false })
 		const session = await liveSession(restored, created.sessionId)
 		return { restored, session, sessionId: created.sessionId, entryId, childId: spawned.value }
@@ -354,6 +358,38 @@ describe('loadAllSessions without resume', () => {
 		await waitUntil(() => restored.llmProvider.getCallHistory().some(request => JSON.stringify(request.messages).includes('The rebase conflicted')))
 		await Bun.sleep(50)
 		expect(await agentStatus(restored, sessionId, childId)).toBe('paused')
+	})
+
+	it('refuses an agent that answers a host notice its resume of a held child', async () => {
+		const { restored, session, sessionId, entryId, childId } = await heldChildSession(childId => MockLLMProvider.withSequence([
+			{ toolCalls: [{ id: ToolCallId('tc1'), name: 'resume_agent', input: { agentId: String(childId) } }] },
+			{ content: 'Done', toolCalls: [] },
+		]))
+
+		const notice = await session.callPluginMethod('user-chat.sendMessage', { sessionId, agentId: entryId, content: 'The rebase conflicted', keepHold: true })
+		expect(notice.ok).toBe(true)
+		await waitUntil(() => restored.llmProvider.getCallCount() === 2)
+		expect(JSON.stringify(restored.llmProvider.getLastRequest()?.messages)).toContain('it resumes when the user writes')
+		expect(await agentStatus(restored, sessionId, childId)).toBe('paused')
+	})
+
+	it('conflicts on a retried delivery that changes keepHold, in flight or after', async () => {
+		const { eventStore, sessionId, agentId } = await interruptedSession()
+		const restored = harness(eventStore)
+		await restored.sessionManager.loadAllSessions({ resume: false })
+		const session = await liveSession(restored, sessionId)
+		const send = (keepHold: boolean | undefined, deliveryId: string) =>
+			session.callPluginMethod('user-chat.sendMessage', { sessionId, agentId, content: 'The rebase conflicted', deliveryId, keepHold })
+
+		const [first, inFlight] = await Promise.all([send(true, 'd1'), send(undefined, 'd1')])
+		expect(first.ok).toBe(true)
+		expect(inFlight.ok ? undefined : inFlight.error.type).toBe('user_chat_delivery_conflict')
+		const after = await send(undefined, 'd1')
+		expect(after.ok ? undefined : after.error.type).toBe('user_chat_delivery_conflict')
+		const flippedOn = await send(false, 'd2')
+		expect(flippedOn.ok).toBe(true)
+		const retried = await send(true, 'd2')
+		expect(retried.ok ? undefined : retried.error.type).toBe('user_chat_delivery_conflict')
 	})
 
 	it('releases the whole hold when its user answers an agent that was not held', async () => {

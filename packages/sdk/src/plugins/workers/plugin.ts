@@ -344,6 +344,8 @@ interface RelaunchContext {
 }
 
 /** The worker's entry now: a hook's `pluginState` is a snapshot that any await in the hook makes stale. */
+const HELD_WORKER_RESUME_REFUSAL = 'This worker was interrupted when its session was restored; it resumes when the user writes.'
+
 function liveWorkerEntry(ctx: { getSessionState: () => SessionState }, workerId: WorkerIdType): WorkerEntry | undefined {
 	return selectPluginState<Map<WorkerIdType, WorkerEntry>>(ctx.getSessionState(), 'workers')?.get(workerId)
 }
@@ -1046,6 +1048,10 @@ export const workerPlugin = definePlugin('workers')
 					workerId: workerIdSchema,
 				}),
 				execute: async (input, context) => {
+					// A restore's hold is lifted by the user, not by an agent's turn while it lasts.
+					if (selectPluginState<Map<WorkerIdType, WorkerEntry>>(context.sessionState, 'workers')?.get(input.workerId)?.pauseResumesOnInput === true) {
+						return Err({ message: HELD_WORKER_RESUME_REFUSAL, recoverable: false })
+					}
 					const result = await ctx.self.resume({
 						sessionId: ctx.sessionState.id,
 						agentId: context.agentId,
@@ -1090,7 +1096,7 @@ export const workerPlugin = definePlugin('workers')
 		if (paused.length > 0) {
 			lines.push('**Paused:**')
 			for (const worker of paused) {
-				lines.push(`- [${worker.id}] ${worker.workerType}`)
+				lines.push(`- [${worker.id}] ${worker.workerType}${worker.pauseResumesOnInput === true ? ' (resumes when the user writes)' : ''}`)
 			}
 			lines.push('')
 		}
