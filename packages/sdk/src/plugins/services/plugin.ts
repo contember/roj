@@ -568,7 +568,8 @@ export const servicePlugin = definePlugin('services')
 				} else if (reaped.value === 'killed') {
 					ctx.logger.info('Killed orphaned service process group', { serviceType, pid: entry.pid })
 				} else {
-					ctx.logger.info('Dropped stale service pid — not the recorded process, nothing killed', {
+					const log = reaped.value === 'pid-reused' ? ctx.logger.warn : ctx.logger.info
+					log.call(ctx.logger, 'Dropped stale service pid — not the recorded process, nothing killed', {
 						serviceType,
 						pid: entry.pid,
 						reason: reaped.value,

@@ -1704,6 +1704,63 @@ describe('services plugin', () => {
 		})
 	})
 
+	// The guard for recorded pids must not reach the runtime's own children: a child it spawned and
+	// has not seen close is ours even when its start time is unknown or its leader is gone.
+	describe('reclaiming a service this runtime started', () => {
+		/** A host without a readable /proc: every start time is unknown. */
+		const withoutProc = (base: FileSystem): FileSystem => {
+			function readFile(path: string): Promise<Buffer>
+			function readFile(path: string, encoding: 'utf-8' | 'utf8'): Promise<string>
+			async function readFile(path: string, encoding?: 'utf-8' | 'utf8'): Promise<Buffer | string> {
+				if (path.startsWith('/proc/')) throw new Error(`ENOENT: ${path}`)
+				return encoding === undefined ? base.readFile(path) : base.readFile(path, encoding)
+			}
+			return { ...base, readFile }
+		}
+
+		const startNeverReady = async (sessionId: SessionId, service: ServiceConfig, fs?: FileSystem) => {
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: fs ?? platform.fs, process: platform.process })
+			const pids: number[] = []
+			executor.onStatusChanged = (_sessionId, _serviceType, status, details) => {
+				if (status === 'starting' && details.pid !== undefined) pids.push(details.pid)
+			}
+			const started = await executor.start(service, sessionId)
+			expect(started.ok).toBe(true)
+			await waitFor(
+				() => executor.getStatus(service.type) === 'failed',
+				() => `status ${executor.getStatus(service.type)}`,
+			)
+			expect(pids).toHaveLength(1)
+			return { executor, pid: pids[0]! }
+		}
+
+		it('a startup timeout still kills the group when the start time cannot be read', async () => {
+			const sessionId = SessionId('s-own-no-proc')
+			const { executor, pid } = await startNeverReady(sessionId, neverReadyService, withoutProc(createNodePlatform().fs))
+			try {
+				await expectProcessGone(pid)
+			} finally {
+				await executor.close(sessionId).catch(() => {})
+			}
+		})
+
+		it('a startup timeout still kills the group when its leader has already exited', async () => {
+			const sessionId = SessionId('s-own-leaderless')
+			// The member keeps the inherited stdio open, so the runtime sees no close while the leader is gone.
+			const leaderless: ServiceConfig = { ...neverReadyService, type: 'leaderless', command: 'sleep 60 & exit 0' }
+			const { executor, pid } = await startNeverReady(sessionId, leaderless)
+			try {
+				const deadline = Date.now() + 3000
+				while (Date.now() < deadline && isGroupAlive(pid)) await new Promise((r) => setTimeout(r, 50))
+				expect(isGroupAlive(pid)).toBe(false)
+			} finally {
+				if (isGroupAlive(pid)) process.kill(-pid, 'SIGKILL')
+				await executor.close(sessionId).catch(() => {})
+			}
+		})
+	})
+
 	describe('reclaiming a failed service', () => {
 		const systemError = (code: string): Error => {
 			const error = new Error(code)

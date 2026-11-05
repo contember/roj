@@ -54,15 +54,17 @@ export async function getProcessStartTime(fs: FileSystem, pid: number): Promise<
  * record can come from another boot or another host (a data directory restored elsewhere),
  * where the same number belongs to an unrelated process or process group.
  *
- * `gone` covers a dead pid and one whose start time cannot be read. `unverified` is a record
- * without a start time: nothing can tell our process from a stranger holding its pid.
+ * `unreadable` is a pid whose start time cannot be read (it is dead, or its stat is not
+ * readable): nothing ties it to the record. `unverified` is a record without a start time:
+ * nothing can tell our process from a stranger holding its pid. A host without /proc only
+ * writes such records, so its restored services are left running, never killed blind.
  */
-export type RecordedProcessCheck = 'ours' | 'gone' | 'pid-reused' | 'unverified'
+export type RecordedProcessCheck = 'ours' | 'unreadable' | 'pid-reused' | 'unverified'
 
 export async function checkRecordedProcess(fs: FileSystem, target: ReapTarget): Promise<RecordedProcessCheck> {
 	if (target.pidStartTime === undefined) return 'unverified'
 	const currentStartTime = await getProcessStartTime(fs, target.pid)
-	if (currentStartTime === undefined) return 'gone'
+	if (currentStartTime === undefined) return 'unreadable'
 	return currentStartTime === target.pidStartTime ? 'ours' : 'pid-reused'
 }
 

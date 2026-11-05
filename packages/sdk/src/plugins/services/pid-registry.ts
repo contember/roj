@@ -163,7 +163,8 @@ export class ServicePidRegistry {
 	private async killIfStillOurs(record: ServicePidRecord): Promise<void> {
 		const check = await checkRecordedProcess(this.fs, record)
 		if (check !== 'ours') {
-			this.logger.info('Dropped stale service pid record — not the recorded process, nothing killed', {
+			const log = check === 'pid-reused' ? this.logger.warn : this.logger.info
+			log.call(this.logger, 'Dropped stale service pid record — not the recorded process, nothing killed', {
 				sessionId: record.sessionId,
 				serviceType: record.serviceType,
 				pid: record.pid,
