@@ -1047,13 +1047,17 @@ export class SessionManager {
 	 * waiting for input still takes new messages.
 	 * A load another caller starts meanwhile pauses the same way; one finished before this call
 	 * already resumed, so call it before the manager serves requests.
+	 *
+	 * Returns the sessions that failed to load. Without resume their work is not held yet: only a
+	 * later load in this process, or the next `loadAllSessions({ resume: false })`, holds it.
 	 */
-	async loadAllSessions({ resume = true }: { resume?: boolean } = {}): Promise<void> {
+	async loadAllSessions({ resume = true }: { resume?: boolean } = {}): Promise<{ failed: SessionId[] }> {
 		const sessionIds = await this.eventStore.listSessions()
 		if (!resume) for (const sessionId of sessionIds) this.loadingWithoutResume.add(sessionId)
 
 		let loaded = 0
 		let skipped = 0
+		const failed: SessionId[] = []
 		for (const sessionId of sessionIds) {
 			try {
 				const metadata = await this.eventStore.getMetadata(sessionId)
@@ -1065,18 +1069,25 @@ export class SessionManager {
 				const session = await this.getSession(sessionId)
 				// A resident session was not loaded here, so its mark would wait for an unrelated later load.
 				// A failed load keeps it, so the next load holds the work.
-				if (session.ok) this.loadingWithoutResume.delete(sessionId)
-				loaded++
+				if (session.ok) {
+					this.loadingWithoutResume.delete(sessionId)
+					loaded++
+				} else {
+					this.logger.error('Failed to load session', undefined, { sessionId, error: session.error.message })
+					failed.push(sessionId)
+				}
 			} catch (error) {
 				this.logger.error(
 					'Failed to load session',
 					error instanceof Error ? error : new Error(String(error)),
 					{ sessionId },
 				)
+				failed.push(sessionId)
 			}
 		}
 
-		this.logger.info('Loaded sessions', { loaded, skipped, total: sessionIds.length })
+		this.logger.info('Loaded sessions', { loaded, skipped, failed: failed.length, total: sessionIds.length })
+		return { failed }
 	}
 
 	/**

@@ -392,6 +392,23 @@ describe('loadAllSessions without resume', () => {
 		expect(retried.ok ? undefined : retried.error.type).toBe('user_chat_delivery_conflict')
 	})
 
+	it('reports a session that failed to load, whose work it did not hold', async () => {
+		const { eventStore, sessionId } = await interruptedSession()
+		class FailingStore extends MemoryEventStore {
+			override async load(id: SessionId): Promise<DomainEvent[]> {
+				if (id === sessionId) throw new Error('unreadable log')
+				return super.load(id)
+			}
+		}
+		const failing = new FailingStore()
+		for (const event of await eventStore.load(sessionId)) await failing.append(sessionId, event)
+		const restored = harness(failing)
+
+		const loaded = await restored.sessionManager.loadAllSessions({ resume: false })
+		expect(loaded.failed).toEqual([sessionId])
+		expect((await harness(eventStore).sessionManager.loadAllSessions({ resume: false })).failed).toEqual([])
+	})
+
 	it('releases the whole hold when its user answers an agent that was not held', async () => {
 		const { restored, session, sessionId, entryId, childId } = await heldChildSession()
 
