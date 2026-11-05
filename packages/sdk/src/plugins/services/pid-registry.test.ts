@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it, spyOn } from 'bun:test'
 import { spawn } from 'node:child_process'
 import { readdir, readFile, mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -26,6 +26,36 @@ function spawnVictim(): { pid: number; exited: Promise<void> } {
 	if (!child.pid) throw new Error('failed to spawn victim')
 	const exited = new Promise<void>(resolve => child.on('close', () => resolve()))
 	return { pid: child.pid, exited }
+}
+
+/**
+ * A detached group whose leader has exited while a member lives on: the pid reads as dead,
+ * yet `kill(-pid)` would still reach somebody.
+ */
+async function spawnLeaderlessGroup(): Promise<number> {
+	const leader = spawn('/bin/sh', ['-c', 'sleep 60 & exit 0'], { detached: true, stdio: 'ignore' })
+	leader.unref()
+	if (!leader.pid) throw new Error('failed to spawn group leader')
+	await new Promise<void>(resolve => leader.on('close', () => resolve()))
+	return leader.pid
+}
+
+function isGroupAlive(pgid: number): boolean {
+	try {
+		process.kill(-pgid, 0)
+		return true
+	} catch {
+		return false
+	}
+}
+
+/** Watch the signals sent to process groups; they still land. */
+function watchGroupSignals() {
+	const spy = spyOn(process, 'kill')
+	return {
+		sentTo: (pgid: number) => spy.mock.calls.filter(([target, signal]) => target === -pgid && signal !== 0).map(([, signal]) => signal),
+		restore: () => spy.mockRestore(),
+	}
 }
 
 function isAlive(pid: number): boolean {
@@ -67,11 +97,69 @@ describe('ServicePidRegistry', () => {
 				agentStartTime: 12345,
 			})
 
-			await makeRegistry(dataPath).sweepOrphans()
+			const signals = watchGroupSignals()
+			try {
+				await makeRegistry(dataPath).sweepOrphans()
+				expect(signals.sentTo(victim.pid)).toEqual(['SIGKILL'])
+			} finally {
+				signals.restore()
+			}
 
 			await victim.exited
 			expect(isAlive(victim.pid)).toBe(false)
 			expect(await readdir(join(dataPath, 'service-pids'))).toEqual([])
+		})
+	})
+
+	it('sends no signal to the group of a recorded pid that is no longer running, and drops the record', async () => {
+		await withDataDir(async dataPath => {
+			const pgid = await spawnLeaderlessGroup()
+			const signals = watchGroupSignals()
+			try {
+				await writeRecord(dataPath, {
+					sessionId: 'sess-1',
+					serviceType: 'astro-dev',
+					pid: pgid,
+					pidStartTime: 12345,
+					command: 'sleep 60',
+					agentPid: await unusablePid(),
+				})
+
+				await makeRegistry(dataPath).sweepOrphans()
+
+				expect(signals.sentTo(pgid)).toEqual([])
+				expect(isGroupAlive(pgid)).toBe(true)
+				expect(await readdir(join(dataPath, 'service-pids'))).toEqual([])
+			} finally {
+				signals.restore()
+				process.kill(-pgid, 'SIGKILL')
+			}
+		})
+	})
+
+	it('sends no signal for a record that carries no start time, and drops the record', async () => {
+		await withDataDir(async dataPath => {
+			const victim = spawnVictim()
+			const signals = watchGroupSignals()
+			try {
+				// Nothing tells the process the record meant from whoever holds that pid now.
+				await writeRecord(dataPath, {
+					sessionId: 'sess-1',
+					serviceType: 'astro-dev',
+					pid: victim.pid,
+					command: 'sleep 60',
+					agentPid: await unusablePid(),
+				})
+
+				await makeRegistry(dataPath).sweepOrphans()
+
+				expect(signals.sentTo(victim.pid)).toEqual([])
+				expect(isAlive(victim.pid)).toBe(true)
+				expect(await readdir(join(dataPath, 'service-pids'))).toEqual([])
+			} finally {
+				signals.restore()
+				process.kill(-victim.pid, 'SIGKILL')
+			}
 		})
 	})
 
@@ -115,7 +203,13 @@ describe('ServicePidRegistry', () => {
 					agentPid: await unusablePid(),
 				})
 
-				await makeRegistry(dataPath).sweepOrphans()
+				const signals = watchGroupSignals()
+				try {
+					await makeRegistry(dataPath).sweepOrphans()
+					expect(signals.sentTo(victim.pid)).toEqual([])
+				} finally {
+					signals.restore()
+				}
 
 				expect(isAlive(victim.pid)).toBe(true)
 				// The record still goes — whatever holds that pid now, it is not ours to track.

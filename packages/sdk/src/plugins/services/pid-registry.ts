@@ -18,7 +18,7 @@
 import { join } from 'node:path'
 import type { FileSystem } from '~/platform/fs.js'
 import type { Logger } from '../../lib/logger/logger.js'
-import { getProcessStartTime } from './service.js'
+import { checkRecordedProcess, getProcessStartTime } from './service.js'
 
 /**
  * What we need in order to decide, later and from another process, whether a recorded
@@ -161,15 +161,14 @@ export class ServicePidRegistry {
 	}
 
 	private async killIfStillOurs(record: ServicePidRecord): Promise<void> {
-		const currentStartTime = await getProcessStartTime(this.fs, record.pid)
-		if (currentStartTime === undefined) return // Process is gone.
-		if (record.pidStartTime !== undefined && currentStartTime !== record.pidStartTime) {
-			this.logger.warn('PID reuse detected during orphan sweep — refusing to kill', {
+		const check = await checkRecordedProcess(this.fs, record)
+		if (check !== 'ours') {
+			const log = check === 'pid-reused' ? this.logger.warn : this.logger.info
+			log.call(this.logger, 'Dropped stale service pid record — not the recorded process, nothing killed', {
 				sessionId: record.sessionId,
 				serviceType: record.serviceType,
 				pid: record.pid,
-				storedStartTime: record.pidStartTime,
-				currentStartTime,
+				reason: check,
 			})
 			return
 		}

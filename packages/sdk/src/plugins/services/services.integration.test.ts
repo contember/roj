@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it, spyOn } from 'bun:test'
 import { ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
@@ -24,7 +24,7 @@ import { PortPool } from './port-pool.js'
 import { buildServiceStatusMessage } from './prompt.js'
 import type { ServiceCommandArgs, ServiceConfig, ServiceCwdArgs, ServiceEntry, ServiceStatus } from './schema.js'
 import type { ServiceStatusChangeDetails } from './service.js'
-import { ServiceExecutor, setServiceExecutorObserverForTesting } from './service.js'
+import { getProcessStartTime, ServiceExecutor, setServiceExecutorObserverForTesting } from './service.js'
 
 // ============================================================================
 // Test Service Configs
@@ -246,7 +246,9 @@ async function expectProcessGone(pid: number, timeoutMs = 3000): Promise<void> {
  * way a crashed runtime would have left one behind. The caller then writes the events
  * that runtime would have written about it and reopens the session.
  */
-async function seedCrashedRuntime(eventStore: MemoryEventStore): Promise<{ sessionId: SessionId; orphanPid: number }> {
+async function seedCrashedRuntime(
+	eventStore: MemoryEventStore,
+): Promise<{ sessionId: SessionId; orphanPid: number; orphanStartTime: number }> {
 	const harness = new TestHarness({
 		presets: [createServicesPreset([quickService], ['quick'], new PortPool())],
 		llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
@@ -260,7 +262,44 @@ async function seedCrashedRuntime(eventStore: MemoryEventStore): Promise<{ sessi
 	const orphanPid = orphan.pid
 	if (orphanPid === undefined) throw new Error('Detached orphan did not receive a pid')
 	expect(isProcessAlive(orphanPid)).toBe(true)
-	return { sessionId, orphanPid }
+	return { sessionId, orphanPid, orphanStartTime: await startTimeOf(orphanPid) }
+}
+
+/** The /proc start time a runtime records at spawn; these tests need Linux to have one. */
+async function startTimeOf(pid: number): Promise<number> {
+	const startTime = await getProcessStartTime(createNodePlatform().fs, pid)
+	if (startTime === undefined) throw new Error(`No start time readable for pid ${pid}`)
+	return startTime
+}
+
+/**
+ * A detached group whose leader has exited while a member lives on: the pid reads as dead,
+ * yet `kill(-pid)` would still reach somebody.
+ */
+async function spawnLeaderlessGroup(): Promise<number> {
+	const leader = createNodePlatform().process.spawn('/bin/sh', ['-c', 'sleep 60 & exit 0'], { detached: true, stdio: 'ignore' })
+	const pgid = leader.pid
+	if (pgid === undefined) throw new Error('Detached group leader did not receive a pid')
+	await new Promise<void>((resolve) => leader.on('close', () => resolve()))
+	return pgid
+}
+
+function isGroupAlive(pgid: number): boolean {
+	try {
+		process.kill(-pgid, 0)
+		return true
+	} catch {
+		return false
+	}
+}
+
+/** Watch the signals sent to process groups; they still land. Install before the runtime builds its executor. */
+function watchGroupSignals() {
+	const spy = spyOn(process, 'kill')
+	return {
+		sentTo: (pgid: number) => spy.mock.calls.filter(([target, signal]) => target === -pgid && signal !== 0).map(([, signal]) => signal),
+		restore: () => spy.mockRestore(),
+	}
 }
 
 /** Reopen a seeded session on a fresh runtime, which is what fires the reconcile. */
@@ -1438,6 +1477,7 @@ describe('services plugin', () => {
 					toStatus: 'starting',
 					port: orphanPort,
 					pid: orphanPid,
+					pidStartTime: await startTimeOf(orphanPid),
 				}),
 				sessionId,
 			})
@@ -1453,9 +1493,15 @@ describe('services plugin', () => {
 			currentHarness = harness2
 
 			// Opening the session fires onSessionReady → reconcile kills the orphan
-			const session2 = await harness2.openSession(sessionId)
-
-			await waitForServiceStateStatus(session2, 'quick', 'stopped', 3000)
+			const signals = watchGroupSignals()
+			let session2: Awaited<ReturnType<TestHarness['openSession']>>
+			try {
+				session2 = await harness2.openSession(sessionId)
+				await waitForServiceStateStatus(session2, 'quick', 'stopped', 3000)
+				expect(signals.sentTo(orphanPid)).toEqual(['SIGKILL'])
+			} finally {
+				signals.restore()
+			}
 
 			// Give the OS a beat to reap the killed process
 			for (let i = 0; i < 20; i++) {
@@ -1492,7 +1538,7 @@ describe('services plugin', () => {
 
 		it('reclaims a failed entry a previous runtime left owning a process', async () => {
 			const eventStore = new MemoryEventStore()
-			const { sessionId, orphanPid } = await seedCrashedRuntime(eventStore)
+			const { sessionId, orphanPid, orphanStartTime } = await seedCrashedRuntime(eventStore)
 			const orphanPort = 41_235
 
 			// The shape production leaves behind: the wait gave up, the process did not.
@@ -1502,12 +1548,14 @@ describe('services plugin', () => {
 					toStatus: 'starting',
 					port: orphanPort,
 					pid: orphanPid,
+					pidStartTime: orphanStartTime,
 				}),
 				serviceEvents.create('service_status_changed', {
 					serviceType: 'quick',
 					toStatus: 'failed',
 					port: orphanPort,
 					pid: orphanPid,
+					pidStartTime: orphanStartTime,
 					error: 'Service startup timed out after 30000ms',
 				}),
 			]) {
@@ -1532,7 +1580,7 @@ describe('services plugin', () => {
 
 		it('reclaims an orphan that session_restarted had already marked stopped', async () => {
 			const eventStore = new MemoryEventStore()
-			const { sessionId, orphanPid } = await seedCrashedRuntime(eventStore)
+			const { sessionId, orphanPid, orphanStartTime } = await seedCrashedRuntime(eventStore)
 			const orphanPort = 41_236
 
 			// A runtime that dies mid-run recovers through session_restarted, which lands
@@ -1544,6 +1592,7 @@ describe('services plugin', () => {
 					toStatus: 'starting',
 					port: orphanPort,
 					pid: orphanPid,
+					pidStartTime: orphanStartTime,
 				}),
 				sessionEvents.create('session_restarted', { resetAgentIds: [], clearedToolAgentIds: [] }),
 			]) {
@@ -1576,14 +1625,139 @@ describe('services plugin', () => {
 				sessionId,
 			})
 
-			const session = await reopenOverSameStore(eventStore).openSession(sessionId)
-			await waitForServiceStateStatus(session, 'quick', 'stopped', 3000)
+			const signals = watchGroupSignals()
+			try {
+				const session = await reopenOverSameStore(eventStore).openSession(sessionId)
+				await waitForServiceStateStatus(session, 'quick', 'stopped', 3000)
 
-			// The pid is somebody else's now, so it is not ours to kill — but the claim
-			// still goes, or every later boot would examine it again.
-			expect(isProcessAlive(orphanPid)).toBe(true)
-			expect(selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('quick')?.pid).toBeUndefined()
+				// The pid is somebody else's now, so it is not ours to kill — but the claim
+				// still goes, or every later boot would examine it again.
+				expect(signals.sentTo(orphanPid)).toEqual([])
+				expect(isProcessAlive(orphanPid)).toBe(true)
+				expect(selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('quick')?.pid).toBeUndefined()
+			} finally {
+				signals.restore()
+				process.kill(-orphanPid, 'SIGKILL')
+			}
+		})
+
+		it('sends no signal to the group of a recorded pid that is no longer running', async () => {
+			const eventStore = new MemoryEventStore()
+			const { sessionId, orphanPid } = await seedCrashedRuntime(eventStore)
 			process.kill(-orphanPid, 'SIGKILL')
+			await expectProcessGone(orphanPid)
+			// Restored elsewhere, the recorded number names an unrelated group the kill would reach.
+			const strangerGroup = await spawnLeaderlessGroup()
+
+			await eventStore.append(sessionId, {
+				...serviceEvents.create('service_status_changed', {
+					serviceType: 'quick',
+					toStatus: 'starting',
+					port: 41_238,
+					pid: strangerGroup,
+					pidStartTime: 12345,
+				}),
+				sessionId,
+			})
+
+			const signals = watchGroupSignals()
+			try {
+				const session = await reopenOverSameStore(eventStore).openSession(sessionId)
+				await waitForServiceStateStatus(session, 'quick', 'stopped', 3000)
+
+				expect(signals.sentTo(strangerGroup)).toEqual([])
+				expect(isGroupAlive(strangerGroup)).toBe(true)
+				expect(selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('quick')?.pid).toBeUndefined()
+			} finally {
+				signals.restore()
+				process.kill(-strangerGroup, 'SIGKILL')
+			}
+		})
+
+		it('sends no signal for a record that carries no start time', async () => {
+			const eventStore = new MemoryEventStore()
+			const { sessionId, orphanPid } = await seedCrashedRuntime(eventStore)
+
+			await eventStore.append(sessionId, {
+				...serviceEvents.create('service_status_changed', {
+					serviceType: 'quick',
+					toStatus: 'starting',
+					port: 41_239,
+					pid: orphanPid,
+				}),
+				sessionId,
+			})
+
+			const signals = watchGroupSignals()
+			try {
+				const session = await reopenOverSameStore(eventStore).openSession(sessionId)
+				await waitForServiceStateStatus(session, 'quick', 'stopped', 3000)
+
+				// Nothing tells the process the record meant from whoever holds that pid now.
+				expect(signals.sentTo(orphanPid)).toEqual([])
+				expect(isProcessAlive(orphanPid)).toBe(true)
+				expect(selectPluginState<Map<string, ServiceEntry>>(session.state, 'services')?.get('quick')?.pid).toBeUndefined()
+			} finally {
+				signals.restore()
+				process.kill(-orphanPid, 'SIGKILL')
+			}
+		})
+	})
+
+	// The guard for recorded pids must not reach the runtime's own children: a child it spawned and
+	// has not seen close is ours even when its start time is unknown or its leader is gone.
+	describe('reclaiming a service this runtime started', () => {
+		/** A host without a readable /proc: every start time is unknown. */
+		const withoutProc = (base: FileSystem): FileSystem => {
+			function readFile(path: string): Promise<Buffer>
+			function readFile(path: string, encoding: 'utf-8' | 'utf8'): Promise<string>
+			async function readFile(path: string, encoding?: 'utf-8' | 'utf8'): Promise<Buffer | string> {
+				if (path.startsWith('/proc/')) throw new Error(`ENOENT: ${path}`)
+				return encoding === undefined ? base.readFile(path) : base.readFile(path, encoding)
+			}
+			return { ...base, readFile }
+		}
+
+		const startNeverReady = async (sessionId: SessionId, service: ServiceConfig, fs?: FileSystem) => {
+			const platform = createNodePlatform()
+			const executor = new ServiceExecutor(silentLogger, new PortPool(), { fs: fs ?? platform.fs, process: platform.process })
+			const pids: number[] = []
+			executor.onStatusChanged = (_sessionId, _serviceType, status, details) => {
+				if (status === 'starting' && details.pid !== undefined) pids.push(details.pid)
+			}
+			const started = await executor.start(service, sessionId)
+			expect(started.ok).toBe(true)
+			await waitFor(
+				() => executor.getStatus(service.type) === 'failed',
+				() => `status ${executor.getStatus(service.type)}`,
+			)
+			expect(pids).toHaveLength(1)
+			return { executor, pid: pids[0]! }
+		}
+
+		it('a startup timeout still kills the group when the start time cannot be read', async () => {
+			const sessionId = SessionId('s-own-no-proc')
+			const { executor, pid } = await startNeverReady(sessionId, neverReadyService, withoutProc(createNodePlatform().fs))
+			try {
+				await expectProcessGone(pid)
+			} finally {
+				await executor.close(sessionId).catch(() => {})
+			}
+		})
+
+		it('a startup timeout still kills the group when its leader has already exited', async () => {
+			const sessionId = SessionId('s-own-leaderless')
+			// The member keeps the inherited stdio open, so the runtime sees no close while the leader is gone.
+			const leaderless: ServiceConfig = { ...neverReadyService, type: 'leaderless', command: 'sleep 60 & exit 0' }
+			const { executor, pid } = await startNeverReady(sessionId, leaderless)
+			try {
+				const deadline = Date.now() + 3000
+				while (Date.now() < deadline && isGroupAlive(pid)) await new Promise((r) => setTimeout(r, 50))
+				expect(isGroupAlive(pid)).toBe(false)
+			} finally {
+				if (isGroupAlive(pid)) process.kill(-pid, 'SIGKILL')
+				await executor.close(sessionId).catch(() => {})
+			}
 		})
 	})
 
