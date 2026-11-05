@@ -1041,9 +1041,9 @@ export class SessionManager {
 	 * `resume: false` is for sessions restored somewhere new, whose interrupted work must not run
 	 * unattended: every agent that would continue is paused before it does, durably, so a later
 	 * load does not restart it either, and the pause wakes no parent. Session-ready hooks see
-	 * `resumeInterruptedWork: false`, so running workers are parked instead of relaunched. A user
-	 * message to a paused agent resumes that agent alone; a sub-agent stays paused until its parent
-	 * or a caller resumes it. An agent only waiting for input still takes new messages.
+	 * `resumeInterruptedWork: false`, so running workers are parked instead of relaunched. The hold
+	 * is session-wide: a user message or answer to any agent releases it, resuming every held agent
+	 * and relaunching every parked worker. An agent only waiting for input still takes new messages.
 	 * A load another caller starts meanwhile pauses the same way; one finished before this call
 	 * already resumed, so call it before the manager serves requests.
 	 */

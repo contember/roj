@@ -741,12 +741,9 @@ export const userChatPlugin = definePlugin("user-chat")
 				const receipt = state?.acceptedDeliveries?.get(input.deliveryId);
 				if (receipt) {
 					if (receipt.fingerprint !== fingerprint) return Err(deliveryConflict());
-					// A retry after a failed resume: the message is in, the agent may still be held.
-					const target = input.agentId ?? getEntryAgentId(ctx.sessionState);
-					if (target) {
-						const resumed = await ctx.resumeOnInput(target);
-						if (!resumed.ok) return resumed;
-					}
+					// A retry after a failed release: the message is in, the session may still be held.
+					const released = await ctx.releaseHold();
+					if (!released.ok) return released;
 					return Ok({ messageId: receipt.messageId });
 				}
 				const inFlight = ctx.pluginContext.inFlightDeliveries.get(input.deliveryId);
@@ -814,8 +811,8 @@ export const userChatPlugin = definePlugin("user-chat")
 					}),
 				);
 				// After the message lands, so the resumed agent answers it rather than only its old work.
-				const resumed = await ctx.resumeOnInput(agentId);
-				if (!resumed.ok) return resumed;
+				const released = await ctx.releaseHold();
+				if (!released.ok) return released;
 				ctx.scheduleAgent(agentId);
 				return Ok({ messageId });
 			};
@@ -846,9 +843,9 @@ export const userChatPlugin = definePlugin("user-chat")
 				(msg) => msg.type === "ask_user" && msg.questionId === input.questionId,
 			);
 			if (asked?.type === "ask_user" && asked.answered) {
-				// A retry after a failed resume: the answer is in, the agent may still be held.
-				const resumed = await ctx.resumeOnInput(input.agentId);
-				return resumed.ok ? Ok({}) : resumed;
+				// A retry after a failed release: the answer is in, the session may still be held.
+				const released = await ctx.releaseHold();
+				return released.ok ? Ok({}) : released;
 			}
 
 			const messageId = generateChatMessageId(
@@ -863,8 +860,8 @@ export const userChatPlugin = definePlugin("user-chat")
 					timestamp: Date.now(),
 				}),
 			);
-			const resumed = await ctx.resumeOnInput(input.agentId);
-			if (!resumed.ok) return resumed;
+			const released = await ctx.releaseHold();
+			if (!released.ok) return released;
 			ctx.scheduleAgent(input.agentId);
 			return Ok({});
 		},

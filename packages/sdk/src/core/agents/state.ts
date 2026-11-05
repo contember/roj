@@ -257,7 +257,7 @@ export interface AgentState {
 	pauseReason?: AgentPauseReason
 	/** Human-readable pause message */
 	pauseMessage?: string
-	/** Whether the next user message resumes the paused agent (`agent_paused.resumeOnInput`) */
+	/** Paused by a restore's hold, so `Session.releaseHold` resumes it (`agent_paused.resumeOnInput`) */
 	pauseResumesOnInput?: boolean
 	/** Metrics from the most recent completed inference — used by plugins (e.g. context-compact) to size context against the provider-reported truth. */
 	lastInferenceMetrics?: LLMMetrics

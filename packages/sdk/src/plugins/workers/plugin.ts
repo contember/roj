@@ -20,6 +20,9 @@ import { generateWorkerId, type WorkerEntry, WorkerId, type WorkerId as WorkerId
 /** Most workers a single session runtime runs at once. */
 export const MAX_CONCURRENT_WORKERS = 10
 
+/** Why a restore's hold parked a running worker. */
+const HELD_REASON = 'Held: the session was restored, so the worker waits for a new message'
+
 /** Default bound on waiting for a stopped worker's `execute()` to return. */
 export const WORKER_STOP_TIMEOUT_MS = 5000
 
@@ -319,6 +322,109 @@ function launchWorker({
 	return Ok(undefined)
 }
 
+interface WorkersPluginContext {
+	runningWorkers: Map<WorkerIdType, RunningWorker>
+	pendingLaunches: Set<WorkerIdType>
+	abandonedWorkers: Set<WorkerIdType>
+	logger: Logger
+}
+
+/** What relaunching a paused worker reads from a method or session hook context. */
+interface RelaunchContext {
+	sessionId: SessionId
+	pluginConfig: WorkerPresetConfig
+	pluginContext: WorkersPluginContext
+	pluginState: Map<WorkerIdType, WorkerEntry>
+	files: { session: FileStore }
+	emitEvent: EmitEvent
+	getSessionState: () => SessionState
+	reserveMailboxMessageSequence: (activity?: SessionRuntimeActivity) => number
+	scheduleAgent: (agentId: AgentId) => void
+	runtimeActivity: SessionRuntimeActivity
+}
+
+/** Relaunch a paused worker with its replayed state; shared by `resume` and the release of a restore's hold. */
+async function relaunchPausedWorker(ctx: RelaunchContext, workerId: WorkerIdType): Promise<Result<void, string>> {
+	const { runningWorkers, pendingLaunches, abandonedWorkers, logger } = ctx.pluginContext
+	const workerEntry = ctx.pluginState.get(workerId)
+	if (!workerEntry) {
+		return Err(`Worker not found: ${workerId}`)
+	}
+	if (workerEntry.status !== 'paused') {
+		return Err(`Worker not in paused state: ${workerEntry.status}`)
+	}
+	if (!Object.hasOwn(workerEntry, 'config') || !Object.hasOwn(workerEntry, 'state')) {
+		return Err(`Worker is no longer resumable: ${workerId}`)
+	}
+	const definition = ctx.pluginConfig.workers.find((candidate) => candidate.type === workerEntry.workerType)
+	if (!definition) {
+		return Err(`Unknown worker type: ${workerEntry.workerType}`)
+	}
+	// Nothing runs a paused worker any more, so resume relaunches it — and must
+	// never overwrite a live entry, whose lease would then leak. The claim below
+	// is therefore taken in the same synchronous block as the checks: everything
+	// from here to `pendingLaunches.add` must stay free of `await`.
+	if (runningWorkers.has(workerId)) {
+		return Err(`Worker is already running: ${workerId}`)
+	}
+	if (pendingLaunches.has(workerId)) {
+		return Err(`Worker is already resuming: ${workerId}`)
+	}
+	if (abandonedWorkers.has(workerId)) {
+		return Err(`Worker did not stop within its deadline and may still be running: ${workerId}`)
+	}
+	if (runningWorkers.size + pendingLaunches.size >= MAX_CONCURRENT_WORKERS) {
+		return Err(`Max concurrent workers reached (${MAX_CONCURRENT_WORKERS})`)
+	}
+	pendingLaunches.add(workerId)
+
+	try {
+		// The status event goes first: a worker that finishes instantly would otherwise
+		// have its terminal projection overwritten by this event.
+		await ctx.emitEvent(workerEvents.create('worker_status_changed', {
+			workerId,
+			fromStatus: 'paused',
+			toStatus: 'running',
+		}))
+
+		const launched = launchWorker({
+			sessionId: ctx.sessionId,
+			agentId: workerEntry.agentId,
+			workerId,
+			definition,
+			config: workerEntry.config,
+			initialState: workerEntry.state,
+			resumed: !workerEntry.pendingStart,
+			files: ctx.files.session,
+			emitEvent: ctx.emitEvent,
+			getSessionState: ctx.getSessionState,
+			reserveMailboxMessageSequence: ctx.reserveMailboxMessageSequence,
+			scheduleAgent: ctx.scheduleAgent,
+			runtimeActivity: ctx.runtimeActivity,
+			runningWorkers,
+			effectDrainTimeoutMs: resolveStopTimeouts(ctx.pluginConfig).effectDrainTimeoutMs,
+			logger,
+		})
+		if (!launched.ok) {
+			// Park it again rather than fail it: both triggers are transient, and a
+			// `worker_failed` would drop the state and config that keep it resumable.
+			// A held worker stays held, so the next release retries it.
+			await ctx.emitEvent(workerEvents.create('worker_status_changed', {
+				workerId,
+				fromStatus: 'running',
+				toStatus: 'paused',
+				reason: launched.error,
+				...(workerEntry.pauseResumesOnInput && { resumeOnInput: true }),
+			}))
+			return Err(launched.error)
+		}
+
+		return Ok(undefined)
+	} finally {
+		pendingLaunches.delete(workerId)
+	}
+}
+
 // ============================================================================
 // Helper functions for creating worker tools
 // ============================================================================
@@ -396,11 +502,10 @@ export const workerPlugin = definePlugin('workers')
 
 					const newWorkers = new Map(workers)
 					if (event.toStatus === 'running' || event.toStatus === 'paused') {
-						newWorkers.set(event.workerId, {
-							...worker,
-							status: event.toStatus,
-							updatedAt: event.timestamp,
-						})
+						const next: WorkerEntry = { ...worker, status: event.toStatus, updatedAt: event.timestamp }
+						if (event.toStatus === 'paused' && event.resumeOnInput === true) next.pauseResumesOnInput = true
+						else delete next.pauseResumesOnInput
+						newWorkers.set(event.workerId, next)
 					} else {
 						newWorkers.set(event.workerId, {
 							id: worker.id,
@@ -457,7 +562,7 @@ export const workerPlugin = definePlugin('workers')
 			}
 		},
 	})
-	.context(async (ctx) => {
+	.context(async (ctx): Promise<WorkersPluginContext> => {
 		const runningWorkers = new Map<WorkerIdType, RunningWorker>()
 		// Claimed synchronously by `resume` so the emit it awaits cannot let a second
 		// resume through and overwrite the live entry, leaking its lease.
@@ -566,11 +671,12 @@ export const workerPlugin = definePlugin('workers')
 		const { effectDrainTimeoutMs } = resolveStopTimeouts(ctx.pluginConfig)
 		// A relaunch that does not happen must not leave the projection claiming `running`
 		// — park the worker instead, which keeps its state and lets `resume` pick it up.
-		const parkStoppedWorker = async (workerId: WorkerIdType): Promise<void> => {
+		const parkStoppedWorker = async (workerId: WorkerIdType, hold?: { reason: string; resumeOnInput: true }): Promise<void> => {
 			await ctx.emitEvent(workerEvents.create('worker_status_changed', {
 				workerId,
 				fromStatus: 'running',
 				toStatus: 'paused',
+				...hold,
 			}))
 		}
 		for (const worker of ctx.pluginState.values()) {
@@ -578,9 +684,9 @@ export const workerPlugin = definePlugin('workers')
 			if (worker.status !== 'running') continue
 			if (!Object.hasOwn(worker, 'config') || !Object.hasOwn(worker, 'state')) continue
 			if (runningWorkers.has(worker.id)) continue
-			// A load that holds interrupted work: the worker waits for `resume` like its held agents.
+			// A load that holds interrupted work: the worker waits with the held agents for `Session.releaseHold`.
 			if (!ctx.resumeInterruptedWork) {
-				await parkStoppedWorker(worker.id)
+				await parkStoppedWorker(worker.id, { reason: HELD_REASON, resumeOnInput: true })
 				continue
 			}
 			const definition = ctx.pluginConfig.workers.find((candidate) => candidate.type === worker.workerType)
@@ -747,86 +853,17 @@ export const workerPlugin = definePlugin('workers')
 		}),
 		output: z.object({}),
 		handler: async (ctx, input) => {
-			const workerId = WorkerId(input.workerId)
-			const { runningWorkers, pendingLaunches, abandonedWorkers, logger } = ctx.pluginContext
-			const workerEntry = ctx.pluginState.get(workerId)
-			if (!workerEntry) {
-				return Err(ValidationErrors.invalid(`Worker not found: ${input.workerId}`))
-			}
-			if (workerEntry.status !== 'paused') {
-				return Err(ValidationErrors.invalid(`Worker not in paused state: ${workerEntry.status}`))
-			}
-			if (!Object.hasOwn(workerEntry, 'config') || !Object.hasOwn(workerEntry, 'state')) {
-				return Err(ValidationErrors.invalid(`Worker is no longer resumable: ${input.workerId}`))
-			}
-			const definition = ctx.pluginConfig.workers.find((candidate) => candidate.type === workerEntry.workerType)
-			if (!definition) {
-				return Err(ValidationErrors.invalid(`Unknown worker type: ${workerEntry.workerType}`))
-			}
-			// Nothing runs a paused worker any more, so resume relaunches it — and must
-			// never overwrite a live entry, whose lease would then leak. The claim below
-			// is therefore taken in the same synchronous block as the checks: everything
-			// from here to `pendingLaunches.add` must stay free of `await`.
-			if (runningWorkers.has(workerId)) {
-				return Err(ValidationErrors.invalid(`Worker is already running: ${input.workerId}`))
-			}
-			if (pendingLaunches.has(workerId)) {
-				return Err(ValidationErrors.invalid(`Worker is already resuming: ${input.workerId}`))
-			}
-			if (abandonedWorkers.has(workerId)) {
-				return Err(ValidationErrors.invalid(
-					`Worker did not stop within its deadline and may still be running: ${input.workerId}`,
-				))
-			}
-			if (runningWorkers.size + pendingLaunches.size >= MAX_CONCURRENT_WORKERS) {
-				return Err(ValidationErrors.invalid(`Max concurrent workers reached (${MAX_CONCURRENT_WORKERS})`))
-			}
-			pendingLaunches.add(workerId)
-
-			try {
-				// The status event goes first: a worker that finishes instantly would otherwise
-				// have its terminal projection overwritten by this event.
-				await ctx.emitEvent(workerEvents.create('worker_status_changed', {
-					workerId,
-					fromStatus: 'paused',
-					toStatus: 'running',
-				}))
-
-				const launched = launchWorker({
-					sessionId: ctx.sessionId,
-					agentId: workerEntry.agentId,
-					workerId,
-					definition,
-					config: workerEntry.config,
-					initialState: workerEntry.state,
-					resumed: !workerEntry.pendingStart,
-					files: ctx.files.session,
-					emitEvent: ctx.emitEvent,
-					getSessionState: ctx.getSessionState,
-					reserveMailboxMessageSequence: ctx.reserveMailboxMessageSequence,
-					scheduleAgent: ctx.scheduleAgent,
-					runtimeActivity: ctx.runtimeActivity,
-					runningWorkers,
-					effectDrainTimeoutMs: resolveStopTimeouts(ctx.pluginConfig).effectDrainTimeoutMs,
-					logger,
-				})
-				if (!launched.ok) {
-					// Park it again rather than fail it: both triggers are transient, and a
-					// `worker_failed` would drop the state and config that keep it resumable.
-					await ctx.emitEvent(workerEvents.create('worker_status_changed', {
-						workerId,
-						fromStatus: 'running',
-						toStatus: 'paused',
-						reason: launched.error,
-					}))
-					return Err(ValidationErrors.invalid(launched.error))
-				}
-
-				return Ok({})
-			} finally {
-				pendingLaunches.delete(workerId)
-			}
+			const relaunched = await relaunchPausedWorker(ctx, WorkerId(input.workerId))
+			return relaunched.ok ? Ok({}) : Err(ValidationErrors.invalid(relaunched.error))
 		},
+	})
+	.sessionHook('onHoldRelease', async (ctx) => {
+		for (const worker of ctx.pluginState.values()) {
+			if (worker.status !== 'paused' || worker.pauseResumesOnInput !== true) continue
+			// A failed relaunch parks it held again, so the next release retries it.
+			const relaunched = await relaunchPausedWorker(ctx, worker.id)
+			if (!relaunched.ok) ctx.pluginContext.logger.warn('Cannot relaunch held worker', { workerId: worker.id, reason: relaunched.error })
+		}
 	})
 	.sessionHook('onSessionPark', async (ctx) => {
 		const { runningWorkers, abandonedWorkers, logger } = ctx.pluginContext

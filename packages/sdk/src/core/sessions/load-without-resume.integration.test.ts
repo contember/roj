@@ -128,7 +128,7 @@ describe('loadAllSessions without resume', () => {
 		expect(await agentStatus(restored, sessionId, agentId)).not.toBe('paused')
 	})
 
-	it('resumes only the agent the user writes to', async () => {
+	it('resumes every held agent in the session when its user writes to one', async () => {
 		const source = harness()
 		const session = await source.createSession('test')
 		const entryId = session.getEntryAgentId()
@@ -147,10 +147,32 @@ describe('loadAllSessions without resume', () => {
 		await restored.sessionManager.loadAllSessions({ resume: false })
 		const reopened = await restored.openSession(session.sessionId)
 		await reopened.sendMessage('Change the title')
+		await waitUntil(() => restored.llmProvider.getCallCount() >= 2)
+		expect(await agentStatus(restored, session.sessionId, childId)).not.toBe('paused')
+		expect(await agentStatus(restored, session.sessionId, entryId)).not.toBe('paused')
+		const requests = JSON.stringify(restored.llmProvider.getCallHistory().map(request => request.messages))
+		expect(requests).toContain('Finish the old task')
+	})
+
+	it('leaves an agent paused by hand paused when the hold is released', async () => {
+		const source = harness()
+		const session = await source.createSession('test')
+		const entryId = session.getEntryAgentId()
+		if (!entryId) throw new Error('Expected an entry agent')
+		const spawned = await (await liveSession(source, session.sessionId)).spawnAgentManually('child', entryId, 'Start the task')
+		if (!spawned.ok) throw new Error(spawned.error.message)
+		await waitUntil(() => source.llmProvider.getCallCount() === 1)
+		await leaveUnanswered(source, session, entryId, 'Rebuild the site')
+		await session.pauseAgent(spawned.value)
+		await source.shutdown()
+
+		const restored = harness(source.eventStore)
+		await restored.sessionManager.loadAllSessions({ resume: false })
+		const reopened = await restored.openSession(session.sessionId)
+		await reopened.sendMessage('Change the title')
 		await waitUntil(() => restored.llmProvider.getCallCount() === 1)
 		await Bun.sleep(50)
-		expect(restored.llmProvider.getCallCount()).toBe(1)
-		expect(await agentStatus(restored, session.sessionId, childId)).toBe('paused')
+		expect(await agentStatus(restored, session.sessionId, spawned.value)).toBe('paused')
 	})
 
 	it('leaves an agent paused by hand paused when its user writes to it', async () => {

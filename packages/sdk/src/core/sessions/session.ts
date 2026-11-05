@@ -381,16 +381,26 @@ export class Session {
 		return Ok(undefined)
 	}
 
-	/** Resume an agent held until its user writes; an agent paused any other way stays paused. */
-	async resumeOnInput(agentId: AgentId): Promise<Result<void, DomainError>> {
-		const agentState = this.store.getAgentState(agentId)
-		if (agentState?.status !== 'paused' || agentState.pauseResumesOnInput !== true) return Ok(undefined)
-		return this.resumeAgent(agentId)
+	/**
+	 * Release the hold a restore left (`SessionManager.loadAllSessions({ resume: false })`): resume
+	 * every agent it paused, then let plugins relaunch what they parked for it. Anything paused any
+	 * other way stays paused, and a session with nothing held is left as it is.
+	 */
+	async releaseHold(activity: SessionRuntimeActivity = this.runtimeActivity): Promise<Result<void, DomainError>> {
+		for (const [agentId, agentState] of this.store.getState().agents) {
+			if (agentState.status !== 'paused' || agentState.pauseResumesOnInput !== true) continue
+			const resumed = await this.resumeAgent(agentId)
+			if (!resumed.ok) return resumed
+		}
+		for (const plugin of this.plugins) {
+			if (plugin.sessionHooks?.onHoldRelease) await plugin.sessionHooks.onHoldRelease(this.buildSessionHookContext(plugin, activity))
+		}
+		return Ok(undefined)
 	}
 
 	/**
 	 * Pause every agent that would pick up work on its own, and return their ids. The pause is an
-	 * event, so it holds across later loads until the agent is resumed or its user writes to it; an
+	 * event, so it holds across later loads until the agent is resumed or `releaseHold` runs; an
 	 * agent that only waits for input is left alone. The mailbox does not report this pause to the
 	 * parent, so holding a child does not wake it.
 	 */
@@ -849,7 +859,7 @@ export class Session {
 			pluginContext,
 			pluginState,
 			scheduleAgent: (targetAgentId: AgentId) => this.scheduleAgent(targetAgentId),
-			resumeOnInput: (targetAgentId: AgentId) => this.resumeOnInput(targetAgentId),
+			releaseHold: () => this.releaseHold(activity),
 			notify: this.createNotify(pluginName, activity),
 			deps,
 		}
