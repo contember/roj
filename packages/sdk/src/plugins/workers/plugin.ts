@@ -5,6 +5,7 @@ import type { FileStore } from '~/core/file-store/types.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import type { SessionRuntimeActivity } from '~/core/sessions/runtime-activity.js'
 import { RuntimeFileStore } from '~/core/sessions/context.js'
+import { selectPluginState } from '~/core/sessions/reducer.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import type { SessionState } from '~/core/sessions/state.js'
 import { createTool, type ToolDefinition } from '~/core/tools/definition.js'
@@ -334,7 +335,6 @@ interface RelaunchContext {
 	sessionId: SessionId
 	pluginConfig: WorkerPresetConfig
 	pluginContext: WorkersPluginContext
-	pluginState: Map<WorkerIdType, WorkerEntry>
 	files: { session: FileStore }
 	emitEvent: EmitEvent
 	getSessionState: () => SessionState
@@ -346,7 +346,8 @@ interface RelaunchContext {
 /** Relaunch a paused worker with its replayed state; shared by `resume` and the release of a restore's hold. */
 async function relaunchPausedWorker(ctx: RelaunchContext, workerId: WorkerIdType): Promise<Result<void, string>> {
 	const { runningWorkers, pendingLaunches, abandonedWorkers, logger } = ctx.pluginContext
-	const workerEntry = ctx.pluginState.get(workerId)
+	// The live entry: a hook's `pluginState` is a snapshot that an earlier relaunch's await makes stale.
+	const workerEntry = selectPluginState<Map<WorkerIdType, WorkerEntry>>(ctx.getSessionState(), 'workers')?.get(workerId)
 	if (!workerEntry) {
 		return Err(`Worker not found: ${workerId}`)
 	}

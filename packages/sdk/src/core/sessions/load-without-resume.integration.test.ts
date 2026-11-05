@@ -233,6 +233,45 @@ describe('loadAllSessions without resume', () => {
 		await waitUntil(() => restored.llmProvider.getCallCount() === 1)
 	})
 
+	/** A restored session whose entry agent is idle and whose child is held. */
+	async function heldChildSession(): Promise<{ restored: TestHarness; session: Session; sessionId: SessionId; entryId: AgentId; childId: AgentId }> {
+		const source = harness()
+		const created = await source.createSession('test')
+		const entryId = created.getEntryAgentId()
+		if (!entryId) throw new Error('Expected an entry agent')
+		const spawned = await (await liveSession(source, created.sessionId)).spawnAgentManually('child', entryId, 'Start the task')
+		if (!spawned.ok) throw new Error(spawned.error.message)
+		await created.waitForIdle()
+		const before = source.llmProvider.getCallCount()
+		await leaveUnanswered(source, created, spawned.value, 'Finish the old task')
+		// The parent answers the manual pause's notice here, so it is idle when the session is restored.
+		await waitUntil(() => source.llmProvider.getCallCount() === before + 1)
+		await source.shutdown()
+
+		const restored = harness(source.eventStore)
+		await restored.sessionManager.loadAllSessions({ resume: false })
+		const session = await liveSession(restored, created.sessionId)
+		return { restored, session, sessionId: created.sessionId, entryId, childId: spawned.value }
+	}
+
+	it('answers a retried delivery whose release failed on another agent', async () => {
+		const { restored, session, sessionId, entryId } = await heldChildSession()
+		const send = () => session.callPluginMethod('user-chat.sendMessage', { sessionId, agentId: entryId, content: 'Change the title', deliveryId: 'd1' })
+
+		spyOn(Session.prototype, 'resumeAgent').mockImplementationOnce(async () => Err(ValidationErrors.invalid('runtime parking')))
+		expect((await send()).ok).toBe(false)
+		expect((await send()).ok).toBe(true)
+		await waitUntil(() => restored.llmProvider.getCallHistory().some(request => JSON.stringify(request.messages).includes('Change the title')))
+	})
+
+	it('releases the whole hold when its user answers an agent that was not held', async () => {
+		const { restored, session, sessionId, entryId, childId } = await heldChildSession()
+
+		const answered = await session.callPluginMethod('user-chat.answerQuestion', { agentId: entryId, questionId: 'm0', answer: 'Yes' })
+		expect(answered.ok).toBe(true)
+		expect(await agentStatus(restored, sessionId, childId)).not.toBe('paused')
+	})
+
 	it('resumes a held agent when its user answers it', async () => {
 		const { eventStore, sessionId, agentId } = await interruptedSession()
 		const restored = harness(eventStore)

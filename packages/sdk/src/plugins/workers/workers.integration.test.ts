@@ -754,7 +754,7 @@ describe('workers plugin', () => {
 					config: { input: 'restored' },
 				})))
 				for (const event of extra) await eventStore.append(sessionId, withSessionId(sessionId, event))
-				return { gated, sessionId, harnessFor }
+				return { gated, sessionId, eventStore, harnessFor }
 			}
 
 			it('parks a running worker as held instead of relaunching it', async () => {
@@ -845,6 +845,78 @@ describe('workers plugin', () => {
 				await reopened.sendMessage('And the footer')
 				await waitFor(() => resumable.runs.length === MAX_CONCURRENT_WORKERS + 1)
 				expect(held[0] && workersOf(reopened)?.get(held[0].id)?.status).toBe('running')
+				await restored.shutdown()
+			})
+
+			it('does not relaunch a held worker cancelled while the release relaunches another', async () => {
+				const runs: string[] = []
+				const looping = createWorkerDefinition('looping', 'Runs until it is stopped', z.object({ name: z.string() }), {
+					initialState: () => ({}),
+					reduce: (state: {}) => state,
+					execute: async (config, ctx) => {
+						runs.push(config.name)
+						while (ctx.shouldContinue()) await Bun.sleep(5)
+						return Ok({ status: 'stopped', summary: 'Stopped' })
+					},
+				})
+				let onFirstRelaunch = () => {}
+				class RelaunchHookedStore extends MemoryEventStore {
+					override async append(sessionId: SessionId, event: DomainEvent): Promise<void> {
+						await super.append(sessionId, event)
+						if (event.type === 'worker_status_changed' && event.workerId === 'w0' && event.toStatus === 'running') onFirstRelaunch()
+					}
+				}
+				const eventStore = new RelaunchHookedStore()
+				const preset = createTestPreset({ plugins: [workerPlugin.configure({ workers: [looping] })] })
+				const harnessFor = () => createWorkersHarness({
+					presets: [preset],
+					eventStore,
+					llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				})
+				const first = harnessFor()
+				const firstSession = await first.createSession('test')
+				const sessionId = firstSession.sessionId
+				const agentId = firstSession.getEntryAgentId()
+				if (!agentId) throw new Error('Expected entry agent')
+				await first.shutdown()
+				for (const name of ['w0', 'w1', 'w2']) {
+					await eventStore.append(sessionId, withSessionId(sessionId, workerEvents.create('worker_started', {
+						workerId: WorkerId(name),
+						agentId,
+						workerType: 'looping',
+						config: { name },
+					})))
+				}
+
+				const restored = harnessFor()
+				await restored.sessionManager.loadAllSessions({ resume: false })
+				const live = await restored.sessionManager.getSession(sessionId)
+				if (!live.ok) throw new Error(live.error.message)
+				let cancelled: Promise<unknown> = Promise.resolve()
+				onFirstRelaunch = () => {
+					onFirstRelaunch = () => {}
+					cancelled = live.value.callPluginMethod('workers.cancel', { sessionId, agentId, workerId: 'w2' })
+				}
+				const sent = await live.value.callPluginMethod('user-chat.sendMessage', { sessionId, agentId, content: 'Go on' })
+				expect(sent.ok).toBe(true)
+				await cancelled
+				await Bun.sleep(50)
+				expect(runs.sort()).toEqual(['w0', 'w1'])
+				expect(selectPluginState<Map<WorkerId, WorkerEntry>>(live.value.state, 'workers')?.get(WorkerId('w2'))?.status).toBe('cancelled')
+				await restored.shutdown()
+			})
+
+			it('keeps a held worker whose definition is gone held, and still takes the message', async () => {
+				const { sessionId, eventStore } = await interruptedWorker()
+				const restored = createWorkersHarness({
+					presets: [createTestPreset({ plugins: [workerPlugin.configure({ workers: [] })] })],
+					eventStore,
+					llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				})
+				await restored.sessionManager.loadAllSessions({ resume: false })
+				const reopened = await restored.openSession(sessionId)
+				await reopened.sendMessage('Change the title')
+				expect(workersOf(reopened)?.get(workerId)).toMatchObject({ status: 'paused', pauseResumesOnInput: true })
 				await restored.shutdown()
 			})
 

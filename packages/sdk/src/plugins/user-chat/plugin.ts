@@ -18,7 +18,7 @@ import { estimateTokens, truncateByTokens } from "~/core/llm/tokens.js";
 import { definePlugin } from "~/core/plugins/plugin-builder.js";
 import { selectPluginState } from "~/core/sessions/reducer.js";
 import { sessionIdSchema } from "~/core/sessions/schema.js";
-import { getEntryAgentId } from "~/core/sessions/state.js";
+import { getEntryAgentId, type SessionState } from "~/core/sessions/state.js";
 import { createTool } from "~/core/tools/definition.js";
 import { Err, Ok, type Result } from "~/lib/utils/result.js";
 import { getUserCommunicationInstructions } from "~/prompts/base.js";
@@ -160,6 +160,11 @@ export interface UserChatState {
 	pendingAnswers?: Map<number, PendingAnswerRecord>;
 	/** Highest reducer-assigned inbound occurrence. */
 	nextInboundOrdinal?: number;
+}
+
+/** Inbound messages and answers no agent has read yet; a replay of a read one schedules nothing. */
+function pendingInboundOf(sessionState: SessionState): PendingInboundMessage[] {
+	return selectPluginState<UserChatState>(sessionState, "messages")?.pendingInbound ?? [];
 }
 
 interface UserChatPluginContext {
@@ -741,9 +746,11 @@ export const userChatPlugin = definePlugin("user-chat")
 				const receipt = state?.acceptedDeliveries?.get(input.deliveryId);
 				if (receipt) {
 					if (receipt.fingerprint !== fingerprint) return Err(deliveryConflict());
-					// A retry after a failed release: the message is in, the session may still be held.
+					// A retry after a failed release: the message is in, but its agent may never have been scheduled.
 					const released = await ctx.releaseHold();
 					if (!released.ok) return released;
+					const unread = pendingInboundOf(ctx.getSessionState()).find((m) => m.messageId === receipt.messageId);
+					if (unread) ctx.scheduleAgent(unread.agentId);
 					return Ok({ messageId: receipt.messageId });
 				}
 				const inFlight = ctx.pluginContext.inFlightDeliveries.get(input.deliveryId);
@@ -843,9 +850,12 @@ export const userChatPlugin = definePlugin("user-chat")
 				(msg) => msg.type === "ask_user" && msg.questionId === input.questionId,
 			);
 			if (asked?.type === "ask_user" && asked.answered) {
-				// A retry after a failed release: the answer is in, the session may still be held.
+				// A retry after a failed release: the answer is in, but its agent may never have been scheduled.
 				const released = await ctx.releaseHold();
-				return released.ok ? Ok({}) : released;
+				if (!released.ok) return released;
+				const unread = pendingInboundOf(ctx.getSessionState()).find((m) => m.questionId === input.questionId);
+				if (unread) ctx.scheduleAgent(unread.agentId);
+				return Ok({});
 			}
 
 			const messageId = generateChatMessageId(
