@@ -558,10 +558,7 @@ export const servicePlugin = definePlugin('services')
 			if (entry.pid !== undefined) {
 				// Guarded and loud when it fails: a signal that did not land must not look
 				// like one that did.
-				const reaped = await ctx.pluginContext.executor.reapProcessGroup(
-					{ pid: entry.pid, pidStartTime: entry.pidStartTime },
-					{ serviceType },
-				)
+				const reaped = await ctx.pluginContext.executor.reapProcessGroup({ pid: entry.pid, pidStartTime: entry.pidStartTime })
 				if (!reaped.ok) {
 					ctx.logger.warn('Could not kill orphaned service process group', {
 						serviceType,
@@ -570,6 +567,12 @@ export const servicePlugin = definePlugin('services')
 					})
 				} else if (reaped.value === 'killed') {
 					ctx.logger.info('Killed orphaned service process group', { serviceType, pid: entry.pid })
+				} else {
+					ctx.logger.info('Dropped stale service pid — not the recorded process, nothing killed', {
+						serviceType,
+						pid: entry.pid,
+						reason: reaped.value,
+					})
 				}
 			}
 

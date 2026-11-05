@@ -17,7 +17,7 @@ import type { PortPool } from '~/plugins/services/port-pool.js'
 import type { ServicePidRegistry } from '~/plugins/services/pid-registry.js'
 import type { ServiceConfig, ServiceStartArgs, ServiceStatus, ServiceStopSource } from '~/plugins/services/schema.js'
 import type { ToolError } from '../../core/tools/executor.js'
-import type { LogContext, Logger } from '../../lib/logger/logger.js'
+import type { Logger } from '../../lib/logger/logger.js'
 import { RingBuffer } from '../../lib/logger/ring-buffer.js'
 
 // ============================================================================
@@ -47,6 +47,23 @@ export async function getProcessStartTime(fs: FileSystem, pid: number): Promise<
 	} catch {
 		return undefined
 	}
+}
+
+/**
+ * What a pid recorded by an earlier runtime names now. Only `ours` may be signalled: the
+ * record can come from another boot or another host (a data directory restored elsewhere),
+ * where the same number belongs to an unrelated process or process group.
+ *
+ * `gone` covers a dead pid and one whose start time cannot be read. `unverified` is a record
+ * without a start time: nothing can tell our process from a stranger holding its pid.
+ */
+export type RecordedProcessCheck = 'ours' | 'gone' | 'pid-reused' | 'unverified'
+
+export async function checkRecordedProcess(fs: FileSystem, target: ReapTarget): Promise<RecordedProcessCheck> {
+	if (target.pidStartTime === undefined) return 'unverified'
+	const currentStartTime = await getProcessStartTime(fs, target.pid)
+	if (currentStartTime === undefined) return 'gone'
+	return currentStartTime === target.pidStartTime ? 'ours' : 'pid-reused'
 }
 
 // ============================================================================
@@ -79,11 +96,10 @@ export interface ReapTarget {
 }
 
 /**
- * What a guarded reap did. `killed` covers a group that was already gone — the signal
- * had nothing left to reach. `pid-reused` means the kernel handed the pid on and the
- * process under it is somebody else's.
+ * What a reap of a recorded pid did. `killed` means the recorded process was still there
+ * and its group got SIGKILL; every other outcome is a stale record that got no signal.
  */
-export type ReapOutcome = 'killed' | 'pid-reused'
+export type ReapOutcome = 'killed' | Exclude<RecordedProcessCheck, 'ours'>
 
 export interface ServiceStatusChangeDetails {
 	port?: number
@@ -1193,28 +1209,12 @@ export class ServiceExecutor {
 	}
 
 	/**
-	 * Reclaim a service process group we spawned, unless the kernel recycled its pid.
-	 *
-	 * Every path that gives up on a service comes through here, because ending the
-	 * *wait* is not ending the *process*: a dev server that missed its readiness
-	 * window keeps its several hundred MB of RSS until somebody kills it, which on a
-	 * memory-starved box is what makes the next startup miss its window too.
-	 *
-	 * `pidStartTime` was captured at spawn, so a different current start time means
-	 * the pid now belongs to an unrelated process and killing it would be disastrous.
-	 * An unknown start time (non-Linux, no /proc) leaves only the kill-and-hope path.
+	 * Reclaim the process group of a pid a previous runtime recorded, only while it is still
+	 * the recorded process — see {@link checkRecordedProcess}. A stale record gets no signal.
 	 */
-	async reapProcessGroup(target: ReapTarget, context: LogContext = {}): Promise<Result<ReapOutcome, Error>> {
-		const currentStartTime = await getProcessStartTime(this.fs, target.pid)
-		if (target.pidStartTime !== undefined && currentStartTime !== undefined && currentStartTime !== target.pidStartTime) {
-			this.logger.warn('PID reuse detected — refusing to kill service process group', {
-				...context,
-				pid: target.pid,
-				storedStartTime: target.pidStartTime,
-				currentStartTime,
-			})
-			return Ok('pid-reused')
-		}
+	async reapProcessGroup(target: ReapTarget): Promise<Result<ReapOutcome, Error>> {
+		const check = await checkRecordedProcess(this.fs, target)
+		if (check !== 'ours') return Ok(check)
 
 		const killed = this.killProcessGroup(target.pid)
 		if (!killed.ok) return killed
@@ -1222,7 +1222,17 @@ export class ServiceExecutor {
 	}
 
 	/**
-	 * Reclaim the process group of an entry we are giving up on or replacing.
+	 * Reclaim the process group of an entry we are giving up on or replacing, unless the
+	 * kernel recycled its pid.
+	 *
+	 * Every path that gives up on a service comes through here, because ending the
+	 * *wait* is not ending the *process*: a dev server that missed its readiness
+	 * window keeps its several hundred MB of RSS until somebody kills it, which on a
+	 * memory-starved box is what makes the next startup miss its window too.
+	 *
+	 * Unlike {@link reapProcessGroup}, the pid is a child this runtime spawned and has not
+	 * seen close, so an unknown start time (non-Linux, no /proc) still kills — and so does a
+	 * dead leader, whose group keeps the pid from being handed out while it has members.
 	 *
 	 * A no-op once the child's `close` has fired: there is nothing left to reclaim,
 	 * and skipping it also keeps the non-Linux kill-and-hope path away from a pid the
@@ -1231,19 +1241,27 @@ export class ServiceExecutor {
 	 */
 	private async reapEntry(entry: RunningService, reason: string): Promise<Result<void, Error>> {
 		if (entry.exited) return Ok(undefined)
-		const reaped = await this.reapProcessGroup(
-			{ pid: entry.pid, pidStartTime: entry.pidStartTime },
-			{ serviceType: entry.config.type, reason },
-		)
-		if (!reaped.ok) return reaped
+		const currentStartTime = await getProcessStartTime(this.fs, entry.pid)
+		if (entry.pidStartTime !== undefined && currentStartTime !== undefined && currentStartTime !== entry.pidStartTime) {
+			this.logger.warn('PID reuse detected — refusing to kill service process group', {
+				serviceType: entry.config.type,
+				reason,
+				pid: entry.pid,
+				storedStartTime: entry.pidStartTime,
+				currentStartTime,
+			})
+		} else {
+			const killed = this.killProcessGroup(entry.pid)
+			if (!killed.ok) return killed
+		}
 		entry.exited = true
 		return Ok(undefined)
 	}
 
 	/**
 	 * SIGKILL a process group through the injectable kill seam, without waiting
-	 * for it to go. Reached through {@link reapProcessGroup} wherever a recorded
-	 * pid could have been recycled.
+	 * for it to go. Reached through {@link reapEntry} or {@link reapProcessGroup}
+	 * wherever the pid could have been recycled.
 	 */
 	killProcessGroup(pid: number): Result<void, Error> {
 		try {
