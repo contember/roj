@@ -848,7 +848,11 @@ describe('workers plugin', () => {
 				await restored.shutdown()
 			})
 
-			it('does not relaunch a held worker cancelled while the release relaunches another', async () => {
+			/**
+			 * A restored session holding one looping worker per name. `onRelaunch` runs after each
+			 * relaunch's `running` event is stored and before the release loop goes on.
+			 */
+			async function heldLoopingWorkers(names: string[], onRelaunch: (workerId: string) => Promise<void> | void) {
 				const runs: string[] = []
 				const looping = createWorkerDefinition('looping', 'Runs until it is stopped', z.object({ name: z.string() }), {
 					initialState: () => ({}),
@@ -859,11 +863,11 @@ describe('workers plugin', () => {
 						return Ok({ status: 'stopped', summary: 'Stopped' })
 					},
 				})
-				let onFirstRelaunch = () => {}
+				let hooked = false
 				class RelaunchHookedStore extends MemoryEventStore {
 					override async append(sessionId: SessionId, event: DomainEvent): Promise<void> {
 						await super.append(sessionId, event)
-						if ('workerId' in event && event.workerId === 'w0' && 'toStatus' in event && event.toStatus === 'running') onFirstRelaunch()
+						if (hooked && 'workerId' in event && 'toStatus' in event && event.toStatus === 'running') await onRelaunch(String(event.workerId))
 					}
 				}
 				const eventStore = new RelaunchHookedStore()
@@ -879,7 +883,7 @@ describe('workers plugin', () => {
 				const agentId = firstSession.getEntryAgentId()
 				if (!agentId) throw new Error('Expected entry agent')
 				await first.shutdown()
-				for (const name of ['w0', 'w1', 'w2']) {
+				for (const name of names) {
 					await eventStore.append(sessionId, withSessionId(sessionId, workerEvents.create('worker_started', {
 						workerId: WorkerId(name),
 						agentId,
@@ -892,18 +896,47 @@ describe('workers plugin', () => {
 				await restored.sessionManager.loadAllSessions({ resume: false })
 				const live = await restored.sessionManager.getSession(sessionId)
 				if (!live.ok) throw new Error(live.error.message)
+				hooked = true
+				const call = (method: string, workerId: string) => live.value.callPluginMethod(`workers.${method}`, { sessionId, agentId, workerId })
+				const statusOf = (workerId: string) => selectPluginState<Map<WorkerId, WorkerEntry>>(live.value.state, 'workers')?.get(WorkerId(workerId))?.status
+				return { runs, restored, session: live.value, sessionId, agentId, call, statusOf }
+			}
+
+			it('does not relaunch a held worker cancelled while the release relaunches another', async () => {
 				let cancelled: Promise<unknown> = Promise.resolve()
-				onFirstRelaunch = () => {
-					onFirstRelaunch = () => {}
-					cancelled = live.value.callPluginMethod('workers.cancel', { sessionId, agentId, workerId: 'w2' })
-				}
-				const sent = await live.value.callPluginMethod('user-chat.sendMessage', { sessionId, agentId, content: 'Go on' })
+				let trigger = true
+				const held = await heldLoopingWorkers(['w0', 'w1', 'w2'], (workerId) => {
+					if (workerId !== 'w0' || !trigger) return
+					trigger = false
+					cancelled = held.call('cancel', 'w2')
+				})
+				const sent = await held.session.callPluginMethod('user-chat.sendMessage', { sessionId: held.sessionId, agentId: held.agentId, content: 'Go on' })
 				expect(sent.ok).toBe(true)
 				await cancelled
 				await Bun.sleep(50)
-				expect(runs.sort()).toEqual(['w0', 'w1'])
-				expect(selectPluginState<Map<WorkerId, WorkerEntry>>(live.value.state, 'workers')?.get(WorkerId('w2'))?.status).toBe('cancelled')
-				await restored.shutdown()
+				expect(held.runs.sort()).toEqual(['w0', 'w1'])
+				expect(held.statusOf('w2')).toBe('cancelled')
+				await held.restored.shutdown()
+			})
+
+			it('does not relaunch a held worker resumed and paused by hand while the release relaunches another', async () => {
+				let paused: Promise<unknown> = Promise.resolve()
+				let trigger = true
+				const held = await heldLoopingWorkers(['w0', 'w1', 'w2', 'w3'], async (workerId) => {
+					if (workerId === 'w0' && trigger) {
+						trigger = false
+						paused = held.call('resume', 'w3').then(() => held.call('pause', 'w3'))
+					}
+					// Slows the loop, so the pause lands before it reaches w3.
+					if (workerId === 'w1') await Bun.sleep(100)
+				})
+				const sent = await held.session.callPluginMethod('user-chat.sendMessage', { sessionId: held.sessionId, agentId: held.agentId, content: 'Go on' })
+				expect(sent.ok).toBe(true)
+				expect(await paused).toMatchObject({ ok: true })
+				await Bun.sleep(50)
+				expect(held.runs.sort()).toEqual(['w0', 'w1', 'w2', 'w3'])
+				expect(held.statusOf('w3')).toBe('paused')
+				await held.restored.shutdown()
 			})
 
 			it('keeps a held worker whose definition is gone held, and still takes the message', async () => {

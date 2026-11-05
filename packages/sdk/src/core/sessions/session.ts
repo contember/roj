@@ -387,8 +387,10 @@ export class Session {
 	 * other way stays paused, and a session with nothing held is left as it is.
 	 */
 	async releaseHold(activity: SessionRuntimeActivity = this.runtimeActivity): Promise<Result<void, DomainError>> {
-		for (const [agentId, agentState] of this.store.getState().agents) {
-			if (agentState.status !== 'paused' || agentState.pauseResumesOnInput !== true) continue
+		for (const agentId of [...this.store.getState().agents.keys()]) {
+			// The live state: a manual resume or pause can land while an earlier resume awaits.
+			const agentState = this.store.getAgentState(agentId)
+			if (agentState?.status !== 'paused' || agentState.pauseResumesOnInput !== true) continue
 			const resumed = await this.resumeAgent(agentId)
 			if (!resumed.ok) return resumed
 		}

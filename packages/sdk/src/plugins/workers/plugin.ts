@@ -343,11 +343,15 @@ interface RelaunchContext {
 	runtimeActivity: SessionRuntimeActivity
 }
 
+/** The worker's entry now: a hook's `pluginState` is a snapshot that any await in the hook makes stale. */
+function liveWorkerEntry(ctx: { getSessionState: () => SessionState }, workerId: WorkerIdType): WorkerEntry | undefined {
+	return selectPluginState<Map<WorkerIdType, WorkerEntry>>(ctx.getSessionState(), 'workers')?.get(workerId)
+}
+
 /** Relaunch a paused worker with its replayed state; shared by `resume` and the release of a restore's hold. */
 async function relaunchPausedWorker(ctx: RelaunchContext, workerId: WorkerIdType): Promise<Result<void, string>> {
 	const { runningWorkers, pendingLaunches, abandonedWorkers, logger } = ctx.pluginContext
-	// The live entry: a hook's `pluginState` is a snapshot that an earlier relaunch's await makes stale.
-	const workerEntry = selectPluginState<Map<WorkerIdType, WorkerEntry>>(ctx.getSessionState(), 'workers')?.get(workerId)
+	const workerEntry = liveWorkerEntry(ctx, workerId)
 	if (!workerEntry) {
 		return Err(`Worker not found: ${workerId}`)
 	}
@@ -859,11 +863,14 @@ export const workerPlugin = definePlugin('workers')
 		},
 	})
 	.sessionHook('onHoldRelease', async (ctx) => {
-		for (const worker of ctx.pluginState.values()) {
-			if (worker.status !== 'paused' || worker.pauseResumesOnInput !== true) continue
+		for (const workerId of [...ctx.pluginState.keys()]) {
+			// The live entry, checked in the same tick as the relaunch's claim: a manual
+			// resume or pause can land while an earlier relaunch awaits.
+			const worker = liveWorkerEntry(ctx, workerId)
+			if (worker?.status !== 'paused' || worker.pauseResumesOnInput !== true) continue
 			// A failed relaunch parks it held again, so the next release retries it.
-			const relaunched = await relaunchPausedWorker(ctx, worker.id)
-			if (!relaunched.ok) ctx.pluginContext.logger.warn('Cannot relaunch held worker', { workerId: worker.id, reason: relaunched.error })
+			const relaunched = await relaunchPausedWorker(ctx, workerId)
+			if (!relaunched.ok) ctx.pluginContext.logger.warn('Cannot relaunch held worker', { workerId, reason: relaunched.error })
 		}
 	})
 	.sessionHook('onSessionPark', async (ctx) => {

@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, spyOn } from 'bun:test'
 import type { AgentId } from '~/core/agents/schema.js'
 import { ValidationErrors } from '~/core/errors.js'
 import { agentEvents } from '~/core/agents/state.js'
-import type { MemoryEventStore } from '~/core/events/memory.js'
+import { MemoryEventStore } from '~/core/events/memory.js'
+import type { DomainEvent } from '~/core/events/types.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import { Session } from '~/core/sessions/session.js'
@@ -253,6 +254,53 @@ describe('loadAllSessions without resume', () => {
 		const session = await liveSession(restored, created.sessionId)
 		return { restored, session, sessionId: created.sessionId, entryId, childId: spawned.value }
 	}
+
+	it('does not resume again a held agent resumed and paused by hand during the release', async () => {
+		let onResumed: (agentId: string) => Promise<void> | void = () => {}
+		class ResumeHookedStore extends MemoryEventStore {
+			override async append(sessionId: SessionId, event: DomainEvent): Promise<void> {
+				await super.append(sessionId, event)
+				if (event.type === 'agent_resumed' && 'agentId' in event) await onResumed(String(event.agentId))
+			}
+		}
+		const source = harness(new ResumeHookedStore())
+		const created = await source.createSession('test')
+		const entryId = created.getEntryAgentId()
+		if (!entryId) throw new Error('Expected an entry agent')
+		const owner = await liveSession(source, created.sessionId)
+		const first = await owner.spawnAgentManually('child', entryId, 'Start the first task')
+		const second = await owner.spawnAgentManually('child', entryId, 'Start the second task')
+		if (!first.ok || !second.ok) throw new Error('spawn failed')
+		await created.waitForIdle()
+		await leaveUnanswered(source, created, first.value, 'Finish the first task')
+		await leaveUnanswered(source, created, second.value, 'Finish the second task')
+		await leaveUnanswered(source, created, entryId, 'Rebuild the site')
+		await source.shutdown()
+
+		const restored = harness(source.eventStore)
+		await restored.sessionManager.loadAllSessions({ resume: false })
+		const session = await liveSession(restored, created.sessionId)
+		let byHand: Promise<unknown> = Promise.resolve()
+		let trigger = true
+		onResumed = async (agentId) => {
+			if (agentId === entryId && trigger) {
+				trigger = false
+				byHand = session.resumeAgent(second.value).then(() => session.pauseAgent(second.value))
+			}
+			// Slows the loop, so the manual pause lands before it reaches the second child.
+			if (agentId === first.value) await Bun.sleep(100)
+		}
+		const restoredAt = (await source.eventStore.load(created.sessionId)).length
+		const sent = await session.callPluginMethod('user-chat.sendMessage', { sessionId: created.sessionId, agentId: entryId, content: 'Change the title' })
+		expect(sent.ok).toBe(true)
+		expect(await byHand).toMatchObject({ ok: true })
+		const resumes = (await source.eventStore.load(created.sessionId)).slice(restoredAt).flatMap(event =>
+			event.type === 'agent_resumed' && 'agentId' in event ? [event.agentId] : []
+		)
+		// The second child's one resume is the manual one; the release skips it once it is paused by hand.
+		expect(resumes.filter(agentId => agentId === second.value)).toHaveLength(1)
+		expect(resumes).toContain(first.value)
+	})
 
 	it('answers a retried delivery whose release failed on another agent', async () => {
 		const { restored, session, sessionId, entryId } = await heldChildSession()
