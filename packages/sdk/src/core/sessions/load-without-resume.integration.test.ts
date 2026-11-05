@@ -375,15 +375,39 @@ describe('loadAllSessions without resume', () => {
 
 	it('conflicts on a retried delivery that changes keepHold, in flight or after', async () => {
 		const { eventStore, sessionId, agentId } = await interruptedSession()
-		const restored = harness(eventStore)
+		let entered = () => {}
+		const appending = new Promise<void>(resolve => { entered = resolve })
+		let release = () => {}
+		const released = new Promise<void>(resolve => { release = resolve })
+		/** Holds the first message's append, so a second call meets it in flight. */
+		class GatedStore extends MemoryEventStore {
+			hold = false
+			override async append(id: SessionId, event: DomainEvent): Promise<void> {
+				await this.appendBatch(id, [event])
+			}
+			override async appendBatch(id: SessionId, events: DomainEvent[]): Promise<void> {
+				if (this.hold && events.some(event => event.type === 'user_chat_message_received')) {
+					entered()
+					await released
+				}
+				await super.appendBatch(id, events)
+			}
+		}
+		const gated = new GatedStore()
+		for (const event of await eventStore.load(sessionId)) await gated.append(sessionId, event)
+		const restored = harness(gated)
 		await restored.sessionManager.loadAllSessions({ resume: false })
 		const session = await liveSession(restored, sessionId)
 		const send = (keepHold: boolean | undefined, deliveryId: string) =>
 			session.callPluginMethod('user-chat.sendMessage', { sessionId, agentId, content: 'The rebase conflicted', deliveryId, keepHold })
 
-		const [first, inFlight] = await Promise.all([send(true, 'd1'), send(undefined, 'd1')])
-		expect(first.ok).toBe(true)
+		gated.hold = true
+		const first = send(true, 'd1')
+		await appending
+		const inFlight = await send(undefined, 'd1')
 		expect(inFlight.ok ? undefined : inFlight.error.type).toBe('user_chat_delivery_conflict')
+		release()
+		expect((await first).ok).toBe(true)
 		const after = await send(undefined, 'd1')
 		expect(after.ok ? undefined : after.error.type).toBe('user_chat_delivery_conflict')
 		const flippedOn = await send(false, 'd2')
@@ -407,6 +431,14 @@ describe('loadAllSessions without resume', () => {
 		const loaded = await restored.sessionManager.loadAllSessions({ resume: false })
 		expect(loaded.failed).toEqual([sessionId])
 		expect((await harness(eventStore).sessionManager.loadAllSessions({ resume: false })).failed).toEqual([])
+	})
+
+	it('reports a session whose preset is gone, which no load can hold', async () => {
+		const { eventStore, sessionId } = await interruptedSession()
+		const withoutPreset = new TestHarness({ presets: [createTestPreset({ id: 'other' })], eventStore })
+		harnesses.push(withoutPreset)
+
+		expect((await withoutPreset.sessionManager.loadAllSessions({ resume: false })).failed).toEqual([sessionId])
 	})
 
 	it('releases the whole hold when its user answers an agent that was not held', async () => {

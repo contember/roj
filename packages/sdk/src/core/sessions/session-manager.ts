@@ -1048,8 +1048,9 @@ export class SessionManager {
 	 * A load another caller starts meanwhile pauses the same way; one finished before this call
 	 * already resumed, so call it before the manager serves requests.
 	 *
-	 * Returns the sessions that failed to load. Without resume their work is not held yet: only a
-	 * later load in this process, or the next `loadAllSessions({ resume: false })`, holds it.
+	 * Returns the sessions that failed to load. Their work may not be held yet; a later load in this
+	 * process, or the next `loadAllSessions({ resume: false })`, holds it. A session that cannot load
+	 * at all is reported on every call.
 	 */
 	async loadAllSessions({ resume = true }: { resume?: boolean } = {}): Promise<{ failed: SessionId[] }> {
 		const sessionIds = await this.eventStore.listSessions()

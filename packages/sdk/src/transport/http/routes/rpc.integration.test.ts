@@ -215,7 +215,7 @@ describe('RPC integration', () => {
 			expect(conflict.status).toBe(200)
 			expect(await conflict.json()).toEqual({ ok: false, error: {
 				type: 'user_chat_delivery_conflict',
-				message: 'Delivery ID was already used with different content, context or agent target',
+				message: 'Delivery ID was already used with different content, context, agent target or keepHold',
 			} })
 			const invalid = await rpcCall(app, 'user-chat.sendMessage', { ...input, deliveryId: '' })
 			expect(invalid.status).toBe(200)

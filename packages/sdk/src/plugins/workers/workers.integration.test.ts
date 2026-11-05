@@ -1010,6 +1010,28 @@ describe('workers plugin', () => {
 				await restored.shutdown()
 			})
 
+			it('lets an agent resume a worker paused by hand, which the hold does not cover', async () => {
+				const paused = workerEvents.create('worker_status_changed', { workerId, fromStatus: 'running', toStatus: 'paused' })
+				const { gated, sessionId, eventStore } = await interruptedWorker([paused])
+				const preset = createTestPreset({ plugins: [workerPlugin.configure({ workers: [gated.worker] })] })
+				const restored = createWorkersHarness({
+					presets: [preset],
+					eventStore,
+					llmProvider: MockLLMProvider.withSequence([
+						{ toolCalls: [{ id: ToolCallId('tc1'), name: 'worker_resume', input: { workerId: String(workerId) } }] },
+						{ content: 'Done', toolCalls: [] },
+					]),
+				})
+				await restored.sessionManager.loadAllSessions({ resume: false })
+				const reopened = await restored.openSession(sessionId)
+
+				await reopened.sendMessage('Resume the crawl')
+				await gated.started
+				expect(gated.resumedRuns).toEqual([true])
+				gated.finish()
+				await restored.shutdown()
+			})
+
 			it('leaves a worker paused by hand paused when its user writes', async () => {
 				const paused = workerEvents.create('worker_status_changed', { workerId, fromStatus: 'running', toStatus: 'paused' })
 				const { gated, sessionId, harnessFor } = await interruptedWorker([paused])

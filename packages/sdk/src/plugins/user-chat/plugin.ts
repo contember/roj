@@ -182,7 +182,7 @@ export interface SendMessageOutput {
 function deliveryConflict(): DomainError {
 	return createDomainError(
 		"user_chat_delivery_conflict",
-		"Delivery ID was already used with different content, context or agent target",
+		"Delivery ID was already used with different content, context, agent target or keepHold",
 		409,
 	);
 }

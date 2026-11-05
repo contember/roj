@@ -343,9 +343,9 @@ interface RelaunchContext {
 	runtimeActivity: SessionRuntimeActivity
 }
 
-/** The worker's entry now: a hook's `pluginState` is a snapshot that any await in the hook makes stale. */
 const HELD_WORKER_RESUME_REFUSAL = 'This worker was interrupted when its session was restored; it resumes when the user writes.'
 
+/** The worker's entry now: a hook's `pluginState` is a snapshot that any await in the hook makes stale. */
 function liveWorkerEntry(ctx: { getSessionState: () => SessionState }, workerId: WorkerIdType): WorkerEntry | undefined {
 	return selectPluginState<Map<WorkerIdType, WorkerEntry>>(ctx.getSessionState(), 'workers')?.get(workerId)
 }
