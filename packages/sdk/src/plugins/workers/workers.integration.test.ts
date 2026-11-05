@@ -863,7 +863,7 @@ describe('workers plugin', () => {
 				class RelaunchHookedStore extends MemoryEventStore {
 					override async append(sessionId: SessionId, event: DomainEvent): Promise<void> {
 						await super.append(sessionId, event)
-						if (event.type === 'worker_status_changed' && event.workerId === 'w0' && event.toStatus === 'running') onFirstRelaunch()
+						if ('workerId' in event && event.workerId === 'w0' && 'toStatus' in event && event.toStatus === 'running') onFirstRelaunch()
 					}
 				}
 				const eventStore = new RelaunchHookedStore()
