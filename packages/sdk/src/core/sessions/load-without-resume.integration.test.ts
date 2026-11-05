@@ -3,10 +3,12 @@ import type { AgentId } from '~/core/agents/schema.js'
 import { ValidationErrors } from '~/core/errors.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { MemoryEventStore } from '~/core/events/memory.js'
+import { MockLLMProvider } from '~/core/llm/mock.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import { Session } from '~/core/sessions/session.js'
+import { ToolCallId } from '~/core/tools/schema.js'
 import { Err } from '~/lib/utils/result.js'
 import { createTestPreset, TestHarness, type TestSession } from '~/testing/index.js'
 
@@ -15,9 +17,9 @@ afterEach(async () => {
 	for (const harness of harnesses.splice(0)) await harness.shutdown()
 })
 
-function harness(eventStore?: MemoryEventStore): TestHarness {
+function harness(eventStore?: MemoryEventStore, llmProvider?: MockLLMProvider): TestHarness {
 	const preset = createTestPreset({ agents: [{ name: 'child', system: 'Finish the task', tools: [], agents: [] }] })
-	const result = new TestHarness({ presets: [preset], eventStore })
+	const result = new TestHarness({ presets: [preset], eventStore, llmProvider })
 	harnesses.push(result)
 	return result
 }
@@ -235,7 +237,9 @@ describe('loadAllSessions without resume', () => {
 	})
 
 	/** A restored session whose entry agent is idle and whose child is held. */
-	async function heldChildSession(): Promise<{ restored: TestHarness; session: Session; sessionId: SessionId; entryId: AgentId; childId: AgentId }> {
+	async function heldChildSession(
+		restoredLlm?: (childId: AgentId) => MockLLMProvider,
+	): Promise<{ restored: TestHarness; session: Session; sessionId: SessionId; entryId: AgentId; childId: AgentId }> {
 		const source = harness()
 		const created = await source.createSession('test')
 		const entryId = created.getEntryAgentId()
@@ -249,7 +253,7 @@ describe('loadAllSessions without resume', () => {
 		await waitUntil(() => source.llmProvider.getCallCount() === before + 1)
 		await source.shutdown()
 
-		const restored = harness(source.eventStore)
+		const restored = harness(source.eventStore, restoredLlm?.(spawned.value))
 		await restored.sessionManager.loadAllSessions({ resume: false })
 		const session = await liveSession(restored, created.sessionId)
 		return { restored, session, sessionId: created.sessionId, entryId, childId: spawned.value }
@@ -310,6 +314,131 @@ describe('loadAllSessions without resume', () => {
 		expect((await send()).ok).toBe(false)
 		expect((await send()).ok).toBe(true)
 		await waitUntil(() => restored.llmProvider.getCallHistory().some(request => JSON.stringify(request.messages).includes('Change the title')))
+	})
+
+	it('keeps a held agent paused on a host notice, and it reads the notice once its user writes', async () => {
+		const { eventStore, sessionId, agentId } = await interruptedSession()
+		const restored = harness(eventStore)
+		await restored.sessionManager.loadAllSessions({ resume: false })
+		const session = await liveSession(restored, sessionId)
+
+		const notice = await session.callPluginMethod('user-chat.sendMessage', { sessionId, agentId, content: 'The rebase conflicted', keepHold: true })
+		expect(notice.ok).toBe(true)
+		await Bun.sleep(50)
+		expect(restored.llmProvider.getCallCount()).toBe(0)
+		expect(await agentStatus(restored, sessionId, agentId)).toBe('paused')
+
+		const reopened = await restored.openSession(sessionId)
+		await reopened.sendMessage('Change the title')
+		await waitUntil(() => restored.llmProvider.getCallCount() === 1)
+		const request = JSON.stringify(restored.llmProvider.getLastRequest()?.messages)
+		expect(request).toContain('The rebase conflicted')
+		expect(request).toContain('Change the title')
+	})
+
+	it('keeps the hold on the retry of a host notice', async () => {
+		const { eventStore, sessionId, agentId } = await interruptedSession()
+		const restored = harness(eventStore)
+		await restored.sessionManager.loadAllSessions({ resume: false })
+		const session = await liveSession(restored, sessionId)
+		const send = () => session.callPluginMethod('user-chat.sendMessage', { sessionId, agentId, content: 'The rebase conflicted', deliveryId: 'd1', keepHold: true })
+
+		expect((await send()).ok).toBe(true)
+		expect((await send()).ok).toBe(true)
+		await Bun.sleep(50)
+		expect(restored.llmProvider.getCallCount()).toBe(0)
+		expect(await agentStatus(restored, sessionId, agentId)).toBe('paused')
+	})
+
+	it('answers a host notice to an agent that is not held, and keeps the rest held', async () => {
+		const { restored, session, sessionId, entryId, childId } = await heldChildSession()
+
+		const notice = await session.callPluginMethod('user-chat.sendMessage', { sessionId, agentId: entryId, content: 'The rebase conflicted', keepHold: true })
+		expect(notice.ok).toBe(true)
+		await waitUntil(() => restored.llmProvider.getCallHistory().some(request => JSON.stringify(request.messages).includes('The rebase conflicted')))
+		await Bun.sleep(50)
+		expect(await agentStatus(restored, sessionId, childId)).toBe('paused')
+	})
+
+	it('refuses an agent that answers a host notice its resume of a held child', async () => {
+		const { restored, session, sessionId, entryId, childId } = await heldChildSession(childId => MockLLMProvider.withSequence([
+			{ toolCalls: [{ id: ToolCallId('tc1'), name: 'resume_agent', input: { agentId: String(childId) } }] },
+			{ content: 'Done', toolCalls: [] },
+		]))
+
+		const notice = await session.callPluginMethod('user-chat.sendMessage', { sessionId, agentId: entryId, content: 'The rebase conflicted', keepHold: true })
+		expect(notice.ok).toBe(true)
+		await waitUntil(() => restored.llmProvider.getCallCount() === 2)
+		expect(JSON.stringify(restored.llmProvider.getLastRequest()?.messages)).toContain('it resumes when the user writes')
+		expect(await agentStatus(restored, sessionId, childId)).toBe('paused')
+	})
+
+	it('conflicts on a retried delivery that changes keepHold, in flight or after', async () => {
+		const { eventStore, sessionId, agentId } = await interruptedSession()
+		let entered = () => {}
+		const appending = new Promise<void>(resolve => { entered = resolve })
+		let release = () => {}
+		const released = new Promise<void>(resolve => { release = resolve })
+		/** Holds the first message's append, so a second call meets it in flight. */
+		class GatedStore extends MemoryEventStore {
+			hold = false
+			override async append(id: SessionId, event: DomainEvent): Promise<void> {
+				await this.appendBatch(id, [event])
+			}
+			override async appendBatch(id: SessionId, events: DomainEvent[]): Promise<void> {
+				if (this.hold && events.some(event => event.type === 'user_chat_message_received')) {
+					entered()
+					await released
+				}
+				await super.appendBatch(id, events)
+			}
+		}
+		const gated = new GatedStore()
+		for (const event of await eventStore.load(sessionId)) await gated.append(sessionId, event)
+		const restored = harness(gated)
+		await restored.sessionManager.loadAllSessions({ resume: false })
+		const session = await liveSession(restored, sessionId)
+		const send = (keepHold: boolean | undefined, deliveryId: string) =>
+			session.callPluginMethod('user-chat.sendMessage', { sessionId, agentId, content: 'The rebase conflicted', deliveryId, keepHold })
+
+		gated.hold = true
+		const first = send(true, 'd1')
+		await appending
+		const inFlight = await send(undefined, 'd1')
+		expect(inFlight.ok ? undefined : inFlight.error.type).toBe('user_chat_delivery_conflict')
+		release()
+		expect((await first).ok).toBe(true)
+		const after = await send(undefined, 'd1')
+		expect(after.ok ? undefined : after.error.type).toBe('user_chat_delivery_conflict')
+		const flippedOn = await send(false, 'd2')
+		expect(flippedOn.ok).toBe(true)
+		const retried = await send(true, 'd2')
+		expect(retried.ok ? undefined : retried.error.type).toBe('user_chat_delivery_conflict')
+	})
+
+	it('reports a session that failed to load, whose work it did not hold', async () => {
+		const { eventStore, sessionId } = await interruptedSession()
+		class FailingStore extends MemoryEventStore {
+			override async load(id: SessionId): Promise<DomainEvent[]> {
+				if (id === sessionId) throw new Error('unreadable log')
+				return super.load(id)
+			}
+		}
+		const failing = new FailingStore()
+		for (const event of await eventStore.load(sessionId)) await failing.append(sessionId, event)
+		const restored = harness(failing)
+
+		const loaded = await restored.sessionManager.loadAllSessions({ resume: false })
+		expect(loaded.failed).toEqual([sessionId])
+		expect((await harness(eventStore).sessionManager.loadAllSessions({ resume: false })).failed).toEqual([])
+	})
+
+	it('reports a session whose preset is gone, which no load can hold', async () => {
+		const { eventStore, sessionId } = await interruptedSession()
+		const withoutPreset = new TestHarness({ presets: [createTestPreset({ id: 'other' })], eventStore })
+		harnesses.push(withoutPreset)
+
+		expect((await withoutPreset.sessionManager.loadAllSessions({ resume: false })).failed).toEqual([sessionId])
 	})
 
 	it('releases the whole hold when its user answers an agent that was not held', async () => {

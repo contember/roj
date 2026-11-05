@@ -109,9 +109,15 @@ Fence stale scheduler calls so an old owner cannot cancel or replace a new wake.
 
 ## Retryable user-chat acceptance
 
-`user-chat.sendMessage` accepts `{ content, agentId?, deliveryId? }` and returns
+`user-chat.sendMessage` accepts `{ content, agentId?, deliveryId?, keepHold? }` and returns
 `{ messageId }` in a successful `Result`. `deliveryId` is an optional nonempty
 opaque string of at most 256 characters, scoped to the session. Without it, calls do not deduplicate.
+
+`keepHold: true` is for notices the host sends on its own. In a session loaded by
+`loadAllSessions({ resume: false })`, such a message does not release the hold: a held
+agent reads it once the hold is released, and an agent that is not held answers it as
+usual. That agent's `resume_agent` and `worker_resume` refuse what the hold paused.
+`keepHold: true` is part of the delivery fingerprint, so a retry that changes it conflicts.
 
 - A matching retry returns the original `messageId`, including after replay.
 - Concurrent matching calls in one runtime share the in-flight acceptance.

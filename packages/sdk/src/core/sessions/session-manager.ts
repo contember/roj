@@ -1043,16 +1043,22 @@ export class SessionManager {
 	 * load does not restart it either, and the pause wakes no parent. Session-ready hooks see
 	 * `resumeInterruptedWork: false`, so running workers are parked instead of relaunched. The hold
 	 * is session-wide: a user message or answer to any agent releases it, resuming every held agent
-	 * and relaunching every parked worker. An agent only waiting for input still takes new messages.
+	 * and relaunching every parked worker; a message sent with `keepHold` does not. An agent only
+	 * waiting for input still takes new messages.
 	 * A load another caller starts meanwhile pauses the same way; one finished before this call
 	 * already resumed, so call it before the manager serves requests.
+	 *
+	 * Returns the sessions that failed to load. Their work may not be held yet; a later load in this
+	 * process, or the next `loadAllSessions({ resume: false })`, holds it. A session that cannot load
+	 * at all is reported on every call.
 	 */
-	async loadAllSessions({ resume = true }: { resume?: boolean } = {}): Promise<void> {
+	async loadAllSessions({ resume = true }: { resume?: boolean } = {}): Promise<{ failed: SessionId[] }> {
 		const sessionIds = await this.eventStore.listSessions()
 		if (!resume) for (const sessionId of sessionIds) this.loadingWithoutResume.add(sessionId)
 
 		let loaded = 0
 		let skipped = 0
+		const failed: SessionId[] = []
 		for (const sessionId of sessionIds) {
 			try {
 				const metadata = await this.eventStore.getMetadata(sessionId)
@@ -1064,18 +1070,25 @@ export class SessionManager {
 				const session = await this.getSession(sessionId)
 				// A resident session was not loaded here, so its mark would wait for an unrelated later load.
 				// A failed load keeps it, so the next load holds the work.
-				if (session.ok) this.loadingWithoutResume.delete(sessionId)
-				loaded++
+				if (session.ok) {
+					this.loadingWithoutResume.delete(sessionId)
+					loaded++
+				} else {
+					this.logger.error('Failed to load session', undefined, { sessionId, error: session.error.message })
+					failed.push(sessionId)
+				}
 			} catch (error) {
 				this.logger.error(
 					'Failed to load session',
 					error instanceof Error ? error : new Error(String(error)),
 					{ sessionId },
 				)
+				failed.push(sessionId)
 			}
 		}
 
-		this.logger.info('Loaded sessions', { loaded, skipped, total: sessionIds.length })
+		this.logger.info('Loaded sessions', { loaded, skipped, failed: failed.length, total: sessionIds.length })
+		return { failed }
 	}
 
 	/**

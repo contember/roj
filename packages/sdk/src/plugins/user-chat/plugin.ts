@@ -182,7 +182,7 @@ export interface SendMessageOutput {
 function deliveryConflict(): DomainError {
 	return createDomainError(
 		"user_chat_delivery_conflict",
-		"Delivery ID was already used with different content, context or agent target",
+		"Delivery ID was already used with different content, context, agent target or keepHold",
 		409,
 	);
 }
@@ -191,8 +191,11 @@ async function deliveryFingerprint(
 	content: string,
 	context: string | undefined,
 	agentId: AgentId | undefined,
+	keepHold: boolean | undefined,
 ): Promise<string> {
-	const bytes = new TextEncoder().encode(JSON.stringify([content, context ?? null, agentId ?? null]));
+	// `keepHold` only when set, so every receipt written before it existed keeps its identity.
+	const fields = [content, context ?? null, agentId ?? null, ...(keepHold === true ? [true] : [])];
+	const bytes = new TextEncoder().encode(JSON.stringify(fields));
 	const digest = await crypto.subtle.digest("SHA-256", bytes);
 	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -733,21 +736,24 @@ export const userChatPlugin = definePlugin("user-chat")
 			agentId: agentIdSchema.optional(),
 			content: z.string(),
 			context: z.string().optional(),
+			// A notice from the host, not its user: it waits for a held session's release instead of releasing it.
+			keepHold: z.boolean().optional(),
 		}),
 		output: z.object({
 			messageId: chatMessageIdSchema,
 		}),
 		handler: async (ctx, input) => {
+			const releaseHold = async (): Promise<Result<void, DomainError>> => input.keepHold === true ? Ok(undefined) : ctx.releaseHold();
 			const fingerprint = input.deliveryId === undefined
 				? undefined
-				: await deliveryFingerprint(input.content, input.context, input.agentId);
+				: await deliveryFingerprint(input.content, input.context, input.agentId, input.keepHold);
 			if (input.deliveryId !== undefined) {
 				const state = selectPluginState<UserChatState>(ctx.getSessionState(), "messages");
 				const receipt = state?.acceptedDeliveries?.get(input.deliveryId);
 				if (receipt) {
 					if (receipt.fingerprint !== fingerprint) return Err(deliveryConflict());
 					// A retry after a failed release: the message is in, but its agent may never have been scheduled.
-					const released = await ctx.releaseHold();
+					const released = await releaseHold();
 					if (!released.ok) return released;
 					const unread = pendingInboundOf(ctx.getSessionState()).find((m) => m.messageId === receipt.messageId);
 					if (unread) ctx.scheduleAgent(unread.agentId);
@@ -818,7 +824,7 @@ export const userChatPlugin = definePlugin("user-chat")
 					}),
 				);
 				// After the message lands, so the resumed agent answers it rather than only its old work.
-				const released = await ctx.releaseHold();
+				const released = await releaseHold();
 				if (!released.ok) return released;
 				ctx.scheduleAgent(agentId);
 				return Ok({ messageId });

@@ -517,6 +517,10 @@ Do NOT act on a supervision tick unless something is genuinely wrong (a child ha
 				if (target.status !== 'paused' && target.status !== 'errored') {
 					return Err({ message: `Agent "${input.agentId}" is ${target.status}, not paused — nothing to resume.`, recoverable: false })
 				}
+				// A restore's hold is lifted by the user, not by an agent's turn while it lasts.
+				if (target.status === 'paused' && target.pauseResumesOnInput === true) {
+					return Err({ message: `Agent "${input.agentId}" was interrupted when its session was restored; it resumes when the user writes.`, recoverable: false })
+				}
 
 				const result = await ctx.self.resume({ agentId: input.agentId })
 				if (!result.ok) {

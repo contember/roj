@@ -110,7 +110,11 @@ export async function startServer(options: StartServerOptions): Promise<ServerHa
 
 	// Load persisted sessions after HTTP server is up (health checks pass during loading).
 	await runServerStartup(lifecycle, [
-		{ run: () => sessionManager.loadAllSessions() },
+		{
+			run: async () => {
+				await sessionManager.loadAllSessions()
+			},
+		},
 		// A pending connection is canceled before the remaining ordered cleanup.
 		{ run: () => transport.start(), cancel: stopTransportOnce },
 	])

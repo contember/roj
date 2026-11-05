@@ -209,7 +209,11 @@ export async function startStandaloneServer(options: StartStandaloneOptions): Pr
 	})
 
 	await runServerStartup(lifecycle, [
-		{ run: () => sessionManager.loadAllSessions() },
+		{
+			run: async () => {
+				await sessionManager.loadAllSessions()
+			},
+		},
 		// A pending connection is canceled before the remaining ordered cleanup.
 		{ run: () => transport.start(), cancel: stopTransportOnce },
 	])
