@@ -381,15 +381,22 @@ export class Session {
 		return Ok(undefined)
 	}
 
+	/** Resume an agent held until its user writes; an agent paused any other way stays paused. */
+	async resumeOnInput(agentId: AgentId): Promise<Result<void, DomainError>> {
+		if (this.store.getAgentState(agentId)?.pauseResumesOnInput !== true) return Ok(undefined)
+		return this.resumeAgent(agentId)
+	}
+
 	/**
 	 * Pause every agent that would pick up work on its own, and return their ids. The pause is an
-	 * event, so it holds across later loads; an agent that only waits for input is left alone.
+	 * event, so it holds across later loads until the agent is resumed or its user writes to it; an
+	 * agent that only waits for input is left alone.
 	 */
 	async pauseAgentsWithWork(message: string): Promise<Result<AgentId[], DomainError>> {
 		const paused: AgentId[] = []
 		for (const agent of this.agents.values()) {
 			if (!agent.hasWorkToResume()) continue
-			const result = await this.pauseAgent(agent.id, message)
+			const result = await this.mutate('pause', (activity) => this.performPauseAgent(agent.id, message, activity, true))
 			if (!result.ok) return result
 			paused.push(agent.id)
 		}
@@ -403,7 +410,12 @@ export class Session {
 		return this.mutate('pause', (activity) => this.performPauseAgent(agentId, message, activity))
 	}
 
-	private async performPauseAgent(agentId: AgentId, message: string | undefined, activity: SessionRuntimeActivity): Promise<Result<void, DomainError>> {
+	private async performPauseAgent(
+		agentId: AgentId,
+		message: string | undefined,
+		activity: SessionRuntimeActivity,
+		resumeOnInput = false,
+	): Promise<Result<void, DomainError>> {
 		if (this.store.isClosed()) {
 			return Err(SessionErrors.closed(String(this.id)))
 		}
@@ -424,6 +436,7 @@ export class Session {
 				agentId,
 				reason: 'manual',
 				message,
+				...(resumeOnInput && { resumeOnInput }),
 			}),
 		))
 
@@ -834,6 +847,7 @@ export class Session {
 			pluginContext,
 			pluginState,
 			scheduleAgent: (targetAgentId: AgentId) => this.scheduleAgent(targetAgentId),
+			resumeOnInput: (targetAgentId: AgentId) => this.resumeOnInput(targetAgentId),
 			notify: this.createNotify(pluginName, activity),
 			deps,
 		}

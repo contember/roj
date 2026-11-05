@@ -808,6 +808,9 @@ export const userChatPlugin = definePlugin("user-chat")
 							: {}),
 					}),
 				);
+				// After the message lands, so the resumed agent answers it rather than only its old work.
+				const resumed = await ctx.resumeOnInput(agentId);
+				if (!resumed.ok) return resumed;
 				ctx.scheduleAgent(agentId);
 				return Ok({ messageId });
 			};
@@ -851,6 +854,8 @@ export const userChatPlugin = definePlugin("user-chat")
 					timestamp: Date.now(),
 				}),
 			);
+			const resumed = await ctx.resumeOnInput(input.agentId);
+			if (!resumed.ok) return resumed;
 			ctx.scheduleAgent(input.agentId);
 			return Ok({});
 		},

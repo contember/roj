@@ -55,6 +55,8 @@ import type { SessionStoreOptions } from './session-store.js'
 import { Session, type SessionReopenRegistration, type UserOutputCallback } from './session.js'
 import { SessionRuntimeActivityController, SessionRuntimeUnavailableError } from './runtime-activity.js'
 
+const NOT_RESUMED_MESSAGE = 'Not resumed: the session was restored, so its interrupted work waits for a new message or an explicit resume'
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -63,8 +65,6 @@ import { SessionRuntimeActivityController, SessionRuntimeUnavailableError } from
  * Internal error for session loading failures.
  * Wraps DomainError for proper error handling in async loading.
  */
-const NOT_RESUMED_MESSAGE = 'Not resumed: the session was restored, so its interrupted work waits for an explicit resume'
-
 class SessionLoadError extends Error {
 	constructor(public readonly domainError: DomainError) {
 		super(`Session load error: ${domainError.type}`)
@@ -1040,7 +1040,8 @@ export class SessionManager {
 	 *
 	 * `resume: false` is for sessions restored somewhere new, whose interrupted work must not run
 	 * unattended: every agent that would continue is paused before it does, durably, so a later
-	 * load does not restart it either. An agent only waiting for input still takes new messages.
+	 * load does not restart it either. A user message to a paused agent resumes that agent alone;
+	 * an agent only waiting for input still takes new messages.
 	 * A load another caller starts meanwhile pauses the same way; one finished before this call
 	 * already resumed, so call it before the manager serves requests.
 	 */

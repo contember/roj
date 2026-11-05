@@ -159,6 +159,8 @@ export type MethodHandlerContext<TConfig, TContext, TState, TNotifications exten
 		pluginContext: TContext
 		pluginState: TState
 		scheduleAgent: (agentId: AgentId) => void
+		/** Resume an agent held until its user writes (see `SessionManager.loadAllSessions`); a no-op for any other agent. */
+		resumeOnInput: (agentId: AgentId) => Promise<Result<void, DomainError>>
 		notify: <K extends string & keyof TNotifications>(type: K, payload: z4.infer<TNotifications[K]['schema']>) => void
 		deps: TDeps
 	}
@@ -312,6 +314,7 @@ export type BaseMethodHandlerContext = SessionContext & {
 	pluginContext: unknown
 	pluginState: unknown
 	scheduleAgent: (agentId: AgentId) => void
+	resumeOnInput: (agentId: AgentId) => Promise<Result<void, DomainError>>
 	notify: (type: string, payload: unknown) => void
 	deps: Record<string, Record<string, (input: unknown) => Promise<Result<unknown, DomainError>>>>
 }
