@@ -786,6 +786,22 @@ describe('workers plugin', () => {
 				await restored.shutdown()
 			})
 
+			it('keeps the held worker parked on a host notice', async () => {
+				const { gated, sessionId, harnessFor } = await interruptedWorker()
+				const restored = harnessFor()
+				await restored.sessionManager.loadAllSessions({ resume: false })
+				const reopened = await restored.openSession(sessionId)
+				const live = await restored.sessionManager.getSession(sessionId)
+				if (!live.ok) throw new Error(live.error.message)
+
+				const notice = await live.value.callPluginMethod('user-chat.sendMessage', { sessionId, content: 'The rebase conflicted', keepHold: true })
+				expect(notice.ok).toBe(true)
+				await Bun.sleep(50)
+				expect(gated.resumedRuns).toEqual([])
+				expect(workersOf(reopened)?.get(workerId)).toMatchObject({ status: 'paused', pauseResumesOnInput: true })
+				await restored.shutdown()
+			})
+
 			it('keeps the worker held through a later default load, until its user writes', async () => {
 				const { gated, sessionId, harnessFor } = await interruptedWorker()
 				const holding = harnessFor()

@@ -1043,7 +1043,8 @@ export class SessionManager {
 	 * load does not restart it either, and the pause wakes no parent. Session-ready hooks see
 	 * `resumeInterruptedWork: false`, so running workers are parked instead of relaunched. The hold
 	 * is session-wide: a user message or answer to any agent releases it, resuming every held agent
-	 * and relaunching every parked worker. An agent only waiting for input still takes new messages.
+	 * and relaunching every parked worker; a message sent with `keepHold` does not. An agent only
+	 * waiting for input still takes new messages.
 	 * A load another caller starts meanwhile pauses the same way; one finished before this call
 	 * already resumed, so call it before the manager serves requests.
 	 */

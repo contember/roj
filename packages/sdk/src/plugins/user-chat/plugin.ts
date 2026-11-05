@@ -733,11 +733,14 @@ export const userChatPlugin = definePlugin("user-chat")
 			agentId: agentIdSchema.optional(),
 			content: z.string(),
 			context: z.string().optional(),
+			// A notice from the host, not its user: it waits for a held session's release instead of releasing it.
+			keepHold: z.boolean().optional(),
 		}),
 		output: z.object({
 			messageId: chatMessageIdSchema,
 		}),
 		handler: async (ctx, input) => {
+			const releaseHold = async (): Promise<Result<void, DomainError>> => input.keepHold === true ? Ok(undefined) : ctx.releaseHold();
 			const fingerprint = input.deliveryId === undefined
 				? undefined
 				: await deliveryFingerprint(input.content, input.context, input.agentId);
@@ -747,7 +750,7 @@ export const userChatPlugin = definePlugin("user-chat")
 				if (receipt) {
 					if (receipt.fingerprint !== fingerprint) return Err(deliveryConflict());
 					// A retry after a failed release: the message is in, but its agent may never have been scheduled.
-					const released = await ctx.releaseHold();
+					const released = await releaseHold();
 					if (!released.ok) return released;
 					const unread = pendingInboundOf(ctx.getSessionState()).find((m) => m.messageId === receipt.messageId);
 					if (unread) ctx.scheduleAgent(unread.agentId);
@@ -818,7 +821,7 @@ export const userChatPlugin = definePlugin("user-chat")
 					}),
 				);
 				// After the message lands, so the resumed agent answers it rather than only its old work.
-				const released = await ctx.releaseHold();
+				const released = await releaseHold();
 				if (!released.ok) return released;
 				ctx.scheduleAgent(agentId);
 				return Ok({ messageId });

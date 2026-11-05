@@ -312,6 +312,50 @@ describe('loadAllSessions without resume', () => {
 		await waitUntil(() => restored.llmProvider.getCallHistory().some(request => JSON.stringify(request.messages).includes('Change the title')))
 	})
 
+	it('keeps a held agent paused on a host notice, and it reads the notice once its user writes', async () => {
+		const { eventStore, sessionId, agentId } = await interruptedSession()
+		const restored = harness(eventStore)
+		await restored.sessionManager.loadAllSessions({ resume: false })
+		const session = await liveSession(restored, sessionId)
+
+		const notice = await session.callPluginMethod('user-chat.sendMessage', { sessionId, agentId, content: 'The rebase conflicted', keepHold: true })
+		expect(notice.ok).toBe(true)
+		await Bun.sleep(50)
+		expect(restored.llmProvider.getCallCount()).toBe(0)
+		expect(await agentStatus(restored, sessionId, agentId)).toBe('paused')
+
+		const reopened = await restored.openSession(sessionId)
+		await reopened.sendMessage('Change the title')
+		await waitUntil(() => restored.llmProvider.getCallCount() === 1)
+		const request = JSON.stringify(restored.llmProvider.getLastRequest()?.messages)
+		expect(request).toContain('The rebase conflicted')
+		expect(request).toContain('Change the title')
+	})
+
+	it('keeps the hold on the retry of a host notice', async () => {
+		const { eventStore, sessionId, agentId } = await interruptedSession()
+		const restored = harness(eventStore)
+		await restored.sessionManager.loadAllSessions({ resume: false })
+		const session = await liveSession(restored, sessionId)
+		const send = () => session.callPluginMethod('user-chat.sendMessage', { sessionId, agentId, content: 'The rebase conflicted', deliveryId: 'd1', keepHold: true })
+
+		expect((await send()).ok).toBe(true)
+		expect((await send()).ok).toBe(true)
+		await Bun.sleep(50)
+		expect(restored.llmProvider.getCallCount()).toBe(0)
+		expect(await agentStatus(restored, sessionId, agentId)).toBe('paused')
+	})
+
+	it('answers a host notice to an agent that is not held, and keeps the rest held', async () => {
+		const { restored, session, sessionId, entryId, childId } = await heldChildSession()
+
+		const notice = await session.callPluginMethod('user-chat.sendMessage', { sessionId, agentId: entryId, content: 'The rebase conflicted', keepHold: true })
+		expect(notice.ok).toBe(true)
+		await waitUntil(() => restored.llmProvider.getCallHistory().some(request => JSON.stringify(request.messages).includes('The rebase conflicted')))
+		await Bun.sleep(50)
+		expect(await agentStatus(restored, sessionId, childId)).toBe('paused')
+	})
+
 	it('releases the whole hold when its user answers an agent that was not held', async () => {
 		const { restored, session, sessionId, entryId, childId } = await heldChildSession()
 
