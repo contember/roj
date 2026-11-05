@@ -476,6 +476,8 @@ export const coreReducer = createTypedReducer(
 						// The rewritten history is not what an interrupted call answered.
 						interruptedInference: undefined,
 						status: 'pending' as const,
+						// No longer paused, so no longer held for its user's next message.
+						pauseResumesOnInput: undefined,
 					}
 				})
 
@@ -537,6 +539,7 @@ export const coreReducer = createTypedReducer(
 					status: 'paused',
 					pauseReason: event.reason,
 					pauseMessage: event.message,
+					pauseResumesOnInput: event.resumeOnInput,
 				}))
 
 			case 'agent_resumed':
@@ -547,6 +550,7 @@ export const coreReducer = createTypedReducer(
 					status: agent.pendingToolCalls.length > 0 ? 'tool_exec' : 'pending',
 					pauseReason: undefined,
 					pauseMessage: undefined,
+					pauseResumesOnInput: undefined,
 				}))
 
 			default:

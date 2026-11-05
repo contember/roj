@@ -18,7 +18,7 @@ import { estimateTokens, truncateByTokens } from "~/core/llm/tokens.js";
 import { definePlugin } from "~/core/plugins/plugin-builder.js";
 import { selectPluginState } from "~/core/sessions/reducer.js";
 import { sessionIdSchema } from "~/core/sessions/schema.js";
-import { getEntryAgentId } from "~/core/sessions/state.js";
+import { getEntryAgentId, type SessionState } from "~/core/sessions/state.js";
 import { createTool } from "~/core/tools/definition.js";
 import { Err, Ok, type Result } from "~/lib/utils/result.js";
 import { getUserCommunicationInstructions } from "~/prompts/base.js";
@@ -160,6 +160,11 @@ export interface UserChatState {
 	pendingAnswers?: Map<number, PendingAnswerRecord>;
 	/** Highest reducer-assigned inbound occurrence. */
 	nextInboundOrdinal?: number;
+}
+
+/** Inbound messages and answers no agent has read yet; a replay of a read one schedules nothing. */
+function pendingInboundOf(sessionState: SessionState): PendingInboundMessage[] {
+	return selectPluginState<UserChatState>(sessionState, "messages")?.pendingInbound ?? [];
 }
 
 interface UserChatPluginContext {
@@ -740,9 +745,13 @@ export const userChatPlugin = definePlugin("user-chat")
 				const state = selectPluginState<UserChatState>(ctx.getSessionState(), "messages");
 				const receipt = state?.acceptedDeliveries?.get(input.deliveryId);
 				if (receipt) {
-					return receipt.fingerprint === fingerprint
-						? Ok({ messageId: receipt.messageId })
-						: Err(deliveryConflict());
+					if (receipt.fingerprint !== fingerprint) return Err(deliveryConflict());
+					// A retry after a failed release: the message is in, but its agent may never have been scheduled.
+					const released = await ctx.releaseHold();
+					if (!released.ok) return released;
+					const unread = pendingInboundOf(ctx.getSessionState()).find((m) => m.messageId === receipt.messageId);
+					if (unread) ctx.scheduleAgent(unread.agentId);
+					return Ok({ messageId: receipt.messageId });
 				}
 				const inFlight = ctx.pluginContext.inFlightDeliveries.get(input.deliveryId);
 				if (inFlight) {
@@ -808,6 +817,9 @@ export const userChatPlugin = definePlugin("user-chat")
 							: {}),
 					}),
 				);
+				// After the message lands, so the resumed agent answers it rather than only its old work.
+				const released = await ctx.releaseHold();
+				if (!released.ok) return released;
 				ctx.scheduleAgent(agentId);
 				return Ok({ messageId });
 			};
@@ -837,7 +849,14 @@ export const userChatPlugin = definePlugin("user-chat")
 			const asked = ctx.pluginState.messages.find(
 				(msg) => msg.type === "ask_user" && msg.questionId === input.questionId,
 			);
-			if (asked?.type === "ask_user" && asked.answered) return Ok({});
+			if (asked?.type === "ask_user" && asked.answered) {
+				// A retry after a failed release: the answer is in, but its agent may never have been scheduled.
+				const released = await ctx.releaseHold();
+				if (!released.ok) return released;
+				const unread = pendingInboundOf(ctx.getSessionState()).find((m) => m.questionId === input.questionId);
+				if (unread) ctx.scheduleAgent(unread.agentId);
+				return Ok({});
+			}
 
 			const messageId = generateChatMessageId(
 				reserveMessageSequence(ctx.pluginContext),
@@ -851,6 +870,8 @@ export const userChatPlugin = definePlugin("user-chat")
 					timestamp: Date.now(),
 				}),
 			);
+			const released = await ctx.releaseHold();
+			if (!released.ok) return released;
 			ctx.scheduleAgent(input.agentId);
 			return Ok({});
 		},

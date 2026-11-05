@@ -220,6 +220,8 @@ export const mailboxPlugin = definePlugin("mailbox")
 		// (no parent) have no one to notify.
 		const parentId = ctx.agentState.parentId;
 		if (!parentId || !ctx.sessionState.agents.has(parentId)) return null;
+		// A restore's hold: the child never ran here, and telling the parent would wake it unattended.
+		if (ctx.agentState.pauseResumesOnInput) return null;
 
 		await ctx.self.send({
 			fromAgentId: ctx.agentId,

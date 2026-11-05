@@ -55,6 +55,8 @@ import type { SessionStoreOptions } from './session-store.js'
 import { Session, type SessionReopenRegistration, type UserOutputCallback } from './session.js'
 import { SessionRuntimeActivityController, SessionRuntimeUnavailableError } from './runtime-activity.js'
 
+const NOT_RESUMED_MESSAGE = 'Not resumed: the session was restored, so its interrupted work waits for a new message or an explicit resume'
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -351,6 +353,8 @@ export class SessionManager {
 	private cacheEvictions = 0
 	/** Set by shutdown(). Also fences wakes: one armed before it must not reload a session after it. */
 	private shuttingDown = false
+	/** Marked by `loadAllSessions({ resume: false })` until their first load, which pauses their agents before they continue. */
+	private readonly loadingWithoutResume = new Set<SessionId>()
 
 	constructor(options: SessionManagerOptions) {
 		if (options.sessionIdleTimeoutMs !== undefined && (!Number.isSafeInteger(options.sessionIdleTimeoutMs) || options.sessionIdleTimeoutMs < 0)) {
@@ -900,12 +904,20 @@ export class SessionManager {
 		}
 
 		// Create session (auto-start services run via onSessionReady)
-		const session = await this.createSessionInstance(store, preset, plugins, entry)
+		const session = await this.createSessionInstance(store, preset, plugins, entry, { holdInterruptedWork: this.loadingWithoutResume.has(sessionId) })
+		// Only once held: a load that failed leaves the mark, so the next load holds the work too.
+		this.loadingWithoutResume.delete(sessionId)
 
 		// Check for pending agents
 		session.checkPendingAgents()
 
 		return session
+	}
+
+	private async pauseUnresumedAgents(session: Session): Promise<void> {
+		const paused = await session.pauseAgentsWithWork(NOT_RESUMED_MESSAGE)
+		if (!paused.ok) throw new SessionLoadError(paused.error)
+		if (paused.value.length > 0) this.logger.info('Session loaded without resuming its agents', { sessionId: session.id, pausedAgents: paused.value })
 	}
 
 	/**
@@ -1025,9 +1037,19 @@ export class SessionManager {
 	 * Closed sessions are skipped — they have no runtime to restore. Loading them
 	 * would trigger callSessionReadyHooks and emit events to an immutable session log,
 	 * causing write amplification on every agent startup.
+	 *
+	 * `resume: false` is for sessions restored somewhere new, whose interrupted work must not run
+	 * unattended: every agent that would continue is paused before it does, durably, so a later
+	 * load does not restart it either, and the pause wakes no parent. Session-ready hooks see
+	 * `resumeInterruptedWork: false`, so running workers are parked instead of relaunched. The hold
+	 * is session-wide: a user message or answer to any agent releases it, resuming every held agent
+	 * and relaunching every parked worker. An agent only waiting for input still takes new messages.
+	 * A load another caller starts meanwhile pauses the same way; one finished before this call
+	 * already resumed, so call it before the manager serves requests.
 	 */
-	async loadAllSessions(): Promise<void> {
+	async loadAllSessions({ resume = true }: { resume?: boolean } = {}): Promise<void> {
 		const sessionIds = await this.eventStore.listSessions()
+		if (!resume) for (const sessionId of sessionIds) this.loadingWithoutResume.add(sessionId)
 
 		let loaded = 0
 		let skipped = 0
@@ -1035,10 +1057,14 @@ export class SessionManager {
 			try {
 				const metadata = await this.eventStore.getMetadata(sessionId)
 				if (metadata?.status === 'closed') {
+					this.loadingWithoutResume.delete(sessionId)
 					skipped++
 					continue
 				}
-				await this.getSession(sessionId)
+				const session = await this.getSession(sessionId)
+				// A resident session was not loaded here, so its mark would wait for an unrelated later load.
+				// A failed load keeps it, so the next load holds the work.
+				if (session.ok) this.loadingWithoutResume.delete(sessionId)
 				loaded++
 			} catch (error) {
 				this.logger.error(
@@ -1390,7 +1416,7 @@ export class SessionManager {
 		preset: Preset,
 		plugins: ConfiguredPlugin[],
 		entry: SessionCacheEntry,
-		opts: { skipReadyHooks?: boolean } = {},
+		opts: { skipReadyHooks?: boolean; holdInterruptedWork?: boolean } = {},
 	): Promise<Session> {
 		const sessionDir = this.getSessionDir(store.sessionId)
 		const sessionLogger = new TeeLogger([
@@ -1435,8 +1461,12 @@ export class SessionManager {
 			await session.initPluginContexts()
 			this.assertAdmission(entry.tenure)
 
+			// Before the ready hooks, so nothing they start can act on the work first; a failure disposes the runtime.
+			if (opts.holdInterruptedWork) await this.pauseUnresumedAgents(session)
+			this.assertAdmission(entry.tenure)
+
 			// Skipped for closed sessions to preserve event log immutability.
-			if (!opts.skipReadyHooks) await session.callSessionReadyHooks()
+			if (!opts.skipReadyHooks) await session.callSessionReadyHooks({ resumeInterruptedWork: opts.holdInterruptedWork !== true })
 			this.assertAdmission(entry.tenure)
 		} catch (error) {
 			const stopped = entry.activity.getSnapshot().state === 'revoked'

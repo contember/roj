@@ -159,6 +159,8 @@ export type MethodHandlerContext<TConfig, TContext, TState, TNotifications exten
 		pluginContext: TContext
 		pluginState: TState
 		scheduleAgent: (agentId: AgentId) => void
+		/** Release the hold a restore left on the session (see `SessionManager.loadAllSessions`); a no-op when nothing is held. */
+		releaseHold: () => Promise<Result<void, DomainError>>
 		notify: <K extends string & keyof TNotifications>(type: K, payload: z4.infer<TNotifications[K]['schema']>) => void
 		deps: TDeps
 	}
@@ -257,8 +259,12 @@ type SessionHookMap<TCtx> = {
 	/**
 	 * Runs once per resident runtime lifetime, not once per session — an evicted
 	 * runtime is rebuilt from its event log and runs this hook again.
+	 * `resumeInterruptedWork` is false on a load that holds interrupted work
+	 * (`SessionManager.loadAllSessions({ resume: false })`): restart nothing that was running.
 	 */
-	onSessionReady: (ctx: TCtx) => Promise<void>
+	onSessionReady: (ctx: TCtx & { resumeInterruptedWork: boolean }) => Promise<void>
+	/** The session's held work is released (`Session.releaseHold`): relaunch what was parked instead of restarted. */
+	onHoldRelease: (ctx: TCtx) => Promise<void>
 	/** Quiesce background work before the runtime waits for admitted operations to drain. */
 	onSessionPark: (ctx: TCtx) => Promise<void>
 	/**
@@ -312,6 +318,7 @@ export type BaseMethodHandlerContext = SessionContext & {
 	pluginContext: unknown
 	pluginState: unknown
 	scheduleAgent: (agentId: AgentId) => void
+	releaseHold: () => Promise<Result<void, DomainError>>
 	notify: (type: string, payload: unknown) => void
 	deps: Record<string, Record<string, (input: unknown) => Promise<Result<unknown, DomainError>>>>
 }
@@ -343,7 +350,8 @@ type ErasedAgentHookMap = {
  */
 type ErasedSessionHookMap = {
 	/** Fires once per resident runtime lifetime — a rebuilt runtime runs it again. */
-	onSessionReady: (ctx: BaseSessionHookContext) => Promise<void>
+	onSessionReady: (ctx: BaseSessionHookContext & { resumeInterruptedWork: boolean }) => Promise<void>
+	onHoldRelease: (ctx: BaseSessionHookContext) => Promise<void>
 	onSessionPark: (ctx: BaseSessionHookContext) => Promise<void>
 	/** Fires once per resident runtime lifetime — `reason` says whether the session ends or is only parked. */
 	onSessionClose: (ctx: BaseSessionHookContext & { reason: SessionCloseReason }) => Promise<void>

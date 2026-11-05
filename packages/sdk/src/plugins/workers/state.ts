@@ -37,6 +37,8 @@ export const workerEvents = createEventsFactory({
 			fromStatus: z.enum(['running', 'paused', 'completed', 'failed', 'cancelled']),
 			toStatus: z.enum(['running', 'paused', 'completed', 'failed', 'cancelled']),
 			reason: z.string().optional(),
+			/** A pause by a restore's hold, which `Session.releaseHold` lifts. */
+			resumeOnInput: z.boolean().optional(),
 		}),
 		worker_completed: z.object({
 			workerId: workerIdSchema,

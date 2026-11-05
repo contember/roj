@@ -60,6 +60,8 @@ export interface WorkerEntry {
 	workerType: string
 	/** Common status */
 	status: WorkerStatus
+	/** Paused by a restore's hold, so `Session.releaseHold` relaunches it (`worker_status_changed.resumeOnInput`). */
+	pauseResumesOnInput?: boolean
 	/** A durable request whose body has not been entered yet. */
 	pendingStart?: boolean
 	/** Worker-specific state, retained only while resumable. */

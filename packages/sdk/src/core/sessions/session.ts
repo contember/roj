@@ -220,7 +220,7 @@ export class Session {
 	 * Only errors are persisted as events — successful runs produce no event
 	 * to keep the session log focused on state changes, not invocation noise.
 	 */
-	async callSessionReadyHooks(): Promise<void> {
+	async callSessionReadyHooks({ resumeInterruptedWork = true }: { resumeInterruptedWork?: boolean } = {}): Promise<void> {
 		for (const plugin of this.plugins) {
 			if (plugin.sessionHooks?.onSessionReady) {
 				const startTime = Date.now()
@@ -228,7 +228,7 @@ export class Session {
 				if (!operation) throw new SessionRuntimeUnavailableError(this.id, this.runtimeActivity.getSnapshot().state)
 
 				try {
-					const ctx = this.buildSessionHookContext(plugin, operation.activity)
+					const ctx = { ...this.buildSessionHookContext(plugin, operation.activity), resumeInterruptedWork }
 					await plugin.sessionHooks.onSessionReady(ctx)
 				} catch (err) {
 					if (this.runtimeActivity.getSnapshot().state === 'revoked') throw err
@@ -382,13 +382,54 @@ export class Session {
 	}
 
 	/**
+	 * Release the hold a restore left (`SessionManager.loadAllSessions({ resume: false })`): resume
+	 * every agent it paused, then let plugins relaunch what they parked for it. Anything paused any
+	 * other way stays paused, and a session with nothing held is left as it is.
+	 */
+	async releaseHold(activity: SessionRuntimeActivity = this.runtimeActivity): Promise<Result<void, DomainError>> {
+		for (const agentId of [...this.store.getState().agents.keys()]) {
+			// The live state: a manual resume or pause can land while an earlier resume awaits.
+			const agentState = this.store.getAgentState(agentId)
+			if (agentState?.status !== 'paused' || agentState.pauseResumesOnInput !== true) continue
+			const resumed = await this.resumeAgent(agentId)
+			if (!resumed.ok) return resumed
+		}
+		for (const plugin of this.plugins) {
+			if (plugin.sessionHooks?.onHoldRelease) await plugin.sessionHooks.onHoldRelease(this.buildSessionHookContext(plugin, activity))
+		}
+		return Ok(undefined)
+	}
+
+	/**
+	 * Pause every agent that would pick up work on its own, and return their ids. The pause is an
+	 * event, so it holds across later loads until the agent is resumed or `releaseHold` runs; an
+	 * agent that only waits for input is left alone. The mailbox does not report this pause to the
+	 * parent, so holding a child does not wake it.
+	 */
+	async pauseAgentsWithWork(message: string): Promise<Result<AgentId[], DomainError>> {
+		const paused: AgentId[] = []
+		for (const agent of this.agents.values()) {
+			if (!agent.hasWorkToResume()) continue
+			const result = await this.mutate('pause', (activity) => this.performPauseAgent(agent.id, message, activity, true))
+			if (!result.ok) return result
+			paused.push(agent.id)
+		}
+		return Ok(paused)
+	}
+
+	/**
 	 * Pause an agent manually via API.
 	 */
 	async pauseAgent(agentId: AgentId, message?: string): Promise<Result<void, DomainError>> {
 		return this.mutate('pause', (activity) => this.performPauseAgent(agentId, message, activity))
 	}
 
-	private async performPauseAgent(agentId: AgentId, message: string | undefined, activity: SessionRuntimeActivity): Promise<Result<void, DomainError>> {
+	private async performPauseAgent(
+		agentId: AgentId,
+		message: string | undefined,
+		activity: SessionRuntimeActivity,
+		resumeOnInput = false,
+	): Promise<Result<void, DomainError>> {
 		if (this.store.isClosed()) {
 			return Err(SessionErrors.closed(String(this.id)))
 		}
@@ -409,6 +450,7 @@ export class Session {
 				agentId,
 				reason: 'manual',
 				message,
+				...(resumeOnInput && { resumeOnInput }),
 			}),
 		))
 
@@ -819,6 +861,7 @@ export class Session {
 			pluginContext,
 			pluginState,
 			scheduleAgent: (targetAgentId: AgentId) => this.scheduleAgent(targetAgentId),
+			releaseHold: () => this.releaseHold(activity),
 			notify: this.createNotify(pluginName, activity),
 			deps,
 		}

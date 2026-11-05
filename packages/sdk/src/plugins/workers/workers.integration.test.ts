@@ -3,10 +3,11 @@ import z from 'zod/v4'
 import { EventAppendError } from '~/core/events/event-store.js'
 import { MemoryEventStore } from '~/core/events/memory.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
-import type { DomainEvent } from '~/core/events/types.js'
+import type { BaseEvent, DomainEvent } from '~/core/events/types.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import type { SessionId } from '~/core/sessions/schema.js'
+import type { SessionState } from '~/core/sessions/state.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import { generateMessageId } from '~/plugins/mailbox/schema.js'
@@ -724,6 +725,247 @@ describe('workers plugin', () => {
 			expect(completed).not.toHaveProperty('state')
 			expect(completed?.result?.summary).toBe('Gated worker completed')
 			await secondHarness.shutdown()
+		})
+
+		describe('a load that holds interrupted work', () => {
+			const workerId = WorkerId('restored-running-worker')
+			const workersOf = (session: { state: SessionState }) => selectPluginState<Map<WorkerId, WorkerEntry>>(session.state, 'workers')
+
+			/** A persisted session with one worker left running, plus whatever `extra` events follow it. */
+			async function interruptedWorker(extra: Omit<BaseEvent<string>, 'sessionId'>[] = []) {
+				const gated = createGatedWorker()
+				const eventStore = new MemoryEventStore()
+				const preset = createTestPreset({ plugins: [workerPlugin.configure({ workers: [gated.worker] })] })
+				const harnessFor = () => createWorkersHarness({
+					presets: [preset],
+					eventStore,
+					llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				})
+				const first = harnessFor()
+				const firstSession = await first.createSession('test')
+				const sessionId = firstSession.sessionId
+				const agentId = firstSession.getEntryAgentId()
+				if (!agentId) throw new Error('Expected entry agent')
+				await first.shutdown()
+				await eventStore.append(sessionId, withSessionId(sessionId, workerEvents.create('worker_started', {
+					workerId,
+					agentId,
+					workerType: 'gated',
+					config: { input: 'restored' },
+				})))
+				for (const event of extra) await eventStore.append(sessionId, withSessionId(sessionId, event))
+				return { gated, sessionId, eventStore, harnessFor }
+			}
+
+			it('parks a running worker as held instead of relaunching it', async () => {
+				const { gated, sessionId, harnessFor } = await interruptedWorker()
+				const restored = harnessFor()
+				await restored.sessionManager.loadAllSessions({ resume: false })
+				const reopened = await restored.openSession(sessionId)
+				await Bun.sleep(50)
+				expect(gated.resumedRuns).toEqual([])
+				expect(workersOf(reopened)?.get(workerId)).toMatchObject({ status: 'paused', pauseResumesOnInput: true })
+				await restored.shutdown()
+			})
+
+			it('relaunches the held worker once when its user writes to any agent', async () => {
+				const { gated, sessionId, harnessFor } = await interruptedWorker()
+				const restored = harnessFor()
+				await restored.sessionManager.loadAllSessions({ resume: false })
+				const reopened = await restored.openSession(sessionId)
+
+				await reopened.sendMessage('Change the title')
+				await gated.started
+				await reopened.sendMessage('And the footer')
+				await Bun.sleep(50)
+				expect(gated.resumedRuns).toEqual([true])
+				const running = workersOf(reopened)?.get(workerId)
+				expect(running?.status).toBe('running')
+				expect(running).not.toHaveProperty('pauseResumesOnInput')
+				gated.finish()
+				await restored.shutdown()
+			})
+
+			it('keeps the worker held through a later default load, until its user writes', async () => {
+				const { gated, sessionId, harnessFor } = await interruptedWorker()
+				const holding = harnessFor()
+				await holding.sessionManager.loadAllSessions({ resume: false })
+				await holding.shutdown()
+
+				const later = harnessFor()
+				await later.sessionManager.loadAllSessions()
+				const reopened = await later.openSession(sessionId)
+				await Bun.sleep(50)
+				expect(gated.resumedRuns).toEqual([])
+
+				await reopened.sendMessage('Change the title')
+				await gated.started
+				expect(gated.resumedRuns).toEqual([true])
+				gated.finish()
+				await later.shutdown()
+			})
+
+			it('keeps a held worker over the concurrency cap held, so a later release retries it', async () => {
+				const resumable = createResumableWorker()
+				const eventStore = new MemoryEventStore()
+				const preset = createTestPreset({ plugins: [workerPlugin.configure({ workers: [resumable.worker] })] })
+				const harnessFor = () => createWorkersHarness({
+					presets: [preset],
+					eventStore,
+					llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				})
+				const first = harnessFor()
+				const firstSession = await first.createSession('test')
+				const sessionId = firstSession.sessionId
+				const agentId = firstSession.getEntryAgentId()
+				if (!agentId) throw new Error('Expected entry agent')
+				await first.shutdown()
+				for (let i = 0; i <= MAX_CONCURRENT_WORKERS; i++) {
+					await eventStore.append(sessionId, withSessionId(sessionId, workerEvents.create('worker_started', {
+						workerId: WorkerId(`held-worker-${i}`),
+						agentId,
+						workerType: 'resumable',
+						config: {},
+					})))
+				}
+
+				const restored = harnessFor()
+				await restored.sessionManager.loadAllSessions({ resume: false })
+				const reopened = await restored.openSession(sessionId)
+				await reopened.sendMessage('Change the title')
+				await waitFor(() => resumable.runs.length === MAX_CONCURRENT_WORKERS)
+				const held = [...(workersOf(reopened)?.values() ?? [])].filter((worker) => worker.status === 'paused')
+				expect(held).toHaveLength(1)
+				expect(held[0]?.pauseResumesOnInput).toBe(true)
+
+				const live = await restored.sessionManager.getSession(sessionId)
+				if (!live.ok) throw new Error(live.error.message)
+				const cancelled = await live.value.callPluginMethod('workers.cancel', { sessionId, agentId, workerId: 'held-worker-0' })
+				expect(cancelled.ok).toBe(true)
+				await reopened.sendMessage('And the footer')
+				await waitFor(() => resumable.runs.length === MAX_CONCURRENT_WORKERS + 1)
+				expect(held[0] && workersOf(reopened)?.get(held[0].id)?.status).toBe('running')
+				await restored.shutdown()
+			})
+
+			/**
+			 * A restored session holding one looping worker per name. `onRelaunch` runs after each
+			 * relaunch's `running` event is stored and before the release loop goes on.
+			 */
+			async function heldLoopingWorkers(names: string[], onRelaunch: (workerId: string) => Promise<void> | void) {
+				const runs: string[] = []
+				const looping = createWorkerDefinition('looping', 'Runs until it is stopped', z.object({ name: z.string() }), {
+					initialState: () => ({}),
+					reduce: (state: {}) => state,
+					execute: async (config, ctx) => {
+						runs.push(config.name)
+						while (ctx.shouldContinue()) await Bun.sleep(5)
+						return Ok({ status: 'stopped', summary: 'Stopped' })
+					},
+				})
+				let hooked = false
+				class RelaunchHookedStore extends MemoryEventStore {
+					override async append(sessionId: SessionId, event: DomainEvent): Promise<void> {
+						await super.append(sessionId, event)
+						if (hooked && 'workerId' in event && 'toStatus' in event && event.toStatus === 'running') await onRelaunch(String(event.workerId))
+					}
+				}
+				const eventStore = new RelaunchHookedStore()
+				const preset = createTestPreset({ plugins: [workerPlugin.configure({ workers: [looping] })] })
+				const harnessFor = () => createWorkersHarness({
+					presets: [preset],
+					eventStore,
+					llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				})
+				const first = harnessFor()
+				const firstSession = await first.createSession('test')
+				const sessionId = firstSession.sessionId
+				const agentId = firstSession.getEntryAgentId()
+				if (!agentId) throw new Error('Expected entry agent')
+				await first.shutdown()
+				for (const name of names) {
+					await eventStore.append(sessionId, withSessionId(sessionId, workerEvents.create('worker_started', {
+						workerId: WorkerId(name),
+						agentId,
+						workerType: 'looping',
+						config: { name },
+					})))
+				}
+
+				const restored = harnessFor()
+				await restored.sessionManager.loadAllSessions({ resume: false })
+				const live = await restored.sessionManager.getSession(sessionId)
+				if (!live.ok) throw new Error(live.error.message)
+				hooked = true
+				const call = (method: string, workerId: string) => live.value.callPluginMethod(`workers.${method}`, { sessionId, agentId, workerId })
+				const statusOf = (workerId: string) => selectPluginState<Map<WorkerId, WorkerEntry>>(live.value.state, 'workers')?.get(WorkerId(workerId))?.status
+				return { runs, restored, session: live.value, sessionId, agentId, call, statusOf }
+			}
+
+			it('does not relaunch a held worker cancelled while the release relaunches another', async () => {
+				let cancelled: Promise<unknown> = Promise.resolve()
+				let trigger = true
+				const held = await heldLoopingWorkers(['w0', 'w1', 'w2'], (workerId) => {
+					if (workerId !== 'w0' || !trigger) return
+					trigger = false
+					cancelled = held.call('cancel', 'w2')
+				})
+				const sent = await held.session.callPluginMethod('user-chat.sendMessage', { sessionId: held.sessionId, agentId: held.agentId, content: 'Go on' })
+				expect(sent.ok).toBe(true)
+				await cancelled
+				await Bun.sleep(50)
+				expect(held.runs.sort()).toEqual(['w0', 'w1'])
+				expect(held.statusOf('w2')).toBe('cancelled')
+				await held.restored.shutdown()
+			})
+
+			it('does not relaunch a held worker resumed and paused by hand while the release relaunches another', async () => {
+				let paused: Promise<unknown> = Promise.resolve()
+				let trigger = true
+				const held = await heldLoopingWorkers(['w0', 'w1', 'w2', 'w3'], async (workerId) => {
+					if (workerId === 'w0' && trigger) {
+						trigger = false
+						paused = held.call('resume', 'w3').then(() => held.call('pause', 'w3'))
+					}
+					// Slows the loop, so the pause lands before it reaches w3.
+					if (workerId === 'w1') await Bun.sleep(100)
+				})
+				const sent = await held.session.callPluginMethod('user-chat.sendMessage', { sessionId: held.sessionId, agentId: held.agentId, content: 'Go on' })
+				expect(sent.ok).toBe(true)
+				expect(await paused).toMatchObject({ ok: true })
+				await Bun.sleep(50)
+				expect(held.runs.sort()).toEqual(['w0', 'w1', 'w2', 'w3'])
+				expect(held.statusOf('w3')).toBe('paused')
+				await held.restored.shutdown()
+			})
+
+			it('keeps a held worker whose definition is gone held, and still takes the message', async () => {
+				const { sessionId, eventStore } = await interruptedWorker()
+				const restored = createWorkersHarness({
+					presets: [createTestPreset({ plugins: [workerPlugin.configure({ workers: [] })] })],
+					eventStore,
+					llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				})
+				await restored.sessionManager.loadAllSessions({ resume: false })
+				const reopened = await restored.openSession(sessionId)
+				await reopened.sendMessage('Change the title')
+				expect(workersOf(reopened)?.get(workerId)).toMatchObject({ status: 'paused', pauseResumesOnInput: true })
+				await restored.shutdown()
+			})
+
+			it('leaves a worker paused by hand paused when its user writes', async () => {
+				const paused = workerEvents.create('worker_status_changed', { workerId, fromStatus: 'running', toStatus: 'paused' })
+				const { gated, sessionId, harnessFor } = await interruptedWorker([paused])
+				const restored = harnessFor()
+				await restored.sessionManager.loadAllSessions({ resume: false })
+				const reopened = await restored.openSession(sessionId)
+
+				await reopened.sendMessage('Change the title')
+				await Bun.sleep(50)
+				expect(gated.resumedRuns).toEqual([])
+				expect(workersOf(reopened)?.get(workerId)?.status).toBe('paused')
+				await restored.shutdown()
+			})
 		})
 
 		it('parks a running worker the rebuilt runtime cannot relaunch', async () => {

@@ -62,6 +62,8 @@ export const agentEvents = createEventsFactory({
 			agentId: agentIdSchema,
 			reason: z4.enum(['limit', 'handler', 'manual']),
 			message: z4.string().optional(),
+			/** Set by a restore's hold: the next user message to the agent resumes it. */
+			resumeOnInput: z4.boolean().optional(),
 		}),
 		agent_resumed: z4.object({
 			agentId: agentIdSchema,
@@ -255,6 +257,8 @@ export interface AgentState {
 	pauseReason?: AgentPauseReason
 	/** Human-readable pause message */
 	pauseMessage?: string
+	/** Paused by a restore's hold, so `Session.releaseHold` resumes it (`agent_paused.resumeOnInput`) */
+	pauseResumesOnInput?: boolean
 	/** Metrics from the most recent completed inference — used by plugins (e.g. context-compact) to size context against the provider-reported truth. */
 	lastInferenceMetrics?: LLMMetrics
 	/** Consecutive inference_failed count since the last committed turn — drives the outer error-resume backoff. */
