@@ -476,6 +476,8 @@ export const coreReducer = createTypedReducer(
 						// The rewritten history is not what an interrupted call answered.
 						interruptedInference: undefined,
 						status: 'pending' as const,
+						// No longer paused, so no longer held for its user's next message.
+						pauseResumesOnInput: undefined,
 					}
 				})
 

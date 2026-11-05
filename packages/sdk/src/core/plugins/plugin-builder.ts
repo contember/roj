@@ -259,8 +259,10 @@ type SessionHookMap<TCtx> = {
 	/**
 	 * Runs once per resident runtime lifetime, not once per session — an evicted
 	 * runtime is rebuilt from its event log and runs this hook again.
+	 * `resumeInterruptedWork` is false on a load that holds interrupted work
+	 * (`SessionManager.loadAllSessions({ resume: false })`): restart nothing that was running.
 	 */
-	onSessionReady: (ctx: TCtx) => Promise<void>
+	onSessionReady: (ctx: TCtx & { resumeInterruptedWork: boolean }) => Promise<void>
 	/** Quiesce background work before the runtime waits for admitted operations to drain. */
 	onSessionPark: (ctx: TCtx) => Promise<void>
 	/**
@@ -346,7 +348,7 @@ type ErasedAgentHookMap = {
  */
 type ErasedSessionHookMap = {
 	/** Fires once per resident runtime lifetime — a rebuilt runtime runs it again. */
-	onSessionReady: (ctx: BaseSessionHookContext) => Promise<void>
+	onSessionReady: (ctx: BaseSessionHookContext & { resumeInterruptedWork: boolean }) => Promise<void>
 	onSessionPark: (ctx: BaseSessionHookContext) => Promise<void>
 	/** Fires once per resident runtime lifetime — `reason` says whether the session ends or is only parked. */
 	onSessionClose: (ctx: BaseSessionHookContext & { reason: SessionCloseReason }) => Promise<void>

@@ -726,6 +726,37 @@ describe('workers plugin', () => {
 			await secondHarness.shutdown()
 		})
 
+		it('parks a running worker instead of relaunching it on a load that holds interrupted work', async () => {
+			const gated = createGatedWorker()
+			const eventStore = new MemoryEventStore()
+			const preset = createTestPreset({
+				plugins: [workerPlugin.configure({ workers: [gated.worker] })],
+			})
+			const llmProvider = () => MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] })
+			const firstHarness = createWorkersHarness({ presets: [preset], eventStore, llmProvider: llmProvider() })
+			const firstSession = await firstHarness.createSession('test')
+			const sessionId = firstSession.sessionId
+			const agentId = firstSession.getEntryAgentId()
+			if (!agentId) throw new Error('Expected entry agent')
+			await firstHarness.shutdown()
+
+			const workerId = WorkerId('restored-running-worker')
+			await eventStore.append(sessionId, withSessionId(sessionId, workerEvents.create('worker_started', {
+				workerId,
+				agentId,
+				workerType: 'gated',
+				config: { input: 'restored' },
+			})))
+
+			const restored = createWorkersHarness({ presets: [preset], eventStore, llmProvider: llmProvider() })
+			await restored.sessionManager.loadAllSessions({ resume: false })
+			const reopened = await restored.openSession(sessionId)
+			await Bun.sleep(50)
+			expect(gated.resumedRuns).toEqual([])
+			expect(selectPluginState<Map<WorkerId, WorkerEntry>>(reopened.state, 'workers')?.get(workerId)?.status).toBe('paused')
+			await restored.shutdown()
+		})
+
 		it('parks a running worker the rebuilt runtime cannot relaunch', async () => {
 			const resumable = createResumableWorker()
 			const eventStore = new MemoryEventStore()

@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it, spyOn } from 'bun:test'
 import type { AgentId } from '~/core/agents/schema.js'
+import { ValidationErrors } from '~/core/errors.js'
 import { agentEvents } from '~/core/agents/state.js'
 import type { MemoryEventStore } from '~/core/events/memory.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { SessionId } from '~/core/sessions/schema.js'
+import { Session } from '~/core/sessions/session.js'
+import { Err } from '~/lib/utils/result.js'
 import { createTestPreset, TestHarness, type TestSession } from '~/testing/index.js'
 
 const harnesses: TestHarness[] = []
@@ -42,6 +45,12 @@ async function leaveUnanswered(owner: TestHarness, session: TestSession, agentId
 	await owner.eventStore.append(session.sessionId, withSessionId(session.sessionId, agentEvents.create('agent_resumed', { agentId })))
 }
 
+async function liveSession(owner: TestHarness, sessionId: SessionId): Promise<Session> {
+	const session = await owner.sessionManager.getSession(sessionId)
+	if (!session.ok) throw new Error(`getSession failed: ${session.error.message}`)
+	return session.value
+}
+
 async function agentStatus(owner: TestHarness, sessionId: SessionId, agentId: AgentId): Promise<string | undefined> {
 	const session = await owner.sessionManager.getSession(sessionId)
 	if (!session.ok) throw new Error(`getSession failed: ${session.error.message}`)
@@ -72,7 +81,7 @@ describe('loadAllSessions without resume', () => {
 		expect(restored.llmProvider.getCallCount()).toBe(0)
 		expect(await agentStatus(restored, sessionId, agentId)).toBe('paused')
 		const pauses = (await eventStore.load(sessionId)).filter(event => event.type === 'agent_paused')
-		expect(pauses.at(-1)).toMatchObject({ agentId, reason: 'manual' })
+		expect(pauses.at(-1)).toMatchObject({ agentId, reason: 'manual', resumeOnInput: true })
 	})
 
 	it('keeps the agent paused through a later load, until it is resumed', async () => {
@@ -155,5 +164,72 @@ describe('loadAllSessions without resume', () => {
 		await Bun.sleep(50)
 		expect(owner.llmProvider.getCallCount()).toBe(0)
 		expect(await agentStatus(owner, session.sessionId, agentId)).toBe('paused')
+	})
+
+	it('does not wake an idle parent by holding its child', async () => {
+		const source = harness()
+		const session = await source.createSession('test')
+		const entryId = session.getEntryAgentId()
+		if (!entryId) throw new Error('Expected an entry agent')
+		const spawned = await (await liveSession(source, session.sessionId)).spawnAgentManually('child', entryId, 'Start the task')
+		if (!spawned.ok) throw new Error(spawned.error.message)
+		await session.waitForIdle()
+		const before = source.llmProvider.getCallCount()
+		await leaveUnanswered(source, session, spawned.value, 'Finish the old task')
+		// The parent answers the manual pause's notice here, so it is idle when the session is restored.
+		await waitUntil(() => source.llmProvider.getCallCount() === before + 1)
+		await source.shutdown()
+
+		const restored = harness(source.eventStore)
+		await restored.sessionManager.loadAllSessions({ resume: false })
+		await Bun.sleep(50)
+		expect(restored.llmProvider.getCallCount()).toBe(0)
+		expect(await agentStatus(restored, session.sessionId, spawned.value)).toBe('paused')
+	})
+
+	it('holds the work on the next load when the hold failed', async () => {
+		const { eventStore, sessionId, agentId } = await interruptedSession()
+		const restored = harness(eventStore)
+		spyOn(Session.prototype, 'pauseAgentsWithWork').mockImplementationOnce(async () => Err(ValidationErrors.invalid('store unavailable')))
+		await restored.sessionManager.loadAllSessions({ resume: false })
+
+		expect(await agentStatus(restored, sessionId, agentId)).toBe('paused')
+		await Bun.sleep(50)
+		expect(restored.llmProvider.getCallCount()).toBe(0)
+	})
+
+	it('resumes a held agent on the retry of a delivery whose resume failed', async () => {
+		const { eventStore, sessionId, agentId } = await interruptedSession()
+		const restored = harness(eventStore)
+		await restored.sessionManager.loadAllSessions({ resume: false })
+		const session = await liveSession(restored, sessionId)
+		const send = () => session.callPluginMethod('user-chat.sendMessage', { sessionId, agentId, content: 'Change the title', deliveryId: 'd1' })
+
+		spyOn(Session.prototype, 'resumeAgent').mockImplementationOnce(async () => Err(ValidationErrors.invalid('runtime parking')))
+		expect((await send()).ok).toBe(false)
+		expect((await send()).ok).toBe(true)
+		await waitUntil(() => restored.llmProvider.getCallCount() === 1)
+	})
+
+	it('resumes a held agent when its user answers it', async () => {
+		const { eventStore, sessionId, agentId } = await interruptedSession()
+		const restored = harness(eventStore)
+		await restored.sessionManager.loadAllSessions({ resume: false })
+		const session = await liveSession(restored, sessionId)
+
+		const answered = await session.callPluginMethod('user-chat.answerQuestion', { agentId, questionId: 'm0', answer: 'Yes' })
+		expect(answered.ok).toBe(true)
+		await waitUntil(() => restored.llmProvider.getCallCount() === 1)
+	})
+
+	it('accepts a message to a held agent that was rewound since', async () => {
+		const { eventStore, sessionId, agentId } = await interruptedSession()
+		await harness(eventStore).sessionManager.loadAllSessions({ resume: false })
+		await eventStore.append(sessionId, withSessionId(sessionId, agentEvents.create('agent_conversation_spliced', { agentId, start: 0, deleteCount: 0 })))
+
+		const later = harness(eventStore)
+		const reopened = await later.openSession(sessionId)
+		await reopened.sendMessage('Change the title')
+		expect(await agentStatus(later, sessionId, agentId)).not.toBe('paused')
 	})
 })

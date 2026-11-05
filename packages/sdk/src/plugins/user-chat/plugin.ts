@@ -740,9 +740,14 @@ export const userChatPlugin = definePlugin("user-chat")
 				const state = selectPluginState<UserChatState>(ctx.getSessionState(), "messages");
 				const receipt = state?.acceptedDeliveries?.get(input.deliveryId);
 				if (receipt) {
-					return receipt.fingerprint === fingerprint
-						? Ok({ messageId: receipt.messageId })
-						: Err(deliveryConflict());
+					if (receipt.fingerprint !== fingerprint) return Err(deliveryConflict());
+					// A retry after a failed resume: the message is in, the agent may still be held.
+					const target = input.agentId ?? getEntryAgentId(ctx.sessionState);
+					if (target) {
+						const resumed = await ctx.resumeOnInput(target);
+						if (!resumed.ok) return resumed;
+					}
+					return Ok({ messageId: receipt.messageId });
 				}
 				const inFlight = ctx.pluginContext.inFlightDeliveries.get(input.deliveryId);
 				if (inFlight) {
@@ -840,7 +845,11 @@ export const userChatPlugin = definePlugin("user-chat")
 			const asked = ctx.pluginState.messages.find(
 				(msg) => msg.type === "ask_user" && msg.questionId === input.questionId,
 			);
-			if (asked?.type === "ask_user" && asked.answered) return Ok({});
+			if (asked?.type === "ask_user" && asked.answered) {
+				// A retry after a failed resume: the answer is in, the agent may still be held.
+				const resumed = await ctx.resumeOnInput(input.agentId);
+				return resumed.ok ? Ok({}) : resumed;
+			}
 
 			const messageId = generateChatMessageId(
 				reserveMessageSequence(ctx.pluginContext),

@@ -578,6 +578,11 @@ export const workerPlugin = definePlugin('workers')
 			if (worker.status !== 'running') continue
 			if (!Object.hasOwn(worker, 'config') || !Object.hasOwn(worker, 'state')) continue
 			if (runningWorkers.has(worker.id)) continue
+			// A load that holds interrupted work: the worker waits for `resume` like its held agents.
+			if (!ctx.resumeInterruptedWork) {
+				await parkStoppedWorker(worker.id)
+				continue
+			}
 			const definition = ctx.pluginConfig.workers.find((candidate) => candidate.type === worker.workerType)
 			if (!definition) {
 				logger.warn('Cannot resume worker with missing definition', { workerId: worker.id, workerType: worker.workerType })

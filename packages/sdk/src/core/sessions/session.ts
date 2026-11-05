@@ -220,7 +220,7 @@ export class Session {
 	 * Only errors are persisted as events — successful runs produce no event
 	 * to keep the session log focused on state changes, not invocation noise.
 	 */
-	async callSessionReadyHooks(): Promise<void> {
+	async callSessionReadyHooks({ resumeInterruptedWork = true }: { resumeInterruptedWork?: boolean } = {}): Promise<void> {
 		for (const plugin of this.plugins) {
 			if (plugin.sessionHooks?.onSessionReady) {
 				const startTime = Date.now()
@@ -228,7 +228,7 @@ export class Session {
 				if (!operation) throw new SessionRuntimeUnavailableError(this.id, this.runtimeActivity.getSnapshot().state)
 
 				try {
-					const ctx = this.buildSessionHookContext(plugin, operation.activity)
+					const ctx = { ...this.buildSessionHookContext(plugin, operation.activity), resumeInterruptedWork }
 					await plugin.sessionHooks.onSessionReady(ctx)
 				} catch (err) {
 					if (this.runtimeActivity.getSnapshot().state === 'revoked') throw err
@@ -383,14 +383,16 @@ export class Session {
 
 	/** Resume an agent held until its user writes; an agent paused any other way stays paused. */
 	async resumeOnInput(agentId: AgentId): Promise<Result<void, DomainError>> {
-		if (this.store.getAgentState(agentId)?.pauseResumesOnInput !== true) return Ok(undefined)
+		const agentState = this.store.getAgentState(agentId)
+		if (agentState?.status !== 'paused' || agentState.pauseResumesOnInput !== true) return Ok(undefined)
 		return this.resumeAgent(agentId)
 	}
 
 	/**
 	 * Pause every agent that would pick up work on its own, and return their ids. The pause is an
 	 * event, so it holds across later loads until the agent is resumed or its user writes to it; an
-	 * agent that only waits for input is left alone.
+	 * agent that only waits for input is left alone. The mailbox does not report this pause to the
+	 * parent, so holding a child does not wake it.
 	 */
 	async pauseAgentsWithWork(message: string): Promise<Result<AgentId[], DomainError>> {
 		const paused: AgentId[] = []
