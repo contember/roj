@@ -28,7 +28,7 @@ export const serviceEvents = createEventsFactory({
 			 * before the discriminator existed — the reducer reads those as `agent`,
 			 * the only default that cannot resurrect a service meant to stay down.
 			 */
-			stoppedBy: z.enum(['agent', 'eviction']).optional(),
+			stoppedBy: z.enum(['agent', 'eviction', 'hold']).optional(),
 			/**
 			 * Set on a `failed` change when the `restartPolicy` has already queued a
 			 * revival, so that no consumer — agent prompt, SPA, platform — mistakes it
@@ -98,6 +98,9 @@ export const servicePlugin = definePlugin('services')
 							pid: event.pid,
 							pidStartTime: event.pidStartTime,
 						})
+					} else if (!existing && event.toStatus === 'stopped' && event.stoppedBy === 'hold') {
+						// A hold keeps down an autoStart service that never ran, too.
+						newServices.set(event.serviceType, { serviceType: event.serviceType, status: 'stopped', stoppedBy: 'hold', stoppedAt: event.timestamp })
 					} else if (existing) {
 						const updated: ServiceEntry = {
 							...existing,
@@ -373,30 +376,48 @@ export const servicePlugin = definePlugin('services')
 				}
 			}
 		}
-		/** Starts the services configured with autoStart that are down; `held` while a hold on this runtime's load kept them down. */
-		const autoStart = {
-			held: false,
-			run: async (sessionId: Parameters<ServiceExecutor['start']>[1], workspaceDir: string | undefined, services: ReadonlyMap<string, ServiceEntry>): Promise<void> => {
-				for (const svcConfig of pluginConfig.services) {
-					if (!svcConfig.autoStart) continue
-					const status = executor.getStatus(svcConfig.type)
-					if (status === 'ready' || status === 'starting') continue
+		/**
+		 * The services configured with autoStart that are down and may start on their own: not stopped
+		 * by the agent, and not kept down by a hold on interrupted work (`stoppedBy: 'hold'`).
+		 */
+		const autoStartable = (services: ReadonlyMap<string, ServiceEntry>, release: boolean): ServiceConfig[] => {
+			const startable: ServiceConfig[] = []
+			for (const svcConfig of pluginConfig.services) {
+				if (!svcConfig.autoStart) continue
+				const status = executor.getStatus(svcConfig.type)
+				if (status === 'ready' || status === 'starting') continue
 
-					// On a fresh runtime the executor knows nothing, so the persisted decision is
-					// the only thing that can tell an evicted service (bring it back) from one the
-					// agent stopped on purpose (leave it down).
-					const entry = services.get(svcConfig.type)
-					if (entry?.status === 'stopped' && entry.stoppedBy === 'agent') {
-						logger.debug('Auto-start skipped — the agent stopped this service', { serviceType: svcConfig.type })
-						continue
-					}
-
-					const startResult = await startService(svcConfig, sessionId, workspaceDir, entry?.port)
-					if (!startResult.ok) {
-						logger.debug('Auto-start service skipped', { serviceType: svcConfig.type, error: startResult.error.message })
-					}
+				// On a fresh runtime the executor knows nothing, so the persisted decision is
+				// the only thing that can tell an evicted service (bring it back) from one the
+				// agent stopped on purpose (leave it down).
+				const entry = services.get(svcConfig.type)
+				if (entry?.status === 'stopped' && entry.stoppedBy === 'agent') {
+					logger.debug('Auto-start skipped — the agent stopped this service', { serviceType: svcConfig.type })
+					continue
 				}
-			},
+				const held = entry?.status === 'stopped' && entry.stoppedBy === 'hold'
+				if (held === release) startable.push(svcConfig)
+			}
+			return startable
+		}
+		const startAll = async (
+			configs: readonly ServiceConfig[],
+			sessionId: Parameters<ServiceExecutor['start']>[1],
+			workspaceDir: string | undefined,
+			services: ReadonlyMap<string, ServiceEntry>,
+		): Promise<void> => {
+			for (const svcConfig of configs) {
+				const startResult = await startService(svcConfig, sessionId, workspaceDir, services.get(svcConfig.type)?.port)
+				if (!startResult.ok) {
+					logger.debug('Auto-start service skipped', { serviceType: svcConfig.type, error: startResult.error.message })
+				}
+			}
+		}
+		const autoStart = {
+			startable: (services: ReadonlyMap<string, ServiceEntry>) => autoStartable(services, false),
+			/** The services a hold kept down, which its release starts. */
+			held: (services: ReadonlyMap<string, ServiceEntry>) => autoStartable(services, true),
+			startAll,
 		}
 		return { executor, startService, restartService, stopService, close, autoStart }
 	})
@@ -614,17 +635,19 @@ export const servicePlugin = definePlugin('services')
 				}))
 		}
 
-		// A load that holds interrupted work starts nothing on its own; the hold's release does.
-		if (!ctx.resumeInterruptedWork) {
-			ctx.pluginContext.autoStart.held = true
+		const startable = ctx.pluginContext.autoStart.startable(ctx.pluginState)
+		if (ctx.resumeInterruptedWork) {
+			await ctx.pluginContext.autoStart.startAll(startable, ctx.sessionId, ctx.sessionState.workspaceDir, ctx.pluginState)
 			return
 		}
-		await ctx.pluginContext.autoStart.run(ctx.sessionId, ctx.sessionState.workspaceDir, ctx.pluginState)
+		// Recorded, not only skipped: a later load of the still-held session, after an eviction, must not start them either.
+		for (const svcConfig of startable) {
+			await ctx.emitEvent(serviceEvents.create('service_status_changed', { serviceType: svcConfig.type, toStatus: 'stopped', stoppedBy: 'hold' }))
+		}
 	})
 	.sessionHook('onHoldRelease', async (ctx) => {
-		if (!ctx.pluginContext.autoStart.held) return
-		ctx.pluginContext.autoStart.held = false
-		await ctx.pluginContext.autoStart.run(ctx.sessionId, ctx.sessionState.workspaceDir, ctx.pluginState)
+		const held = ctx.pluginContext.autoStart.held(ctx.pluginState)
+		await ctx.pluginContext.autoStart.startAll(held, ctx.sessionId, ctx.sessionState.workspaceDir, ctx.pluginState)
 	})
 	.sessionHook('onSessionClose', async (ctx) => {
 		await ctx.pluginContext.close(ctx.sessionId, ctx.reason, ctx.runtimeActivity)

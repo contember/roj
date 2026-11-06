@@ -38,7 +38,7 @@ const sessionState: SessionState = createSessionState(sessionId, 'preset', 0)
 const entrySchema = z.object({
 	serviceType: z.string(),
 	status: z.enum(['stopped', 'starting', 'ready', 'stopping', 'failed']),
-	stoppedBy: z.enum(['agent', 'eviction', 'never']),
+	stoppedBy: z.enum(['agent', 'eviction', 'never', 'hold']),
 	port: z.number().optional(),
 	error: z.string().optional(),
 	startedAt: z.number().optional(),
@@ -101,6 +101,16 @@ describe('services projection conformance', () => {
 		])
 		// The only default that cannot resurrect a service somebody meant to stay down.
 		expect(final.web.stoppedBy).toBe('agent')
+	})
+
+	it('records a hold on an autoStart service that never ran, and clears it on the next start', () => {
+		const held = assertConformant([statusChanged({ serviceType: 'web', toStatus: 'stopped', stoppedBy: 'hold' })])
+		expect(held.web).toMatchObject({ status: 'stopped', stoppedBy: 'hold' })
+		const final = assertConformant([
+			statusChanged({ serviceType: 'web', toStatus: 'stopped', stoppedBy: 'hold' }),
+			statusChanged({ serviceType: 'web', toStatus: 'starting' }),
+		])
+		expect(final.web.stoppedBy).toBe('never')
 	})
 
 	it('resets stoppedBy, error and port on the next start', () => {

@@ -56,6 +56,8 @@ export function applyEventToServices(state: ServicesProjectionState, event: Proj
 					port: event.port,
 					startedAt: event.timestamp,
 				})
+			} else if (!existing && event.toStatus === 'stopped' && event.stoppedBy === 'hold') {
+				newServices.set(event.serviceType, { serviceType: event.serviceType, status: 'stopped', stoppedBy: 'hold', stoppedAt: event.timestamp })
 			} else if (existing) {
 				const updated: ServiceEntry = {
 					...existing,
