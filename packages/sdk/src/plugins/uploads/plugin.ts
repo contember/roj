@@ -621,7 +621,8 @@ async function isSuperseded(prepared: PreparedUpload): Promise<boolean> {
 }
 
 async function writeMetadata(uploadStore: FileStore, metadata: UploadMetadata): Promise<void> {
-	const result = await uploadStore.write('meta.json', JSON.stringify(metadata, null, 2))
+	// Read while it is rewritten: by the processing that supersedes a run, and by hosts polling an upload's status.
+	const result = await uploadStore.write('meta.json', JSON.stringify(metadata, null, 2), { atomic: true })
 	if (!result.ok) throw new Error(result.error)
 }
 
@@ -940,7 +941,11 @@ async function removeUploadFiles(uploadStore: FileStore, keep: ReadonlySet<strin
 		if (keep.has(entryPath)) continue
 		if (entry.type !== 'file' && entry.type !== 'symlink') return Err(`Unsupported upload entry: ${entryPath}`)
 		const removed = await uploadStore.remove(entryPath)
-		if (!removed.ok) return removed
+		if (removed.ok) continue
+		// A run that outlived its runtime renames its pending meta.json away between the listing and the removal.
+		// Listed again rather than `exists`, which follows links and would take a dangling one for gone.
+		const relisted = await uploadStore.list(path, { maxDepth: 1 })
+		if (!relisted.ok || relisted.value.some((listed) => listed.name === entry.name)) return removed
 	}
 	return Ok(undefined)
 }

@@ -210,7 +210,7 @@ export { Err, Ok } from '~/lib/utils/result.js'
 export type { Result } from '~/lib/utils/result.js'
 
 // File store
-export type { FileEntry, FileStore } from '~/core/file-store/types.js'
+export type { FileEntry, FileStore, WriteOptions } from '~/core/file-store/types.js'
 
 // Service config
 export { PortPool } from '~/plugins/services/port-pool.js'

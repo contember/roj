@@ -16,10 +16,12 @@
  * - 'workspace': paths relative to workspaceDir
  */
 
-import { dirname, join, normalize, resolve } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { basename, dirname, join, normalize, resolve } from 'node:path'
 import { containmentOf } from '~/core/file-store/containment.js'
-import type { FileEntry, FileStore } from '~/core/file-store/types.js'
+import type { FileEntry, FileStore, WriteOptions } from '~/core/file-store/types.js'
 import type { FileSystem, WalkEntry } from '~/platform/fs.js'
+import { replaceViaRename } from '~/platform/replace-file.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { Result } from '~/lib/utils/result.js'
 
@@ -64,18 +66,36 @@ export class SessionFileStore implements FileStore {
 		return new SessionFileStore(this.sessionDir, this.workspaceDir, this.sandboxed, this.fs, 'workspace', this.containmentRoots)
 	}
 
-	async write(path: string, content: string | Buffer): Promise<Result<{ path: string }, string>> {
+	async write(path: string, content: string | Buffer, options?: WriteOptions): Promise<Result<{ path: string }, string>> {
 		const resolved = await this.resolveContained(path, 'create')
 		if (!resolved.ok) return resolved
+		if (options?.atomic === true) {
+			// The rename replaces the entry rather than writing through a link at it, so its directory must be inside too.
+			const parent = await this.resolveContained(path, 'entry')
+			if (!parent.ok) return parent
+		}
 
 		try {
 			await this.fs.mkdir(dirname(resolved.value), { recursive: true })
-			await this.fs.writeFile(resolved.value, content)
+			if (options?.atomic === true) await this.replaceFile(resolved.value, content)
+			else await this.fs.writeFile(resolved.value, content)
 		} catch {
 			return Err(`Failed to write: ${path}`)
 		}
 
 		return Ok({ path: this.toAgentPath(resolved.value) })
+	}
+
+	/** Writes beside the file and renames over it, so a reader never sees a partial write. */
+	private async replaceFile(absolute: string, content: string | Buffer): Promise<void> {
+		const rename = this.fs.rename
+		// A platform without rename must have a writeFile no reader can interleave with (`FileSystem.rename`).
+		if (rename === undefined) {
+			await this.fs.writeFile(absolute, content)
+			return
+		}
+		const pending = join(dirname(absolute), `.${basename(absolute)}.pending-${randomUUID()}`)
+		await replaceViaRename(this.fs, rename.bind(this.fs), pending, absolute, content)
 	}
 
 	async read(path: string): Promise<Result<string, string>>

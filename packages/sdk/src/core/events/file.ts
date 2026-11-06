@@ -4,6 +4,7 @@ import z from 'zod/v4'
 import type { DomainEvent } from '~/core/events/types.js'
 import { silentLogger, type Logger } from '~/lib/logger/logger.js'
 import type { Dirent, FileSystem } from '~/platform/fs.js'
+import { replaceViaRename } from '~/platform/replace-file.js'
 import { domainEventSchema, isValidSessionId, SessionId, sessionMetadataSchema } from '~/core/sessions/schema.js'
 import type { SessionMetadata } from '~/core/sessions/schema.js'
 import { BaseEventStore } from './base-event-store.js'
@@ -291,12 +292,7 @@ export class FileEventStore extends BaseEventStore {
 	/** Swap in a whole new log in one rename, so a crash leaves either the old bytes or the new ones. */
 	private async replaceLog(sessionId: SessionId, content: Buffer): Promise<void> {
 		const pending = join(this.getEventsDir(sessionId), `.pending-${randomUUID()}`)
-		try {
-			await this.fs.writeFile(pending, content)
-			await this.rename(pending, this.getEventsPath(sessionId))
-		} finally {
-			await this.fs.unlink(pending).catch(() => {})
-		}
+		await replaceViaRename(this.fs, this.rename, pending, this.getEventsPath(sessionId), content)
 	}
 
 	async load(sessionId: SessionId): Promise<DomainEvent[]> {

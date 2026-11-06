@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import * as path from 'node:path'
+import type { FileSystem } from '~/platform/fs.js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
 import { SessionFileStore } from './file-store.js'
 
@@ -171,5 +172,70 @@ describe('SessionFileStore on a link it cannot resolve', () => {
 		const result = await store.remove('escape/secret.txt')
 		expect(result.ok).toBe(false)
 		expect(fs.existsSync(path.join(outside, 'secret.txt'))).toBe(true)
+	})
+})
+
+describe('SessionFileStore atomic write', () => {
+	/** A slow disk lets a reader in while a write is half done. */
+	function halvingFileSystem(options: { rename: boolean }): { fs: FileSystem; midWrite: () => Promise<void>; finish: () => void } {
+		const node = createNodeFileSystem()
+		let reachedMidWrite: () => void = () => {}
+		const midWrite = new Promise<void>((resolve) => { reachedMidWrite = resolve })
+		let finish: () => void = () => {}
+		const finished = new Promise<void>((resolve) => { finish = resolve })
+		const writeFile = async (target: string, data: string | Uint8Array): Promise<void> => {
+			const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data
+			await node.writeFile(target, bytes.subarray(0, bytes.length / 2))
+			reachedMidWrite()
+			await finished
+			await node.writeFile(target, bytes)
+		}
+		return { fs: { ...node, writeFile, rename: options.rename ? node.rename : undefined }, midWrite: () => midWrite, finish }
+	}
+
+	it('lets a concurrent read see the old content or the new, never a partial write', async () => {
+		fs.writeFileSync(path.join(root, 'meta.json'), '{"status":"processing"}')
+		const halving = halvingFileSystem({ rename: true })
+		const atomicStore = new SessionFileStore(root, undefined, false, halving.fs, 'session')
+
+		const writing = atomicStore.write('meta.json', '{"status":"ready"}', { atomic: true })
+		await halving.midWrite()
+		expect(await atomicStore.read('meta.json')).toEqual({ ok: true, value: '{"status":"processing"}' })
+		halving.finish()
+
+		expect((await writing).ok).toBe(true)
+		expect(await atomicStore.read('meta.json')).toEqual({ ok: true, value: '{"status":"ready"}' })
+		expect(fs.readdirSync(root).sort()).toEqual(['inside.txt', 'meta.json'])
+	})
+
+	it('leaves no pending file behind when the rename fails', async () => {
+		const node = createNodeFileSystem()
+		const failing = new SessionFileStore(root, undefined, false, {
+			...node,
+			rename: async () => { throw new Error('rename refused') },
+		}, 'session')
+
+		expect((await failing.write('meta.json', '{}', { atomic: true })).ok).toBe(false)
+		expect(fs.readdirSync(root)).toEqual(['inside.txt'])
+	})
+
+	it('refuses an atomic write whose directory is outside the root, though its link points back inside', async () => {
+		fs.symlinkSync(outside, path.join(root, 'link'))
+		fs.symlinkSync(path.join(root, 'inside.txt'), path.join(outside, 'meta.json'))
+
+		const result = await store.write('link/meta.json', 'replaced', { atomic: true })
+		expect(result.ok).toBe(false)
+		expect(fs.readdirSync(outside).sort()).toEqual(['meta.json', 'secret.txt'])
+		expect(fs.lstatSync(path.join(outside, 'meta.json')).isSymbolicLink()).toBe(true)
+		expect(fs.readFileSync(path.join(root, 'inside.txt'), 'utf8')).toBe('inside')
+	})
+
+	it('writes in place on a platform without rename', async () => {
+		const halving = halvingFileSystem({ rename: false })
+		halving.finish()
+		const inPlace = new SessionFileStore(root, undefined, false, halving.fs, 'session')
+
+		expect((await inPlace.write('meta.json', '{"status":"ready"}', { atomic: true })).ok).toBe(true)
+		expect(fs.readFileSync(path.join(root, 'meta.json'), 'utf8')).toBe('{"status":"ready"}')
 	})
 })

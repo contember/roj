@@ -18,6 +18,7 @@ import { Ok } from '~/lib/utils/result.js'
 import type { Preprocessor } from '~/plugins/uploads/preprocessor.js'
 import type { UploadSource } from '~/plugins/uploads/source.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
+import type { Platform } from '~/platform/index.js'
 import { createNodePlatform } from '~/testing/node-platform.js'
 import { bootstrapForTesting } from '../../../testing/bootstrap-for-testing.js'
 import type { AppEnv } from '../context.js'
@@ -345,7 +346,7 @@ describe('stored upload route', () => {
 
 	let fixture: StoredFixture | undefined
 
-	async function createStoredFixture(uploads?: BootstrapUploadOptions): Promise<StoredFixture> {
+	async function createStoredFixture(uploads?: BootstrapUploadOptions, platform: Platform = createNodePlatform()): Promise<StoredFixture> {
 		const dataDir = await mkdtemp(join(tmpdir(), 'roj-stored-upload-'))
 		const services = bootstrap({
 			port: 0,
@@ -360,7 +361,7 @@ describe('stored upload route', () => {
 				finishReason: 'stop',
 				metrics: { promptTokens: 0, completionTokens: 0, totalTokens: 0, latencyMs: 0, model: 'mock' },
 			}),
-		}, { presets: [createTestPreset()] }, createNodePlatform(), { uploads })
+		}, { presets: [createTestPreset()] }, platform, { uploads })
 		const sessionRuntime = createSystemFromServices(services).sessionManager
 
 		const storedApp = new Hono<AppEnv>()
@@ -454,6 +455,43 @@ describe('stored upload route', () => {
 		expect(opened).toEqual(['blob-1'])
 		expect(runs).toEqual([{ localPath: undefined, bytes: [1, 2, 3] }])
 		expect(await createNodePlatform().fs.exists(join(dataDir, 'sessions', sessionId, 'uploads', accepted.uploadId, 'scan.pdf'))).toBe(false)
+	})
+
+	it('never lets a status poll read a meta.json that is half written', async () => {
+		const bytes = new Uint8Array([1, 2, 3])
+		const node = createNodePlatform()
+		// Every write lands in two halves with time for several polls in between, as a slow disk lets one land.
+		const writeFile = async (path: string, data: string | Uint8Array): Promise<void> => {
+			const encoded = typeof data === 'string' ? new TextEncoder().encode(data) : data
+			await node.fs.writeFile(path, encoded.subarray(0, encoded.length / 2))
+			await new Promise((resolve) => setTimeout(resolve, 30))
+			await node.fs.writeFile(path, encoded)
+		}
+		const { app: storedApp, services, sessionRuntime } = await createStoredFixture({
+			blobStore: {
+				async open() {
+					return Ok({
+						size: bytes.length,
+						stream: () => new Blob([bytes]).stream(),
+						bytes: async () => bytes,
+						range: async (offset, length) => bytes.subarray(offset, offset + length),
+					})
+				},
+			},
+		}, { ...node, fs: { ...node.fs, writeFile } })
+		const sessionId = await createSession(sessionRuntime)
+
+		const res = await postStored(storedApp, sessionId, {
+			filename: 'notes.txt',
+			mimeType: 'text/plain',
+			size: bytes.length,
+			sha256: 'c'.repeat(64),
+			blobRef: 'blob-2',
+		})
+
+		expect(res.status).toBe(202)
+		const accepted = z.object({ uploadId: z.string() }).parse(await res.json())
+		await waitForStatus(services, sessionId, accepted.uploadId, 'ready')
 	})
 
 	it('applies the host processing timeout instead of the plugin default', async () => {
