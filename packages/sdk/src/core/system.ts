@@ -21,7 +21,7 @@ import type { LLMLogger } from './llm/logger.js'
 import type { LLMProvider } from './llm/provider.js'
 import type { PluginDefinition } from './plugins/plugin-builder.js'
 import type { Preset } from './preset/index.js'
-import { SessionManager } from './sessions/session-manager.js'
+import { type InterruptedWorkHold, SessionManager } from './sessions/session-manager.js'
 import type { UserOutputCallback } from './sessions/session.js'
 import type { ToolExecutor } from './tools/executor.js'
 
@@ -142,6 +142,8 @@ export interface CreateSystemOptions<TPlugins extends readonly PluginDefinition<
 	 * the SDK default. A host that drains on a deadline should keep this under its own budget.
 	 */
 	writeQueueTimeoutMs?: number
+	/** Which sessions load without resuming their interrupted work. Absent resumes every one. */
+	holdInterruptedWork?: InterruptedWorkHold
 }
 
 // ============================================================================
@@ -174,6 +176,7 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		platform,
 		sessionIdleTimeoutMs,
 		writeQueueTimeoutMs,
+		holdInterruptedWork,
 	} = options
 
 	// Build plugins accessor — typed record keyed by plugin name
@@ -204,6 +207,7 @@ export function createSystem<const TPlugins extends readonly PluginDefinition<st
 		platform,
 		sessionIdleTimeoutMs,
 		writeQueueTimeoutMs,
+		holdInterruptedWork,
 		systemPlugins: [...plugins],
 	})
 

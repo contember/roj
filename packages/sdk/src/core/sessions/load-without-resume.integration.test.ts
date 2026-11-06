@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, spyOn } from 'bun:test'
+import { afterEach, describe, expect, it, setSystemTime, spyOn } from 'bun:test'
 import type { AgentId } from '~/core/agents/schema.js'
 import { ValidationErrors } from '~/core/errors.js'
 import { agentEvents } from '~/core/agents/state.js'
@@ -7,6 +7,7 @@ import { MockLLMProvider } from '~/core/llm/mock.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { SessionId } from '~/core/sessions/schema.js'
+import type { InterruptedWorkHold } from '~/core/sessions/session-manager.js'
 import { Session } from '~/core/sessions/session.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { Err } from '~/lib/utils/result.js'
@@ -14,12 +15,17 @@ import { createTestPreset, TestHarness, type TestSession } from '~/testing/index
 
 const harnesses: TestHarness[] = []
 afterEach(async () => {
+	setSystemTime()
 	for (const harness of harnesses.splice(0)) await harness.shutdown()
 })
 
-function harness(eventStore?: MemoryEventStore, llmProvider?: MockLLMProvider): TestHarness {
+function harness(
+	eventStore?: MemoryEventStore,
+	llmProvider?: MockLLMProvider,
+	options: { holdInterruptedWork?: InterruptedWorkHold; sessionIdleTimeoutMs?: number } = {},
+): TestHarness {
 	const preset = createTestPreset({ agents: [{ name: 'child', system: 'Finish the task', tools: [], agents: [] }] })
-	const result = new TestHarness({ presets: [preset], eventStore, llmProvider })
+	const result = new TestHarness({ presets: [preset], eventStore, llmProvider, ...options })
 	harnesses.push(result)
 	return result
 }
@@ -469,5 +475,64 @@ describe('loadAllSessions without resume', () => {
 		const reopened = await later.openSession(sessionId)
 		await reopened.sendMessage('Change the title')
 		expect(await agentStatus(later, sessionId, agentId)).not.toBe('paused')
+	})
+})
+
+describe('holdInterruptedWork', () => {
+	const HOUR_MS = 60 * 60 * 1000
+
+	it('holds a session whose last event is older than idleForMs, on a load a wake or a request starts', async () => {
+		const { eventStore, sessionId, agentId } = await interruptedSession()
+		const later = harness(eventStore, undefined, { holdInterruptedWork: { idleForMs: 24 * HOUR_MS } })
+		setSystemTime(new Date(Date.now() + 25 * HOUR_MS))
+
+		await liveSession(later, sessionId)
+		await Bun.sleep(50)
+		expect(later.llmProvider.getCallCount()).toBe(0)
+		expect(await agentStatus(later, sessionId, agentId)).toBe('paused')
+		const pauses = (await eventStore.load(sessionId)).filter(event => event.type === 'agent_paused')
+		expect(pauses.at(-1)).toMatchObject({ agentId, resumeOnInput: true })
+	})
+
+	it('resumes a session that has not been idle that long', async () => {
+		const { eventStore, sessionId } = await interruptedSession()
+		const later = harness(eventStore, undefined, { holdInterruptedWork: { idleForMs: 24 * HOUR_MS } })
+		setSystemTime(new Date(Date.now() + 23 * HOUR_MS))
+
+		await liveSession(later, sessionId)
+		await waitUntil(() => later.llmProvider.getCallCount() === 1)
+	})
+
+	it('resumes an idle session held this way when its user writes', async () => {
+		const { eventStore, sessionId, agentId } = await interruptedSession()
+		const later = harness(eventStore, undefined, { holdInterruptedWork: { idleForMs: 24 * HOUR_MS } })
+		setSystemTime(new Date(Date.now() + 25 * HOUR_MS))
+
+		const reopened = await later.openSession(sessionId)
+		await reopened.sendMessage('Change the title')
+		await waitUntil(() => later.llmProvider.getCallCount() === 1)
+		expect(await agentStatus(later, sessionId, agentId)).not.toBe('paused')
+	})
+
+	it('holds a restored session that a request loads before loadAllSessions runs', async () => {
+		const { eventStore, sessionId, agentId } = await interruptedSession()
+		const restored = harness(eventStore, undefined, { holdInterruptedWork: { restored: true } })
+
+		await liveSession(restored, sessionId)
+		await Bun.sleep(50)
+		expect(restored.llmProvider.getCallCount()).toBe(0)
+		expect(await agentStatus(restored, sessionId, agentId)).toBe('paused')
+	})
+
+	it('does not hold a session this manager created when it loads it again', async () => {
+		const owner = harness(undefined, undefined, { holdInterruptedWork: { restored: true }, sessionIdleTimeoutMs: 100 })
+		const session = await owner.createSession('test')
+		const agentId = session.getEntryAgentId()
+		if (!agentId) throw new Error('Expected an entry agent')
+		await leaveUnanswered(owner, session, agentId, 'Rebuild the site')
+		await waitUntil(() => owner.sessionManager.getRuntimeCacheStats().loadedSessionCount === 0, 2_000)
+
+		await liveSession(owner, session.sessionId)
+		await waitUntil(() => owner.llmProvider.getCallCount() === 1)
 	})
 })

@@ -110,6 +110,22 @@ export interface SessionManagerOptions {
 	 * close instead of outliving it.
 	 */
 	writeQueueTimeoutMs?: number
+	/** Which sessions this manager loads without resuming their interrupted work. Absent resumes every one. */
+	holdInterruptedWork?: InterruptedWorkHold
+}
+
+/**
+ * Sessions whose interrupted work waits for their user instead of resuming as they load, held the way
+ * `loadAllSessions({ resume: false })` holds it. A user message or answer releases the hold.
+ */
+export interface InterruptedWorkHold {
+	/**
+	 * Every session's log came from somewhere else: each is held at its first load by this manager.
+	 * Set at construction, so no request can load one unheld before `loadAllSessions` runs.
+	 */
+	restored?: boolean
+	/** A session whose last event is at least this old when it loads has slept too long to continue on its own. */
+	idleForMs?: number
 }
 
 interface SessionCacheEntry {
@@ -355,6 +371,9 @@ export class SessionManager {
 	private shuttingDown = false
 	/** Marked by `loadAllSessions({ resume: false })` until their first load, which pauses their agents before they continue. */
 	private readonly loadingWithoutResume = new Set<SessionId>()
+	private readonly interruptedWorkHold: InterruptedWorkHold
+	/** Sessions whose runtime this manager built; with `restored`, the others are still to be held. */
+	private readonly builtHere = new Set<SessionId>()
 
 	constructor(options: SessionManagerOptions) {
 		if (options.sessionIdleTimeoutMs !== undefined && (!Number.isSafeInteger(options.sessionIdleTimeoutMs) || options.sessionIdleTimeoutMs < 0)) {
@@ -363,6 +382,11 @@ export class SessionManager {
 		if (options.writeQueueTimeoutMs !== undefined && !isValidWriteQueueTimeoutMs(options.writeQueueTimeoutMs)) {
 			throw new Error(`Invalid writeQueueTimeoutMs: ${options.writeQueueTimeoutMs}`)
 		}
+		const idleForMs = options.holdInterruptedWork?.idleForMs
+		if (idleForMs !== undefined && (!Number.isSafeInteger(idleForMs) || idleForMs <= 0)) {
+			throw new Error(`Invalid holdInterruptedWork.idleForMs: ${idleForMs}`)
+		}
+		this.interruptedWorkHold = options.holdInterruptedWork ?? {}
 		this.eventStore = options.eventStore
 		this.llmProvider = options.llmProvider
 		this.llmProviders = options.llmProviders ?? new Map()
@@ -885,6 +909,9 @@ export class SessionManager {
 			return await this.createSessionInstance(store, preset, plugins, entry, { skipReadyHooks: true })
 		}
 
+		// Decided before the recovery below appends an event of its own.
+		const holdsInterruptedWork = this.holdsInterruptedWork(sessionId, events[events.length - 1].timestamp)
+
 		// Check if recovery is needed after restart
 		const recoveryData = checkRecoveryNeeded(state)
 		if (recoveryData) {
@@ -904,7 +931,7 @@ export class SessionManager {
 		}
 
 		// Create session (auto-start services run via onSessionReady)
-		const session = await this.createSessionInstance(store, preset, plugins, entry, { holdInterruptedWork: this.loadingWithoutResume.has(sessionId) })
+		const session = await this.createSessionInstance(store, preset, plugins, entry, { holdInterruptedWork: holdsInterruptedWork })
 		// Only once held: a load that failed leaves the mark, so the next load holds the work too.
 		this.loadingWithoutResume.delete(sessionId)
 
@@ -912,6 +939,14 @@ export class SessionManager {
 		session.checkPendingAgents()
 
 		return session
+	}
+
+	/** Whether this load holds the session's interrupted work: marked by `loadAllSessions`, or by `InterruptedWorkHold`. */
+	private holdsInterruptedWork(sessionId: SessionId, lastEventAt: number): boolean {
+		if (this.loadingWithoutResume.has(sessionId)) return true
+		if (this.interruptedWorkHold.restored === true && !this.builtHere.has(sessionId)) return true
+		const { idleForMs } = this.interruptedWorkHold
+		return idleForMs !== undefined && Date.now() - lastEventAt >= idleForMs
 	}
 
 	private async pauseUnresumedAgents(session: Session): Promise<void> {
@@ -1481,6 +1516,7 @@ export class SessionManager {
 			// Skipped for closed sessions to preserve event log immutability.
 			if (!opts.skipReadyHooks) await session.callSessionReadyHooks({ resumeInterruptedWork: opts.holdInterruptedWork !== true })
 			this.assertAdmission(entry.tenure)
+			if (this.interruptedWorkHold.restored === true) this.builtHere.add(store.sessionId)
 		} catch (error) {
 			const stopped = entry.activity.getSnapshot().state === 'revoked'
 			if (entry.tenure.state === 'revoked') session.revoke()

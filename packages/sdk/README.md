@@ -107,6 +107,22 @@ also mean an obsolete target or unrecognized key was ignored, not inference ran.
 Graceful park waits for tracked scheduler operations and rejects on their failure.
 Fence stale scheduler calls so an old owner cannot cancel or replace a new wake.
 
+## Holding interrupted work
+
+A session loads by default with its interrupted work resumed: a pending start, tool calls, an
+unanswered inference, a retry after an error. A host that must not run such work unattended holds
+it instead, with `createSystemFromServices(services, { holdInterruptedWork })`:
+
+- `restored: true` holds every session at its first load by this manager, for logs copied from
+  somewhere else. Set at construction, so a request that loads a session before
+  `loadAllSessions({ resume: false })` reaches it is held too.
+- `idleForMs` holds a session whose last event is at least that old when it loads, on whatever
+  path loads it: a request, a wake, `loadAllSessions`.
+
+A held load pauses each agent with work durably and parks running workers; services configured
+with `autoStart` stay down. A user message or answer releases the hold: the agents resume, the
+workers relaunch and the services start.
+
 ## Retryable user-chat acceptance
 
 `user-chat.sendMessage` accepts `{ content, agentId?, deliveryId?, keepHold? }` and returns
@@ -114,7 +130,8 @@ Fence stale scheduler calls so an old owner cannot cancel or replace a new wake.
 opaque string of at most 256 characters, scoped to the session. Without it, calls do not deduplicate.
 
 `keepHold: true` is for notices the host sends on its own. In a session loaded by
-`loadAllSessions({ resume: false })`, such a message does not release the hold: a held
+`loadAllSessions({ resume: false })` or under the manager's `holdInterruptedWork` option,
+such a message does not release the hold: a held
 agent reads it once the hold is released, and an agent that is not held answers it as
 usual. That agent's `resume_agent` and `worker_resume` refuse what the hold paused.
 `keepHold: true` is part of the delivery fingerprint, so a retry that changes it conflicts.

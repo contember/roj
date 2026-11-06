@@ -24,7 +24,7 @@ import { ImageClassifierPreprocessor, MarkitdownPreprocessor, PdfPreprocessor, Z
 import type { UploadBlobStore } from '~/plugins/uploads/source.js'
 import type { Config } from './config.js'
 import { SessionFileStore } from './core/file-store/file-store.js'
-import type { SessionManager } from './core/sessions/session-manager.js'
+import type { InterruptedWorkHold, SessionManager } from './core/sessions/session-manager.js'
 import type { UserOutputCallback } from './core/sessions/session.js'
 import { type AllMethodSchemas, createSystem, type System } from './core/system.js'
 import type { ToolExecutor } from './core/tools/executor.js'
@@ -339,6 +339,8 @@ function createLLMProvider(config: Config, logger: Logger, platform: Platform, i
 
 interface CreateSystemFromServicesOptions {
 	onUserOutput?: UserOutputCallback
+	/** Which sessions load without resuming their interrupted work. Absent resumes every one. */
+	holdInterruptedWork?: InterruptedWorkHold
 }
 
 /** Everything a System needs except the plugin set, which the profile picks. */
@@ -353,6 +355,7 @@ function buildSystem(services: Services<PluginProfile>, options?: CreateSystemFr
 		basePath: services.config.dataPath,
 		dataFileStore: services.dataFileStore,
 		onUserOutput: options?.onUserOutput,
+		holdInterruptedWork: options?.holdInterruptedWork,
 		preprocessorRegistry: services.preprocessorRegistry,
 		uploadBlobStore: services.uploadBlobStore,
 		uploadProcessingTimeoutMs: services.uploadProcessingTimeoutMs,
