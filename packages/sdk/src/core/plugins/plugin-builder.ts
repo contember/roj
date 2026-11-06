@@ -260,7 +260,7 @@ type SessionHookMap<TCtx> = {
 	 * Runs once per resident runtime lifetime, not once per session — an evicted
 	 * runtime is rebuilt from its event log and runs this hook again.
 	 * `resumeInterruptedWork` is false on a load that holds interrupted work
-	 * (`SessionManager.loadAllSessions({ resume: false })`): restart nothing that was running.
+	 * (`SessionManager.loadAllSessions({ resume: false })`, `InterruptedWorkHold`): start nothing on your own.
 	 */
 	onSessionReady: (ctx: TCtx & { resumeInterruptedWork: boolean }) => Promise<void>
 	/** The session's held work is released (`Session.releaseHold`): relaunch what was parked instead of restarted. */

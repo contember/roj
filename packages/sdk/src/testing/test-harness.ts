@@ -13,7 +13,7 @@ import type { CallerContext, PluginDefinition, PluginNotification } from '~/core
 import type { Preset } from '~/core/preset/index.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import type { SessionId } from '~/core/sessions/schema.js'
-import { SessionManager } from '~/core/sessions/session-manager.js'
+import { type InterruptedWorkHold, SessionManager } from '~/core/sessions/session-manager.js'
 import type { Session } from '~/core/sessions/session.js'
 import type { SessionOverridesPatch, SessionState } from '~/core/sessions/state.js'
 import { ToolExecutor } from '~/core/tools/executor.js'
@@ -61,6 +61,7 @@ export class TestHarness {
 		sessionIdleTimeoutMs?: number
 		uploadMaxFileSize?: number
 		writeQueueTimeoutMs?: number
+		holdInterruptedWork?: InterruptedWorkHold
 		/** Stand in for a durable scheduler, so tests can fail a wake the way a real one does. */
 		scheduler?: Scheduler
 		/** Extra notification sink, run after the recorder. Throwing here simulates a hostile embedder. */
@@ -123,6 +124,7 @@ export class TestHarness {
 			sessionIdleTimeoutMs: options.sessionIdleTimeoutMs,
 			uploadMaxFileSize: options.uploadMaxFileSize,
 			writeQueueTimeoutMs: options.writeQueueTimeoutMs,
+			holdInterruptedWork: options.holdInterruptedWork,
 			systemPlugins: mergeSystemPlugins([...fullPlugins, ...(options.systemPlugins ?? [])]),
 		})
 	}

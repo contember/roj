@@ -22,8 +22,11 @@ export type ServiceStatus = 'stopped' | 'starting' | 'ready' | 'stopping' | 'fai
  */
 export type ServiceStopSource = 'agent' | 'eviction'
 
-/** `never` means the service has not been stopped since its last start. */
-export type ServiceStoppedBy = ServiceStopSource | 'never'
+/**
+ * `never` means the service has not been stopped since its last start. `hold` keeps an autoStart
+ * service down while its session holds interrupted work; the hold's release starts it.
+ */
+export type ServiceStoppedBy = ServiceStopSource | 'never' | 'hold'
 
 // ============================================================================
 // Service Config (declared in presets)

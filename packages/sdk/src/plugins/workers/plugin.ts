@@ -22,7 +22,7 @@ import { generateWorkerId, type WorkerEntry, WorkerId, type WorkerId as WorkerId
 export const MAX_CONCURRENT_WORKERS = 10
 
 /** Why a restore's hold parked a running worker. */
-const HELD_REASON = 'Held: the session was restored, so the worker waits for a new message'
+const HELD_REASON = 'Held: the session holds its interrupted work, so the worker waits for a new message'
 
 /** Default bound on waiting for a stopped worker's `execute()` to return. */
 export const WORKER_STOP_TIMEOUT_MS = 5000
@@ -343,7 +343,7 @@ interface RelaunchContext {
 	runtimeActivity: SessionRuntimeActivity
 }
 
-const HELD_WORKER_RESUME_REFUSAL = 'This worker was interrupted when its session was restored; it resumes when the user writes.'
+const HELD_WORKER_RESUME_REFUSAL = 'This worker\'s interrupted work is held; it resumes when the user writes.'
 
 /** The worker's entry now: a hook's `pluginState` is a snapshot that any await in the hook makes stale. */
 function liveWorkerEntry(ctx: { getSessionState: () => SessionState }, workerId: WorkerIdType): WorkerEntry | undefined {

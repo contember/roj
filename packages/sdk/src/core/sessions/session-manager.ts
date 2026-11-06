@@ -55,7 +55,7 @@ import type { SessionStoreOptions } from './session-store.js'
 import { Session, type SessionReopenRegistration, type UserOutputCallback } from './session.js'
 import { SessionRuntimeActivityController, SessionRuntimeUnavailableError } from './runtime-activity.js'
 
-const NOT_RESUMED_MESSAGE = 'Not resumed: the session was restored, so its interrupted work waits for a new message or an explicit resume'
+const NOT_RESUMED_MESSAGE = 'Not resumed: the session holds its interrupted work until a new message or an explicit resume'
 
 // ============================================================================
 // Errors
@@ -110,6 +110,26 @@ export interface SessionManagerOptions {
 	 * close instead of outliving it.
 	 */
 	writeQueueTimeoutMs?: number
+	/** Which sessions this manager loads without resuming their interrupted work. Absent resumes every one. */
+	holdInterruptedWork?: InterruptedWorkHold
+}
+
+/**
+ * Sessions whose interrupted work waits for their user instead of resuming as they load, held the way
+ * `loadAllSessions({ resume: false })` holds it. A user message or answer releases the hold.
+ */
+export interface InterruptedWorkHold {
+	/**
+	 * Every session's log came from somewhere else: each is held at its first load by this manager.
+	 * Set at construction, so no request can load one unheld before `loadAllSessions` runs. A session
+	 * this manager built (created, forked or held) is not held again for the rest of its life, eviction included.
+	 */
+	restored?: boolean
+	/**
+	 * A session whose last event is at least this old when it loads has slept too long to continue on its own.
+	 * The hold's own events make the log fresh again; the work stays held by them, not by this clock.
+	 */
+	idleForMs?: number
 }
 
 interface SessionCacheEntry {
@@ -153,6 +173,8 @@ interface SessionTenure {
 	parkPromise?: Promise<void>
 	entry?: SessionCacheEntry
 	readonly entries: Set<SessionCacheEntry>
+	/** A load under this activation decided to hold the work and failed before it held it; the retry holds too. */
+	holdOnRetry?: boolean
 }
 
 /** Why the manager is dropping a resident runtime — finer-grained than what plugins see. */
@@ -355,6 +377,9 @@ export class SessionManager {
 	private shuttingDown = false
 	/** Marked by `loadAllSessions({ resume: false })` until their first load, which pauses their agents before they continue. */
 	private readonly loadingWithoutResume = new Set<SessionId>()
+	private readonly interruptedWorkHold: InterruptedWorkHold
+	/** Sessions whose runtime this manager built; with `restored`, the others are still to be held. */
+	private readonly builtHere = new Set<SessionId>()
 
 	constructor(options: SessionManagerOptions) {
 		if (options.sessionIdleTimeoutMs !== undefined && (!Number.isSafeInteger(options.sessionIdleTimeoutMs) || options.sessionIdleTimeoutMs < 0)) {
@@ -363,6 +388,11 @@ export class SessionManager {
 		if (options.writeQueueTimeoutMs !== undefined && !isValidWriteQueueTimeoutMs(options.writeQueueTimeoutMs)) {
 			throw new Error(`Invalid writeQueueTimeoutMs: ${options.writeQueueTimeoutMs}`)
 		}
+		const idleForMs = options.holdInterruptedWork?.idleForMs
+		if (idleForMs !== undefined && (!Number.isSafeInteger(idleForMs) || idleForMs <= 0)) {
+			throw new Error(`Invalid holdInterruptedWork.idleForMs: ${idleForMs}`)
+		}
+		this.interruptedWorkHold = options.holdInterruptedWork ?? {}
 		this.eventStore = options.eventStore
 		this.llmProvider = options.llmProvider
 		this.llmProviders = options.llmProviders ?? new Map()
@@ -885,6 +915,10 @@ export class SessionManager {
 			return await this.createSessionInstance(store, preset, plugins, entry, { skipReadyHooks: true })
 		}
 
+		const holdsInterruptedWork = entry.tenure.holdOnRetry === true || this.holdsInterruptedWork(sessionId, events)
+		// Until the load holds the work durably: a retry under this activation holds it too, though the recovery below makes the log look fresh.
+		if (holdsInterruptedWork) entry.tenure.holdOnRetry = true
+
 		// Check if recovery is needed after restart
 		const recoveryData = checkRecoveryNeeded(state)
 		if (recoveryData) {
@@ -904,14 +938,28 @@ export class SessionManager {
 		}
 
 		// Create session (auto-start services run via onSessionReady)
-		const session = await this.createSessionInstance(store, preset, plugins, entry, { holdInterruptedWork: this.loadingWithoutResume.has(sessionId) })
-		// Only once held: a load that failed leaves the mark, so the next load holds the work too.
+		const session = await this.createSessionInstance(store, preset, plugins, entry, { holdInterruptedWork: holdsInterruptedWork })
+		// Only once held: a load that failed leaves the marks, so the next load holds the work too.
 		this.loadingWithoutResume.delete(sessionId)
+		entry.tenure.holdOnRetry = false
 
 		// Check for pending agents
 		session.checkPendingAgents()
 
 		return session
+	}
+
+	/** Whether this load holds the session's interrupted work: marked by `loadAllSessions`, or by `InterruptedWorkHold`. */
+	private holdsInterruptedWork(sessionId: SessionId, events: readonly DomainEvent[]): boolean {
+		if (this.loadingWithoutResume.has(sessionId)) return true
+		if (this.interruptedWorkHold.restored === true && !this.builtHere.has(sessionId)) return true
+		const { idleForMs } = this.interruptedWorkHold
+		if (idleForMs === undefined) return false
+		// A load that failed before it held the work leaves its recovery as the last event; the session slept since the one before.
+		for (let i = events.length - 1; i >= 0; i--) {
+			if (events[i].type !== 'session_restarted') return Date.now() - events[i].timestamp >= idleForMs
+		}
+		return false
 	}
 
 	private async pauseUnresumedAgents(session: Session): Promise<void> {
@@ -1481,6 +1529,7 @@ export class SessionManager {
 			// Skipped for closed sessions to preserve event log immutability.
 			if (!opts.skipReadyHooks) await session.callSessionReadyHooks({ resumeInterruptedWork: opts.holdInterruptedWork !== true })
 			this.assertAdmission(entry.tenure)
+			if (this.interruptedWorkHold.restored === true) this.builtHere.add(store.sessionId)
 		} catch (error) {
 			const stopped = entry.activity.getSnapshot().state === 'revoked'
 			if (entry.tenure.state === 'revoked') session.revoke()
