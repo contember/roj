@@ -173,6 +173,8 @@ interface SessionTenure {
 	parkPromise?: Promise<void>
 	entry?: SessionCacheEntry
 	readonly entries: Set<SessionCacheEntry>
+	/** A load under this activation decided to hold the work and failed before it held it; the retry holds too. */
+	holdOnRetry?: boolean
 }
 
 /** Why the manager is dropping a resident runtime — finer-grained than what plugins see. */
@@ -913,9 +915,9 @@ export class SessionManager {
 			return await this.createSessionInstance(store, preset, plugins, entry, { skipReadyHooks: true })
 		}
 
-		const holdsInterruptedWork = this.holdsInterruptedWork(sessionId, events)
-		// Until the load holds the work durably: a retry in this process holds it too, though the recovery below makes the log look fresh.
-		if (holdsInterruptedWork) this.loadingWithoutResume.add(sessionId)
+		const holdsInterruptedWork = entry.tenure.holdOnRetry === true || this.holdsInterruptedWork(sessionId, events)
+		// Until the load holds the work durably: a retry under this activation holds it too, though the recovery below makes the log look fresh.
+		if (holdsInterruptedWork) entry.tenure.holdOnRetry = true
 
 		// Check if recovery is needed after restart
 		const recoveryData = checkRecoveryNeeded(state)
@@ -937,8 +939,9 @@ export class SessionManager {
 
 		// Create session (auto-start services run via onSessionReady)
 		const session = await this.createSessionInstance(store, preset, plugins, entry, { holdInterruptedWork: holdsInterruptedWork })
-		// Only once held: a load that failed leaves the mark, so the next load holds the work too.
+		// Only once held: a load that failed leaves the marks, so the next load holds the work too.
 		this.loadingWithoutResume.delete(sessionId)
+		entry.tenure.holdOnRetry = false
 
 		// Check for pending agents
 		session.checkPendingAgents()

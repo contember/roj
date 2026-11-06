@@ -122,8 +122,10 @@ it instead, with `createSystemFromServices(services, { holdInterruptedWork })`:
 A held load pauses each agent with work durably and parks running workers; services configured
 with `autoStart` stay down, recorded as `stoppedBy: 'hold'`. All three hold across later loads,
 an eviction included. A user message or answer releases the hold: the agents resume, the workers
-relaunch and the services start. The idle clock skips the recovery event a failed held load
-leaves behind, so a retry holds the work too.
+relaunch and the services start. An explicit `agents.resume` resumes that agent alone; held
+workers and services wait for the user's message, or for `services.start`. The idle clock skips the
+recovery event a failed held load leaves behind, and a retry under the same activation holds the
+work too.
 
 ## Retryable user-chat acceptance
 

@@ -574,6 +574,22 @@ describe('holdInterruptedWork', () => {
 		expect(readyHooks.mock.calls.map(call => call[0])).toEqual([{ resumeInterruptedWork: false }, { resumeInterruptedWork: false }])
 	})
 
+	it('does not hold a session that another host made fresh after a held load here failed', async () => {
+		const { eventStore, sessionId, agentId } = await idleInferringSession()
+		const here = harness(eventStore, undefined, { holdInterruptedWork: { idleForMs: 24 * HOUR_MS } })
+		const first = here.sessionManager.activateSession(sessionId)
+		if (!first.ok) throw new Error('Expected the first activation')
+		spyOn(Session.prototype, 'pauseAgentsWithWork').mockImplementationOnce(async () => Err(ValidationErrors.invalid('store unavailable')))
+		expect((await here.sessionManager.getSession(sessionId)).ok).toBe(false)
+		here.sessionManager.revokeSession(first.value)
+
+		// Another host owned it meanwhile: the user wrote there, and the agent has fresh work.
+		await eventStore.append(sessionId, withSessionId(sessionId, agentEvents.create('agent_resumed', { agentId })))
+		expect(here.sessionManager.activateSession(sessionId).ok).toBe(true)
+		await liveSession(here, sessionId)
+		await waitUntil(() => here.llmProvider.getCallCount() === 1)
+	})
+
 	it('refuses an idleForMs that is not a positive integer', () => {
 		for (const idleForMs of [0, -1, 1.5, Number.NaN]) {
 			expect(() => harness(undefined, undefined, { holdInterruptedWork: { idleForMs } })).toThrow('Invalid holdInterruptedWork.idleForMs')
