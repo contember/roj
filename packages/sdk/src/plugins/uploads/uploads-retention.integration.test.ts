@@ -6,7 +6,7 @@ import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { EventAppendError, SessionOwnershipLostError } from '~/core/events/event-store.js'
 import type { DomainEvent } from '~/core/events/types.js'
 import { SessionFileStore } from '~/core/file-store/file-store.js'
-import type { FileEntry, FileStore } from '~/core/file-store/types.js'
+import type { FileEntry, FileStore, WriteOptions } from '~/core/file-store/types.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import type { SessionId } from '~/core/sessions/schema.js'
 import { SessionManager } from '~/core/sessions/session-manager.js'
@@ -111,13 +111,13 @@ class SelectiveFailureStore implements FileStore {
 		return this.faults.writes.filter((write) => write.path.endsWith(suffix))
 	}
 
-	write(path: string, content: string | Buffer): Promise<Result<{ path: string }, string>> {
+	write(path: string, content: string | Buffer, options?: WriteOptions): Promise<Result<{ path: string }, string>> {
 		const fault = this.faults.writeFaults.get(path.split('/').pop() ?? path)
 		if (fault?.mode === 'throw') throw new Error(fault.message)
 		if (fault?.mode === 'err') return Promise.resolve(Err(fault.message))
 		this.faults.writes.push({ path: this.prefix ? `${this.prefix}/${path}` : path, content: content.toString() })
-		if (this.faults.beforeWrite) return this.faults.beforeWrite(path, content).then(() => this.delegate.write(path, content))
-		return this.delegate.write(path, content)
+		if (this.faults.beforeWrite) return this.faults.beforeWrite(path, content).then(() => this.delegate.write(path, content, options))
+		return this.delegate.write(path, content, options)
 	}
 
 	read(path: string): Promise<Result<string, string>>

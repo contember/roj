@@ -621,7 +621,8 @@ async function isSuperseded(prepared: PreparedUpload): Promise<boolean> {
 }
 
 async function writeMetadata(uploadStore: FileStore, metadata: UploadMetadata): Promise<void> {
-	const result = await uploadStore.write('meta.json', JSON.stringify(metadata, null, 2))
+	// Read while it is rewritten: by the processing that supersedes a run, and by hosts polling an upload's status.
+	const result = await uploadStore.write('meta.json', JSON.stringify(metadata, null, 2), { atomic: true })
 	if (!result.ok) throw new Error(result.error)
 }
 

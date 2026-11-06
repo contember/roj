@@ -18,9 +18,16 @@ export interface FileEntry {
 	size?: number
 }
 
+export interface WriteOptions {
+	atomic?: boolean
+}
+
 export interface FileStore {
-	/** Write text or binary content. Auto-creates parent dirs. Returns the agent-visible path. */
-	write(path: string, content: string | Buffer): Promise<Result<{ path: string }, string>>
+	/**
+	 * Write text or binary content. Auto-creates parent dirs. Returns the agent-visible path.
+	 * `atomic` replaces the file in one step, so a concurrent read sees the old content or the new, never part of it.
+	 */
+	write(path: string, content: string | Buffer, options?: WriteOptions): Promise<Result<{ path: string }, string>>
 
 	/** Read file as UTF-8 text. */
 	read(path: string): Promise<Result<string, string>>

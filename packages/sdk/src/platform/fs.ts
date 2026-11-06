@@ -28,7 +28,10 @@ export interface FileSystem {
 
 	writeFile(path: string, data: string | Uint8Array): Promise<void>
 	appendFile(path: string, data: string | Uint8Array): Promise<void>
-	/** FileEventStore requires atomic same-directory rename, including replacement of metadata files. */
+	/**
+	 * FileEventStore requires atomic same-directory rename, including replacement of metadata files.
+	 * Without it, an atomic FileStore write falls back to `writeFile`, which must then be atomic to readers.
+	 */
 	rename?(source: string, dest: string): Promise<void>
 
 	mkdir(path: string, options?: { recursive?: boolean }): Promise<void>

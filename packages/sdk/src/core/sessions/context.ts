@@ -4,7 +4,7 @@ import type { LLMLogger } from '~/core/llm/logger'
 import type { LLMProvider } from '~/core/llm/provider'
 import type { Logger } from '~/lib/logger/logger'
 import type { Platform } from '~/platform/index.js'
-import type { FileStore } from '../file-store/types.js'
+import type { FileStore, WriteOptions } from '../file-store/types.js'
 import type { SessionId } from './schema.js'
 import type { SessionEnvironment } from './session-environment.js'
 import type { SessionRuntimeActivity } from './runtime-activity.js'
@@ -17,8 +17,8 @@ export class RuntimeFileStore implements FileStore {
 		this.source = source instanceof RuntimeFileStore ? source.source : source
 	}
 
-	write(path: string, content: string | Buffer) {
-		return this.activity.trackResource(() => this.source.write(path, content))
+	write(path: string, content: string | Buffer, options?: WriteOptions) {
+		return this.activity.trackResource(() => this.source.write(path, content, options))
 	}
 
 	// Reads pass through. Only a write can land behind the runtime that replaces
