@@ -233,7 +233,7 @@ export class ContextCompactor {
 
 	/**
 	 * Compact conversation history if needed.
-	 * Returns null if compaction was not needed.
+	 * Returns null if compaction was not needed, or when every message falls in the kept tail and nothing was compacted.
 	 */
 	async compactIfNeeded(
 		sessionId: SessionId,
@@ -243,6 +243,9 @@ export class ContextCompactor {
 		lastActualPromptTokens?: number,
 	): Promise<Result<CompactionResult | null, Error>> {
 		if (!this.needsCompaction(messages, lastActualPromptTokens)) {
+			return Ok(null)
+		}
+		if (this.computeKeepCount(messages) === messages.length) {
 			return Ok(null)
 		}
 
