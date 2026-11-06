@@ -10,6 +10,7 @@ import type { SessionId } from '~/core/sessions/schema.js'
 import type { InterruptedWorkHold } from '~/core/sessions/session-manager.js'
 import { Session } from '~/core/sessions/session.js'
 import { ToolCallId } from '~/core/tools/schema.js'
+import { llmEvents } from '~/core/llm/state.js'
 import { Err } from '~/lib/utils/result.js'
 import { createTestPreset, TestHarness, type TestSession } from '~/testing/index.js'
 
@@ -522,6 +523,61 @@ describe('holdInterruptedWork', () => {
 		await Bun.sleep(50)
 		expect(restored.llmProvider.getCallCount()).toBe(0)
 		expect(await agentStatus(restored, sessionId, agentId)).toBe('paused')
+	})
+
+	/** An idle session whose entry agent was inferring when its runtime stopped, so its load appends a recovery event. */
+	async function idleInferringSession(): Promise<{ eventStore: MemoryEventStore; sessionId: SessionId; agentId: AgentId }> {
+		const interrupted = await interruptedSession()
+		const { eventStore, sessionId, agentId } = interrupted
+		await eventStore.append(sessionId, withSessionId(sessionId, llmEvents.create('inference_started', { agentId, messages: [], consumedMessageIds: [] })))
+		setSystemTime(new Date(Date.now() + 25 * HOUR_MS))
+		return interrupted
+	}
+
+	it('holds an idle session on the retry of a held load that failed after its recovery', async () => {
+		const { eventStore, sessionId, agentId } = await idleInferringSession()
+		const later = harness(eventStore, undefined, { holdInterruptedWork: { idleForMs: 24 * HOUR_MS } })
+		spyOn(Session.prototype, 'pauseAgentsWithWork').mockImplementationOnce(async () => Err(ValidationErrors.invalid('store unavailable')))
+
+		expect((await later.sessionManager.getSession(sessionId)).ok).toBe(false)
+		expect((await eventStore.load(sessionId)).at(-1)?.type).toBe('session_restarted')
+		await liveSession(later, sessionId)
+		await Bun.sleep(50)
+		expect(later.llmProvider.getCallCount()).toBe(0)
+		expect(await agentStatus(later, sessionId, agentId)).toBe('paused')
+	})
+
+	it('holds an idle session in the next process after a held load failed after its recovery', async () => {
+		const { eventStore, sessionId, agentId } = await idleInferringSession()
+		const failing = harness(eventStore, undefined, { holdInterruptedWork: { idleForMs: 24 * HOUR_MS } })
+		spyOn(Session.prototype, 'pauseAgentsWithWork').mockImplementationOnce(async () => Err(ValidationErrors.invalid('store unavailable')))
+		expect((await failing.sessionManager.getSession(sessionId)).ok).toBe(false)
+		await failing.shutdown()
+
+		const next = harness(eventStore, undefined, { holdInterruptedWork: { idleForMs: 24 * HOUR_MS } })
+		await liveSession(next, sessionId)
+		await Bun.sleep(50)
+		expect(next.llmProvider.getCallCount()).toBe(0)
+		expect(await agentStatus(next, sessionId, agentId)).toBe('paused')
+	})
+
+	it('holds an idle session for the plugins on the retry of a held load whose ready hooks failed', async () => {
+		const { eventStore, sessionId } = await idleInferringSession()
+		const later = harness(eventStore, undefined, { holdInterruptedWork: { idleForMs: 24 * HOUR_MS } })
+		const readyHooks = spyOn(Session.prototype, 'callSessionReadyHooks')
+		readyHooks.mockImplementationOnce(async () => {
+			throw new Error('plugin unavailable')
+		})
+
+		await expect(later.sessionManager.getSession(sessionId)).rejects.toThrow('plugin unavailable')
+		await liveSession(later, sessionId)
+		expect(readyHooks.mock.calls.map(call => call[0])).toEqual([{ resumeInterruptedWork: false }, { resumeInterruptedWork: false }])
+	})
+
+	it('refuses an idleForMs that is not a positive integer', () => {
+		for (const idleForMs of [0, -1, 1.5, Number.NaN]) {
+			expect(() => harness(undefined, undefined, { holdInterruptedWork: { idleForMs } })).toThrow('Invalid holdInterruptedWork.idleForMs')
+		}
 	})
 
 	it('does not hold a session this manager created when it loads it again', async () => {

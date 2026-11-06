@@ -55,7 +55,7 @@ import type { SessionStoreOptions } from './session-store.js'
 import { Session, type SessionReopenRegistration, type UserOutputCallback } from './session.js'
 import { SessionRuntimeActivityController, SessionRuntimeUnavailableError } from './runtime-activity.js'
 
-const NOT_RESUMED_MESSAGE = 'Not resumed: the session was restored, so its interrupted work waits for a new message or an explicit resume'
+const NOT_RESUMED_MESSAGE = 'Not resumed: the session holds its interrupted work until a new message or an explicit resume'
 
 // ============================================================================
 // Errors
@@ -121,10 +121,14 @@ export interface SessionManagerOptions {
 export interface InterruptedWorkHold {
 	/**
 	 * Every session's log came from somewhere else: each is held at its first load by this manager.
-	 * Set at construction, so no request can load one unheld before `loadAllSessions` runs.
+	 * Set at construction, so no request can load one unheld before `loadAllSessions` runs. A session
+	 * this manager built (created, forked or held) is not held again for the rest of its life, eviction included.
 	 */
 	restored?: boolean
-	/** A session whose last event is at least this old when it loads has slept too long to continue on its own. */
+	/**
+	 * A session whose last event is at least this old when it loads has slept too long to continue on its own.
+	 * The hold's own events make the log fresh again; the work stays held by them, not by this clock.
+	 */
 	idleForMs?: number
 }
 
@@ -909,8 +913,9 @@ export class SessionManager {
 			return await this.createSessionInstance(store, preset, plugins, entry, { skipReadyHooks: true })
 		}
 
-		// Decided before the recovery below appends an event of its own.
-		const holdsInterruptedWork = this.holdsInterruptedWork(sessionId, events[events.length - 1].timestamp)
+		const holdsInterruptedWork = this.holdsInterruptedWork(sessionId, events)
+		// Until the load holds the work durably: a retry in this process holds it too, though the recovery below makes the log look fresh.
+		if (holdsInterruptedWork) this.loadingWithoutResume.add(sessionId)
 
 		// Check if recovery is needed after restart
 		const recoveryData = checkRecoveryNeeded(state)
@@ -942,11 +947,16 @@ export class SessionManager {
 	}
 
 	/** Whether this load holds the session's interrupted work: marked by `loadAllSessions`, or by `InterruptedWorkHold`. */
-	private holdsInterruptedWork(sessionId: SessionId, lastEventAt: number): boolean {
+	private holdsInterruptedWork(sessionId: SessionId, events: readonly DomainEvent[]): boolean {
 		if (this.loadingWithoutResume.has(sessionId)) return true
 		if (this.interruptedWorkHold.restored === true && !this.builtHere.has(sessionId)) return true
 		const { idleForMs } = this.interruptedWorkHold
-		return idleForMs !== undefined && Date.now() - lastEventAt >= idleForMs
+		if (idleForMs === undefined) return false
+		// A load that failed before it held the work leaves its recovery as the last event; the session slept since the one before.
+		for (let i = events.length - 1; i >= 0; i--) {
+			if (events[i].type !== 'session_restarted') return Date.now() - events[i].timestamp >= idleForMs
+		}
+		return false
 	}
 
 	private async pauseUnresumedAgents(session: Session): Promise<void> {
