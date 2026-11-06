@@ -80,10 +80,12 @@ interface StoreFaults {
 	writeFaults: Map<string, { mode: 'throw' | 'err'; message: string }>
 	/** File names whose removal returns Err. */
 	failedRemoves: Set<string>
+	/** File names another writer renames away just before their removal, which then returns Err. */
+	vanishingRemoves: Set<string>
 	writes: Array<{ path: string; content: string }>
 }
 
-const createStoreFaults = (): StoreFaults => ({ failedReads: new Set(), writeFaults: new Map(), failedRemoves: new Set(), writes: [] })
+const createStoreFaults = (): StoreFaults => ({ failedReads: new Set(), writeFaults: new Map(), failedRemoves: new Set(), vanishingRemoves: new Set(), writes: [] })
 
 class SelectiveFailureStore implements FileStore {
 	constructor(
@@ -142,7 +144,9 @@ class SelectiveFailureStore implements FileStore {
 	}
 
 	remove(path: string): Promise<Result<void, string>> {
-		if (this.faults.failedRemoves.has(path.split('/').pop() ?? path)) return Promise.resolve(Err(`Injected remove failure: ${path}`))
+		const name = path.split('/').pop() ?? path
+		if (this.faults.failedRemoves.has(name)) return Promise.resolve(Err(`Injected remove failure: ${path}`))
+		if (this.faults.vanishingRemoves.has(name)) return this.delegate.remove(path).then(() => Err(`Failed to remove: ${path}`))
 		return this.delegate.remove(path)
 	}
 
@@ -1871,6 +1875,36 @@ describe('uploads restart re-run', () => {
 				'extracted/entry.txt-content/run-2.md',
 				'meta.json',
 			])
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+
+	it('clears for a re-run past a file that another writer renamed away between the listing and its removal', async () => {
+		const seen: Array<{ attempt: number; files: string[] }> = []
+		const started = { current: deferred() }
+		const fixture = restartFixture({ preprocessorRegistry: registryWith(derivesFilesPreprocessor(seen, started)) })
+		try {
+			const source = fixture.open()
+			const session = await source.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.uploadAsync', {
+					sessionId: String(session.sessionId),
+					filename: 'race.txt',
+					mimeType: 'text/plain',
+					size: 4,
+					fileBuffer: Buffer.from('race'),
+				}),
+				asyncUploadSchema,
+			)
+			await started.current.promise
+			await fixture.crash(source)
+			fixture.dataFileStore.faults.vanishingRemoves.add('run-1.md')
+
+			const recovered = fixture.open()
+			await recovered.openSession(session.sessionId)
+			await waitForTerminal(recovered, upload.uploadId, 'ready')
+			expect(seen.map((run) => run.attempt)).toEqual([1, 2])
 		} finally {
 			await fixture.cleanup()
 		}

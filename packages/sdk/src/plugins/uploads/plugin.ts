@@ -941,7 +941,10 @@ async function removeUploadFiles(uploadStore: FileStore, keep: ReadonlySet<strin
 		if (keep.has(entryPath)) continue
 		if (entry.type !== 'file' && entry.type !== 'symlink') return Err(`Unsupported upload entry: ${entryPath}`)
 		const removed = await uploadStore.remove(entryPath)
-		if (!removed.ok) return removed
+		if (removed.ok) continue
+		// A run that outlived its runtime renames its pending meta.json away between the listing and the removal.
+		const exists = await uploadStore.exists(entryPath)
+		if (!exists.ok || exists.value) return removed
 	}
 	return Ok(undefined)
 }
