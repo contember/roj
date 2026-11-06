@@ -163,6 +163,98 @@ describe('context-compact plugin', () => {
 		})
 	})
 
+	describe('repeated compaction', () => {
+		function reportingPromptTokens(promptTokens: () => number) {
+			return (request: InferenceRequest) => ({
+				content: isSummarizationRequest(request) ? 'Summary of conversation so far.' : 'Agent response.',
+				toolCalls: [],
+				finishReason: 'stop' as const,
+				metrics: { ...MockLLMProvider.defaultMetrics(), promptTokens: promptTokens() },
+			})
+		}
+
+		it('emits no compaction while every message still falls in the kept tail', async () => {
+			// Over maxTokens from the first turn, as with a system prompt or preamble larger than the threshold.
+			const harness = createCompactHarness({
+				presets: [createCompactPreset(500)],
+				mockHandler: reportingPromptTokens(() => 1000),
+			})
+			const session = await harness.createSession('test')
+
+			await session.sendAndWaitForIdle('First')
+			await session.sendAndWaitForIdle('Second')
+			expect(await session.getEventsByType(contextEvents, 'context_compacted')).toHaveLength(0)
+
+			await session.sendAndWaitForIdle('Third')
+			const compactions = await session.getEventsByType(contextEvents, 'context_compacted')
+			expect(compactions.map((event) => event.messagesRemoved > 0)).toEqual([true])
+
+			await harness.shutdown()
+		})
+
+		it('does not compact again on the prompt size measured before a compaction whose turn was paused', async () => {
+			let paused = false
+			const pauseAfterFirstCompaction = definePlugin('pause-after-compaction')
+				.hook('beforeInference', async (ctx) => {
+					if (paused || ctx.turnNumber !== 3) return null
+					paused = true
+					return { action: 'pause', reason: 'probe' }
+				})
+				.build()
+
+			const harness = new TestHarness({
+				presets: [createCompactPreset(500)],
+				systemPlugins: [contextCompactPlugin, pauseAfterFirstCompaction],
+				mockHandler: reportingPromptTokens(() => 1000),
+			})
+			const session = await harness.createSession('test')
+			const entryAgentId = session.getEntryAgentId()!
+
+			await session.sendAndWaitForIdle('First')
+			await session.sendAndWaitForIdle('Second')
+			await session.sendMessage('Third compacts, then the turn is paused')
+			await waitForAgentPaused(session, entryAgentId)
+			expect(await session.getEventsByType(contextEvents, 'context_compacted')).toHaveLength(1)
+
+			await session.resumeAgent(entryAgentId)
+			await session.waitForIdle()
+			expect(await session.getEventsByType(contextEvents, 'context_compacted')).toHaveLength(1)
+
+			await harness.shutdown()
+		})
+
+		it('does not compact again on the prompt size measured before a compaction whose inference failed', async () => {
+			// Every attempt of the first inference after the summary fails (withLLMRetry makes 5), then the provider recovers.
+			let failuresLeft = 0
+			let armed = false
+			const preset = createCompactPreset(500)
+			preset.orchestrator.errorResumeBackoff = { baseDelayMs: 50, maxDelayMs: 50 }
+			const harness = createCompactHarness({
+				presets: [preset],
+				mockHandler: (request) => {
+					if (isSummarizationRequest(request)) {
+						if (!armed) failuresLeft = 5
+						armed = true
+					} else if (failuresLeft > 0) {
+						failuresLeft--
+						throw { type: 'server_error', message: 'boom', retryAfterMs: 1 }
+					}
+					return reportingPromptTokens(() => 1000)(request)
+				},
+			})
+			const session = await harness.createSession('test')
+
+			await session.sendAndWaitForIdle('First')
+			await session.sendAndWaitForIdle('Second')
+			// The failed turn is resumed after the backoff and runs beforeInference again.
+			await session.sendAndWaitForIdle('Third compacts, then its inference fails', { timeoutMs: 10_000 })
+			expect(await session.getEventsByType(llmEvents, 'inference_failed')).toHaveLength(1)
+			expect(await session.getEventsByType(contextEvents, 'context_compacted')).toHaveLength(1)
+
+			await harness.shutdown()
+		})
+	})
+
 	// =========================================================================
 	// Turn numbering
 	// =========================================================================
@@ -255,14 +347,11 @@ describe('context-compact plugin', () => {
 
 	describe('compaction behavior', () => {
 		it('after compaction, subsequent inference sees fewer messages', async () => {
-			let inferenceCallCount = 0
-			let messagesInThirdCall = 0
+			const regularMessageCounts: number[] = []
 
 			const harness = createCompactHarness({
 				presets: [createCompactPreset(10)],
 				mockHandler: (request) => {
-					inferenceCallCount++
-
 					// Summarization requests (from context-compact plugin)
 					if (isSummarizationRequest(request)) {
 						return {
@@ -273,10 +362,7 @@ describe('context-compact plugin', () => {
 						}
 					}
 
-					// Track messages in later calls
-					if (inferenceCallCount >= 3) {
-						messagesInThirdCall = request.messages.length
-					}
+					regularMessageCounts.push(request.messages.length)
 
 					return {
 						content: 'Response with enough content to push tokens over the limit for compaction.',
@@ -291,12 +377,16 @@ describe('context-compact plugin', () => {
 
 			// First message — builds history
 			await session.sendAndWaitForIdle('First long message with plenty of content')
-			// Second message — triggers compaction, then inference with compacted history
-			await session.sendAndWaitForIdle('Second long message to trigger compaction')
+			await session.sendAndWaitForIdle('Second long message')
+			// Third message — the history is past keepRecentMessages, so compaction removes the oldest turn
+			await session.sendAndWaitForIdle('Third long message to trigger compaction')
 
-			// After compaction, the conversation history should be shorter
 			const compactedEvents = await session.getEventsByType(contextEvents, 'context_compacted')
 			expect(compactedEvents.length).toBeGreaterThanOrEqual(1)
+			expect(compactedEvents.every((event) => event.messagesRemoved > 0)).toBe(true)
+			// Each turn adds two messages; the compacted third request carries fewer than the second one plus those two.
+			const [, second, third] = regularMessageCounts
+			expect(third).toBeLessThan((second ?? 0) + 2)
 
 			await harness.shutdown()
 		})
