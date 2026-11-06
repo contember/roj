@@ -176,7 +176,7 @@ describe('SessionFileStore on a link it cannot resolve', () => {
 })
 
 describe('SessionFileStore atomic write', () => {
-	/** A filesystem whose writeFile lands in two halves, with a read let in between. */
+	/** A slow disk lets a reader in while a write is half done. */
 	function halvingFileSystem(options: { rename: boolean }): { fs: FileSystem; midWrite: () => Promise<void>; finish: () => void } {
 		const node = createNodeFileSystem()
 		let reachedMidWrite: () => void = () => {}
@@ -217,6 +217,17 @@ describe('SessionFileStore atomic write', () => {
 
 		expect((await failing.write('meta.json', '{}', { atomic: true })).ok).toBe(false)
 		expect(fs.readdirSync(root)).toEqual(['inside.txt'])
+	})
+
+	it('refuses an atomic write whose directory is outside the root, though its link points back inside', async () => {
+		fs.symlinkSync(outside, path.join(root, 'link'))
+		fs.symlinkSync(path.join(root, 'inside.txt'), path.join(outside, 'meta.json'))
+
+		const result = await store.write('link/meta.json', 'replaced', { atomic: true })
+		expect(result.ok).toBe(false)
+		expect(fs.readdirSync(outside).sort()).toEqual(['meta.json', 'secret.txt'])
+		expect(fs.lstatSync(path.join(outside, 'meta.json')).isSymbolicLink()).toBe(true)
+		expect(fs.readFileSync(path.join(root, 'inside.txt'), 'utf8')).toBe('inside')
 	})
 
 	it('writes in place on a platform without rename', async () => {

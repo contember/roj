@@ -21,6 +21,7 @@ import { basename, dirname, join, normalize, resolve } from 'node:path'
 import { containmentOf } from '~/core/file-store/containment.js'
 import type { FileEntry, FileStore, WriteOptions } from '~/core/file-store/types.js'
 import type { FileSystem, WalkEntry } from '~/platform/fs.js'
+import { replaceViaRename } from '~/platform/replace-file.js'
 import { Err, Ok } from '~/lib/utils/result.js'
 import type { Result } from '~/lib/utils/result.js'
 
@@ -68,6 +69,11 @@ export class SessionFileStore implements FileStore {
 	async write(path: string, content: string | Buffer, options?: WriteOptions): Promise<Result<{ path: string }, string>> {
 		const resolved = await this.resolveContained(path, 'create')
 		if (!resolved.ok) return resolved
+		if (options?.atomic === true) {
+			// The rename replaces the entry rather than writing through a link at it, so its directory must be inside too.
+			const parent = await this.resolveContained(path, 'entry')
+			if (!parent.ok) return parent
+		}
 
 		try {
 			await this.fs.mkdir(dirname(resolved.value), { recursive: true })
@@ -89,12 +95,7 @@ export class SessionFileStore implements FileStore {
 			return
 		}
 		const pending = join(dirname(absolute), `.${basename(absolute)}.pending-${randomUUID()}`)
-		try {
-			await this.fs.writeFile(pending, content)
-			await rename.call(this.fs, pending, absolute)
-		} finally {
-			await this.fs.unlink(pending).catch(() => {})
-		}
+		await replaceViaRename(this.fs, rename.bind(this.fs), pending, absolute, content)
 	}
 
 	async read(path: string): Promise<Result<string, string>>
