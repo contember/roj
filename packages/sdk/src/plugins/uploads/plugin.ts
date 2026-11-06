@@ -943,8 +943,9 @@ async function removeUploadFiles(uploadStore: FileStore, keep: ReadonlySet<strin
 		const removed = await uploadStore.remove(entryPath)
 		if (removed.ok) continue
 		// A run that outlived its runtime renames its pending meta.json away between the listing and the removal.
-		const exists = await uploadStore.exists(entryPath)
-		if (!exists.ok || exists.value) return removed
+		// Listed again rather than `exists`, which follows links and would take a dangling one for gone.
+		const relisted = await uploadStore.list(path, { maxDepth: 1 })
+		if (!relisted.ok || relisted.value.some((listed) => listed.name === entry.name)) return removed
 	}
 	return Ok(undefined)
 }
