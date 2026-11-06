@@ -513,6 +513,24 @@ describe('services plugin', () => {
 		)
 	})
 
+	it('a load that holds interrupted work starts no autoStart service until its user writes', async () => {
+		const preset = createServicesPreset([autoStartService], ['auto-start'], new PortPool())
+		const source = new TestHarness({ presets: [preset], systemPlugins: [servicePlugin] })
+		const created = await source.createSession('test')
+		await waitForServiceStateStatus(created, 'auto-start', 'ready')
+		await source.shutdown()
+
+		const restored = createServicesHarness({ presets: [preset], eventStore: source.eventStore, holdInterruptedWork: { restored: true } })
+		const reopened = await restored.openSession(created.sessionId)
+		const starts = async () => (await reopened.getEventsByType(serviceEvents, 'service_status_changed'))
+			.filter((event) => event.serviceType === 'auto-start' && event.toStatus === 'starting').length
+		await Bun.sleep(300)
+		expect(await starts()).toBe(1)
+
+		await reopened.sendMessage('Change the title')
+		await waitForAsync(async () => await starts() === 2, () => 'waiting for the released hold to auto-start the service')
+	})
+
 	it('a rebuilt runtime leaves a service the agent stopped alone', async () => {
 		const harness = createServicesHarness({
 			presets: [createServicesPreset([autoStartService], ['auto-start'], new PortPool())],

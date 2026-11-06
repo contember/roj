@@ -373,7 +373,32 @@ export const servicePlugin = definePlugin('services')
 				}
 			}
 		}
-		return { executor, startService, restartService, stopService, close }
+		/** Starts the services configured with autoStart that are down; `held` while a hold on this runtime's load kept them down. */
+		const autoStart = {
+			held: false,
+			run: async (sessionId: Parameters<ServiceExecutor['start']>[1], workspaceDir: string | undefined, services: ReadonlyMap<string, ServiceEntry>): Promise<void> => {
+				for (const svcConfig of pluginConfig.services) {
+					if (!svcConfig.autoStart) continue
+					const status = executor.getStatus(svcConfig.type)
+					if (status === 'ready' || status === 'starting') continue
+
+					// On a fresh runtime the executor knows nothing, so the persisted decision is
+					// the only thing that can tell an evicted service (bring it back) from one the
+					// agent stopped on purpose (leave it down).
+					const entry = services.get(svcConfig.type)
+					if (entry?.status === 'stopped' && entry.stoppedBy === 'agent') {
+						logger.debug('Auto-start skipped — the agent stopped this service', { serviceType: svcConfig.type })
+						continue
+					}
+
+					const startResult = await startService(svcConfig, sessionId, workspaceDir, entry?.port)
+					if (!startResult.ok) {
+						logger.debug('Auto-start service skipped', { serviceType: svcConfig.type, error: startResult.error.message })
+					}
+				}
+			},
+		}
+		return { executor, startService, restartService, stopService, close, autoStart }
 	})
 	.agentConfig<ServiceAgentConfig>()
 	.method('start', {
@@ -589,26 +614,17 @@ export const servicePlugin = definePlugin('services')
 				}))
 		}
 
-		// Auto-start services configured with autoStart
-		for (const svcConfig of ctx.pluginConfig.services) {
-			if (!svcConfig.autoStart) continue
-			const status = ctx.pluginContext.executor.getStatus(svcConfig.type)
-			if (status === 'ready' || status === 'starting') continue
-
-			// On a fresh runtime the executor knows nothing, so the persisted decision is
-			// the only thing that can tell an evicted service (bring it back) from one the
-			// agent stopped on purpose (leave it down).
-			const entry = ctx.pluginState.get(svcConfig.type)
-			if (entry?.status === 'stopped' && entry.stoppedBy === 'agent') {
-				ctx.logger.debug('Auto-start skipped — the agent stopped this service', { serviceType: svcConfig.type })
-				continue
-			}
-
-			const startResult = await ctx.pluginContext.startService(svcConfig, ctx.sessionId, ctx.sessionState.workspaceDir, entry?.port)
-			if (!startResult.ok) {
-				ctx.logger.debug('Auto-start service skipped', { serviceType: svcConfig.type, error: startResult.error.message })
-			}
+		// A load that holds interrupted work starts nothing on its own; the hold's release does.
+		if (!ctx.resumeInterruptedWork) {
+			ctx.pluginContext.autoStart.held = true
+			return
 		}
+		await ctx.pluginContext.autoStart.run(ctx.sessionId, ctx.sessionState.workspaceDir, ctx.pluginState)
+	})
+	.sessionHook('onHoldRelease', async (ctx) => {
+		if (!ctx.pluginContext.autoStart.held) return
+		ctx.pluginContext.autoStart.held = false
+		await ctx.pluginContext.autoStart.run(ctx.sessionId, ctx.sessionState.workspaceDir, ctx.pluginState)
 	})
 	.sessionHook('onSessionClose', async (ctx) => {
 		await ctx.pluginContext.close(ctx.sessionId, ctx.reason, ctx.runtimeActivity)
