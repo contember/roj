@@ -382,7 +382,7 @@ export class Session {
 	}
 
 	/**
-	 * Release the hold a restore left (`SessionManager.loadAllSessions({ resume: false })`): resume
+	 * Release the hold a load left (`loadAllSessions({ resume: false })` or `InterruptedWorkHold`): resume
 	 * every agent it paused, then let plugins relaunch what they parked for it. Anything paused any
 	 * other way stays paused, and a session with nothing held is left as it is.
 	 */
