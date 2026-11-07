@@ -251,6 +251,8 @@ export interface AgentState {
 	typedInput?: unknown
 	/** Whether onStart handler has been executed (for first-run initialization) */
 	onStartCalled?: boolean
+	/** onComplete ran and the agent has not started a turn, resumed or been rewritten since — so a reload does not run it again */
+	completionHandled?: boolean
 	/** Inference turns committed so far — persisted, so compaction can't erase it. */
 	turnNumber?: number
 	/** Reason for pause (set when status is 'paused') */

@@ -255,6 +255,7 @@ export const coreReducer = createTypedReducer(
 						? { llmCallId: event.llmCallId, inputKey: event.inputKey }
 						: undefined,
 					interruptedInference: undefined,
+					completionHandled: undefined,
 				}))
 
 			case 'inference_completed': {
@@ -478,6 +479,7 @@ export const coreReducer = createTypedReducer(
 						status: 'pending' as const,
 						// No longer paused, so no longer held for its user's next message.
 						pauseResumesOnInput: undefined,
+						completionHandled: undefined,
 					}
 				})
 
@@ -500,6 +502,12 @@ export const coreReducer = createTypedReducer(
 					return updateAgent(state, event.agentId, (agent) => ({
 						...agent,
 						onStartCalled: true,
+					}))
+				}
+				if (event.handlerName === 'onComplete') {
+					return updateAgent(state, event.agentId, (agent) => ({
+						...agent,
+						completionHandled: true,
 					}))
 				}
 				return state
@@ -551,6 +559,7 @@ export const coreReducer = createTypedReducer(
 					pauseReason: undefined,
 					pauseMessage: undefined,
 					pauseResumesOnInput: undefined,
+					completionHandled: undefined,
 				}))
 
 			default:

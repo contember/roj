@@ -638,13 +638,13 @@ export class Agent {
 		if (state.status === 'tool_exec' && state.pendingToolCalls.length > 0) return 'tool_exec'
 		if (state.status === 'pending') {
 			if (hasWork(state) || this.hasPluginPendingMessages()) return 'infer'
-			return 'complete'
+			return state.completionHandled ? 'idle' : 'complete'
 		}
 		if (state.status === 'errored') {
 			// Errored with new messages (e.g. user sent a message): emit resume event, then retry
 			// Only check for new messages, not stale pendingToolResults — those were present when inference failed
 			if (this.hasPluginPendingMessages()) return 'resume_from_error'
-			return 'complete'
+			return state.completionHandled ? 'idle' : 'complete'
 		}
 		return 'idle'
 	}
@@ -1405,12 +1405,12 @@ export class Agent {
 	 * Emit handler_completed event.
 	 *
 	 * Skipped when the handler produced no action (null result) — those events are
-	 * pure noise (64%+ of a typical session log). onStart is the one exception: the
-	 * reducer uses its completion event to flip `onStartCalled`, so we always emit
-	 * it even with a null result.
+	 * pure noise (64%+ of a typical session log). onStart and onComplete are the
+	 * exceptions: the reducer flips `onStartCalled` and `completionHandled` on their
+	 * completion events, so we always emit them even with a null result.
 	 */
 	private async emitHandlerCompleted(handlerName: HandlerName, result: HandlerResult): Promise<void> {
-		if (result === null && handlerName !== 'onStart') return
+		if (result === null && handlerName !== 'onStart' && handlerName !== 'onComplete') return
 
 		await this.store.emit(withSessionId(
 			this.store.sessionId,

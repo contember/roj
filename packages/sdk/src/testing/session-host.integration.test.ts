@@ -588,6 +588,8 @@ describe('cross-host file-backed handoff', () => {
 			const receipts = z.array(z.object({ messageId: z.string() })).parse(before.filter((event) => event.type === 'user_chat_message_received'))
 			expect(receipts).toHaveLength(committed ? 1 : 0)
 			const reopened = await load(b, session.id)
+			// Let the load's own turn finish, so the delivery's wake is armed here and not as that turn's reschedule.
+			await reopened.getEntryAgent()?.waitForIdle()
 			const ids = await Promise.all([send(reopened, 'd1', 'fault input'), send(reopened, 'd1', 'fault input')])
 			expect(ids[0]).toBe(ids[1])
 			if (committed) expect(receipts[0]?.messageId).toBe(ids[0])
