@@ -319,8 +319,81 @@ describe('core: plugin hooks', () => {
 
 			expect(calls).toContain('onComplete')
 
-			// onComplete with null result no longer emits handler_completed (pure noise);
-			// hook invocation is verified via the `calls` array above.
+			await harness.shutdown()
+		})
+
+		it('onComplete does not fire again when a completed session is reopened, only after new work', async () => {
+			const firstRun: string[] = []
+			const secondRun: string[] = []
+			const trackingPlugin = (calls: string[]) =>
+				definePlugin('tracking')
+					.hook('onComplete', async () => {
+						calls.push('onComplete')
+						return null
+					})
+					.build()
+
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				systemPlugins: [trackingPlugin(firstRun)],
+			})
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Hello')
+			expect(firstRun).toEqual(['onComplete'])
+			await harness.shutdown()
+
+			const restarted = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				systemPlugins: [trackingPlugin(secondRun)],
+				eventStore: harness.eventStore,
+			})
+			const reopened = await restarted.openSession(session.sessionId)
+			await reopened.waitForIdle()
+			expect(secondRun).toEqual([])
+
+			await reopened.sendAndWaitForIdle('Again')
+			expect(secondRun).toEqual(['onComplete'])
+
+			await restarted.shutdown()
+		})
+
+		it('onComplete hooks after a pausing one run when the agent is resumed', async () => {
+			const calls: string[] = []
+			let paused = false
+			const pausingPlugin = definePlugin('pausing')
+				.hook('onComplete', async () => {
+					if (paused) return null
+					paused = true
+					return { action: 'pause', reason: 'review' }
+				})
+				.build()
+			const trackingPlugin = definePlugin('tracking')
+				.hook('onComplete', async () => {
+					calls.push('onComplete')
+					return null
+				})
+				.build()
+
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				systemPlugins: [pausingPlugin, trackingPlugin],
+			})
+			const session = await harness.createSession('test')
+			await session.sendMessage('Hello')
+			const entryAgentId = session.getEntryAgentId()!
+			const deadline = Date.now() + 5000
+			while (Date.now() < deadline && session.state.agents.get(entryAgentId)?.status !== 'paused') {
+				await new Promise((r) => setTimeout(r, 10))
+			}
+			expect(session.state.agents.get(entryAgentId)?.status).toBe('paused')
+			expect(calls).toEqual([])
+
+			await session.resumeAgent(entryAgentId)
+			await session.waitForIdle()
+			expect(calls).toEqual(['onComplete'])
 
 			await harness.shutdown()
 		})

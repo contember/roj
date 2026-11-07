@@ -255,6 +255,7 @@ export const coreReducer = createTypedReducer(
 						? { llmCallId: event.llmCallId, inputKey: event.inputKey }
 						: undefined,
 					interruptedInference: undefined,
+					completionHandled: undefined,
 				}))
 
 			case 'inference_completed': {
@@ -285,6 +286,8 @@ export const coreReducer = createTypedReducer(
 						lastInferenceFailureAt: undefined,
 						turnNumber: (agent.turnNumber ?? 0) + 1,
 						inferenceCall: undefined,
+						// A turn a beforeInference skip committed has no inference_started to clear it.
+						completionHandled: undefined,
 						// Only the staged turn may consume it; one committed without a call (a skip) must not leave it for the next.
 						interruptedInference: undefined,
 					}
@@ -478,6 +481,7 @@ export const coreReducer = createTypedReducer(
 						status: 'pending' as const,
 						// No longer paused, so no longer held for its user's next message.
 						pauseResumesOnInput: undefined,
+						completionHandled: undefined,
 					}
 				})
 
@@ -500,6 +504,13 @@ export const coreReducer = createTypedReducer(
 					return updateAgent(state, event.agentId, (agent) => ({
 						...agent,
 						onStartCalled: true,
+					}))
+				}
+				// A pausing onComplete stopped the hooks after it; its resume runs them, so only a clean completion counts.
+				if (event.handlerName === 'onComplete' && event.result === null) {
+					return updateAgent(state, event.agentId, (agent) => ({
+						...agent,
+						completionHandled: true,
 					}))
 				}
 				return state
@@ -551,6 +562,7 @@ export const coreReducer = createTypedReducer(
 					pauseReason: undefined,
 					pauseMessage: undefined,
 					pauseResumesOnInput: undefined,
+					completionHandled: undefined,
 				}))
 
 			default:
