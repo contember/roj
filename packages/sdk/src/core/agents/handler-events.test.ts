@@ -163,5 +163,21 @@ describe('Handler Events in Session State', () => {
 			const agent = state.agents.get(TEST_AGENT_ID)
 			expect(agent?.onStartCalled).toBeUndefined()
 		})
+
+		it('marks the completion handled only when onComplete finished without pausing', () => {
+			const spawned = applyEvent(
+				createBaseState(),
+				withSessionId(TEST_SESSION_ID, agentEvents.create('agent_spawned', { agentId: TEST_AGENT_ID, definitionName: 'test-agent', parentId: null })),
+			)
+			const onComplete = (result: null | { action: 'pause'; reason: string }) =>
+				applyEvent(
+					spawned,
+					withSessionId(TEST_SESSION_ID, agentEvents.create('handler_completed', { agentId: TEST_AGENT_ID, handlerName: 'onComplete', result })),
+				)
+
+			expect(onComplete(null).agents.get(TEST_AGENT_ID)?.completionHandled).toBe(true)
+			// The pause event may never land after this one; the hooks the pause stopped must still run on the next load.
+			expect(onComplete({ action: 'pause', reason: 'review' }).agents.get(TEST_AGENT_ID)?.completionHandled).toBeUndefined()
+		})
 	})
 })

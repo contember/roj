@@ -358,6 +358,45 @@ describe('core: plugin hooks', () => {
 
 			await restarted.shutdown()
 		})
+
+		it('onComplete hooks after a pausing one run when the agent is resumed', async () => {
+			const calls: string[] = []
+			let paused = false
+			const pausingPlugin = definePlugin('pausing')
+				.hook('onComplete', async () => {
+					if (paused) return null
+					paused = true
+					return { action: 'pause', reason: 'review' }
+				})
+				.build()
+			const trackingPlugin = definePlugin('tracking')
+				.hook('onComplete', async () => {
+					calls.push('onComplete')
+					return null
+				})
+				.build()
+
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+				systemPlugins: [pausingPlugin, trackingPlugin],
+			})
+			const session = await harness.createSession('test')
+			await session.sendMessage('Hello')
+			const entryAgentId = session.getEntryAgentId()!
+			const deadline = Date.now() + 5000
+			while (Date.now() < deadline && session.state.agents.get(entryAgentId)?.status !== 'paused') {
+				await new Promise((r) => setTimeout(r, 10))
+			}
+			expect(session.state.agents.get(entryAgentId)?.status).toBe('paused')
+			expect(calls).toEqual([])
+
+			await session.resumeAgent(entryAgentId)
+			await session.waitForIdle()
+			expect(calls).toEqual(['onComplete'])
+
+			await harness.shutdown()
+		})
 	})
 
 	// =========================================================================
