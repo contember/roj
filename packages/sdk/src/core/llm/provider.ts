@@ -15,7 +15,7 @@ import type { ToolCallId } from '~/core/tools/schema.js'
 import type { Result } from '~/lib/utils/result.js'
 import { ProviderMessageValidationError } from './message-sanitization.js'
 import z from 'zod/v4'
-import { ModelId, type ProviderErrorDetail } from './schema.js'
+import { type LLMErrorType, ModelId, type ProviderErrorDetail } from './schema.js'
 
 // Re-export LLMMessage types from agents/state for backwards compatibility
 export type { AssistantLLMMessage, LLMMessage, ReasoningDetails, SystemLLMMessage, ThinkingBlocks, ToolCall, ToolLLMMessage, UserLLMMessage }
@@ -228,14 +228,7 @@ export interface LLMMetrics {
  * LLM error types
  */
 export interface LLMError {
-	type:
-		| 'rate_limit'
-		| 'invalid_request'
-		| 'context_length'
-		| 'server_error'
-		| 'network_error'
-		| 'timeout'
-		| 'aborted'
+	type: LLMErrorType
 	message: string
 	retryAfterMs?: number
 	/** HTTP status code from the provider response */

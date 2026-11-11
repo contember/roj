@@ -688,8 +688,8 @@ export class Agent {
 
 	private static readonly MAX_INFERENCE_RETRIES = 3
 
-	/** Consecutive failed inferences, the last one non-retryable, after which the agent pauses instead of staying errored. */
-	private static readonly MAX_CONSECUTIVE_FAILED_INFERENCES = 3
+	/** Non-retryable failures of the same tool-result turn after which the agent pauses instead of staying errored. */
+	private static readonly MAX_CONSECUTIVE_REJECTED_TURNS = 3
 
 	/** Max retries for empty-stop LLM responses (provider glitch). Total attempts = this + 1. */
 	private static readonly MAX_EMPTY_RESPONSE_RETRIES = 2
@@ -926,21 +926,23 @@ export class Agent {
 					error: llmResponse.error.message,
 					llmCallId,
 					providerError: repeatsRetryableFailure ? undefined : llmResponse.error.providerError,
+					errorType: llmResponse.error.type,
 				}),
 			))
 			const errorState = this.state
-			const failures = errorState?.consecutiveInferenceFailures ?? 1
-			// A conversation the provider keeps rejecting fails the same way after every restart; pausing stops
+			const rejected = errorState?.consecutiveRejectedTurns ?? 0
+			// A rejected tool-result turn is rebuilt unchanged after every restart and fails again; pausing stops
 			// the restart from resetting it and tells the parent once, through the onPause hooks.
-			if (errorState && !isRetryableLLMError(llmResponse.error) && failures >= Agent.MAX_CONSECUTIVE_FAILED_INFERENCES) {
-				await this.emitPause('limit', `Inference failed ${failures} times in a row and the agent will not retry on its own. Last error: ${llmResponse.error.message}`)
+			if (errorState && rejected >= Agent.MAX_CONSECUTIVE_REJECTED_TURNS) {
+				await this.emitPause('limit', `The provider rejected this turn ${rejected} times in a row and the agent will not retry it on its own. Last error: ${llmResponse.error.message}`)
 				return
 			}
 			// Notify plugins (e.g. mailbox sends error message to parent). For retryable
 			// errors, notify only on the first failure of an episode — the preserved
 			// token means each error-resume cycle re-fails here, and one parent
 			// notification per cycle would flood the parent during a provider outage.
-			const isRepeatRetryableFailure = isRetryableLLMError(llmResponse.error) && failures > 1
+			const isRepeatRetryableFailure = isRetryableLLMError(llmResponse.error)
+				&& (errorState?.consecutiveInferenceFailures ?? 1) > 1
 			if (errorState && !isRepeatRetryableFailure) {
 				await this.executeOnError(errorState, llmResponse.error.message)
 			}

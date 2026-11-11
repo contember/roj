@@ -1789,43 +1789,64 @@ describe('the call a restart interrupts', () => {
 	})
 })
 
-describe('a failure streak across restarts', () => {
+describe('a rejected turn across restarts', () => {
 	const agentId = generateTestAgentId()
-	const spawned = withSessionId(SESSION_ID, agentEvents.create('agent_spawned', { agentId, definitionName: 'test', parentId: null }))
-	const started = withSessionId(SESSION_ID, llmEvents.create('inference_started', { agentId, messages: [], consumedMessageIds: [] }))
-	const failed = withSessionId(SESSION_ID, llmEvents.create('inference_failed', { agentId, error: 'Provider returned error' }))
-	const restarted = withSessionId(SESSION_ID, sessionEvents.create('session_restarted', { resetAgentIds: [agentId], clearedToolAgentIds: [] }))
-	const pausedOnFailures = withSessionId(SESSION_ID, agentEvents.create('agent_paused', { agentId, reason: 'limit', message: 'Inference failed 3 times in a row' }))
+	const toolCallId = generateToolCallId()
 	const metrics = { promptTokens: 1, completionTokens: 1, totalTokens: 2, latencyMs: 1, model: 'test' }
-	const completed = withSessionId(SESSION_ID, llmEvents.create('inference_completed', { agentId, consumedMessageIds: [], response: { content: 'ok', toolCalls: [] }, metrics }))
+	const spawned = withSessionId(SESSION_ID, agentEvents.create('agent_spawned', { agentId, definitionName: 'test', parentId: null }))
+	const calledTool = withSessionId(SESSION_ID, llmEvents.create('inference_completed', {
+		agentId,
+		consumedMessageIds: [],
+		response: { content: null, toolCalls: [{ id: toolCallId, name: 'look', input: {} }] },
+		metrics,
+	}))
+	const toolDone = withSessionId(SESSION_ID, toolEvents.create('tool_completed', { agentId, toolCallId, result: 'a large screenshot' }))
+	const started = withSessionId(SESSION_ID, llmEvents.create('inference_started', { agentId, messages: [], consumedMessageIds: [] }))
+	const rejected = withSessionId(SESSION_ID, llmEvents.create('inference_failed', { agentId, error: 'Provider returned error', errorType: 'invalid_request' }))
+	const outage = withSessionId(SESSION_ID, llmEvents.create('inference_failed', { agentId, error: 'Bad gateway', errorType: 'server_error' }))
+	const legacy = withSessionId(SESSION_ID, llmEvents.create('inference_failed', { agentId, error: 'Provider returned error' }))
+	const restarted = withSessionId(SESSION_ID, sessionEvents.create('session_restarted', { resetAgentIds: [agentId], clearedToolAgentIds: [] }))
+	const pausedOnRejections = withSessionId(SESSION_ID, agentEvents.create('agent_paused', { agentId, reason: 'limit', message: 'rejected 3 times' }))
+	const resumed = withSessionId(SESSION_ID, agentEvents.create('agent_resumed', { agentId }))
+	const answered = withSessionId(SESSION_ID, llmEvents.create('inference_completed', { agentId, consumedMessageIds: [], response: { content: 'ok', toolCalls: [] }, metrics }))
 	const replay = (events: DomainEvent[]) => events.reduce(applyEvent, createSessionState(SESSION_ID, 'test', TIMESTAMP))
 	const agentAfter = (events: DomainEvent[]) => {
 		const agent = getAgentState(replay(events), agentId)
 		if (agent === null) throw new Error('the agent was spawned')
 		return agent
 	}
+	const toolTurn = [spawned, calledTool, toolDone]
+	const rejectedTwiceAcrossRestarts = [...toolTurn, started, rejected, restarted, started, rejected, restarted]
 
-	it('resets an agent after a single failure, keeping the streak but not the backoff', () => {
-		expect(checkRecoveryNeeded(replay([spawned, started, failed]))?.resetAgentIds).toEqual([agentId])
+	it('resets an agent after one or two rejections, keeping the rejected-turn streak', () => {
+		expect(checkRecoveryNeeded(replay([...toolTurn, started, rejected]))?.resetAgentIds).toEqual([agentId])
+		expect(checkRecoveryNeeded(replay([...toolTurn, started, rejected, restarted, started, rejected]))?.resetAgentIds).toEqual([agentId])
 
-		const agent = agentAfter([spawned, started, failed, restarted])
+		const agent = agentAfter(rejectedTwiceAcrossRestarts)
 		expect(agent.status).toBe('pending')
-		expect(agent.consecutiveInferenceFailures).toBe(1)
+		expect(agent.consecutiveRejectedTurns).toBe(2)
+		// The backoff episode still starts fresh on a restart.
+		expect(agent.consecutiveInferenceFailures).toBe(0)
 		expect(agent.lastInferenceFailureAt).toBeUndefined()
 	})
 
-	it('counts failures across restarts until a turn commits', () => {
-		const twoRestarts = [spawned, started, failed, restarted, started, failed, restarted, started, failed]
-		expect(agentAfter(twoRestarts).consecutiveInferenceFailures).toBe(3)
-		expect(agentAfter([...twoRestarts, restarted, started, completed]).consecutiveInferenceFailures).toBe(0)
+	it('does not reset an agent paused after the third rejection', () => {
+		const events = [...rejectedTwiceAcrossRestarts, started, rejected, pausedOnRejections]
+		expect(agentAfter(events.slice(0, -1)).consecutiveRejectedTurns).toBe(3)
+		expect(checkRecoveryNeeded(replay(events))).toBeNull()
+		expect(agentAfter([...events, restarted]).status).toBe('paused')
 	})
 
-	it('does not reset an agent paused after three failures', () => {
-		const events = [spawned, started, failed, restarted, started, failed, restarted, started, failed, pausedOnFailures]
-		expect(checkRecoveryNeeded(replay(events))).toBeNull()
+	it('counts neither retryable failures, nor failures without a type, nor a rejected message', () => {
+		expect(agentAfter([...toolTurn, started, outage, restarted, started, outage]).consecutiveRejectedTurns).toBeUndefined()
+		expect(agentAfter([...toolTurn, started, legacy, restarted, started, legacy]).consecutiveRejectedTurns).toBeUndefined()
+		// No pending tool results: the failed turn's message is consumed, so the next turn is a different request.
+		expect(agentAfter([spawned, started, rejected, started, rejected, started, rejected]).consecutiveRejectedTurns).toBeUndefined()
+	})
 
-		const agent = agentAfter([...events, restarted])
-		expect(agent.status).toBe('paused')
-		expect(agent.pauseReason).toBe('limit')
+	it('keeps the streak through a resume and clears it when a turn commits', () => {
+		const paused = [...rejectedTwiceAcrossRestarts, started, rejected, pausedOnRejections]
+		expect(agentAfter([...paused, resumed]).consecutiveRejectedTurns).toBe(3)
+		expect(agentAfter([...paused, resumed, started, answered]).consecutiveRejectedTurns).toBeUndefined()
 	})
 })
