@@ -914,12 +914,15 @@ export class Agent {
 			// consumed. The reducer leaves pendingToolResults / mailbox tokens intact so the
 			// next inference rebuilds the same turn; marking consumed here would drop the
 			// mailbox tokens and the retry would be missing the user message.
+			// An outage repeats the same retryable error every error-resume cycle; its body is kept once per episode.
+			const repeatsRetryableFailure = isRetryableLLMError(llmResponse.error) && (this.state?.consecutiveInferenceFailures ?? 0) > 0
 			await this.store.emit(withSessionId(
 				this.store.sessionId,
 				llmEvents.create('inference_failed', {
 					agentId: this.id,
 					error: llmResponse.error.message,
 					llmCallId,
+					providerError: repeatsRetryableFailure ? undefined : llmResponse.error.providerError,
 				}),
 			))
 			// Notify plugins (e.g. mailbox sends error message to parent). For retryable

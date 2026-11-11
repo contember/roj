@@ -18,7 +18,7 @@ import type {
 	RawToolSpec,
 } from './provider.js'
 import { limitDocumentBytes, resolveDocuments } from './document-content.js'
-import { mapProviderError } from './provider.js'
+import { mapProviderError, parseProviderErrorBody } from './provider.js'
 import { DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS, ProviderRequestAbortError, runProviderRequest } from './provider-request.js'
 import { sanitizeProviderMessages } from './message-sanitization.js'
 import type { RoutableLLMProvider } from './routing-provider.js'
@@ -104,14 +104,6 @@ interface AnthropicMessageResponse {
 		output_tokens: number
 		cache_creation_input_tokens?: number
 		cache_read_input_tokens?: number
-	}
-}
-
-interface AnthropicErrorResponse {
-	type: 'error'
-	error: {
-		type: string
-		message: string
 	}
 }
 
@@ -633,33 +625,24 @@ export class AnthropicProvider implements RoutableLLMProvider {
 	// ============================================================================
 
 	private mapHttpError(status: number, body: string): LLMError {
-		let message = `HTTP ${status}`
-		try {
-			const parsed = JSON.parse(body) as AnthropicErrorResponse
-			if (parsed.error?.message) {
-				message = parsed.error.message
-			}
-		} catch {
-			// use raw body as message if not parseable
-			if (body) message = body
-		}
+		const { message, providerError } = parseProviderErrorBody(status, body, this.apiKey)
 
 		if (status === 429) {
-			return { type: 'rate_limit', message, retryAfterMs: 60000, statusCode: status }
+			return { type: 'rate_limit', message, retryAfterMs: 60000, statusCode: status, providerError }
 		}
 		if (status === 400) {
 			if (message.includes('max_tokens') || message.includes('too long') || message.includes('context') || message.includes('token')) {
-				return { type: 'context_length', message, statusCode: status }
+				return { type: 'context_length', message, statusCode: status, providerError }
 			}
-			return { type: 'invalid_request', message, statusCode: status }
+			return { type: 'invalid_request', message, statusCode: status, providerError }
 		}
 		if (status === 401) {
-			return { type: 'invalid_request', message, statusCode: status }
+			return { type: 'invalid_request', message, statusCode: status, providerError }
 		}
 		if (status === 529 || status >= 500) {
-			return { type: 'server_error', message, statusCode: status }
+			return { type: 'server_error', message, statusCode: status, providerError }
 		}
-		return { type: 'server_error', message, statusCode: status, responseBody: body }
+		return { type: 'server_error', message, statusCode: status, responseBody: body, providerError }
 	}
 
 }

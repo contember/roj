@@ -5,8 +5,11 @@ import { Err, isErr, isOk, Ok } from '~/lib/utils/result.js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
 import { type OpenRouterConfig, OpenRouterProvider } from './openrouter.js'
 import type { InferenceContext, InferenceRequest, InferenceResponse, LLMError } from './provider.js'
-import { LLMMessageFactory } from './provider.js'
+import { LLMMessageFactory, PROVIDER_ERROR_BODY_MAX_LENGTH } from './provider.js'
 import { ModelId } from './schema.js'
+import { llmEvents } from './state.js'
+import { MockLLMProvider } from './mock.js'
+import { createTestPreset, TestHarness } from '~/testing/index.js'
 
 // ============================================================================
 // RetryableLLMProviderStub - Testable implementation of retry logic
@@ -658,5 +661,122 @@ describe('OpenRouterProvider request timeout', () => {
 		expect(result.ok).toBe(false)
 		if (result.ok) return
 		expect(result.error.type).toBe('aborted')
+	})
+})
+
+describe('OpenRouterProvider error response', () => {
+	const API_KEY = 'sk-or-test-secret'
+	const request = {
+		messages: [LLMMessageFactory.user('hi')],
+		model: ModelId('anthropic/claude-opus-4.6'),
+		systemPrompt: '',
+	}
+	const respondingWith = (status: number, body: string) =>
+		new OpenRouterProvider({
+			apiKey: API_KEY,
+			imageProcessor: { resolveContent: async (content) => content },
+			fetch: async () => new Response(body, { status }),
+		})
+	const failWith = async (status: number, body: string): Promise<LLMError> => {
+		const result = await respondingWith(status, body).inference(request)
+		if (result.ok) throw new Error('expected the request to fail')
+		return result.error
+	}
+	const upstream = JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'image exceeds 5 MB maximum' } })
+
+	test('keeps the status and the error object with metadata.raw, and drops the rest of the body', async () => {
+		const error = await failWith(400, JSON.stringify({
+			error: { message: 'Provider returned error', code: 400, metadata: { raw: upstream, provider_name: 'Anthropic' } },
+			user_id: 'user_123',
+		}))
+
+		expect(error.type).toBe('invalid_request')
+		expect(error.message).toBe('Provider returned error')
+		expect(error.providerError?.statusCode).toBe(400)
+		const body = JSON.parse(error.providerError?.body ?? '')
+		expect(body).toEqual({ message: 'Provider returned error', code: 400, metadata: { raw: upstream, provider_name: 'Anthropic' } })
+	})
+
+	test('truncates a long body', async () => {
+		const raw = 'x'.repeat(10_000)
+		const error = await failWith(400, JSON.stringify({ error: { message: 'Provider returned error', metadata: { raw } } }))
+
+		const body = error.providerError?.body ?? ''
+		expect(body.length).toBeLessThan(PROVIDER_ERROR_BODY_MAX_LENGTH + 40)
+		expect(body.startsWith('{"message":"Provider returned error","metadata":{"raw":"xxx')).toBe(true)
+		const omitted = JSON.stringify({ message: 'Provider returned error', metadata: { raw } }).length - PROVIDER_ERROR_BODY_MAX_LENGTH
+		expect(body.endsWith(`… [${omitted} more characters]`)).toBe(true)
+	})
+
+	test('does not split a surrogate pair when it truncates', async () => {
+		// One ASCII character shifts the pairs so that the cut falls between the halves of one.
+		const error = await failWith(502, `a${'😀'.repeat(PROVIDER_ERROR_BODY_MAX_LENGTH)}`)
+
+		const body = error.providerError?.body ?? ''
+		expect(() => encodeURIComponent(body)).not.toThrow()
+		expect(body.startsWith(`a${'😀'.repeat(1023)}… [`)).toBe(true)
+	})
+
+	test('keeps a body that is not JSON as it is, and as the message', async () => {
+		const error = await failWith(502, '<html>Bad gateway</html>')
+
+		expect(error.type).toBe('server_error')
+		expect(error.message).toBe('<html>Bad gateway</html>')
+		expect(error.providerError).toEqual({ statusCode: 502, body: '<html>Bad gateway</html>' })
+	})
+
+	test('never keeps the API key', async () => {
+		const error = await failWith(401, JSON.stringify({ error: { message: `Invalid key ${API_KEY}` } }))
+
+		expect(error.providerError?.body).not.toContain(API_KEY)
+		expect(error.providerError?.body).toContain('[redacted]')
+		expect(error.message).toBe('Invalid key [redacted]')
+	})
+
+	test('ends up in the inference_failed event next to the unchanged message', async () => {
+		const openRouter = respondingWith(400, JSON.stringify({ error: { message: 'Provider returned error', metadata: { raw: upstream } } }))
+		const harness = new TestHarness({
+			presets: [createTestPreset()],
+			llmProvider: new MockLLMProvider(async (inferenceRequest) => {
+				const result = await openRouter.inference(inferenceRequest)
+				if (!result.ok) throw result.error
+				return result.value
+			}),
+		})
+		const session = await harness.createSession('test')
+		await session.sendMessage('hi')
+		const deadline = Date.now() + 2_000
+		while ((await session.getEventsByType(llmEvents, 'inference_failed')).length === 0 && Date.now() < deadline) await Bun.sleep(5)
+
+		const failed = await session.getEventsByType(llmEvents, 'inference_failed')
+		expect(failed).toHaveLength(1)
+		expect(failed[0].error).toBe('Provider returned error')
+		expect(failed[0].providerError?.statusCode).toBe(400)
+		expect(failed[0].providerError?.body).toContain('image exceeds 5 MB maximum')
+
+		await harness.shutdown()
+	})
+
+	test('keeps the body of a retryable failure once per episode, not on every error-resume cycle', async () => {
+		let calls = 0
+		const outage: LLMError = { type: 'server_error', message: 'Bad gateway', retryAfterMs: 1, providerError: { statusCode: 502, body: '<html>Bad gateway</html>' } }
+		const preset = createTestPreset()
+		preset.orchestrator.errorResumeBackoff = { baseDelayMs: 1, maxDelayMs: 1 }
+		const harness = new TestHarness({
+			presets: [preset],
+			// Two error-resume cycles of five attempts each, then the provider is back.
+			llmProvider: new MockLLMProvider(() => {
+				calls++
+				if (calls <= 10) throw outage
+				return { content: 'Recovered', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			}),
+		})
+		const session = await harness.createSession('test')
+		await session.sendAndWaitForIdle('hi', { timeoutMs: 10_000 })
+
+		const failed = await session.getEventsByType(llmEvents, 'inference_failed')
+		expect(failed.map((e) => e.providerError?.statusCode)).toEqual([502, undefined])
+
+		await harness.shutdown()
 	})
 })
