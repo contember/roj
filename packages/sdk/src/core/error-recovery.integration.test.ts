@@ -4,6 +4,8 @@ import type { AgentStatus } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { llmEvents } from '~/core/llm/state.js'
+import { sessionEvents } from '~/core/sessions/state.js'
+import { mailboxEvents } from '~/plugins/mailbox/state.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { createTool } from '~/core/tools/definition.js'
 import { ToolCallId } from '~/core/tools/schema.js'
@@ -424,9 +426,9 @@ describe('core: an agent the provider keeps rejecting', () => {
 		if (!spawned.ok) throw new Error(spawned.error.message)
 		const childId = spawned.value
 
-		const events = () => eventStore.load(session.sessionId)
-		const childFailures = async () => (await events()).filter((e) => e.type === 'inference_failed' && e.agentId === childId).length
-		const childNotices = async () => (await events()).flatMap((e) => (e.type === 'mailbox_message' && e.message.from === childId ? [e.message.content] : []))
+		const childFailures = async () => (await session.getEventsByType(llmEvents, 'inference_failed')).filter((e) => e.agentId === childId).length
+		const childNotices = async () =>
+			(await session.getEventsByType(mailboxEvents, 'mailbox_message')).filter((e) => e.message.from === childId).map((e) => e.message.content)
 		await waitUntil(async () => (await childNotices()).length === 1)
 		await first.shutdown()
 
@@ -447,12 +449,12 @@ describe('core: an agent the provider keeps rejecting', () => {
 		expect(reloaded.value.state.agents.get(childId)?.status).toBe('paused')
 		await afterPause.shutdown()
 
-		const log = await events()
 		expect(childCalls).toBe(4)
-		const pauses = log.filter((e) => e.type === 'agent_paused' && e.agentId === childId)
+		const pauses = (await session.getEventsByType(agentEvents, 'agent_paused')).filter((e) => e.agentId === childId)
 		expect(pauses).toHaveLength(1)
-		expect(pauses[0]).toMatchObject({ reason: 'limit' })
-		const resetAfterPause = log.slice(log.indexOf(pauses[0])).flatMap((e) => (e.type === 'session_restarted' ? e.resetAgentIds : []))
+		expect(pauses[0].reason).toBe('limit')
+		const restarts = await session.getEventsByType(sessionEvents, 'session_restarted')
+		const resetAfterPause = restarts.filter((e) => e.timestamp >= pauses[0].timestamp).flatMap((e) => e.resetAgentIds)
 		expect(resetAfterPause).not.toContain(childId)
 
 		const fromChild = await childNotices()
