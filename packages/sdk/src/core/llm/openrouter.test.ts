@@ -708,6 +708,15 @@ describe('OpenRouterProvider error response', () => {
 		expect(body.endsWith(`… [${omitted} more characters]`)).toBe(true)
 	})
 
+	test('does not split a surrogate pair when it truncates', async () => {
+		// One ASCII character shifts the pairs so that the cut falls between the halves of one.
+		const error = await failWith(502, `a${'😀'.repeat(PROVIDER_ERROR_BODY_MAX_LENGTH)}`)
+
+		const body = error.providerError?.body ?? ''
+		expect(() => encodeURIComponent(body)).not.toThrow()
+		expect(body.startsWith(`a${'😀'.repeat(1023)}… [`)).toBe(true)
+	})
+
 	test('keeps a body that is not JSON as it is, and as the message', async () => {
 		const error = await failWith(502, '<html>Bad gateway</html>')
 
@@ -721,6 +730,7 @@ describe('OpenRouterProvider error response', () => {
 
 		expect(error.providerError?.body).not.toContain(API_KEY)
 		expect(error.providerError?.body).toContain('[redacted]')
+		expect(error.message).toBe('Invalid key [redacted]')
 	})
 
 	test('ends up in the inference_failed event next to the unchanged message', async () => {
@@ -743,6 +753,29 @@ describe('OpenRouterProvider error response', () => {
 		expect(failed[0].error).toBe('Provider returned error')
 		expect(failed[0].providerError?.statusCode).toBe(400)
 		expect(failed[0].providerError?.body).toContain('image exceeds 5 MB maximum')
+
+		await harness.shutdown()
+	})
+
+	test('keeps the body of a retryable failure once per episode, not on every error-resume cycle', async () => {
+		let calls = 0
+		const outage: LLMError = { type: 'server_error', message: 'Bad gateway', retryAfterMs: 1, providerError: { statusCode: 502, body: '<html>Bad gateway</html>' } }
+		const preset = createTestPreset()
+		preset.orchestrator.errorResumeBackoff = { baseDelayMs: 1, maxDelayMs: 1 }
+		const harness = new TestHarness({
+			presets: [preset],
+			// Two error-resume cycles of five attempts each, then the provider is back.
+			llmProvider: new MockLLMProvider(() => {
+				calls++
+				if (calls <= 10) throw outage
+				return { content: 'Recovered', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			}),
+		})
+		const session = await harness.createSession('test')
+		await session.sendAndWaitForIdle('hi', { timeoutMs: 10_000 })
+
+		const failed = await session.getEventsByType(llmEvents, 'inference_failed')
+		expect(failed.map((e) => e.providerError?.statusCode)).toEqual([502, undefined])
 
 		await harness.shutdown()
 	})

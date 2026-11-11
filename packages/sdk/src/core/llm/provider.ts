@@ -269,16 +269,21 @@ const parseJson = (text: string): unknown => {
  * of the body, and never contains the API key.
  */
 export function parseProviderErrorBody(statusCode: number, body: string, apiKey: string): { message: string; providerError: ProviderErrorDetail } {
+	const redact = (text: string): string => (apiKey === '' ? text : text.replaceAll(apiKey, '[redacted]'))
 	const json = parseJson(body)
 	const parsed = providerErrorBodySchema.safeParse(json)
 	// An empty message falls back like a missing one; a body that is not JSON is the message itself.
 	const message = (parsed.success ? parsed.data.error.message : undefined) || (json === undefined && body !== '' ? body : `HTTP ${statusCode}`)
-	const kept = parsed.success ? JSON.stringify(parsed.data.error) : body
-	const redacted = apiKey === '' ? kept : kept.replaceAll(apiKey, '[redacted]')
-	const truncated = redacted.length > PROVIDER_ERROR_BODY_MAX_LENGTH
-		? `${redacted.slice(0, PROVIDER_ERROR_BODY_MAX_LENGTH)}… [${redacted.length - PROVIDER_ERROR_BODY_MAX_LENGTH} more characters]`
-		: redacted
-	return { message, providerError: { statusCode, body: truncated } }
+	const kept = redact(parsed.success ? JSON.stringify(parsed.data.error) : body)
+	return { message: redact(message), providerError: { statusCode, body: truncate(kept, PROVIDER_ERROR_BODY_MAX_LENGTH) } }
+}
+
+/** Cuts `text` to at most `max` UTF-16 code units plus a note, never between the two halves of a surrogate pair. */
+const truncate = (text: string, max: number): string => {
+	if (text.length <= max) return text
+	const lastKept = text.charCodeAt(max - 1)
+	const end = lastKept >= 0xd800 && lastKept <= 0xdbff ? max - 1 : max
+	return `${text.slice(0, end)}… [${text.length - end} more characters]`
 }
 
 // ============================================================================
