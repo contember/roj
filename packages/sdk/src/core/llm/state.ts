@@ -4,7 +4,7 @@ import type { LLMMessage } from '~/core/agents/state'
 import { createEventsFactory } from '~/core/events/types'
 import { toolCallIdSchema } from '~/core/tools/schema'
 import { messageIdSchema } from '~/plugins/mailbox/schema'
-import { llmCallIdSchema } from './schema.js'
+import { llmCallIdSchema, providerErrorDetailSchema } from './schema.js'
 
 // ============================================================================
 // Supporting types for LLM events
@@ -117,6 +117,8 @@ export const llmEvents = createEventsFactory({
 			agentId: agentIdSchema,
 			error: z4.string(),
 			llmCallId: llmCallIdSchema.optional(),
+			/** Status and body of the provider's error response, when the request got one. */
+			providerError: providerErrorDetailSchema.optional(),
 		}),
 		/**
 		 * A plugin's afterInference hook requested a retry of the turn. Rolls back

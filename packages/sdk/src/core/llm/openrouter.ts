@@ -18,7 +18,7 @@ import type {
 	ProviderHttpRequest,
 	RawInferenceRequest,
 } from './provider.js'
-import { mapProviderError } from './provider.js'
+import { mapProviderError, parseProviderErrorBody } from './provider.js'
 import { DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS, ProviderRequestAbortError, runProviderRequest } from './provider-request.js'
 import { limitDocumentBytes, omitDocumentData, resolveDocuments } from './document-content.js'
 import { sanitizeProviderMessages } from './message-sanitization.js'
@@ -82,14 +82,6 @@ interface OpenRouterResponse {
 	model: string
 	choices: OpenRouterChoice[]
 	usage?: OpenRouterUsage
-}
-
-interface OpenRouterErrorResponse {
-	error?: {
-		message: string
-		type?: string
-		code?: string
-	}
 }
 
 // ============================================================================
@@ -472,29 +464,21 @@ export class OpenRouterProvider implements LLMProvider {
 	}
 
 	private mapHttpError(status: number, body: string): LLMError {
-		let message = `HTTP ${status}`
-		try {
-			const parsed = JSON.parse(body) as OpenRouterErrorResponse
-			if (parsed.error?.message) {
-				message = parsed.error.message
-			}
-		} catch {
-			if (body) message = body
-		}
+		const { message, providerError } = parseProviderErrorBody(status, body, this.apiKey)
 
 		if (status === 429) {
-			return { type: 'rate_limit', message, retryAfterMs: 60000, statusCode: status, responseBody: body }
+			return { type: 'rate_limit', message, retryAfterMs: 60000, statusCode: status, responseBody: body, providerError }
 		}
 		if (status === 400) {
 			if (message.includes('context_length') || message.includes('maximum context')) {
-				return { type: 'context_length', message, statusCode: status, responseBody: body }
+				return { type: 'context_length', message, statusCode: status, responseBody: body, providerError }
 			}
-			return { type: 'invalid_request', message, statusCode: status, responseBody: body }
+			return { type: 'invalid_request', message, statusCode: status, responseBody: body, providerError }
 		}
 		if (status >= 500) {
-			return { type: 'server_error', message, statusCode: status, responseBody: body }
+			return { type: 'server_error', message, statusCode: status, responseBody: body, providerError }
 		}
-		return { type: 'server_error', message, statusCode: status, responseBody: body }
+		return { type: 'server_error', message, statusCode: status, responseBody: body, providerError }
 	}
 
 }

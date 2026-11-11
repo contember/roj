@@ -920,6 +920,7 @@ export class Agent {
 					agentId: this.id,
 					error: llmResponse.error.message,
 					llmCallId,
+					providerError: llmResponse.error.providerError,
 				}),
 			))
 			// Notify plugins (e.g. mailbox sends error message to parent). For retryable

@@ -14,7 +14,8 @@ import type { ToolDefinition } from '~/core/tools/definition.js'
 import type { ToolCallId } from '~/core/tools/schema.js'
 import type { Result } from '~/lib/utils/result.js'
 import { ProviderMessageValidationError } from './message-sanitization.js'
-import { ModelId } from './schema.js'
+import z from 'zod/v4'
+import { ModelId, type ProviderErrorDetail } from './schema.js'
 
 // Re-export LLMMessage types from agents/state for backwards compatibility
 export type { AssistantLLMMessage, LLMMessage, ReasoningDetails, SystemLLMMessage, ThinkingBlocks, ToolCall, ToolLLMMessage, UserLLMMessage }
@@ -241,7 +242,43 @@ export interface LLMError {
 	statusCode?: number
 	/** Raw HTTP response body from the provider */
 	responseBody?: string
+	/** The provider's error response, parsed and truncated for the event log */
+	providerError?: ProviderErrorDetail
 	cause?: unknown
+}
+
+/** Longest provider error body `inference_failed` keeps, in characters. */
+export const PROVIDER_ERROR_BODY_MAX_LENGTH = 2048
+
+/** OpenRouter and Anthropic both answer a failed request with `{ error: { message, ... } }`. */
+const providerErrorBodySchema = z.object({
+	error: z.looseObject({ message: z.string().optional() }),
+})
+
+const parseJson = (text: string): unknown => {
+	try {
+		return JSON.parse(text)
+	} catch {
+		return undefined
+	}
+}
+
+/**
+ * Parses a provider's HTTP error body: the message for the error, and the detail for the event log.
+ * The detail keeps the provider's `error` object (for OpenRouter including `metadata.raw`), drops the rest
+ * of the body, and never contains the API key.
+ */
+export function parseProviderErrorBody(statusCode: number, body: string, apiKey: string): { message: string; providerError: ProviderErrorDetail } {
+	const json = parseJson(body)
+	const parsed = providerErrorBodySchema.safeParse(json)
+	// An empty message falls back like a missing one; a body that is not JSON is the message itself.
+	const message = (parsed.success ? parsed.data.error.message : undefined) || (json === undefined && body !== '' ? body : `HTTP ${statusCode}`)
+	const kept = parsed.success ? JSON.stringify(parsed.data.error) : body
+	const redacted = apiKey === '' ? kept : kept.replaceAll(apiKey, '[redacted]')
+	const truncated = redacted.length > PROVIDER_ERROR_BODY_MAX_LENGTH
+		? `${redacted.slice(0, PROVIDER_ERROR_BODY_MAX_LENGTH)}… [${redacted.length - PROVIDER_ERROR_BODY_MAX_LENGTH} more characters]`
+		: redacted
+	return { message, providerError: { statusCode, body: truncated } }
 }
 
 // ============================================================================

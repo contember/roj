@@ -12,6 +12,20 @@ import z from 'zod/v4'
 import type { LLMToolCall } from './state.js'
 
 // ============================================================================
+// Provider error detail
+// ============================================================================
+
+/** What the provider answered to a failed request, as `inference_failed` keeps it. */
+export const providerErrorDetailSchema = z.object({
+	/** HTTP status of the provider's response */
+	statusCode: z.number().int(),
+	/** The provider's `error` object as JSON, or the raw body when it has none; truncated, never headers. */
+	body: z.string(),
+})
+
+export type ProviderErrorDetail = z.infer<typeof providerErrorDetailSchema>
+
+// ============================================================================
 // LLMCallId - Branded type
 // ============================================================================
 

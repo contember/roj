@@ -831,3 +831,28 @@ describe('AnthropicProvider document mapping', () => {
 		})
 	})
 })
+
+describe('AnthropicProvider error response', () => {
+	test('keeps the status and the error object, and drops the rest of the body', async () => {
+		const provider = new AnthropicProvider({
+			apiKey: 'test-key',
+			imageProcessor: { resolveContent: async (content) => content },
+			fetch: async () => new Response(JSON.stringify({
+				type: 'error',
+				error: { type: 'invalid_request_error', message: 'image exceeds 5 MB maximum' },
+				request_id: 'req_123',
+			}), { status: 400 }),
+		})
+		const result = await provider.inference({
+			messages: [LLMMessageFactory.user('hi')],
+			model: ModelId('claude-sonnet-4-5'),
+			systemPrompt: '',
+		})
+		if (result.ok) throw new Error('expected the request to fail')
+
+		expect(result.error.type).toBe('invalid_request')
+		expect(result.error.message).toBe('image exceeds 5 MB maximum')
+		expect(result.error.providerError?.statusCode).toBe(400)
+		expect(JSON.parse(result.error.providerError?.body ?? '')).toEqual({ type: 'invalid_request_error', message: 'image exceeds 5 MB maximum' })
+	})
+})
