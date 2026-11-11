@@ -410,6 +410,8 @@ describe('core: an agent the provider keeps rejecting', () => {
 	 */
 	async function childRejectedAcrossRestarts() {
 		const calls = { child: 0 }
+		// What the provider does with the child's later turns; a test can switch it after the pause.
+		const provider: { child: 'reject' | 'outage' | 'answer' } = { child: 'reject' }
 		const llmProvider = new MockLLMProvider((request) => {
 			if (!request.systemPrompt.includes(CHILD_SYSTEM)) {
 				return { content: 'Noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
@@ -418,6 +420,8 @@ describe('core: an agent the provider keeps rejecting', () => {
 			if (calls.child === 1) {
 				return { content: null, toolCalls: [{ id: ToolCallId('look-1'), name: 'look', input: {} }], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
 			}
+			if (provider.child === 'outage') throw { type: 'server_error', message: 'upstream 502', retryAfterMs: 1 }
+			if (provider.child === 'answer') return { content: 'Inspected', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
 			throw { type: 'invalid_request', message: REJECTED }
 		})
 
@@ -446,7 +450,7 @@ describe('core: an agent the provider keeps rejecting', () => {
 			await waitUntil(async () => (await childNotices()).length === expectedFailures)
 			await pausing.shutdown()
 		}
-		return { calls, llmProvider, eventStore, session, childId, childNotices, childPauses, pausing }
+		return { calls, provider, llmProvider, eventStore, session, childId, childFailures, childNotices, childPauses, pausing }
 	}
 
 	it('pauses after three rejections across restarts, tells its parent once, and is not reset again', async () => {
@@ -497,6 +501,38 @@ describe('core: an agent the provider keeps rejecting', () => {
 
 		expect(calls.child).toBe(5)
 		expect((await childNotices()).filter((content) => content.startsWith('<child-paused'))).toHaveLength(2)
+	})
+
+	it('a resumed agent that hits an outage is retried after it, not paused again', async () => {
+		const { calls, provider, llmProvider, eventStore, session, childId, childFailures, childPauses } = await childRejectedAcrossRestarts()
+
+		provider.child = 'outage'
+		const resuming = new TestHarness({ presets: [preset], llmProvider, eventStore })
+		await resuming.sessionManager.loadAllSessions()
+		const live = await resuming.sessionManager.getSession(session.sessionId)
+		if (!live.ok) throw new Error(live.error.message)
+		const resumed = await live.value.resumeAgent(childId)
+		if (!resumed.ok) throw new Error(resumed.error.message)
+		// The LLM retry gives up after five attempts and the turn fails as retryable.
+		await waitUntil(async () => (await childFailures()) === 4)
+		await Bun.sleep(50)
+		expect(live.value.state.agents.get(childId)?.status).toBe('errored')
+		await resuming.shutdown()
+
+		// The provider is back; the next restart resets the errored agent and the kept turn goes through.
+		provider.child = 'answer'
+		const recovered = new TestHarness({ presets: [preset], llmProvider, eventStore })
+		await recovered.sessionManager.loadAllSessions()
+		const reloaded = await recovered.sessionManager.getSession(session.sessionId)
+		if (!reloaded.ok) throw new Error(reloaded.error.message)
+		const reloadedSession = reloaded.value
+		await waitUntil(async () => reloadedSession.state.agents.get(childId)?.consecutiveRejectedTurns === undefined)
+		await recovered.shutdown()
+
+		expect(await childPauses()).toHaveLength(1)
+		expect(calls.child).toBe(4 + 5 + 1)
+		const failures = (await session.getEventsByType(llmEvents, 'inference_failed')).filter((e) => e.agentId === childId)
+		expect(failures.map((e) => e.errorType)).toEqual(['invalid_request', 'invalid_request', 'invalid_request', 'server_error'])
 	})
 
 	it('a root agent whose messages are rejected answers the next valid message', async () => {

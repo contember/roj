@@ -933,7 +933,7 @@ export class Agent {
 			const rejected = errorState?.consecutiveRejectedTurns ?? 0
 			// A rejected tool-result turn is rebuilt unchanged after every restart and fails again; pausing stops
 			// the restart from resetting it and tells the parent once, through the onPause hooks.
-			if (errorState && rejected >= Agent.MAX_CONSECUTIVE_REJECTED_TURNS) {
+			if (errorState && !isRetryableLLMError(llmResponse.error) && rejected >= Agent.MAX_CONSECUTIVE_REJECTED_TURNS) {
 				await this.emitPause('limit', `The provider rejected this turn ${rejected} times in a row and the agent will not retry it on its own. Last error: ${llmResponse.error.message}`)
 				return
 			}
