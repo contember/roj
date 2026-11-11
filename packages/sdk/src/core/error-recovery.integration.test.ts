@@ -381,3 +381,84 @@ describe('core: error recovery', () => {
 		})
 	})
 })
+
+describe('core: an agent the provider keeps rejecting', () => {
+	const CHILD_SYSTEM = 'Child agent: inspect the page.'
+	const lookTool = createTool({
+		name: 'look',
+		description: 'Look at the page',
+		input: z.object({}),
+		execute: async () => Ok('a large screenshot'),
+	})
+	const preset = createTestPreset({ agents: [{ name: 'child', system: CHILD_SYSTEM, tools: [lookTool], agents: [] }] })
+
+	const waitUntil = async (predicate: () => Promise<boolean>, timeoutMs = 5_000): Promise<void> => {
+		const deadline = Date.now() + timeoutMs
+		while (!(await predicate())) {
+			if (Date.now() >= deadline) throw new Error('Timed out waiting for condition')
+			await Bun.sleep(5)
+		}
+	}
+
+	it('pauses after three failures across restarts, tells its parent once, and is not reset again', async () => {
+		let childCalls = 0
+		// The child's first turn calls a tool; every turn carrying the tool result is rejected, as an oversized image would be.
+		const llmProvider = new MockLLMProvider((request) => {
+			if (!request.systemPrompt.includes(CHILD_SYSTEM)) {
+				return { content: 'Noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			}
+			childCalls++
+			if (childCalls === 1) {
+				return { content: null, toolCalls: [{ id: ToolCallId('look-1'), name: 'look', input: {} }], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			}
+			throw { type: 'invalid_request', message: 'Provider returned error' }
+		})
+
+		const first = new TestHarness({ presets: [preset], llmProvider })
+		const eventStore = first.eventStore
+		const session = await first.createSession('test')
+		const entryId = session.getEntryAgentId()!
+		const live = await first.sessionManager.getSession(session.sessionId)
+		if (!live.ok) throw new Error(live.error.message)
+		const spawned = await live.value.spawnAgentManually('child', entryId, 'Inspect the page')
+		if (!spawned.ok) throw new Error(spawned.error.message)
+		const childId = spawned.value
+
+		const events = () => eventStore.load(session.sessionId)
+		const childFailures = async () => (await events()).filter((e) => e.type === 'inference_failed' && e.agentId === childId).length
+		const childNotices = async () => (await events()).flatMap((e) => (e.type === 'mailbox_message' && e.message.from === childId ? [e.message.content] : []))
+		await waitUntil(async () => (await childNotices()).length === 1)
+		await first.shutdown()
+
+		// Each restart resets the errored child, which fails again; the third failure pauses it.
+		for (const expectedFailures of [2, 3]) {
+			const restarted = new TestHarness({ presets: [preset], llmProvider, eventStore })
+			await restarted.sessionManager.loadAllSessions()
+			await waitUntil(async () => (await childFailures()) === expectedFailures)
+			await waitUntil(async () => (await childNotices()).length === expectedFailures)
+			await restarted.shutdown()
+		}
+
+		const afterPause = new TestHarness({ presets: [preset], llmProvider, eventStore })
+		await afterPause.sessionManager.loadAllSessions()
+		await Bun.sleep(100)
+		const reloaded = await afterPause.sessionManager.getSession(session.sessionId)
+		if (!reloaded.ok) throw new Error(reloaded.error.message)
+		expect(reloaded.value.state.agents.get(childId)?.status).toBe('paused')
+		await afterPause.shutdown()
+
+		const log = await events()
+		expect(childCalls).toBe(4)
+		const pauses = log.filter((e) => e.type === 'agent_paused' && e.agentId === childId)
+		expect(pauses).toHaveLength(1)
+		expect(pauses[0]).toMatchObject({ reason: 'limit' })
+		const resetAfterPause = log.slice(log.indexOf(pauses[0])).flatMap((e) => (e.type === 'session_restarted' ? e.resetAgentIds : []))
+		expect(resetAfterPause).not.toContain(childId)
+
+		const fromChild = await childNotices()
+		expect(fromChild.filter((content) => content.startsWith('Agent encountered an error:'))).toHaveLength(2)
+		const pausedNotices = fromChild.filter((content) => content.startsWith('<child-paused'))
+		expect(pausedNotices).toHaveLength(1)
+		expect(pausedNotices[0]).toContain('Provider returned error')
+	})
+})

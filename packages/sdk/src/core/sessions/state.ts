@@ -439,9 +439,8 @@ export const coreReducer = createTypedReducer(
 							inferenceCall: undefined,
 							// Its response may already be in the call log; the next inference looks there first.
 							interruptedInference: agent.status === 'inferring' ? agent.inferenceCall : undefined,
-							// Restart is an explicit external trigger — start a fresh error episode
-							// so the outer error-resume backoff doesn't delay the first attempt.
-							consecutiveInferenceFailures: 0,
+							// The first attempt after a restart is not delayed by the error-resume backoff, but the failure
+							// streak is kept: a conversation the provider rejects must not look fresh after every restart.
 							lastInferenceFailureAt: undefined,
 						}
 						changed = true

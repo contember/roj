@@ -1788,3 +1788,44 @@ describe('the call a restart interrupts', () => {
 		expect(agentAfter([spawned, started, restarted, spliced]).interruptedInference).toBeUndefined()
 	})
 })
+
+describe('a failure streak across restarts', () => {
+	const agentId = generateTestAgentId()
+	const spawned = withSessionId(SESSION_ID, agentEvents.create('agent_spawned', { agentId, definitionName: 'test', parentId: null }))
+	const started = withSessionId(SESSION_ID, llmEvents.create('inference_started', { agentId, messages: [], consumedMessageIds: [] }))
+	const failed = withSessionId(SESSION_ID, llmEvents.create('inference_failed', { agentId, error: 'Provider returned error' }))
+	const restarted = withSessionId(SESSION_ID, sessionEvents.create('session_restarted', { resetAgentIds: [agentId], clearedToolAgentIds: [] }))
+	const pausedOnFailures = withSessionId(SESSION_ID, agentEvents.create('agent_paused', { agentId, reason: 'limit', message: 'Inference failed 3 times in a row' }))
+	const metrics = { promptTokens: 1, completionTokens: 1, totalTokens: 2, latencyMs: 1, model: 'test' }
+	const completed = withSessionId(SESSION_ID, llmEvents.create('inference_completed', { agentId, consumedMessageIds: [], response: { content: 'ok', toolCalls: [] }, metrics }))
+	const replay = (events: DomainEvent[]) => events.reduce(applyEvent, createSessionState(SESSION_ID, 'test', TIMESTAMP))
+	const agentAfter = (events: DomainEvent[]) => {
+		const agent = getAgentState(replay(events), agentId)
+		if (agent === null) throw new Error('the agent was spawned')
+		return agent
+	}
+
+	it('resets an agent after a single failure, keeping the streak but not the backoff', () => {
+		expect(checkRecoveryNeeded(replay([spawned, started, failed]))?.resetAgentIds).toEqual([agentId])
+
+		const agent = agentAfter([spawned, started, failed, restarted])
+		expect(agent.status).toBe('pending')
+		expect(agent.consecutiveInferenceFailures).toBe(1)
+		expect(agent.lastInferenceFailureAt).toBeUndefined()
+	})
+
+	it('counts failures across restarts until a turn commits', () => {
+		const twoRestarts = [spawned, started, failed, restarted, started, failed, restarted, started, failed]
+		expect(agentAfter(twoRestarts).consecutiveInferenceFailures).toBe(3)
+		expect(agentAfter([...twoRestarts, restarted, started, completed]).consecutiveInferenceFailures).toBe(0)
+	})
+
+	it('does not reset an agent paused after three failures', () => {
+		const events = [spawned, started, failed, restarted, started, failed, restarted, started, failed, pausedOnFailures]
+		expect(checkRecoveryNeeded(replay(events))).toBeNull()
+
+		const agent = agentAfter([...events, restarted])
+		expect(agent.status).toBe('paused')
+		expect(agent.pauseReason).toBe('limit')
+	})
+})

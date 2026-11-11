@@ -104,7 +104,7 @@ export type AgentStatus = 'pending' | 'inferring' | 'tool_exec' | 'errored' | 'p
 
 /**
  * Reason why an agent was paused.
- * - 'limit' — agent hit a hard limit (replaces limitStopped)
+ * - 'limit' — agent hit a hard limit (replaces limitStopped), e.g. too many consecutive failed inferences
  * - 'handler' — handler returned { action: 'pause' }
  * - 'manual' — paused via API call
  */

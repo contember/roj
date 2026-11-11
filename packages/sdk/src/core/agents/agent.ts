@@ -688,6 +688,9 @@ export class Agent {
 
 	private static readonly MAX_INFERENCE_RETRIES = 3
 
+	/** Consecutive failed inferences, the last one non-retryable, after which the agent pauses instead of staying errored. */
+	private static readonly MAX_CONSECUTIVE_FAILED_INFERENCES = 3
+
 	/** Max retries for empty-stop LLM responses (provider glitch). Total attempts = this + 1. */
 	private static readonly MAX_EMPTY_RESPONSE_RETRIES = 2
 
@@ -925,13 +928,19 @@ export class Agent {
 					providerError: repeatsRetryableFailure ? undefined : llmResponse.error.providerError,
 				}),
 			))
+			const errorState = this.state
+			const failures = errorState?.consecutiveInferenceFailures ?? 1
+			// A conversation the provider keeps rejecting fails the same way after every restart; pausing stops
+			// the restart from resetting it and tells the parent once, through the onPause hooks.
+			if (errorState && !isRetryableLLMError(llmResponse.error) && failures >= Agent.MAX_CONSECUTIVE_FAILED_INFERENCES) {
+				await this.emitPause('limit', `Inference failed ${failures} times in a row and the agent will not retry on its own. Last error: ${llmResponse.error.message}`)
+				return
+			}
 			// Notify plugins (e.g. mailbox sends error message to parent). For retryable
 			// errors, notify only on the first failure of an episode — the preserved
 			// token means each error-resume cycle re-fails here, and one parent
 			// notification per cycle would flood the parent during a provider outage.
-			const errorState = this.state
-			const isRepeatRetryableFailure = isRetryableLLMError(llmResponse.error)
-				&& (errorState?.consecutiveInferenceFailures ?? 1) > 1
+			const isRepeatRetryableFailure = isRetryableLLMError(llmResponse.error) && failures > 1
 			if (errorState && !isRepeatRetryableFailure) {
 				await this.executeOnError(errorState, llmResponse.error.message)
 			}
@@ -975,7 +984,7 @@ export class Agent {
 				// Commit the turn before pausing so pendingMessages move to conversationHistory.
 				await this.emitInferenceCompleted(response, llmCallId, llmResponse.value.metrics, llmResponse.value.reasoningDetails, llmResponse.value.thinkingBlocks)
 				await this.consumeDequeuedTokens(pluginDequeued)
-				await this.emitHandlerPause(afterResult.reason)
+				await this.emitPause('handler', afterResult.reason)
 				return
 			}
 			if (afterResult.action === 'retry') {
@@ -1289,14 +1298,14 @@ export class Agent {
 	// ============================================================================
 
 	/**
-	 * Emit agent_paused event with reason 'handler', then run onPause plugin hooks.
+	 * Emit agent_paused, then run onPause plugin hooks.
 	 */
-	private async emitHandlerPause(message?: string): Promise<void> {
+	private async emitPause(reason: 'handler' | 'limit', message?: string): Promise<void> {
 		await this.store.emit(withSessionId(
 			this.store.sessionId,
 			agentEvents.create('agent_paused', {
 				agentId: this.id,
-				reason: 'handler',
+				reason,
 				message,
 			}),
 		))
@@ -1305,7 +1314,7 @@ export class Agent {
 
 	/**
 	 * Run onPause plugin hooks. Called from Session.pauseAgent (manual pause) —
-	 * handler-triggered pauses go through emitHandlerPause which calls this itself.
+	 * handler-triggered pauses go through emitPause which calls this itself.
 	 */
 	async notifyPaused(message?: string, activity: SessionRuntimeActivity = this.getSessionContext().runtimeActivity): Promise<void> {
 		const operation = activity.tryOperation(`agent:${this.id}:pause-hook`)
@@ -1460,7 +1469,7 @@ export class Agent {
 		await this.emitHandlerCompleted('onStart', pauseResult)
 
 		if (pauseResult !== null) {
-			await this.emitHandlerPause(pauseResult.reason)
+			await this.emitPause('handler', pauseResult.reason)
 		}
 
 		return pauseResult
@@ -1498,7 +1507,7 @@ export class Agent {
 						return result
 					case 'pause':
 						await this.emitHandlerCompleted('beforeInference', result)
-						await this.emitHandlerPause(result.reason)
+						await this.emitPause('handler', result.reason)
 						return result
 					default:
 						throw new Error(`Unhandled beforeInference action: ${(result as { action: string }).action}`)
@@ -1617,7 +1626,7 @@ export class Agent {
 						}
 					case 'pause':
 						await this.emitHandlerCompleted('beforeToolCall', result)
-						await this.emitHandlerPause(result.reason)
+						await this.emitPause('handler', result.reason)
 						return result
 					default:
 						throw new Error(`Unhandled beforeToolCall action: ${(result as { action: string }).action}`)
@@ -1678,7 +1687,7 @@ export class Agent {
 					}
 					case 'pause':
 						await this.emitHandlerCompleted('afterToolCall', result)
-						await this.emitHandlerPause(result.reason)
+						await this.emitPause('handler', result.reason)
 						return result
 					default:
 						throw new Error(`Unhandled afterToolCall action: ${(result as { action: string }).action}`)
@@ -1716,7 +1725,7 @@ export class Agent {
 				switch (pluginResult.action) {
 					case 'pause':
 						await this.emitHandlerCompleted('onComplete', pluginResult)
-						await this.emitHandlerPause(pluginResult.reason)
+						await this.emitPause('handler', pluginResult.reason)
 						return
 					default:
 						throw new Error(`Unhandled onComplete action: ${(pluginResult as { action: string }).action}`)
@@ -1752,7 +1761,7 @@ export class Agent {
 				switch (pluginResult.action) {
 					case 'pause':
 						await this.emitHandlerCompleted('onError', pluginResult)
-						await this.emitHandlerPause(pluginResult.reason)
+						await this.emitPause('handler', pluginResult.reason)
 						return
 					default:
 						throw new Error(`Unhandled onError action: ${(pluginResult as { action: string }).action}`)
