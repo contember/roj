@@ -26,6 +26,26 @@ export const providerErrorDetailSchema = z.object({
 export type ProviderErrorDetail = z.infer<typeof providerErrorDetailSchema>
 
 // ============================================================================
+// LLM error type
+// ============================================================================
+
+export const llmErrorTypeSchema = z.enum([
+	'rate_limit',
+	'invalid_request',
+	'context_length',
+	'server_error',
+	'network_error',
+	'timeout',
+	'aborted',
+])
+
+export type LLMErrorType = z.infer<typeof llmErrorTypeSchema>
+
+/** Retryable: rate_limit, server_error, network_error, timeout. The rest fail the same way on every retry. */
+export const isRetryableLLMErrorType = (type: LLMErrorType): boolean =>
+	type === 'rate_limit' || type === 'server_error' || type === 'network_error' || type === 'timeout'
+
+// ============================================================================
 // LLMCallId - Branded type
 // ============================================================================
 

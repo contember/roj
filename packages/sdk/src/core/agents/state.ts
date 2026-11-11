@@ -104,7 +104,7 @@ export type AgentStatus = 'pending' | 'inferring' | 'tool_exec' | 'errored' | 'p
 
 /**
  * Reason why an agent was paused.
- * - 'limit' — agent hit a hard limit (replaces limitStopped)
+ * - 'limit' — agent hit a hard limit (replaces limitStopped), e.g. a turn the provider keeps rejecting
  * - 'handler' — handler returned { action: 'pause' }
  * - 'manual' — paused via API call
  */
@@ -265,6 +265,11 @@ export interface AgentState {
 	lastInferenceMetrics?: LLMMetrics
 	/** Consecutive inference_failed count since the last committed turn — drives the outer error-resume backoff. */
 	consecutiveInferenceFailures?: number
+	/**
+	 * Non-retryable failures of a turn whose input survives them (pending tool results), since the last committed
+	 * turn. A restart rebuilds that turn unchanged, so this streak is not reset by one; it drives the failure pause.
+	 */
+	consecutiveRejectedTurns?: number
 	/** Timestamp of the most recent inference_failed — drives the outer error-resume backoff. */
 	lastInferenceFailureAt?: number
 	/** The staged turn's first call, as its inference_started recorded it; cleared when the turn ends. */

@@ -6,7 +6,7 @@ import { agentEvents } from '~/core/agents/state.js'
 import { contextEvents } from '~/core/context/state.js'
 import { createEventsFactory } from '~/core/events/types'
 import type { DomainEvent } from '~/core/events/types.js'
-import { modelIdSchema } from '~/core/llm/schema.js'
+import { isRetryableLLMErrorType, modelIdSchema } from '~/core/llm/schema.js'
 import { llmEvents } from '~/core/llm/state.js'
 import { SessionId, sessionIdSchema } from '~/core/sessions/schema.js'
 import type { PendingToolResult } from '~/core/tools/schema.js'
@@ -284,6 +284,7 @@ export const coreReducer = createTypedReducer(
 						lastInferenceMetrics: event.metrics,
 						consecutiveInferenceFailures: 0,
 						lastInferenceFailureAt: undefined,
+						consecutiveRejectedTurns: undefined,
 						turnNumber: (agent.turnNumber ?? 0) + 1,
 						inferenceCall: undefined,
 						// A turn a beforeInference skip committed has no inference_started to clear it.
@@ -306,6 +307,10 @@ export const coreReducer = createTypedReducer(
 					inferenceCall: undefined,
 					consecutiveInferenceFailures: (agent.consecutiveInferenceFailures ?? 0) + 1,
 					lastInferenceFailureAt: event.timestamp,
+					// A rejected message is consumed, so only a rejected tool-result turn comes back unchanged.
+					consecutiveRejectedTurns: event.errorType !== undefined && !isRetryableLLMErrorType(event.errorType) && agent.pendingToolResults.length > 0
+						? (agent.consecutiveRejectedTurns ?? 0) + 1
+						: agent.consecutiveRejectedTurns,
 				}))
 
 			case 'inference_retried':
@@ -476,6 +481,7 @@ export const coreReducer = createTypedReducer(
 						pendingMessages: [],
 						executingToolCall: undefined,
 						inferenceCall: undefined,
+						consecutiveRejectedTurns: undefined,
 						// The rewritten history is not what an interrupted call answered.
 						interruptedInference: undefined,
 						status: 'pending' as const,

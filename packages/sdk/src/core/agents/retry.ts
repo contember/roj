@@ -1,4 +1,5 @@
 import type { LLMError } from '~/core/llm/provider.js'
+import { isRetryableLLMErrorType } from '~/core/llm/schema.js'
 import type { Result } from '~/lib/utils/result.js'
 import { Err } from '~/lib/utils/result.js'
 import type { Logger } from '../../lib/logger/logger.js'
@@ -137,9 +138,7 @@ function calculateDelay<E>(
  * Non-retryable: invalid_request, context_length (permanent failures)
  */
 export function isRetryableLLMError(error: LLMError): boolean {
-	return ['rate_limit', 'server_error', 'network_error', 'timeout'].includes(
-		error.type,
-	)
+	return isRetryableLLMErrorType(error.type)
 }
 
 /**

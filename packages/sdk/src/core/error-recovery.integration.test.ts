@@ -4,6 +4,9 @@ import type { AgentStatus } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
 import { llmEvents } from '~/core/llm/state.js'
+import { sessionEvents } from '~/core/sessions/state.js'
+import { mailboxEvents } from '~/plugins/mailbox/state.js'
+import { agentStatusPlugin, agentStoppedNotificationSchema } from '~/plugins/agent-status/plugin.js'
 import { definePlugin } from '~/core/plugins/plugin-builder.js'
 import { createTool } from '~/core/tools/definition.js'
 import { ToolCallId } from '~/core/tools/schema.js'
@@ -379,5 +382,184 @@ describe('core: error recovery', () => {
 
 			await harness.shutdown()
 		})
+	})
+})
+
+describe('core: an agent the provider keeps rejecting', () => {
+	const CHILD_SYSTEM = 'Child agent: inspect the page.'
+	const REJECTED = 'Provider returned error'
+	const lookTool = createTool({
+		name: 'look',
+		description: 'Look at the page',
+		input: z.object({}),
+		execute: async () => Ok('a large screenshot'),
+	})
+	const preset = createTestPreset({ agents: [{ name: 'child', system: CHILD_SYSTEM, tools: [lookTool], agents: [] }] })
+
+	const waitUntil = async (predicate: () => Promise<boolean>, timeoutMs = 5_000): Promise<void> => {
+		const deadline = Date.now() + timeoutMs
+		while (!(await predicate())) {
+			if (Date.now() >= deadline) throw new Error('Timed out waiting for condition')
+			await Bun.sleep(5)
+		}
+	}
+
+	/**
+	 * A child whose first turn calls a tool and whose every turn carrying the tool result is rejected, as an oversized
+	 * image would be. It fails once per load and is paused on the third; returns the harness of that third load.
+	 */
+	async function childRejectedAcrossRestarts() {
+		const calls = { child: 0 }
+		// What the provider does with the child's later turns; a test can switch it after the pause.
+		const provider: { child: 'reject' | 'outage' | 'answer' } = { child: 'reject' }
+		const llmProvider = new MockLLMProvider((request) => {
+			if (!request.systemPrompt.includes(CHILD_SYSTEM)) {
+				return { content: 'Noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			}
+			calls.child++
+			if (calls.child === 1) {
+				return { content: null, toolCalls: [{ id: ToolCallId('look-1'), name: 'look', input: {} }], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			}
+			if (provider.child === 'outage') throw { type: 'server_error', message: 'upstream 502', retryAfterMs: 1 }
+			if (provider.child === 'answer') return { content: 'Inspected', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			throw { type: 'invalid_request', message: REJECTED }
+		})
+
+		const first = new TestHarness({ presets: [preset], llmProvider })
+		const eventStore = first.eventStore
+		const session = await first.createSession('test')
+		const entryId = session.getEntryAgentId()!
+		const live = await first.sessionManager.getSession(session.sessionId)
+		if (!live.ok) throw new Error(live.error.message)
+		const spawned = await live.value.spawnAgentManually('child', entryId, 'Inspect the page')
+		if (!spawned.ok) throw new Error(spawned.error.message)
+		const childId = spawned.value
+
+		const childFailures = async () => (await session.getEventsByType(llmEvents, 'inference_failed')).filter((e) => e.agentId === childId).length
+		const childNotices = async () =>
+			(await session.getEventsByType(mailboxEvents, 'mailbox_message')).filter((e) => e.message.from === childId).map((e) => e.message.content)
+		const childPauses = async () => (await session.getEventsByType(agentEvents, 'agent_paused')).filter((e) => e.agentId === childId)
+		await waitUntil(async () => (await childNotices()).length === 1)
+		await first.shutdown()
+
+		let pausing = first
+		for (const expectedFailures of [2, 3]) {
+			pausing = new TestHarness({ presets: [preset], llmProvider, eventStore, systemPlugins: [agentStatusPlugin] })
+			await pausing.sessionManager.loadAllSessions()
+			await waitUntil(async () => (await childFailures()) === expectedFailures)
+			await waitUntil(async () => (await childNotices()).length === expectedFailures)
+			await pausing.shutdown()
+		}
+		return { calls, provider, llmProvider, eventStore, session, childId, childFailures, childNotices, childPauses, pausing }
+	}
+
+	it('pauses after three rejections across restarts, tells its parent once, and is not reset again', async () => {
+		const { calls, llmProvider, eventStore, session, childId, childNotices, childPauses, pausing } = await childRejectedAcrossRestarts()
+
+		const afterPause = new TestHarness({ presets: [preset], llmProvider, eventStore })
+		await afterPause.sessionManager.loadAllSessions()
+		await Bun.sleep(100)
+		const reloaded = await afterPause.sessionManager.getSession(session.sessionId)
+		if (!reloaded.ok) throw new Error(reloaded.error.message)
+		expect(reloaded.value.state.agents.get(childId)?.status).toBe('paused')
+		await afterPause.shutdown()
+
+		expect(calls.child).toBe(4)
+		const pauses = await childPauses()
+		expect(pauses).toHaveLength(1)
+		expect(pauses[0].reason).toBe('limit')
+		const restarts = await session.getEventsByType(sessionEvents, 'session_restarted')
+		const resetAfterPause = restarts.filter((e) => e.timestamp >= pauses[0].timestamp).flatMap((e) => e.resetAgentIds)
+		expect(resetAfterPause).not.toContain(childId)
+
+		const fromChild = await childNotices()
+		expect(fromChild.filter((content) => content.startsWith('Agent encountered an error:'))).toHaveLength(2)
+		const pausedNotices = fromChild.filter((content) => content.startsWith('<child-paused'))
+		expect(pausedNotices).toHaveLength(1)
+		expect(pausedNotices[0]).toContain(REJECTED)
+
+		// The pausing failure skips onError, so its alert is a pause, not an error.
+		const stopped = pausing.notifications.getAll()
+			.filter((n) => n.pluginName === 'agent-status' && n.type === 'agentStopped')
+			.map((n) => agentStoppedNotificationSchema.parse(n.payload))
+			.filter((n) => n.agentId === childId)
+		expect(stopped.map((n) => [n.kind, n.reason])).toEqual([['paused', 'limit']])
+	})
+
+	it('a resumed agent retries the turn once, and pauses again when it is rejected again', async () => {
+		const { calls, llmProvider, eventStore, session, childId, childNotices, childPauses } = await childRejectedAcrossRestarts()
+
+		const resuming = new TestHarness({ presets: [preset], llmProvider, eventStore })
+		await resuming.sessionManager.loadAllSessions()
+		const live = await resuming.sessionManager.getSession(session.sessionId)
+		if (!live.ok) throw new Error(live.error.message)
+		const resumed = await live.value.resumeAgent(childId)
+		if (!resumed.ok) throw new Error(resumed.error.message)
+		await waitUntil(async () => (await childPauses()).length === 2)
+		await waitUntil(async () => (await childNotices()).length === 4)
+		await resuming.shutdown()
+
+		expect(calls.child).toBe(5)
+		expect((await childNotices()).filter((content) => content.startsWith('<child-paused'))).toHaveLength(2)
+	})
+
+	it('a resumed agent that hits an outage is retried after it, not paused again', async () => {
+		const { calls, provider, llmProvider, eventStore, session, childId, childFailures, childPauses } = await childRejectedAcrossRestarts()
+
+		provider.child = 'outage'
+		const resuming = new TestHarness({ presets: [preset], llmProvider, eventStore })
+		await resuming.sessionManager.loadAllSessions()
+		const live = await resuming.sessionManager.getSession(session.sessionId)
+		if (!live.ok) throw new Error(live.error.message)
+		const resumed = await live.value.resumeAgent(childId)
+		if (!resumed.ok) throw new Error(resumed.error.message)
+		// The LLM retry gives up after five attempts and the turn fails as retryable.
+		await waitUntil(async () => (await childFailures()) === 4)
+		await Bun.sleep(50)
+		expect(live.value.state.agents.get(childId)?.status).toBe('errored')
+		await resuming.shutdown()
+
+		// The provider is back; the next restart resets the errored agent and the kept turn goes through.
+		provider.child = 'answer'
+		const recovered = new TestHarness({ presets: [preset], llmProvider, eventStore })
+		await recovered.sessionManager.loadAllSessions()
+		const reloaded = await recovered.sessionManager.getSession(session.sessionId)
+		if (!reloaded.ok) throw new Error(reloaded.error.message)
+		const reloadedSession = reloaded.value
+		await waitUntil(async () => reloadedSession.state.agents.get(childId)?.consecutiveRejectedTurns === undefined)
+		await recovered.shutdown()
+
+		expect(await childPauses()).toHaveLength(1)
+		expect(calls.child).toBe(4 + 5 + 1)
+		const failures = (await session.getEventsByType(llmEvents, 'inference_failed')).filter((e) => e.agentId === childId)
+		expect(failures.map((e) => e.errorType)).toEqual(['invalid_request', 'invalid_request', 'invalid_request', 'server_error'])
+	})
+
+	it('a root agent whose messages are rejected answers the next valid message', async () => {
+		let calls = 0
+		const llmProvider = new MockLLMProvider((request) => {
+			calls++
+			if (JSON.stringify(request.messages).includes('oversized image')) throw { type: 'invalid_request', message: REJECTED }
+			return { content: 'Answered', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+		})
+		const rootPreset = createTestPreset()
+		rootPreset.orchestrator.errorResumeBackoff = { baseDelayMs: 1, maxDelayMs: 1 }
+		const harness = new TestHarness({ presets: [rootPreset], llmProvider })
+		const session = await harness.createSession('test')
+		const entryId = session.getEntryAgentId()!
+		const failures = async () => (await session.getEventsByType(llmEvents, 'inference_failed')).length
+
+		for (const expected of [1, 2, 3]) {
+			await session.sendMessage('Here is an oversized image')
+			await waitUntil(async () => (await failures()) === expected)
+		}
+		await session.sendAndWaitForIdle('Just a question')
+
+		expect(calls).toBe(4)
+		expect(session.state.agents.get(entryId)?.status).not.toBe('paused')
+		expect(countHistoryMentions(session, 'Answered')).toBe(1)
+		expect(await session.getEventsByType(agentEvents, 'agent_paused')).toHaveLength(0)
+
+		await harness.shutdown()
 	})
 })
