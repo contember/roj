@@ -9,9 +9,15 @@ on:
       - main
   pull_request:
 
+# A new push to a PR cancels its superseded run; a main push gets its own group, so none is cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   checks:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
