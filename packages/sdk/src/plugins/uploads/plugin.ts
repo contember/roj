@@ -1,5 +1,4 @@
 import z from 'zod/v4'
-import type { AgentId } from '~/core/agents/schema.js'
 import { createDomainError, type DomainError, ValidationErrors } from '~/core/errors.js'
 import { EventAppendError } from '~/core/events/event-store.js'
 import type { FileStore } from '~/core/file-store/types.js'
@@ -11,6 +10,7 @@ import type { RuntimeLeaseRelease, RuntimeOperation, SessionRuntimeActivity } fr
 import { SessionId } from '~/core/sessions/schema.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import { getEntryAgentId } from '~/core/sessions/state.js'
+import { hasPendingUserInput } from '~/plugins/user-chat/plugin.js'
 import { ArchiveBudget, type ArchiveLimitOverrides } from '~/lib/archive/index.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
@@ -1217,12 +1217,14 @@ export const uploadsPlugin = definePlugin('uploads')
 		}),
 	)
 	.dequeue({
-		// A ready upload is not work on its own: a client sends the user's message only once its uploads
-		// are ready, so waking on the upload would answer the file before the text it came with.
+		// A ready upload is not work on its own: it goes out with the user's message or answer it came with,
+		// never in a turn without user input, which would answer the file before the text.
 		hasPendingMessages: () => false,
 		getPendingMessages: (ctx) => {
 			const uploads = ctx.pluginState
 			if (uploads.pending.length === 0) return null
+			if (ctx.agentId !== getEntryAgentId(ctx.sessionState)) return null
+			if (!hasPendingUserInput(ctx.sessionState, ctx.agentId)) return null
 			const sessionRoot = ctx.files.getRoots().session
 			return {
 				messages: [

@@ -167,6 +167,11 @@ function pendingInboundOf(sessionState: SessionState): PendingInboundMessage[] {
 	return selectPluginState<UserChatState>(sessionState, "messages")?.pendingInbound ?? [];
 }
 
+/** Whether the agent has a user message or answer it has not read yet. */
+export function hasPendingUserInput(sessionState: SessionState, agentId: AgentId): boolean {
+	return pendingInboundOf(sessionState).some((message) => message.agentId === agentId);
+}
+
 interface UserChatPluginContext {
 	nextMessageSequence: number;
 	inFlightDeliveries: Map<string, {

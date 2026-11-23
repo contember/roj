@@ -2,8 +2,10 @@ import { describe, expect, it } from 'bun:test'
 import z from 'zod/v4'
 import { agentEvents } from '~/core/agents/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import type { InferenceRequest } from '~/core/llm/provider.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
-import { createTestPreset, TestHarness } from '~/testing/index.js'
+import { ToolCallId } from '~/core/tools/schema.js'
+import { createMultiAgentPreset, createTestPreset, TestHarness } from '~/testing/index.js'
 import type { TestSession } from '~/testing/index.js'
 import type { UploadsState } from './state.js'
 import { uploadEvents } from './state.js'
@@ -394,6 +396,76 @@ describe('uploads plugin', () => {
 			expect(uploadsAfter).toBeDefined()
 			if (!uploadsAfter) throw new Error('Expected uploads state')
 			expect(uploadsAfter.pending).toHaveLength(0)
+
+			await harness.shutdown()
+		})
+
+		it('neither a sub-agent nor a turn woken by its report takes the upload before the user writes', async () => {
+			const orchestratorRequests: InferenceRequest[] = []
+			const workerRequests: InferenceRequest[] = []
+			const { promise: workerStarted, resolve: markWorkerStarted } = Promise.withResolvers<void>()
+			const { promise: workerGate, resolve: releaseWorker } = Promise.withResolvers<void>()
+			const harness = new TestHarness({
+				presets: [createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' })],
+				mockHandler: async (request) => {
+					if (request.systemPrompt.includes('Orchestrator')) {
+						orchestratorRequests.push(request)
+						if (orchestratorRequests.length === 1) {
+							return {
+								content: null,
+								toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Long task' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						}
+						return { content: 'noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+					}
+					workerRequests.push(request)
+					if (workerRequests.length === 1) {
+						markWorkerStarted()
+						await workerGate
+						// A tool call gives the worker a second inference after the upload is ready.
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('tc2'), name: 'send_message', input: { to: 'parent', message: 'progress' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return { content: 'done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendMessage('Start')
+			await workerStarted
+
+			const fileContent = Buffer.from('logo bytes')
+			await session.callPluginMethod('uploads.upload', {
+				sessionId: String(session.sessionId),
+				filename: 'logo.txt',
+				mimeType: 'text/plain',
+				size: fileContent.length,
+				fileBuffer: fileContent,
+			})
+			releaseWorker()
+			await session.waitForIdle()
+			expect(workerRequests.length).toBeGreaterThanOrEqual(2)
+
+			await session.sendAndWaitForIdle('Use this logo')
+
+			const hasAttachment = (request: InferenceRequest) =>
+				request.messages.some((m) => typeof m.content === 'string' && m.content.includes('<attachment'))
+			expect(workerRequests.some(hasAttachment)).toBe(false)
+			// The worker's report woke the orchestrator before the user wrote; that turn must not take the file.
+			expect(orchestratorRequests.length).toBeGreaterThanOrEqual(4)
+			expect(orchestratorRequests.slice(0, -1).some(hasAttachment)).toBe(false)
+			const answering = orchestratorRequests.at(-1)
+			if (!answering) throw new Error('Expected the orchestrator to answer the user')
+			expect(answering.messages.some((m) => typeof m.content === 'string' && m.content.includes('Use this logo'))).toBe(true)
+			expect(hasAttachment(answering)).toBe(true)
 
 			await harness.shutdown()
 		})

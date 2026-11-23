@@ -203,6 +203,52 @@ describe('uploads host preprocessors', () => {
 	})
 })
 
+describe('upload delivery', () => {
+	it('a message sent while an upload is processing is answered without it, and the upload goes out with the next message', async () => {
+		const { promise: processingGate, resolve: finishProcessing } = Promise.withResolvers<void>()
+		const slow: Preprocessor = {
+			name: 'slow',
+			supportedMimeTypes: ['application/pdf'],
+			process: async () => {
+				await processingGate
+				return Ok({ extractedContent: 'scan text' })
+			},
+		}
+		const fixture = createFixture({ preprocessorRegistry: registryWith(slow) })
+		try {
+			const session = await fixture.harness.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.uploadAsync', {
+					sessionId: String(session.sessionId),
+					filename: 'scan.pdf',
+					mimeType: 'application/pdf',
+					size: 4,
+					fileBuffer: Buffer.from('%PDF'),
+				}),
+				processingSchema,
+			)
+
+			await session.sendAndWaitForIdle('First message')
+			const hasAttachment = (index: number) =>
+				fixture.harness.llmProvider.getCallHistory()[index]?.messages.some((m) => typeof m.content === 'string' && m.content.includes('<attachment'))
+			expect(fixture.harness.llmProvider.getCallCount()).toBe(1)
+			expect(hasAttachment(0)).toBe(false)
+
+			finishProcessing()
+			await waitForStatus(fixture.harness, upload.uploadId, 'ready')
+			await new Promise((resolve) => setTimeout(resolve, 25))
+			await session.waitForIdle()
+			expect(fixture.harness.llmProvider.getCallCount()).toBe(1)
+
+			await session.sendAndWaitForIdle('Second message')
+			expect(fixture.harness.llmProvider.getCallCount()).toBe(2)
+			expect(hasAttachment(1)).toBe(true)
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+})
+
 describe('uploads.registerStored', () => {
 	it('processes bytes from the blob store without writing the original into the upload dir', async () => {
 		const runs: RecordedRun[] = []
