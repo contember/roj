@@ -187,7 +187,7 @@ describe('uploads host preprocessors', () => {
 				attempts: 1,
 			})
 
-			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Here is the file')
 			const request = fixture.harness.llmProvider.getLastRequest()
 			const attachment = request?.messages.find((m) => typeof m.content === 'string' && m.content.includes('<attachment'))
 			if (!attachment || typeof attachment.content !== 'string') throw new Error('Expected the attachment message')
@@ -679,7 +679,7 @@ describe('preprocessor output the plugin does not trust', () => {
 				size: 4,
 				fileBuffer: Buffer.from('%PDF'),
 			})
-			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Here is the file')
 
 			const request = fixture.harness.llmProvider.getLastRequest()
 			const attachment = request?.messages.find((m) => typeof m.content === 'string' && m.content.includes('<attachment'))
@@ -721,7 +721,7 @@ describe('attachment message', () => {
 				}),
 				syncUploadSchema,
 			)
-			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Here is the file')
 
 			const message = attachmentMessage(fixture.harness)
 			const basePath = basePathOf(message)
@@ -755,7 +755,7 @@ describe('attachment message', () => {
 				processingSchema,
 			)
 			await waitForStatus(fixture.harness, upload.uploadId, 'ready')
-			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Here is the file')
 
 			const message = attachmentMessage(fixture.harness)
 			const basePath = basePathOf(message)
@@ -796,7 +796,7 @@ describe('attachment message', () => {
 				processingSchema,
 			)
 			await waitForStatus(fixture.harness, upload.uploadId, 'ready')
-			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Here is the file')
 
 			const description = await fixture.dataFileStore.read(`sessions/${session.sessionId}/uploads/${upload.uploadId}/description.txt`)
 			expect(description).toEqual({ ok: true, value: 'A red square.' })
@@ -833,7 +833,7 @@ describe('attachment message', () => {
 				processingSchema,
 			)
 			await waitForStatus(fixture.harness, upload.uploadId, 'ready')
-			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Here is the file')
 
 			const message = attachmentMessage(fixture.harness)
 			const basePath = basePathOf(message)
