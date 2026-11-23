@@ -245,8 +245,14 @@ export const PROVIDER_ERROR_BODY_MAX_LENGTH = 2048
 
 /** OpenRouter and Anthropic both answer a failed request with `{ error: { message, ... } }`. */
 const providerErrorBodySchema = z.object({
-	error: z.looseObject({ message: z.string().optional() }),
+	error: z.looseObject({
+		message: z.string().optional(),
+		metadata: z.record(z.string(), z.unknown()).optional().catch(undefined),
+	}),
 })
+
+/** Keys of OpenRouter's `error.metadata` that quote the request: a moderation error's `flagged_input` is part of the prompt. */
+const REQUEST_QUOTING_METADATA_KEYS = new Set(['flagged_input'])
 
 const parseJson = (text: string): unknown => {
 	try {
@@ -259,7 +265,7 @@ const parseJson = (text: string): unknown => {
 /**
  * Parses a provider's HTTP error body: the message for the error, and the detail for the event log.
  * The detail keeps the provider's `error` object (for OpenRouter including `metadata.raw`), drops the rest
- * of the body, and never contains the API key.
+ * of the body and the metadata that quotes the request, and never contains the API key.
  */
 export function parseProviderErrorBody(statusCode: number, body: string, apiKey: string): { message: string; providerError: ProviderErrorDetail } {
 	const redact = (text: string): string => (apiKey === '' ? text : text.replaceAll(apiKey, '[redacted]'))
@@ -267,9 +273,14 @@ export function parseProviderErrorBody(statusCode: number, body: string, apiKey:
 	const parsed = providerErrorBodySchema.safeParse(json)
 	// An empty message falls back like a missing one; a body that is not JSON is the message itself.
 	const message = (parsed.success ? parsed.data.error.message : undefined) || (json === undefined && body !== '' ? body : `HTTP ${statusCode}`)
-	const kept = redact(parsed.success ? JSON.stringify(parsed.data.error) : body)
+	const kept = redact(parsed.success ? JSON.stringify(withoutRequestQuotes(parsed.data.error)) : body)
 	return { message: redact(message), providerError: { statusCode, body: truncate(kept, PROVIDER_ERROR_BODY_MAX_LENGTH) } }
 }
+
+const withoutRequestQuotes = <T extends { metadata?: Record<string, unknown> }>(error: T): T =>
+	error.metadata === undefined
+		? error
+		: { ...error, metadata: Object.fromEntries(Object.entries(error.metadata).filter(([key]) => !REQUEST_QUOTING_METADATA_KEYS.has(key))) }
 
 /** Cuts `text` to at most `max` UTF-16 code units plus a note, never between the two halves of a surrogate pair. */
 const truncate = (text: string, max: number): string => {

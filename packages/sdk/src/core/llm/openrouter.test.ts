@@ -725,6 +725,18 @@ describe('OpenRouterProvider error response', () => {
 		expect(error.providerError).toEqual({ statusCode: 502, body: '<html>Bad gateway</html>' })
 	})
 
+	test('drops the metadata that quotes the prompt, and keeps the rest', async () => {
+		const error = await failWith(403, JSON.stringify({
+			error: { message: 'Input was flagged', code: 403, metadata: { reasons: ['harassment'], flagged_input: 'part of the prompt', provider_name: 'OpenAI' } },
+		}))
+
+		expect(JSON.parse(error.providerError?.body ?? '')).toEqual({
+			message: 'Input was flagged',
+			code: 403,
+			metadata: { reasons: ['harassment'], provider_name: 'OpenAI' },
+		})
+	})
+
 	test('never keeps the API key', async () => {
 		const error = await failWith(401, JSON.stringify({ error: { message: `Invalid key ${API_KEY}` } }))
 

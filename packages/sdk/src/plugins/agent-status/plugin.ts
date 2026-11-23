@@ -23,6 +23,7 @@
 
 import z from 'zod/v4'
 import { agentIdSchema, protocolAgentStatusSchema } from '~/core/agents/schema.js'
+import { inferenceFailureSchema } from '~/core/llm/schema.js'
 import { definePlugin } from '~/core/plugins/index.js'
 import { sessionIdSchema } from '~/core/sessions/schema.js'
 
@@ -39,6 +40,8 @@ export const agentStoppedNotificationSchema = z.object({
 	reason: z.enum(['limit', 'handler', 'manual']).optional(),
 	/** Human-readable detail (budget message / error message). */
 	message: z.string().optional(),
+	/** The failed inference behind the stop: always on `errored`, on `paused` when the provider rejected the same turn repeatedly. */
+	inferenceFailure: inferenceFailureSchema.optional(),
 	timestamp: z.number(),
 })
 
@@ -116,6 +119,7 @@ export const agentStatusPlugin = definePlugin('agent-status')
 			definitionName: ctx.agentState.definitionName,
 			kind: 'errored',
 			message: ctx.error,
+			inferenceFailure: ctx.inferenceFailure,
 			timestamp: Date.now(),
 		})
 		return null
@@ -143,6 +147,7 @@ export const agentStatusPlugin = definePlugin('agent-status')
 			kind: 'paused',
 			reason: ctx.agentState.pauseReason,
 			message: ctx.agentState.pauseMessage,
+			inferenceFailure: ctx.agentState.pauseInferenceFailure,
 			timestamp: Date.now(),
 		})
 		return null
