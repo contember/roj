@@ -470,6 +470,91 @@ describe('uploads plugin', () => {
 			await harness.shutdown()
 		})
 
+		it('a user message addressed to a sub-agent does not take the upload', async () => {
+			const harness = new TestHarness({
+				presets: [createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' })],
+				mockHandler: (request) => {
+					const startsWorker = request.systemPrompt.includes('Orchestrator')
+						&& request.messages.some((m) => typeof m.content === 'string' && m.content.includes('Start'))
+						&& !request.messages.some((m) => m.role === 'assistant')
+					return startsWorker
+						? {
+								content: null,
+								toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Task' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						: { content: 'ok', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Start')
+			const workerId = [...session.state.agents.keys()].find((agentId) => agentId !== session.getEntryAgentId())
+			if (!workerId) throw new Error('Expected the worker')
+
+			const fileContent = Buffer.from('logo bytes')
+			await session.callPluginMethod('uploads.upload', {
+				sessionId: String(session.sessionId),
+				filename: 'logo.txt',
+				mimeType: 'text/plain',
+				size: fileContent.length,
+				fileBuffer: fileContent,
+			})
+			const callsBefore = harness.llmProvider.getCallCount()
+			await session.sendMessageToAgent(workerId, 'Note for the worker')
+			await session.waitForIdle()
+
+			const hasAttachment = (request: InferenceRequest) =>
+				request.messages.some((m) => typeof m.content === 'string' && m.content.includes('<attachment'))
+			const after = harness.llmProvider.getCallHistory().slice(callsBefore)
+			expect(after.length).toBeGreaterThanOrEqual(1)
+			expect(after.some(hasAttachment)).toBe(false)
+			expect(session.getPluginState<UploadsState>('uploads')?.pending).toHaveLength(1)
+
+			await harness.shutdown()
+		})
+
+		it('a ready upload goes out with the answer to an ask_user question', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withSequence([
+					{ toolCalls: [{ id: ToolCallId('tc1'), name: 'ask_user', input: { question: 'Which logo?', inputType: 'text' } }] },
+					{ content: 'Waiting for the answer', toolCalls: [] },
+					{ content: 'Got the logo', toolCalls: [] },
+				]),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Change the logo')
+			const asked = z.object({ questionId: z.string() }).passthrough().parse(harness.notifications.getByType('user-chat', 'askUser')[0]?.payload)
+			const entryAgentId = session.getEntryAgentId()
+			if (!entryAgentId) throw new Error('Expected entry agent')
+
+			const fileContent = Buffer.from('logo bytes')
+			await session.callPluginMethod('uploads.upload', {
+				sessionId: String(session.sessionId),
+				filename: 'logo.txt',
+				mimeType: 'text/plain',
+				size: fileContent.length,
+				fileBuffer: fileContent,
+			})
+			await new Promise((resolve) => setTimeout(resolve, 25))
+			expect(harness.llmProvider.getCallCount()).toBe(2)
+
+			await session.answerQuestion(entryAgentId, asked.questionId, 'This one')
+			await session.waitForIdle()
+			expect(harness.llmProvider.getCallCount()).toBe(3)
+			const answering = harness.llmProvider.getLastRequest()
+			const contents = answering?.messages.map((m) => typeof m.content === 'string' ? m.content : '') ?? []
+			expect(contents.some((content) => content.includes('This one'))).toBe(true)
+			expect(contents.some((content) => content.includes('<attachment'))).toBe(true)
+
+			await harness.shutdown()
+		})
+
 		it('upload does not wake a paused agent', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
