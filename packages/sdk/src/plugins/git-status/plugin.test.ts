@@ -280,14 +280,15 @@ function worktreeCode(char: string | undefined): GitStatusEntry['worktree'] {
 	return char === 'A' || char === 'M' || char === 'D' || char === '?' ? char : ' '
 }
 
+const GIT_IDENTITY = ['-c', 'user.email=test@roj.local', '-c', 'user.name=Roj Test', '-c', 'commit.gpgsign=false']
+
 /** One commit ahead of `main`, one modified tracked file, one untracked file. */
 async function makeRepo(): Promise<{ dir: string; lastCommitAt: number }> {
 	const dir = scratch('repo')
 	await mkdir(dir, { recursive: true })
 	cleanups.push(() => rm(dir, { recursive: true, force: true }))
 
-	const identity = ['-c', 'user.email=test@roj.local', '-c', 'user.name=Roj Test', '-c', 'commit.gpgsign=false']
-	const run = (...args: string[]) => gitRunner.execFile('git', [...identity, ...args], { cwd: dir })
+	const run = (...args: string[]) => gitRunner.execFile('git', [...GIT_IDENTITY, ...args], { cwd: dir })
 
 	await run('init', '-q', '-b', 'main')
 	await writeFile(join(dir, 'note.txt'), 'one\n')
@@ -394,6 +395,49 @@ describe('git-status reads a repository through the port or the binary', () => {
 		expect(seen(overPort.notifications)).toEqual([])
 		expect(seen(overBinary.notifications)).toEqual([])
 	})
+})
+
+describe('git-status reads without taking the index lock', () => {
+	/** Enough overlaps that a read holding `index.lock` shows up as a failed write. */
+	const WRITES = 60
+	const READERS = 4
+
+	test('a git write running alongside the reads never meets index.lock', async () => {
+		const repo = await makeRepo()
+		const platform: Platform = { ...createNodePlatform(), scheduler: new RecordingScheduler() }
+		const { session } = await bootSession({ platform, workspaceDir: repo.dir })
+		const git = (...args: string[]) => gitRunner.execFile('git', [...GIT_IDENTITY, ...args], { cwd: repo.dir })
+
+		// The same read the 2 s poll runs, issued back to back so it overlaps every write.
+		let writing = true
+		let reads = 0
+		const readers = Array.from({ length: READERS }, async () => {
+			while (writing) {
+				if ((await pull(session)).snapshot) reads += 1
+			}
+		})
+
+		const failures: string[] = []
+		try {
+			for (let i = 0; i < WRITES; i++) {
+				await writeFile(join(repo.dir, 'note.txt'), `${i}\n`)
+				try {
+					await git('add', 'note.txt')
+					await git('commit', '-q', '-m', `write ${i}`)
+				} catch (error) {
+					failures.push(error instanceof Error ? error.message : String(error))
+				}
+			}
+		} finally {
+			writing = false
+			await Promise.all(readers)
+		}
+
+		expect(failures).toEqual([])
+		expect(reads).toBeGreaterThan(WRITES)
+		// makeRepo leaves one commit ahead of main; every write must have landed on top.
+		expect((await pull(session)).snapshot?.committedAhead).toBe(WRITES + 1)
+	}, 60_000)
 })
 
 describe('git-status gated on the host filesystem revision', () => {

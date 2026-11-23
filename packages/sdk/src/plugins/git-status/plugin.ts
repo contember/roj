@@ -40,6 +40,8 @@ import z from 'zod/v4'
 const POLL_INTERVAL_MS = 2000
 const GIT_TIMEOUT_MS = 5000
 const DEFAULT_BRANCH_FALLBACK = 'main'
+/** A read must not take `index.lock`, or the agent's own concurrent `git add` fails on it. */
+const GIT_READ = ['--no-optional-locks']
 
 const gitStatusSnapshotSchema = z.object({
 	committedAhead: z.number(),
@@ -283,7 +285,7 @@ async function computeGitStatus(process: ProcessRunner, workdir: string, baseBra
 
 async function isMissingRef(process: ProcessRunner, workdir: string, ref: string): Promise<boolean> {
 	try {
-		await process.execFile('git', ['rev-parse', '--verify', '--quiet', ref], { cwd: workdir, timeout: GIT_TIMEOUT_MS })
+		await process.execFile('git', [...GIT_READ, 'rev-parse', '--verify', '--quiet', ref], { cwd: workdir, timeout: GIT_TIMEOUT_MS })
 		return false
 	} catch (error) {
 		if (error instanceof Error && 'code' in error && error.code === 1) return true
@@ -302,7 +304,7 @@ async function detectDefaultBranch(process: ProcessRunner, workdir: string): Pro
 
 async function runGit(process: ProcessRunner, workdir: string, args: string[]): Promise<string | null> {
 	try {
-		const { stdout } = await process.execFile('git', args, { cwd: workdir, timeout: GIT_TIMEOUT_MS, maxBuffer: 1024 * 1024 })
+		const { stdout } = await process.execFile('git', [...GIT_READ, ...args], { cwd: workdir, timeout: GIT_TIMEOUT_MS, maxBuffer: 1024 * 1024 })
 		return stdout
 	} catch {
 		return null
