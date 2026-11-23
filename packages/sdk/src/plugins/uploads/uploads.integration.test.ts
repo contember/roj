@@ -2,8 +2,10 @@ import { describe, expect, it } from 'bun:test'
 import z from 'zod/v4'
 import { agentEvents } from '~/core/agents/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import type { InferenceRequest } from '~/core/llm/provider.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
-import { createTestPreset, TestHarness } from '~/testing/index.js'
+import { ToolCallId } from '~/core/tools/schema.js'
+import { createMultiAgentPreset, createTestPreset, TestHarness } from '~/testing/index.js'
 import type { TestSession } from '~/testing/index.js'
 import type { UploadsState } from './state.js'
 import { uploadEvents } from './state.js'
@@ -309,7 +311,7 @@ describe('uploads plugin', () => {
 	// =========================================================================
 
 	describe('dequeue', () => {
-		it('upload arriving while agent is idle wakes exactly one inference', async () => {
+		it('a ready upload does not wake the idle agent; it reaches the agent with the next user message', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
 				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Got it', toolCalls: [] }),
@@ -318,31 +320,32 @@ describe('uploads plugin', () => {
 			const session = await harness.createSession('test')
 			const fileContent = Buffer.from('Important document')
 
-			await session.callPluginMethod('uploads.upload', {
+			const result = await session.callPluginMethod('uploads.upload', {
 				sessionId: String(session.sessionId),
 				filename: 'doc.txt',
 				mimeType: 'text/plain',
 				size: fileContent.length,
 				fileBuffer: fileContent,
 			})
+			expect(okValue(result, uploadResultSchema).status).toBe('ready')
 
+			// A client enables Send once the upload is ready; the user types the text after that.
+			await new Promise((resolve) => setTimeout(resolve, 25))
 			await session.waitForIdle()
+			expect(harness.llmProvider.getCallCount()).toBe(0)
+
+			await session.sendAndWaitForIdle('Put this document on the about page')
 			expect(harness.llmProvider.getCallCount()).toBe(1)
 
-			// Check that the LLM received the attachment in its messages
 			const lastRequest = harness.llmProvider.getLastRequest()
-			expect(lastRequest).toBeDefined()
 			if (!lastRequest) throw new Error('Expected lastRequest')
-
-			const attachmentMessage = lastRequest.messages.find(
-				(m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('<attachment'),
-			)
-			expect(attachmentMessage).toBeDefined()
-			if (!attachmentMessage || typeof attachmentMessage.content !== 'string') {
-				throw new Error('Expected attachment message with string content')
-			}
-			expect(attachmentMessage.content).toContain('filename="doc.txt"')
-			expect(attachmentMessage.content).toContain('type="text/plain"')
+			const userContents = lastRequest.messages
+				.filter((m) => m.role === 'user')
+				.map((m) => typeof m.content === 'string' ? m.content : '')
+			expect(userContents.some((content) => content.includes('Put this document on the about page'))).toBe(true)
+			const attachmentMessage = userContents.find((content) => content.includes('<attachment'))
+			expect(attachmentMessage).toContain('filename="doc.txt"')
+			expect(attachmentMessage).toContain('type="text/plain"')
 
 			const consumedEvents = await waitForEvents(() => session.getEventsByType(agentEvents, 'agent_input_consumed'), 1)
 			expect(consumedEvents).toHaveLength(1)
@@ -351,7 +354,7 @@ describe('uploads plugin', () => {
 			await harness.shutdown()
 		})
 
-		it('several quick uploads debounce into one inference and one consumption event', async () => {
+		it('several uploads reach the agent in one inference and one consumption event with the next message', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
 				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Got it', toolCalls: [] }),
@@ -370,7 +373,10 @@ describe('uploads plugin', () => {
 				})
 			}))
 
-			await session.waitForIdle()
+			await new Promise((resolve) => setTimeout(resolve, 25))
+			expect(harness.llmProvider.getCallCount()).toBe(0)
+
+			await session.sendAndWaitForIdle('Use these files')
 			expect(harness.llmProvider.getCallCount()).toBe(1)
 
 			const lastRequest = harness.llmProvider.getLastRequest()
@@ -390,6 +396,161 @@ describe('uploads plugin', () => {
 			expect(uploadsAfter).toBeDefined()
 			if (!uploadsAfter) throw new Error('Expected uploads state')
 			expect(uploadsAfter.pending).toHaveLength(0)
+
+			await harness.shutdown()
+		})
+
+		it('neither a sub-agent nor a turn woken by its report takes the upload before the user writes', async () => {
+			const orchestratorRequests: InferenceRequest[] = []
+			const workerRequests: InferenceRequest[] = []
+			const { promise: workerStarted, resolve: markWorkerStarted } = Promise.withResolvers<void>()
+			const { promise: workerGate, resolve: releaseWorker } = Promise.withResolvers<void>()
+			const harness = new TestHarness({
+				presets: [createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' })],
+				mockHandler: async (request) => {
+					if (request.systemPrompt.includes('Orchestrator')) {
+						orchestratorRequests.push(request)
+						if (orchestratorRequests.length === 1) {
+							return {
+								content: null,
+								toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Long task' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						}
+						return { content: 'noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+					}
+					workerRequests.push(request)
+					if (workerRequests.length === 1) {
+						markWorkerStarted()
+						await workerGate
+						// A tool call gives the worker a second inference after the upload is ready.
+						return {
+							content: null,
+							toolCalls: [{ id: ToolCallId('tc2'), name: 'send_message', input: { to: 'parent', message: 'progress' } }],
+							finishReason: 'stop',
+							metrics: MockLLMProvider.defaultMetrics(),
+						}
+					}
+					return { content: 'done', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendMessage('Start')
+			await workerStarted
+
+			const fileContent = Buffer.from('logo bytes')
+			await session.callPluginMethod('uploads.upload', {
+				sessionId: String(session.sessionId),
+				filename: 'logo.txt',
+				mimeType: 'text/plain',
+				size: fileContent.length,
+				fileBuffer: fileContent,
+			})
+			releaseWorker()
+			await session.waitForIdle()
+			expect(workerRequests.length).toBeGreaterThanOrEqual(2)
+
+			await session.sendAndWaitForIdle('Use this logo')
+
+			const hasAttachment = (request: InferenceRequest) =>
+				request.messages.some((m) => typeof m.content === 'string' && m.content.includes('<attachment'))
+			expect(workerRequests.some(hasAttachment)).toBe(false)
+			// The worker's report woke the orchestrator before the user wrote; that turn must not take the file.
+			expect(orchestratorRequests.length).toBeGreaterThanOrEqual(4)
+			expect(orchestratorRequests.slice(0, -1).some(hasAttachment)).toBe(false)
+			const answering = orchestratorRequests.at(-1)
+			if (!answering) throw new Error('Expected the orchestrator to answer the user')
+			expect(answering.messages.some((m) => typeof m.content === 'string' && m.content.includes('Use this logo'))).toBe(true)
+			expect(hasAttachment(answering)).toBe(true)
+
+			await harness.shutdown()
+		})
+
+		it('a user message addressed to a sub-agent does not take the upload', async () => {
+			const harness = new TestHarness({
+				presets: [createMultiAgentPreset([
+					{ name: 'worker', system: 'Worker agent.', tools: [], agents: [] },
+				], { orchestratorSystem: 'Orchestrator agent.' })],
+				mockHandler: (request) => {
+					const startsWorker = request.systemPrompt.includes('Orchestrator')
+						&& request.messages.some((m) => typeof m.content === 'string' && m.content.includes('Start'))
+						&& !request.messages.some((m) => m.role === 'assistant')
+					return startsWorker
+						? {
+								content: null,
+								toolCalls: [{ id: ToolCallId('tc1'), name: 'start_worker', input: { message: 'Task' } }],
+								finishReason: 'stop',
+								metrics: MockLLMProvider.defaultMetrics(),
+							}
+						: { content: 'ok', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+				},
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Start')
+			const workerId = [...session.state.agents.keys()].find((agentId) => agentId !== session.getEntryAgentId())
+			if (!workerId) throw new Error('Expected the worker')
+
+			const fileContent = Buffer.from('logo bytes')
+			await session.callPluginMethod('uploads.upload', {
+				sessionId: String(session.sessionId),
+				filename: 'logo.txt',
+				mimeType: 'text/plain',
+				size: fileContent.length,
+				fileBuffer: fileContent,
+			})
+			const callsBefore = harness.llmProvider.getCallCount()
+			await session.sendMessageToAgent(workerId, 'Note for the worker')
+			await session.waitForIdle()
+
+			const hasAttachment = (request: InferenceRequest) =>
+				request.messages.some((m) => typeof m.content === 'string' && m.content.includes('<attachment'))
+			const after = harness.llmProvider.getCallHistory().slice(callsBefore)
+			expect(after.length).toBeGreaterThanOrEqual(1)
+			expect(after.some(hasAttachment)).toBe(false)
+			expect(session.getPluginState<UploadsState>('uploads')?.pending).toHaveLength(1)
+
+			await harness.shutdown()
+		})
+
+		it('a ready upload goes out with the answer to an ask_user question', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withSequence([
+					{ toolCalls: [{ id: ToolCallId('tc1'), name: 'ask_user', input: { question: 'Which logo?', inputType: 'text' } }] },
+					{ content: 'Waiting for the answer', toolCalls: [] },
+					{ content: 'Got the logo', toolCalls: [] },
+				]),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Change the logo')
+			const asked = z.object({ questionId: z.string() }).passthrough().parse(harness.notifications.getByType('user-chat', 'askUser')[0]?.payload)
+			const entryAgentId = session.getEntryAgentId()
+			if (!entryAgentId) throw new Error('Expected entry agent')
+
+			const fileContent = Buffer.from('logo bytes')
+			await session.callPluginMethod('uploads.upload', {
+				sessionId: String(session.sessionId),
+				filename: 'logo.txt',
+				mimeType: 'text/plain',
+				size: fileContent.length,
+				fileBuffer: fileContent,
+			})
+			await new Promise((resolve) => setTimeout(resolve, 25))
+			expect(harness.llmProvider.getCallCount()).toBe(2)
+
+			await session.answerQuestion(entryAgentId, asked.questionId, 'This one')
+			await session.waitForIdle()
+			expect(harness.llmProvider.getCallCount()).toBe(3)
+			const answering = harness.llmProvider.getLastRequest()
+			const contents = answering?.messages.map((m) => typeof m.content === 'string' ? m.content : '') ?? []
+			expect(contents.some((content) => content.includes('This one'))).toBe(true)
+			expect(contents.some((content) => content.includes('<attachment'))).toBe(true)
 
 			await harness.shutdown()
 		})
@@ -795,7 +956,7 @@ describe('uploads plugin', () => {
 		// uploadAsync method
 		// =========================================================================
 
-		it('uploadAsync returns processing, then ready upload wakes the idle agent', async () => {
+		it('uploadAsync returns processing, then the ready upload waits for the next user message', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
 				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
@@ -833,10 +994,13 @@ describe('uploads plugin', () => {
 			expect(own[0].status).toBe('processing')
 			expect(own[1].status).toBe('ready')
 
-			await session.waitForIdle()
+			await new Promise((resolve) => setTimeout(resolve, 25))
+			expect(harness.llmProvider.getCallCount()).toBe(0)
+
+			await session.sendAndWaitForIdle('Here is the file')
 			expect(harness.llmProvider.getCallCount()).toBe(1)
 
-			// The ready upload was delivered and consumed by the woken agent.
+			// The ready upload was delivered and consumed with the message.
 			const uploads = selectPluginState<UploadsState>(session.state, 'uploads')
 			if (!uploads) throw new Error('Expected uploads state')
 			expect(uploads.pending).toHaveLength(0)

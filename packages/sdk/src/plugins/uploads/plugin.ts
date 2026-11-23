@@ -1,5 +1,4 @@
 import z from 'zod/v4'
-import type { AgentId } from '~/core/agents/schema.js'
 import { createDomainError, type DomainError, ValidationErrors } from '~/core/errors.js'
 import { EventAppendError } from '~/core/events/event-store.js'
 import type { FileStore } from '~/core/file-store/types.js'
@@ -11,6 +10,7 @@ import type { RuntimeLeaseRelease, RuntimeOperation, SessionRuntimeActivity } fr
 import { SessionId } from '~/core/sessions/schema.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import { getEntryAgentId } from '~/core/sessions/state.js'
+import { hasPendingUserInput } from '~/plugins/user-chat/plugin.js'
 import { ArchiveBudget, type ArchiveLimitOverrides } from '~/lib/archive/index.js'
 import type { Logger } from '~/lib/logger/logger.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
@@ -761,7 +761,7 @@ async function processUpload(args: {
 	resumable: boolean
 	onTerminal: (result: UploadResult) => Promise<void>
 	/** Runs once the terminal status is durable in metadata, even if its event append failed. */
-	onPersisted: (result: UploadResult) => Promise<void>
+	onPersisted?: (result: UploadResult) => Promise<void>
 }): Promise<UploadResult> {
 	const result = await runPreprocessor({
 		uploadStore: args.prepared.uploadStore,
@@ -827,7 +827,7 @@ async function processUpload(args: {
 			}
 		}
 		// The client has no polling fallback, so it is told either way — even when the event never landed.
-		await args.onPersisted(result)
+		await args.onPersisted?.(result)
 	}, { allowDuringClose: true })
 	return result
 }
@@ -844,8 +844,6 @@ function startAsyncUpload(args: {
 	emitEvent: SessionContext['emitEvent']
 	notify: (type: 'uploadStatusChanged', payload: z.infer<typeof statusChangedSchema>) => void
 	logger: Logger
-	entryAgentId: AgentId | null
-	scheduleAgent: (agentId: AgentId) => void
 }): void {
 	// start() rejects synchronously when `run` throws before its first await — that rejection needs a handler.
 	void args.prepared.lifecycle.start(async () => {
@@ -867,7 +865,6 @@ function startAsyncUpload(args: {
 					await args.emitEvent(createUploadResultEvent(args.upload, args.prepared.uploadId, result))
 				},
 				onPersisted: async (result) => {
-					if (result.status === 'ready' && args.entryAgentId) args.scheduleAgent(args.entryAgentId)
 					args.notify('uploadStatusChanged', {
 						sessionId: String(args.sessionId),
 						uploadId: args.prepared.uploadIdStr,
@@ -960,7 +957,6 @@ interface AsyncUploadHost {
 	logger: Logger
 	emitEvent: SessionContext['emitEvent']
 	notify: (type: 'uploadStatusChanged', payload: z.infer<typeof statusChangedSchema>, activity?: SessionRuntimeActivity) => void
-	scheduleAgent: (agentId: AgentId) => void
 	pluginContext: UploadsPluginContext
 	pluginConfig: UploadsPluginConfig
 }
@@ -990,8 +986,6 @@ function launchAsyncProcessing(host: AsyncUploadHost, prepared: PreparedUpload, 
 		emitEvent: (event) => host.emitEvent(event, processing.activity),
 		notify: (type, payload) => host.notify(type, payload, processing.activity),
 		logger: host.logger,
-		entryAgentId: getEntryAgentId(host.sessionState),
-		scheduleAgent: host.scheduleAgent,
 	})
 }
 
@@ -1223,13 +1217,14 @@ export const uploadsPlugin = definePlugin('uploads')
 		}),
 	)
 	.dequeue({
-		hasPendingMessages: (ctx) => {
-			const uploads = ctx.pluginState
-			return uploads.pending.length > 0
-		},
+		// A ready upload is not work on its own: it goes out with the user's message or answer it came with,
+		// never in a turn without user input, which would answer the file before the text.
+		hasPendingMessages: () => false,
 		getPendingMessages: (ctx) => {
 			const uploads = ctx.pluginState
 			if (uploads.pending.length === 0) return null
+			if (ctx.agentId !== getEntryAgentId(ctx.sessionState)) return null
+			if (!hasPendingUserInput(ctx.sessionState, ctx.agentId)) return null
 			const sessionRoot = ctx.files.getRoots().session
 			return {
 				messages: [
@@ -1563,9 +1558,6 @@ export const uploadsPlugin = definePlugin('uploads')
 						onTerminal: async (finalResult) => {
 							await ctx.emitEvent(createUploadResultEvent(upload, prepared.uploadId, finalResult))
 						},
-						onPersisted: async (finalResult) => {
-							if (finalResult.status === 'ready' && entryAgentId) ctx.scheduleAgent(entryAgentId)
-						},
 					}),
 				)
 				return Ok({
@@ -1796,7 +1788,7 @@ export const uploadsPlugin = definePlugin('uploads')
 		)
 		if (!settled) {
 			// Releasing the manager's map entry is not the same as freeing the session: a wedged lifecycle
-			// still holds emitEvent/notify/scheduleAgent closures, so the runtime graph outlives disposal
+			// still holds emitEvent/notify closures, so the runtime graph outlives disposal
 			// until it settles — bounded here only so disposal itself never hangs on it.
 			ctx.logger.warn('Upload lifecycles did not settle before close', {
 				sessionId: String(ctx.sessionId),

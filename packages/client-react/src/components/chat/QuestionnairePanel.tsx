@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { type PendingQuestion, useSessionStore } from '../../stores/session-store.js'
+import { hasInFlightAttachments, type PendingQuestion, useSessionStore } from '../../stores/session-store.js'
 import { QuestionItem } from './QuestionItem.js'
 
 interface QuestionnairePanelProps {
@@ -13,6 +13,7 @@ export function QuestionnairePanel({ questions }: QuestionnairePanelProps) {
 	const questionSubmitStatus = useSessionStore((s) => s.questionSubmitStatus)
 	const setDraftAnswer = useSessionStore((s) => s.setDraftAnswer)
 	const submitAllAnswers = useSessionStore((s) => s.submitAllAnswers)
+	const attachmentsInFlight = useSessionStore((s) => hasInFlightAttachments(s.pendingAttachments))
 
 	const answeredCount = useMemo(() => {
 		return questions.filter((q) => draftAnswers.has(q.questionId)).length
@@ -62,10 +63,10 @@ export function QuestionnairePanel({ questions }: QuestionnairePanelProps) {
 					{hasAnswer && (
 						<button
 							onClick={handleSubmitAll}
-							disabled={isSubmitting}
+							disabled={isSubmitting || attachmentsInFlight}
 							className="w-full px-4 py-2.5 bg-foreground text-background text-sm rounded-xl hover:bg-foreground/90 disabled:bg-muted disabled:text-muted-foreground disabled:cursor-not-allowed font-medium transition-all shadow-sm"
 						>
-							{isSubmitting ? 'Submitting...' : 'Submit'}
+							{isSubmitting ? 'Submitting...' : attachmentsInFlight ? 'Waiting for attachments...' : 'Submit'}
 						</button>
 					)}
 				</div>
@@ -117,10 +118,16 @@ export function QuestionnairePanel({ questions }: QuestionnairePanelProps) {
 
 				<button
 					onClick={handleSubmitAll}
-					disabled={!allAnswered || isSubmitting}
+					disabled={!allAnswered || isSubmitting || attachmentsInFlight}
 					className="w-full px-4 py-2.5 bg-foreground text-background text-sm rounded-xl hover:bg-foreground/90 disabled:bg-muted disabled:text-muted-foreground disabled:cursor-not-allowed font-medium transition-all shadow-sm"
 				>
-					{isSubmitting ? 'Submitting...' : allAnswered ? 'Submit' : `Answer all questions (${answeredCount}/${questions.length})`}
+					{isSubmitting
+						? 'Submitting...'
+						: !allAnswered
+							? `Answer all questions (${answeredCount}/${questions.length})`
+							: attachmentsInFlight
+								? 'Waiting for attachments...'
+								: 'Submit'}
 				</button>
 			</div>
 		</div>

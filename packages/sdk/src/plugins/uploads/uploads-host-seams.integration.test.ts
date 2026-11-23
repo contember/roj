@@ -187,7 +187,7 @@ describe('uploads host preprocessors', () => {
 				attempts: 1,
 			})
 
-			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Here is the file')
 			const request = fixture.harness.llmProvider.getLastRequest()
 			const attachment = request?.messages.find((m) => typeof m.content === 'string' && m.content.includes('<attachment'))
 			if (!attachment || typeof attachment.content !== 'string') throw new Error('Expected the attachment message')
@@ -197,6 +197,52 @@ describe('uploads host preprocessors', () => {
 					+ '- preview-1.jpg (image/jpeg, 4B) — Page 1 (original kept by host)\n'
 					+ '</attachment>',
 			)
+		} finally {
+			await fixture.cleanup()
+		}
+	})
+})
+
+describe('upload delivery', () => {
+	it('a message sent while an upload is processing is answered without it, and the upload goes out with the next message', async () => {
+		const { promise: processingGate, resolve: finishProcessing } = Promise.withResolvers<void>()
+		const slow: Preprocessor = {
+			name: 'slow',
+			supportedMimeTypes: ['application/pdf'],
+			process: async () => {
+				await processingGate
+				return Ok({ extractedContent: 'scan text' })
+			},
+		}
+		const fixture = createFixture({ preprocessorRegistry: registryWith(slow) })
+		try {
+			const session = await fixture.harness.createSession('test')
+			const upload = okValue(
+				await session.callPluginMethod('uploads.uploadAsync', {
+					sessionId: String(session.sessionId),
+					filename: 'scan.pdf',
+					mimeType: 'application/pdf',
+					size: 4,
+					fileBuffer: Buffer.from('%PDF'),
+				}),
+				processingSchema,
+			)
+
+			await session.sendAndWaitForIdle('First message')
+			const hasAttachment = (index: number) =>
+				fixture.harness.llmProvider.getCallHistory()[index]?.messages.some((m) => typeof m.content === 'string' && m.content.includes('<attachment'))
+			expect(fixture.harness.llmProvider.getCallCount()).toBe(1)
+			expect(hasAttachment(0)).toBe(false)
+
+			finishProcessing()
+			await waitForStatus(fixture.harness, upload.uploadId, 'ready')
+			await new Promise((resolve) => setTimeout(resolve, 25))
+			await session.waitForIdle()
+			expect(fixture.harness.llmProvider.getCallCount()).toBe(1)
+
+			await session.sendAndWaitForIdle('Second message')
+			expect(fixture.harness.llmProvider.getCallCount()).toBe(2)
+			expect(hasAttachment(1)).toBe(true)
 		} finally {
 			await fixture.cleanup()
 		}
@@ -679,7 +725,7 @@ describe('preprocessor output the plugin does not trust', () => {
 				size: 4,
 				fileBuffer: Buffer.from('%PDF'),
 			})
-			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Here is the file')
 
 			const request = fixture.harness.llmProvider.getLastRequest()
 			const attachment = request?.messages.find((m) => typeof m.content === 'string' && m.content.includes('<attachment'))
@@ -721,7 +767,7 @@ describe('attachment message', () => {
 				}),
 				syncUploadSchema,
 			)
-			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Here is the file')
 
 			const message = attachmentMessage(fixture.harness)
 			const basePath = basePathOf(message)
@@ -755,7 +801,7 @@ describe('attachment message', () => {
 				processingSchema,
 			)
 			await waitForStatus(fixture.harness, upload.uploadId, 'ready')
-			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Here is the file')
 
 			const message = attachmentMessage(fixture.harness)
 			const basePath = basePathOf(message)
@@ -796,7 +842,7 @@ describe('attachment message', () => {
 				processingSchema,
 			)
 			await waitForStatus(fixture.harness, upload.uploadId, 'ready')
-			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Here is the file')
 
 			const description = await fixture.dataFileStore.read(`sessions/${session.sessionId}/uploads/${upload.uploadId}/description.txt`)
 			expect(description).toEqual({ ok: true, value: 'A red square.' })
@@ -833,7 +879,7 @@ describe('attachment message', () => {
 				processingSchema,
 			)
 			await waitForStatus(fixture.harness, upload.uploadId, 'ready')
-			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Here is the file')
 
 			const message = attachmentMessage(fixture.harness)
 			const basePath = basePathOf(message)

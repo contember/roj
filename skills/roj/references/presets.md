@@ -116,7 +116,7 @@ Rule fields: `name`, `when` (relative path that must exist), `cwd` (`'target'` d
 
 `uploadsPlugin` stores client-uploaded files at `{sessionDir}/uploads/<uploadId>/<filename>` (+ `meta.json`). Preprocessors registered by bootstrap: **markitdown** (PDF/DOCX/PPTX/HTML), **image-classifier**, **zip** (auto-extract).
 
-On next dequeue, pending uploads become a synthetic user message:
+A ready upload never starts a turn. It goes out as a synthetic user message only to the entry agent, in the inference that carries the user's next message or ask_user answer:
 
 ```xml
 <attachment uploadId="..." filename="brief.pdf" type="application/pdf" basePath="/home/user/session/uploads/<uploadId>">

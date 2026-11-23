@@ -8,7 +8,7 @@
 // Stores
 export { configureConnectionUrl, useAutoConnect, useConnectionStore } from './stores/connection-store.js'
 export type { ConnectionStatus, RawMessageHandler, WsUrlBuilder } from './stores/connection-store.js'
-export { useSessionMessageHandler, useSessionStore } from './stores/session-store.js'
+export { hasInFlightAttachments, useSessionMessageHandler, useSessionStore } from './stores/session-store.js'
 export type { PendingAttachment, PendingQuestion, QuestionSubmitStatus, ServiceInfo } from './stores/session-store.js'
 
 // Main hook

@@ -186,6 +186,7 @@ Inject synthetic user messages before each inference. `uploadsPlugin` uses this 
 
 ```ts
 .dequeue({
+  // Return false for messages that should only ride along with another source's (as uploads does).
   hasPendingMessages: (ctx) => ctx.pluginState.pending.length > 0,
 
   getPendingMessages: (ctx) => {

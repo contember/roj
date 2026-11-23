@@ -963,7 +963,7 @@ describe('uploads runtime retention', () => {
 			expect(usedMetadataSchema.parse(JSON.parse(firstMeta.value)).usedInMessageId).toBe('partial-message')
 
 			await session.resumeAgent(entryAgentId)
-			await session.waitForIdle()
+			await session.sendAndWaitForIdle('Here is the file')
 			const requestText = harness.llmProvider.getLastRequest()?.messages
 				.map((message) => typeof message.content === 'string' ? message.content : '')
 				.join('\n') ?? ''
