@@ -3,6 +3,7 @@ import z from 'zod/v4'
 import type { AgentStatus } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import type { InferenceRequest } from '~/core/llm/provider.js'
 import { ModelId } from '~/core/llm/schema.js'
 import { llmEvents } from '~/core/llm/state.js'
 import { sessionEvents } from '~/core/sessions/state.js'
@@ -392,12 +393,15 @@ describe('core: an agent the provider keeps rejecting', () => {
 	const CHILD_MODEL = ModelId('anthropic/claude-haiku-5.5')
 	// What OpenRouter answers when the upstream provider refuses the request.
 	const REJECTION_BODY = JSON.stringify({ message: REJECTED, code: 400, metadata: { raw: '{"type":"error","error":{"type":"invalid_request_error","message":"image exceeds 5 MB maximum"}}' } })
+	const SCREENSHOT_URL = `data:image/png;base64,${Buffer.alloc(1_000, 9).toString('base64')}`
 	const lookTool = createTool({
 		name: 'look',
 		description: 'Look at the page',
 		input: z.object({}),
-		execute: async () => Ok('a large screenshot'),
+		execute: async () => Ok([{ type: 'image_url' as const, imageUrl: { url: SCREENSHOT_URL } }]),
 	})
+	const sendsImageToolResult = (request: InferenceRequest): boolean =>
+		request.messages.some((message) => message.role === 'tool' && typeof message.content !== 'string' && message.content.some((item) => item.type === 'image_url'))
 	const preset = createTestPreset({ agents: [{ name: 'child', system: CHILD_SYSTEM, model: CHILD_MODEL, tools: [lookTool], agents: [] }] })
 
 	const waitUntil = async (predicate: () => Promise<boolean>, timeoutMs = 5_000): Promise<void> => {
@@ -409,23 +413,27 @@ describe('core: an agent the provider keeps rejecting', () => {
 	}
 
 	/**
-	 * A child whose first turn calls a tool and whose every turn carrying the tool result is rejected, as an oversized
+	 * A child whose first turn calls a tool and whose every turn carrying its image result is rejected, as an oversized
 	 * image would be. It fails once per load and is paused on the third; returns the harness of that third load.
 	 */
 	async function childRejectedAcrossRestarts() {
 		const calls = { child: 0 }
+		const sent: InferenceRequest[] = []
 		// What the provider does with the child's later turns; a test can switch it after the pause.
-		const provider: { child: 'reject' | 'outage' | 'answer' } = { child: 'reject' }
+		const provider: { child: 'rejectImages' | 'rejectAll' | 'outage' | 'answer' } = { child: 'rejectImages' }
 		const llmProvider = new MockLLMProvider((request) => {
 			if (!request.systemPrompt.includes(CHILD_SYSTEM)) {
 				return { content: 'Noted', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
 			}
 			calls.child++
+			sent.push(request)
 			if (calls.child === 1) {
 				return { content: null, toolCalls: [{ id: ToolCallId('look-1'), name: 'look', input: {} }], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
 			}
 			if (provider.child === 'outage') throw { type: 'server_error', message: 'upstream 502', retryAfterMs: 1 }
-			if (provider.child === 'answer') return { content: 'Inspected', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			if (provider.child === 'answer' || (provider.child === 'rejectImages' && !sendsImageToolResult(request))) {
+				return { content: 'Inspected', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			}
 			throw { type: 'invalid_request', message: REJECTED, statusCode: 400, providerError: { statusCode: 400, body: REJECTION_BODY } }
 		})
 
@@ -454,7 +462,7 @@ describe('core: an agent the provider keeps rejecting', () => {
 			await waitUntil(async () => (await childNotices()).length === expectedFailures)
 			await pausing.shutdown()
 		}
-		return { calls, provider, llmProvider, eventStore, session, childId, childFailures, childNotices, childPauses, pausing }
+		return { calls, sent, provider, llmProvider, eventStore, session, childId, childFailures, childNotices, childPauses, pausing }
 	}
 
 	it('pauses after three rejections across restarts, tells its parent once, and is not reset again', async () => {
@@ -491,9 +499,30 @@ describe('core: an agent the provider keeps rejecting', () => {
 		expect(stopped[0].inferenceFailure).toEqual({ errorType: 'invalid_request', model: CHILD_MODEL, providerError: { statusCode: 400, body: REJECTION_BODY } })
 	})
 
-	it('a resumed agent retries the turn once, and pauses again when it is rejected again', async () => {
-		const { calls, llmProvider, eventStore, session, childId, childNotices, childPauses } = await childRejectedAcrossRestarts()
+	it('a resumed agent sends the turn without the rejected image and goes on', async () => {
+		const { calls, sent, llmProvider, eventStore, session, childId, childPauses } = await childRejectedAcrossRestarts()
 
+		const resuming = new TestHarness({ presets: [preset], llmProvider, eventStore })
+		await resuming.sessionManager.loadAllSessions()
+		const live = await resuming.sessionManager.getSession(session.sessionId)
+		if (!live.ok) throw new Error(live.error.message)
+		const resumed = await live.value.resumeAgent(childId)
+		if (!resumed.ok) throw new Error(resumed.error.message)
+		await waitUntil(async () => live.value.state.agents.get(childId)?.consecutiveRejectedTurns === undefined)
+		await resuming.shutdown()
+
+		expect(calls.child).toBe(5)
+		expect(await childPauses()).toHaveLength(1)
+		const toolResults = sent[4].messages.filter((message) => message.role === 'tool')
+		expect(toolResults.map((message) => message.content)).toEqual(['content omitted: the provider rejected it: invalid_request'])
+		const history = live.value.state.agents.get(childId)?.conversationHistory ?? []
+		expect(history.at(-1)).toMatchObject({ role: 'assistant', content: 'Inspected' })
+	})
+
+	it('a resumed agent whose turn is rejected without the image too pauses again', async () => {
+		const { calls, provider, llmProvider, eventStore, session, childId, childNotices, childPauses } = await childRejectedAcrossRestarts()
+
+		provider.child = 'rejectAll'
 		const resuming = new TestHarness({ presets: [preset], llmProvider, eventStore })
 		await resuming.sessionManager.loadAllSessions()
 		const live = await resuming.sessionManager.getSession(session.sessionId)
