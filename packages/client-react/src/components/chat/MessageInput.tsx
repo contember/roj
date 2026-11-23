@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { type PendingAttachment, useSessionStore } from '../../stores/session-store.js'
+import { hasInFlightAttachments, type PendingAttachment, useSessionStore } from '../../stores/session-store.js'
 
 interface MessageInputProps {
 	disabled?: boolean
@@ -17,9 +17,9 @@ export function MessageInput({ disabled }: MessageInputProps) {
 
 	const attachments = Array.from(pendingAttachments.values())
 	const hasReadyAttachments = attachments.some((a) => a.status === 'ready')
-	const hasInFlightAttachments = attachments.some((a) => a.status === 'uploading' || a.status === 'processing')
+	const attachmentsInFlight = hasInFlightAttachments(pendingAttachments)
 
-	const canSubmit = !disabled && !hasInFlightAttachments && (content.trim() || hasReadyAttachments)
+	const canSubmit = !disabled && !attachmentsInFlight && (content.trim() || hasReadyAttachments)
 
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault()

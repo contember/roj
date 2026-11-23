@@ -46,6 +46,11 @@ export interface PendingAttachment {
 	error?: string
 }
 
+/** An attachment still on its way: the server delivers it with the message sent after it is ready, not with one sent before. */
+export function hasInFlightAttachments(attachments: ReadonlyMap<string, PendingAttachment>): boolean {
+	return [...attachments.values()].some((attachment) => attachment.status === 'uploading' || attachment.status === 'processing')
+}
+
 export interface ServiceInfo {
 	serviceType: string
 	status: string
@@ -215,6 +220,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 	sendMessage: async (content) => {
 		const { sessionId, entryAgentId, pendingQuestions, pendingAttachments, messageContext } = get()
 		if (!sessionId || !entryAgentId || pendingQuestions.length > 0) return
+		if (hasInFlightAttachments(pendingAttachments)) return
 
 		// Collect ready attachments for display
 		const readyAttachments = Array.from(pendingAttachments.values()).filter(
@@ -336,9 +342,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 	},
 
 	answerQuestion: async (questionId, answer) => {
-		const { sessionId, entryAgentId, pendingQuestions } = get()
+		const { sessionId, entryAgentId, pendingQuestions, pendingAttachments } = get()
 		const pendingQuestion = pendingQuestions.find((q) => q.questionId === questionId)
 		if (!sessionId || !entryAgentId || !pendingQuestion) return
+		if (hasInFlightAttachments(pendingAttachments)) return
 
 		// Set submitting status
 		const newStatus = new Map(get().questionSubmitStatus)
@@ -386,8 +393,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 	},
 
 	submitAllAnswers: async () => {
-		const { sessionId, entryAgentId, pendingQuestions, draftAnswers } = get()
+		const { sessionId, entryAgentId, pendingQuestions, draftAnswers, pendingAttachments } = get()
 		if (!sessionId || !entryAgentId) return
+		if (hasInFlightAttachments(pendingAttachments)) return
 
 		const toSubmit = pendingQuestions
 			.map((q) => ({ question: q, answer: draftAnswers.get(q.questionId) }))
@@ -446,13 +454,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 			draftAnswers: newDrafts,
 		})
 
-		// If the user staged any files (via ask_user `allowAttachments` or the
-		// plain chat composer) while answering, drop them from the local
-		// pending pool now. The files are already on the server (uploadFile
-		// emitted `attachment_uploaded` on upload, and the uploads plugin
-		// dequeues `<attachment>` blocks into the agent's inbox automatically
-		// on the next inference). Keeping them in UI state would leave them
-		// dangling as "ready" indefinitely.
+		// Files staged while answering (ask_user `allowAttachments` or the chat
+		// composer) were ready before the answers went out, so the uploads plugin
+		// delivers them with these answers; drop them from the local pending pool.
 		if (get().pendingAttachments.size > 0) {
 			set({ pendingAttachments: new Map() })
 		}
