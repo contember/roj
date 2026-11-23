@@ -78,7 +78,7 @@ export { applyMiddleware, useProvider, withAnthropic, withMaxTokens, withOpenRou
 export type { InferenceNext, LLMMiddleware } from '~/core/llm/middleware.js'
 export type { OpenRouterProviderRouting, OpenRouterReasoningOptions, OpenRouterRequestOptions } from '~/core/llm/provider.js'
 export { ModelId } from '~/core/llm/schema.js'
-export type { LLMCallId } from '~/core/llm/schema.js'
+export type { InferenceFailure, LLMCallId } from '~/core/llm/schema.js'
 export { llmEvents } from '~/core/llm/state.js'
 export type { InferenceCompletedEvent, InferenceFailedEvent, InferenceStartedEvent } from '~/core/llm/state.js'
 export { estimateTokens } from '~/core/llm/tokens.js'

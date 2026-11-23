@@ -3,6 +3,7 @@ import z from 'zod/v4'
 import type { AgentStatus } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import { ModelId } from '~/core/llm/schema.js'
 import { llmEvents } from '~/core/llm/state.js'
 import { sessionEvents } from '~/core/sessions/state.js'
 import { mailboxEvents } from '~/plugins/mailbox/state.js'
@@ -388,13 +389,16 @@ describe('core: error recovery', () => {
 describe('core: an agent the provider keeps rejecting', () => {
 	const CHILD_SYSTEM = 'Child agent: inspect the page.'
 	const REJECTED = 'Provider returned error'
+	const CHILD_MODEL = ModelId('anthropic/claude-haiku-5.5')
+	// What OpenRouter answers when the upstream provider refuses the request.
+	const REJECTION_BODY = JSON.stringify({ message: REJECTED, code: 400, metadata: { raw: '{"type":"error","error":{"type":"invalid_request_error","message":"image exceeds 5 MB maximum"}}' } })
 	const lookTool = createTool({
 		name: 'look',
 		description: 'Look at the page',
 		input: z.object({}),
 		execute: async () => Ok('a large screenshot'),
 	})
-	const preset = createTestPreset({ agents: [{ name: 'child', system: CHILD_SYSTEM, tools: [lookTool], agents: [] }] })
+	const preset = createTestPreset({ agents: [{ name: 'child', system: CHILD_SYSTEM, model: CHILD_MODEL, tools: [lookTool], agents: [] }] })
 
 	const waitUntil = async (predicate: () => Promise<boolean>, timeoutMs = 5_000): Promise<void> => {
 		const deadline = Date.now() + timeoutMs
@@ -422,7 +426,7 @@ describe('core: an agent the provider keeps rejecting', () => {
 			}
 			if (provider.child === 'outage') throw { type: 'server_error', message: 'upstream 502', retryAfterMs: 1 }
 			if (provider.child === 'answer') return { content: 'Inspected', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
-			throw { type: 'invalid_request', message: REJECTED }
+			throw { type: 'invalid_request', message: REJECTED, statusCode: 400, providerError: { statusCode: 400, body: REJECTION_BODY } }
 		})
 
 		const first = new TestHarness({ presets: [preset], llmProvider })
@@ -484,6 +488,7 @@ describe('core: an agent the provider keeps rejecting', () => {
 			.map((n) => agentStoppedNotificationSchema.parse(n.payload))
 			.filter((n) => n.agentId === childId)
 		expect(stopped.map((n) => [n.kind, n.reason])).toEqual([['paused', 'limit']])
+		expect(stopped[0].inferenceFailure).toEqual({ errorType: 'invalid_request', model: CHILD_MODEL, providerError: { statusCode: 400, body: REJECTION_BODY } })
 	})
 
 	it('a resumed agent retries the turn once, and pauses again when it is rejected again', async () => {

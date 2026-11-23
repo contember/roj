@@ -556,6 +556,7 @@ export const coreReducer = createTypedReducer(
 					status: 'paused',
 					pauseReason: event.reason,
 					pauseMessage: event.message,
+					pauseInferenceFailure: event.inferenceFailure,
 					pauseResumesOnInput: event.resumeOnInput,
 				}))
 
@@ -567,6 +568,7 @@ export const coreReducer = createTypedReducer(
 					status: agent.pendingToolCalls.length > 0 ? 'tool_exec' : 'pending',
 					pauseReason: undefined,
 					pauseMessage: undefined,
+					pauseInferenceFailure: undefined,
 					pauseResumesOnInput: undefined,
 					completionHandled: undefined,
 				}))

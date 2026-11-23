@@ -11,6 +11,7 @@ import type { BaseEvent, DomainEvent } from '../events/types.js'
 import type { ToolResultContent } from '../llm/llm-log-types.js'
 import type { LLMLogger } from '../llm/logger.js'
 import type { LLMMessage } from '../llm/provider.js'
+import type { InferenceFailure } from '../llm/schema.js'
 import type { LLMResponse } from '../llm/state.js'
 import type { Preset } from '../preset/index.js'
 import type { SessionContext } from '../sessions/context.js'
@@ -242,7 +243,7 @@ type HookMap<TCtx> = {
 	beforeToolCall: (ctx: TCtx & { toolCall: ToolCall }) => Promise<BeforeToolCallResult>
 	afterToolCall: (ctx: TCtx & { toolCall: ToolCall; result: { isError: boolean; content: ToolResultContent } }) => Promise<AfterToolCallResult>
 	onComplete: (ctx: TCtx) => Promise<OnCompleteResult>
-	onError: (ctx: TCtx & { error: string }) => Promise<OnErrorResult>
+	onError: (ctx: TCtx & { error: string; inferenceFailure: InferenceFailure }) => Promise<OnErrorResult>
 	onPause: (ctx: TCtx & { reason?: string }) => Promise<OnPauseResult>
 }
 
@@ -341,7 +342,7 @@ type ErasedAgentHookMap = {
 		ctx: BasePluginHookContext & { toolCall: ToolCall; result: { isError: boolean; content: ToolResultContent } },
 	) => Promise<AfterToolCallResult>
 	onComplete: (ctx: BasePluginHookContext) => Promise<OnCompleteResult>
-	onError: (ctx: BasePluginHookContext & { error: string }) => Promise<OnErrorResult>
+	onError: (ctx: BasePluginHookContext & { error: string; inferenceFailure: InferenceFailure }) => Promise<OnErrorResult>
 	onPause: (ctx: BasePluginHookContext & { reason?: string }) => Promise<OnPauseResult>
 }
 

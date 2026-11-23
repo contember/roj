@@ -20,7 +20,7 @@ import { storeInlineData, storeMessageInlineData } from '~/core/llm/document-con
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { LLMLogger } from '~/core/llm/logger.js'
 import type { InferenceRequest, InferenceResponse, LLMError, LLMMessage, LLMProvider } from '~/core/llm/provider.js'
-import { generateLLMCallId, LLMCallId, ModelId } from '~/core/llm/schema.js'
+import { generateLLMCallId, type InferenceFailure, LLMCallId, ModelId } from '~/core/llm/schema.js'
 import type { LLMResponse } from '~/core/llm/state.js'
 import { llmEvents } from '~/core/llm/state.js'
 import type {
@@ -930,11 +930,16 @@ export class Agent {
 				}),
 			))
 			const errorState = this.state
+			const inferenceFailure: InferenceFailure = {
+				errorType: llmResponse.error.type,
+				model: request.model,
+				providerError: llmResponse.error.providerError,
+			}
 			const rejected = errorState?.consecutiveRejectedTurns ?? 0
 			// A rejected tool-result turn is rebuilt unchanged after every restart and fails again; pausing stops
 			// the restart from resetting it and tells the parent once, through the onPause hooks.
 			if (errorState && !isRetryableLLMError(llmResponse.error) && rejected >= Agent.MAX_CONSECUTIVE_REJECTED_TURNS) {
-				await this.emitPause('limit', `The provider rejected this turn ${rejected} times in a row and the agent will not retry it on its own. Last error: ${llmResponse.error.message}`)
+				await this.emitPause('limit', `The provider rejected this turn ${rejected} times in a row and the agent will not retry it on its own. Last error: ${llmResponse.error.message}`, inferenceFailure)
 				return
 			}
 			// Notify plugins (e.g. mailbox sends error message to parent). For retryable
@@ -944,7 +949,7 @@ export class Agent {
 			const isRepeatRetryableFailure = isRetryableLLMError(llmResponse.error)
 				&& (errorState?.consecutiveInferenceFailures ?? 1) > 1
 			if (errorState && !isRepeatRetryableFailure) {
-				await this.executeOnError(errorState, llmResponse.error.message)
+				await this.executeOnError(errorState, llmResponse.error.message, inferenceFailure)
 			}
 			return
 		}
@@ -1302,13 +1307,14 @@ export class Agent {
 	/**
 	 * Emit agent_paused, then run onPause plugin hooks.
 	 */
-	private async emitPause(reason: 'handler' | 'limit', message?: string): Promise<void> {
+	private async emitPause(reason: 'handler' | 'limit', message?: string, inferenceFailure?: InferenceFailure): Promise<void> {
 		await this.store.emit(withSessionId(
 			this.store.sessionId,
 			agentEvents.create('agent_paused', {
 				agentId: this.id,
 				reason,
 				message,
+				inferenceFailure,
 			}),
 		))
 		await this.executeOnPause(message)
@@ -1746,7 +1752,7 @@ export class Agent {
 	/**
 	 * Execute onError handler.
 	 */
-	private async executeOnError(agentState: AgentState, error: string): Promise<void> {
+	private async executeOnError(agentState: AgentState, error: string, inferenceFailure: InferenceFailure): Promise<void> {
 		this.logger.debug('Executing onError handlers', { agentId: this.id })
 
 		const agentContext = this.buildAgentContext(agentState)
@@ -1756,7 +1762,7 @@ export class Agent {
 			if (!plugin.agentHooks?.onError) continue
 			try {
 				const ctx = this.buildPluginHookContext(plugin, agentContext)
-				const pluginResult = await plugin.agentHooks.onError({ ...ctx, error })
+				const pluginResult = await plugin.agentHooks.onError({ ...ctx, error, inferenceFailure })
 				if (pluginResult === null) {
 					continue
 				}

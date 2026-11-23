@@ -143,7 +143,12 @@ describe('agent-status plugin', () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],
 				systemPlugins: [agentStatusPlugin],
-				llmProvider: MockLLMProvider.withError({ type: 'invalid_request', message: 'Bad request' }),
+				llmProvider: MockLLMProvider.withError({
+					type: 'invalid_request',
+					message: 'Bad request',
+					statusCode: 400,
+					providerError: { statusCode: 400, body: '{"message":"Bad request"}' },
+				}),
 			})
 
 			const session = await harness.createSession('test')
@@ -156,6 +161,11 @@ describe('agent-status plugin', () => {
 			expect(stopped[0].kind).toBe('errored')
 			expect(stopped[0].reason).toBeUndefined()
 			expect(stopped[0].message).toBe('Bad request')
+			expect(stopped[0].inferenceFailure).toEqual({
+				errorType: 'invalid_request',
+				model: 'mock',
+				providerError: { statusCode: 400, body: '{"message":"Bad request"}' },
+			})
 			expect(stopped[0].definitionName).toBeDefined()
 
 			await harness.shutdown()

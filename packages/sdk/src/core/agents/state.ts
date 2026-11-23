@@ -9,7 +9,7 @@ import { createEventsFactory } from '~/core/events/types'
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { ChatMessageContentItem, ChatMessageContentItemDocument } from '~/core/llm/llm-log-types.js'
 import type { LLMMetrics } from '~/core/llm/state.js'
-import type { LLMCallId } from '~/core/llm/schema.js'
+import { type InferenceFailure, inferenceFailureSchema, type LLMCallId } from '~/core/llm/schema.js'
 import type { PendingToolResult, ToolCallId } from '~/core/tools/schema.js'
 import { MessageId } from '../../plugins/mailbox/schema.js'
 
@@ -62,6 +62,8 @@ export const agentEvents = createEventsFactory({
 			agentId: agentIdSchema,
 			reason: z4.enum(['limit', 'handler', 'manual']),
 			message: z4.string().optional(),
+			/** The failed inference that caused the pause, when one did. */
+			inferenceFailure: inferenceFailureSchema.optional(),
 			/** Set by a restore's hold: the next user message to the agent resumes it. */
 			resumeOnInput: z4.boolean().optional(),
 		}),
@@ -259,6 +261,8 @@ export interface AgentState {
 	pauseReason?: AgentPauseReason
 	/** Human-readable pause message */
 	pauseMessage?: string
+	/** The failed inference that caused the pause (`agent_paused.inferenceFailure`) */
+	pauseInferenceFailure?: InferenceFailure
 	/** Paused by a restore's hold, so `Session.releaseHold` resumes it (`agent_paused.resumeOnInput`) */
 	pauseResumesOnInput?: boolean
 	/** Metrics from the most recent completed inference — used by plugins (e.g. context-compact) to size context against the provider-reported truth. */
