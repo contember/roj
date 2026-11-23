@@ -6,7 +6,7 @@ import { agentEvents } from '~/core/agents/state.js'
 import { contextEvents } from '~/core/context/state.js'
 import { createEventsFactory } from '~/core/events/types'
 import type { DomainEvent } from '~/core/events/types.js'
-import { isRetryableLLMErrorType, modelIdSchema } from '~/core/llm/schema.js'
+import { type InferenceFailure, isRetryableLLMErrorType, modelIdSchema } from '~/core/llm/schema.js'
 import { llmEvents } from '~/core/llm/state.js'
 import { SessionId, sessionIdSchema } from '~/core/sessions/schema.js'
 import type { PendingToolResult } from '~/core/tools/schema.js'
@@ -566,6 +566,7 @@ export const coreReducer = createTypedReducer(
 					// Resume into tool_exec when the pause interrupted a tool turn — going to
 					// 'pending' would run inference with unresolved tool calls (unpaired tool_use).
 					status: agent.pendingToolCalls.length > 0 ? 'tool_exec' : 'pending',
+					pendingToolResults: withoutRejectedToolResults(agent),
 					pauseReason: undefined,
 					pauseMessage: undefined,
 					pauseInferenceFailure: undefined,
@@ -636,6 +637,31 @@ export const checkRecoveryNeeded = (state: SessionState): {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+const carriesMedia = (result: PendingToolResult): boolean =>
+	typeof result.content !== 'string' && result.content.some((item) => item.type !== 'text')
+
+/** A 4xx the provider answered to the request's content; a 401/403 rejects the credentials, a 429 is retried. */
+const rejectsContent = (failure: InferenceFailure): boolean => {
+	const status = failure.providerError?.statusCode
+	return status !== undefined && status >= 400 && status < 500 && status !== 401 && status !== 403
+		&& !isRetryableLLMErrorType(failure.errorType)
+}
+
+/**
+ * The pending tool results a resume sends after a pause the provider's rejection of them caused: rebuilt unchanged,
+ * the turn would be rejected again. Results with images or documents are replaced by a note, or all of them when none
+ * carries any.
+ */
+const withoutRejectedToolResults = (agent: AgentState): PendingToolResult[] => {
+	const failure = agent.pauseInferenceFailure
+	if (agent.status !== 'paused' || failure === undefined || !rejectsContent(failure)) {
+		return agent.pendingToolResults
+	}
+	const content = `content omitted: the provider rejected it: ${failure.errorType}`
+	const rejected = agent.pendingToolResults.some(carriesMedia) ? carriesMedia : () => true
+	return agent.pendingToolResults.map((result) => rejected(result) ? { ...result, content } : result)
+}
 
 const addAgent = (state: SessionState, agent: AgentState): SessionState => {
 	const newAgents = new Map(state.agents)

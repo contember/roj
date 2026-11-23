@@ -4,11 +4,11 @@ import { generateTestAgentId } from '~/core/agents/schema.js'
 import { agentEvents } from '~/core/agents/state.js'
 import { withSessionId } from '~/core/events/test-helpers.js'
 import type { DomainEvent } from '~/core/events/types.js'
-import { LLMCallId } from '~/core/llm/schema.js'
+import { LLMCallId, type LLMErrorType } from '~/core/llm/schema.js'
 import { llmEvents } from '~/core/llm/state.js'
 import { generateSessionId } from '~/core/sessions/schema.js'
 import { sessionEvents } from '~/core/sessions/state.js'
-import { generateToolCallId } from '~/core/tools/schema.js'
+import { generateToolCallId, type ToolCallId } from '~/core/tools/schema.js'
 import { toolEvents } from '~/core/tools/state.js'
 import { mailboxPlugin } from '~/plugins/mailbox/plugin.js'
 import { getAgentMailbox, selectMailboxState } from '~/plugins/mailbox/query.js'
@@ -1848,5 +1848,57 @@ describe('a rejected turn across restarts', () => {
 		const paused = [...rejectedTwiceAcrossRestarts, started, rejected, pausedOnRejections]
 		expect(agentAfter([...paused, resumed]).consecutiveRejectedTurns).toBe(3)
 		expect(agentAfter([...paused, resumed, started, answered]).consecutiveRejectedTurns).toBeUndefined()
+	})
+})
+
+describe('a resume after the provider rejected the turn', () => {
+	const agentId = generateTestAgentId()
+	const imageCallId = generateToolCallId()
+	const textCallId = generateToolCallId()
+	const metrics = { promptTokens: 1, completionTokens: 1, totalTokens: 2, latencyMs: 1, model: 'test' }
+	const image = [{ type: 'image_url' as const, imageUrl: { url: 'file://.images/screenshot.png' } }]
+	const spawned = withSessionId(SESSION_ID, agentEvents.create('agent_spawned', { agentId, definitionName: 'test', parentId: null }))
+	const calledTools = (ids: ToolCallId[]) =>
+		withSessionId(SESSION_ID, llmEvents.create('inference_completed', {
+			agentId,
+			consumedMessageIds: [],
+			response: { content: null, toolCalls: ids.map((id) => ({ id, name: 'look', input: {} })) },
+			metrics,
+		}))
+	const imageDone = withSessionId(SESSION_ID, toolEvents.create('tool_completed', { agentId, toolCallId: imageCallId, result: image }))
+	const textDone = withSessionId(SESSION_ID, toolEvents.create('tool_completed', { agentId, toolCallId: textCallId, result: 'page text' }))
+	const started = withSessionId(SESSION_ID, llmEvents.create('inference_started', { agentId, messages: [], consumedMessageIds: [] }))
+	const failedWith = (errorType: LLMErrorType, statusCode?: number) => [
+		withSessionId(SESSION_ID, llmEvents.create('inference_failed', { agentId, error: 'Provider returned error', errorType })),
+		withSessionId(SESSION_ID, agentEvents.create('agent_paused', {
+			agentId,
+			reason: 'limit',
+			inferenceFailure: { errorType, model: 'test', providerError: statusCode === undefined ? undefined : { statusCode, body: '{}' } },
+		})),
+	]
+	const resumed = withSessionId(SESSION_ID, agentEvents.create('agent_resumed', { agentId }))
+	const pendingContent = (events: DomainEvent[]) =>
+		getAgentState(events.reduce(applyEvent, createSessionState(SESSION_ID, 'test', TIMESTAMP)), agentId)?.pendingToolResults.map((result) => result.content)
+	const omitted = 'content omitted: the provider rejected it: invalid_request'
+
+	it('replaces the tool results with images by a note and keeps the text ones', () => {
+		const events = [spawned, calledTools([imageCallId, textCallId]), imageDone, textDone, started, ...failedWith('invalid_request', 400)]
+		expect(pendingContent(events)).toEqual([image, 'page text'])
+		expect(pendingContent([...events, resumed])).toEqual([omitted, 'page text'])
+	})
+
+	it('replaces every tool result when none carries an image or a document', () => {
+		const events = [spawned, calledTools([textCallId]), textDone, started, ...failedWith('invalid_request', 400), resumed]
+		expect(pendingContent(events)).toEqual([omitted])
+	})
+
+	it('keeps the tool results when the failure was not a rejection of the content', () => {
+		const turn = [spawned, calledTools([imageCallId]), imageDone, started]
+		expect(pendingContent([...turn, ...failedWith('server_error', 502), resumed])).toEqual([image])
+		expect(pendingContent([...turn, ...failedWith('rate_limit', 429), resumed])).toEqual([image])
+		expect(pendingContent([...turn, ...failedWith('network_error'), resumed])).toEqual([image])
+		expect(pendingContent([...turn, ...failedWith('invalid_request', 401), resumed])).toEqual([image])
+		// No provider answered: e.g. a routing error raised before any request went out.
+		expect(pendingContent([...turn, ...failedWith('invalid_request'), resumed])).toEqual([image])
 	})
 })
