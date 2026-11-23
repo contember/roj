@@ -46,6 +46,12 @@ export interface PendingAttachment {
 	error?: string
 }
 
+function withoutAttachments(attachments: ReadonlyMap<string, PendingAttachment>, uploadIds: readonly string[]): Map<string, PendingAttachment> {
+	const remaining = new Map(attachments)
+	for (const uploadId of uploadIds) remaining.delete(uploadId)
+	return remaining
+}
+
 /** An attachment still on its way: the server delivers it with the message sent after it is ready, not with one sent before. */
 export function hasInFlightAttachments(attachments: ReadonlyMap<string, PendingAttachment>): boolean {
 	return [...attachments.values()].some((attachment) => attachment.status === 'uploading' || attachment.status === 'processing')
@@ -221,6 +227,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 		const { sessionId, entryAgentId, pendingQuestions, pendingAttachments, messageContext } = get()
 		if (!sessionId || !entryAgentId || pendingQuestions.length > 0) return
 		if (hasInFlightAttachments(pendingAttachments)) return
+		const sentAttachmentIds = [...pendingAttachments.keys()]
 
 		// Collect ready attachments for display
 		const readyAttachments = Array.from(pendingAttachments.values()).filter(
@@ -264,10 +271,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 				content: messageContent,
 				context: messageContext ?? undefined,
 			}))
-			// Remove from pending on success and clear attachments
+			// Remove from pending on success, and the attachments that went out with the message
 			const newPendingMessages = new Map(get().pendingMessages)
 			newPendingMessages.delete(messageId)
-			set({ pendingMessages: newPendingMessages, pendingAttachments: new Map() })
+			set({ pendingMessages: newPendingMessages, pendingAttachments: withoutAttachments(get().pendingAttachments, sentAttachmentIds) })
 		} catch (error) {
 			console.error('Failed to send message:', error)
 			// Remove from pending and messages on error
@@ -396,6 +403,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 		const { sessionId, entryAgentId, pendingQuestions, draftAnswers, pendingAttachments } = get()
 		if (!sessionId || !entryAgentId) return
 		if (hasInFlightAttachments(pendingAttachments)) return
+		const sentAttachmentIds = [...pendingAttachments.keys()]
 
 		const toSubmit = pendingQuestions
 			.map((q) => ({ question: q, answer: draftAnswers.get(q.questionId) }))
@@ -454,12 +462,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 			draftAnswers: newDrafts,
 		})
 
-		// Files staged while answering (ask_user `allowAttachments` or the chat
-		// composer) were ready before the answers went out, so the uploads plugin
-		// delivers them with these answers; drop them from the local pending pool.
-		if (get().pendingAttachments.size > 0) {
-			set({ pendingAttachments: new Map() })
-		}
+		// Files staged before the answers went out (ask_user `allowAttachments` or the chat composer) were
+		// settled, so the uploads plugin delivers the ready ones with these answers; one added since stays.
+		set({ pendingAttachments: withoutAttachments(get().pendingAttachments, sentAttachmentIds) })
 	},
 
 	setMessageContext: (context) => {
