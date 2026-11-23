@@ -413,8 +413,7 @@ describe('git-status reads without taking the index lock', () => {
 		let reads = 0
 		const readers = Array.from({ length: READERS }, async () => {
 			while (writing) {
-				await pull(session)
-				reads += 1
+				if ((await pull(session)).snapshot) reads += 1
 			}
 		})
 
@@ -436,6 +435,8 @@ describe('git-status reads without taking the index lock', () => {
 
 		expect(failures).toEqual([])
 		expect(reads).toBeGreaterThan(WRITES)
+		// makeRepo leaves one commit ahead of main; every write must have landed on top.
+		expect((await pull(session)).snapshot?.committedAhead).toBe(WRITES + 1)
 	}, 60_000)
 })
 
