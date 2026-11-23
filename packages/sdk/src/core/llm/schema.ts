@@ -45,7 +45,10 @@ export type LLMErrorType = z.infer<typeof llmErrorTypeSchema>
 export const isRetryableLLMErrorType = (type: LLMErrorType): boolean =>
 	type === 'rate_limit' || type === 'server_error' || type === 'network_error' || type === 'timeout'
 
-/** Why an inference failed, for a stop report: the provider's answer and the model, never the request. */
+/**
+ * Why an inference failed, for a stop report: the model and the provider's answer. The request is never included, but
+ * the provider's own message may quote part of it (e.g. the path of an invalid content block).
+ */
 export const inferenceFailureSchema = z.object({
 	errorType: llmErrorTypeSchema,
 	/** The model the failed request was sent to */

@@ -1769,7 +1769,7 @@ export class Agent {
 				switch (pluginResult.action) {
 					case 'pause':
 						await this.emitHandlerCompleted('onError', pluginResult)
-						await this.emitPause('handler', pluginResult.reason)
+						await this.emitPause('handler', pluginResult.reason, inferenceFailure)
 						return
 					default:
 						throw new Error(`Unhandled onError action: ${(pluginResult as { action: string }).action}`)

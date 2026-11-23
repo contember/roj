@@ -516,12 +516,15 @@ describe('core: an agent the provider keeps rejecting', () => {
 		await resuming.sessionManager.loadAllSessions()
 		const live = await resuming.sessionManager.getSession(session.sessionId)
 		if (!live.ok) throw new Error(live.error.message)
+		expect(live.value.state.agents.get(childId)?.pauseInferenceFailure?.providerError?.statusCode).toBe(400)
 		const resumed = await live.value.resumeAgent(childId)
 		if (!resumed.ok) throw new Error(resumed.error.message)
 		// The LLM retry gives up after five attempts and the turn fails as retryable.
 		await waitUntil(async () => (await childFailures()) === 4)
 		await Bun.sleep(50)
 		expect(live.value.state.agents.get(childId)?.status).toBe('errored')
+		// The rejection that caused the pause is not carried past the resume.
+		expect(live.value.state.agents.get(childId)?.pauseInferenceFailure).toBeUndefined()
 		await resuming.shutdown()
 
 		// The provider is back; the next restart resets the errored agent and the kept turn goes through.
