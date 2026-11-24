@@ -667,6 +667,13 @@ const rejectsContent = (failure: InferenceFailure): boolean => {
 		&& !isRetryableLLMErrorType(failure.errorType)
 }
 
+// Persisted in tool results of the event log: changing it changes how `isOmittedToolResult` classifies stored ones.
+const OMITTED_REJECTED_CONTENT = 'content omitted: the provider rejected it'
+
+/** A tool result a resume already replaced with the omission note, so the provider cannot be rejecting its content. */
+export const isOmittedToolResult = (result: PendingToolResult): boolean =>
+	typeof result.content === 'string' && result.content.startsWith(OMITTED_REJECTED_CONTENT)
+
 /**
  * The pending tool results a resume sends after a pause the provider's rejection of them caused: rebuilt unchanged,
  * the turn would be rejected again. Results with images or documents are replaced by a note, or all of them when none
@@ -677,7 +684,7 @@ const withoutRejectedToolResults = (agent: AgentState): PendingToolResult[] => {
 	if (agent.status !== 'paused' || failure === undefined || !rejectsContent(failure)) {
 		return agent.pendingToolResults
 	}
-	const content = `content omitted: the provider rejected it: ${failure.errorType}`
+	const content = `${OMITTED_REJECTED_CONTENT}: ${failure.errorType}`
 	const rejected = agent.pendingToolResults.some(carriesMedia) ? carriesMedia : () => true
 	return agent.pendingToolResults.map((result) => rejected(result) ? { ...result, content } : result)
 }

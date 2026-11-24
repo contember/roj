@@ -1217,6 +1217,7 @@ export const uploadsPlugin = definePlugin('uploads')
 		}),
 	)
 	.dequeue({
+		inputKind: 'attachments',
 		// A ready upload is not work on its own: it goes out with the user's message or answer it came with,
 		// never in a turn without user input, which would answer the file before the text.
 		hasPendingMessages: () => false,
