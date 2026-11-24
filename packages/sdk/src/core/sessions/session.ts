@@ -345,13 +345,13 @@ export class Session {
 	}
 
 	/**
-	 * Resume a paused agent so it can continue processing.
+	 * Resume a paused agent so it can continue processing. `onInput` marks a resume by a user message (`releaseHold`).
 	 */
-	async resumeAgent(agentId: AgentId): Promise<Result<void, DomainError>> {
-		return this.mutate('resume', () => this.performResumeAgent(agentId))
+	async resumeAgent(agentId: AgentId, options: { onInput?: boolean } = {}): Promise<Result<void, DomainError>> {
+		return this.mutate('resume', () => this.performResumeAgent(agentId, options.onInput === true))
 	}
 
-	private async performResumeAgent(agentId: AgentId): Promise<Result<void, DomainError>> {
+	private async performResumeAgent(agentId: AgentId, onInput: boolean): Promise<Result<void, DomainError>> {
 		if (this.store.isClosed()) {
 			return Err(SessionErrors.closed(String(this.id)))
 		}
@@ -370,6 +370,7 @@ export class Session {
 			this.id,
 			agentEvents.create('agent_resumed', {
 				agentId,
+				...(onInput && { onInput }),
 			}),
 		))
 
@@ -383,15 +384,16 @@ export class Session {
 
 	/**
 	 * Release the hold a load left (`loadAllSessions({ resume: false })` or `InterruptedWorkHold`): resume
-	 * every agent it paused, then let plugins relaunch what they parked for it. Anything paused any
-	 * other way stays paused, and a session with nothing held is left as it is.
+	 * every agent it paused, and an entry agent paused on the rejected-turn limit, then let plugins
+	 * relaunch what they parked for it. Anything paused any other way stays paused, and a session with
+	 * nothing held is left as it is.
 	 */
 	async releaseHold(activity: SessionRuntimeActivity = this.runtimeActivity): Promise<Result<void, DomainError>> {
 		for (const agentId of [...this.store.getState().agents.keys()]) {
 			// The live state: a manual resume or pause can land while an earlier resume awaits.
 			const agentState = this.store.getAgentState(agentId)
 			if (agentState?.status !== 'paused' || agentState.pauseResumesOnInput !== true) continue
-			const resumed = await this.resumeAgent(agentId)
+			const resumed = await this.resumeAgent(agentId, { onInput: true })
 			if (!resumed.ok) return resumed
 		}
 		for (const plugin of this.plugins) {

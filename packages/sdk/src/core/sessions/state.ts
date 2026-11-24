@@ -557,7 +557,8 @@ export const coreReducer = createTypedReducer(
 					pauseReason: event.reason,
 					pauseMessage: event.message,
 					pauseInferenceFailure: event.inferenceFailure,
-					pauseResumesOnInput: event.resumeOnInput,
+					// Only its user can unblock an entry agent the provider keeps rejecting, so the user's next message resumes it.
+					pauseResumesOnInput: event.resumeOnInput === true || (event.reason === 'limit' && getEntryAgentId(state) === event.agentId) || undefined,
 				}))
 
 			case 'agent_resumed':
@@ -567,6 +568,8 @@ export const coreReducer = createTypedReducer(
 					// 'pending' would run inference with unresolved tool calls (unpaired tool_use).
 					status: agent.pendingToolCalls.length > 0 ? 'tool_exec' : 'pending',
 					pendingToolResults: withoutRejectedToolResults(agent),
+					// A user's message is a new attempt; an operator's resume keeps the streak, so a turn still rejected pauses at once.
+					consecutiveRejectedTurns: event.onInput === true && agent.pauseReason === 'limit' ? undefined : agent.consecutiveRejectedTurns,
 					pauseReason: undefined,
 					pauseMessage: undefined,
 					pauseInferenceFailure: undefined,

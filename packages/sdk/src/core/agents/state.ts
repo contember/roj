@@ -69,6 +69,8 @@ export const agentEvents = createEventsFactory({
 		}),
 		agent_resumed: z4.object({
 			agentId: agentIdSchema,
+			/** Resumed by a user message (`Session.releaseHold`); a rejected-turn pause then starts a new streak. */
+			onInput: z4.boolean().optional(),
 		}),
 		agent_input_consumed: z4.object({
 			agentId: agentIdSchema,
@@ -263,7 +265,7 @@ export interface AgentState {
 	pauseMessage?: string
 	/** The failed inference that caused the pause (`agent_paused.inferenceFailure`) */
 	pauseInferenceFailure?: InferenceFailure
-	/** Paused by a restore's hold, so `Session.releaseHold` resumes it (`agent_paused.resumeOnInput`) */
+	/** Paused by a restore's hold or as an entry agent on the rejected-turn limit, so `Session.releaseHold` resumes it (`agent_paused.resumeOnInput`) */
 	pauseResumesOnInput?: boolean
 	/** Metrics from the most recent completed inference — used by plugins (e.g. context-compact) to size context against the provider-reported truth. */
 	lastInferenceMetrics?: LLMMetrics
