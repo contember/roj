@@ -313,6 +313,7 @@ export const coreReducer = createTypedReducer(
 						failure: event.errorType !== undefined && event.model !== undefined
 							? { errorType: event.errorType, model: event.model, providerError: event.providerError }
 							: undefined,
+						at: event.timestamp,
 					},
 					// A rejected message is consumed, so only a rejected tool-result turn comes back unchanged.
 					consecutiveRejectedTurns: event.errorType !== undefined && !isRetryableLLMErrorType(event.errorType) && agent.pendingToolResults.length > 0
@@ -489,6 +490,7 @@ export const coreReducer = createTypedReducer(
 						executingToolCall: undefined,
 						inferenceCall: undefined,
 						consecutiveRejectedTurns: undefined,
+						inferenceError: undefined,
 						// The rewritten history is not what an interrupted call answered.
 						interruptedInference: undefined,
 						status: 'pending' as const,

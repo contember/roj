@@ -114,6 +114,7 @@ export const agentStopSchema = z4.object({
 	message: z4.string().optional(),
 	/** The failed inference behind the stop: on `errored`, and on `paused` when the provider rejected the same turn repeatedly. */
 	inferenceFailure: inferenceFailureSchema.optional(),
+	/** When the agent stopped: the event's time, so it can differ slightly from the live notification's. */
 	timestamp: z4.number(),
 })
 
@@ -288,8 +289,11 @@ export interface AgentState {
 	pauseResumesOnInput?: boolean
 	/** When the current pause began (`agent_paused` timestamp) */
 	pausedAt?: number
-	/** The failure that opened the current inference-failure episode; a repeat of it keeps the first, as `onError` reports only that one. */
-	inferenceError?: { message: string; failure?: InferenceFailure }
+	/**
+	 * The failure that opened the current inference-failure episode (a repeat keeps the first, as `onError` reports only
+	 * that one), until a turn commits. A restart keeps it: resetting the agent does not answer the input that failed.
+	 */
+	inferenceError?: { message: string; failure?: InferenceFailure; at: number }
 	/** Metrics from the most recent completed inference — used by plugins (e.g. context-compact) to size context against the provider-reported truth. */
 	lastInferenceMetrics?: LLMMetrics
 	/** Consecutive inference_failed count since the last committed turn — drives the outer error-resume backoff. */
@@ -336,7 +340,10 @@ export interface ToolResult {
 // AgentState tree helpers
 // ============================================================================
 
-/** The agent's stop while it lasts: null once it is resumed, restarted or running again. */
+/**
+ * The agent's stop while it lasts. A pause lasts until a resume; an error until a turn commits, also across the
+ * restart that resets the agent to pending, but not while the agent runs again.
+ */
 export const getAgentStop = (agent: AgentState): AgentStop | null => {
 	if (agent.status === 'paused' && agent.pausedAt !== undefined) {
 		return {
@@ -349,14 +356,14 @@ export const getAgentStop = (agent: AgentState): AgentStop | null => {
 			timestamp: agent.pausedAt,
 		}
 	}
-	if (agent.status === 'errored' && agent.inferenceError !== undefined && agent.lastInferenceFailureAt !== undefined) {
+	if ((agent.status === 'errored' || agent.status === 'pending') && agent.inferenceError !== undefined) {
 		return {
 			agentId: agent.id,
 			definitionName: agent.definitionName,
 			kind: 'errored',
 			message: agent.inferenceError.message,
 			inferenceFailure: agent.inferenceError.failure,
-			timestamp: agent.lastInferenceFailureAt,
+			timestamp: agent.inferenceError.at,
 		}
 	}
 	return null

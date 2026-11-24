@@ -3,6 +3,7 @@ import z from 'zod/v4'
 import { AgentId } from '~/core/agents/schema.js'
 import { agentStopSchema } from '~/core/agents/state.js'
 import { MockLLMProvider } from '~/core/llm/mock.js'
+import { llmEvents } from '~/core/llm/state.js'
 import type { PluginNotification } from '~/core/plugins/plugin-builder.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { limitsGuardPlugin } from '~/plugins/limits-guard/plugin.js'
@@ -191,38 +192,48 @@ describe('agent-status plugin', () => {
 			return { ...preset, orchestrator: { ...preset.orchestrator, errorResumeBackoff: { baseDelayMs, maxDelayMs: 60_000 } } }
 		}
 
-		it('lists an errored agent as its agentStopped notification reported it, until a new turn commits', async () => {
+		it('lists an errored agent as its agentStopped notification reported it, across a server restart, until a turn commits', async () => {
 			let failing = true
-			const harness = new TestHarness({
-				presets: [retryPreset(1)],
-				systemPlugins: [agentStatusPlugin],
-				mockHandler: () => {
-					if (failing) throw { type: 'invalid_request', message: 'Bad request', statusCode: 400, providerError: { statusCode: 400, body: '{"message":"Bad request"}' } }
-					return { content: 'Answered', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
-				},
+			const presets = [retryPreset(1)]
+			const llmProvider = new MockLLMProvider(() => {
+				if (failing) throw { type: 'invalid_request', message: 'Bad request', statusCode: 400, providerError: { statusCode: 400, body: '{"message":"Bad request"}' } }
+				return { content: 'Answered', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
 			})
-			const session = await harness.createSession('test')
+			const first = new TestHarness({ presets, systemPlugins: [agentStatusPlugin], llmProvider })
+			const session = await first.createSession('test')
 			const entryAgentId = session.getEntryAgentId()!
 			await session.sendMessage('Trigger error')
 			await waitForAgentStatus(session, entryAgentId, 'errored')
 
 			const live = agentStoppedNotifications(session)
 			expect(live).toHaveLength(1)
-			const listed = await stoppedAgents(session)
-			expect(listed).toEqual([{ ...withoutSession(live[0]), timestamp: expect.any(Number) }])
-			expect(listed[0].inferenceFailure).toEqual({ errorType: 'invalid_request', model: 'mock', providerError: { statusCode: 400, body: '{"message":"Bad request"}' } })
+			const [failure] = await session.getEventsByType(llmEvents, 'inference_failed')
+			const expected = [{ ...withoutSession(live[0]), timestamp: failure.timestamp }]
+			expect(await stoppedAgents(session)).toEqual(expected)
+			expect(expected[0].inferenceFailure).toEqual({ errorType: 'invalid_request', model: 'mock', providerError: { statusCode: 400, body: '{"message":"Bad request"}' } })
+			await first.shutdown()
+
+			// The restart resets the agent to pending, but nothing answered the message that failed.
+			const restarted = new TestHarness({ presets, systemPlugins: [agentStatusPlugin], llmProvider, eventStore: first.eventStore })
+			await restarted.sessionManager.loadAllSessions()
+			const reloaded = await restarted.sessionManager.getSession(session.sessionId)
+			if (!reloaded.ok) throw new Error(reloaded.error.message)
+			expect(await stoppedAgents(reloaded.value)).toEqual(expected)
 
 			failing = false
-			await session.sendAndWaitForIdle('Try again')
-			expect(await stoppedAgents(session)).toEqual([])
+			const sent = await reloaded.value.callPluginMethod('user-chat.sendMessage', { content: 'Try again' })
+			if (!sent.ok) throw new Error(sent.error.message)
+			const deadline = Date.now() + 5_000
+			while (reloaded.value.state.agents.get(entryAgentId)?.inferenceError !== undefined && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10))
+			expect(await stoppedAgents(reloaded.value)).toEqual([])
 
-			await harness.shutdown()
+			await restarted.shutdown()
 		})
 
 		it('keeps the failure the error notice reported while a provider outage repeats', async () => {
 			let outage = 0
 			const harness = new TestHarness({
-				presets: [retryPreset(100)],
+				presets: [retryPreset(200)],
 				systemPlugins: [agentStatusPlugin],
 				mockHandler: () => {
 					outage++
@@ -233,10 +244,10 @@ describe('agent-status plugin', () => {
 			const entryAgentId = session.getEntryAgentId()!
 			await session.sendMessage('Hello')
 			await waitForAgentStatus(session, entryAgentId, 'errored')
-			// Between retries the agent runs again and is not stopped; read it in the backoff after its second failure (200 ms).
+			// While a retry runs the agent is not stopped; read it in a backoff after its second failure (400 ms or more).
 			const failedTwice = () => {
 				const agent = session.state.agents.get(entryAgentId)
-				return agent?.status === 'errored' && (agent.consecutiveInferenceFailures ?? 0) === 2
+				return agent?.status === 'errored' && (agent.consecutiveInferenceFailures ?? 0) >= 2
 			}
 			const deadline = Date.now() + 5_000
 			while (!failedTwice() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5))
@@ -244,7 +255,8 @@ describe('agent-status plugin', () => {
 
 			const live = agentStoppedNotifications(session)
 			expect(live).toHaveLength(1)
-			expect(await stoppedAgents(session)).toEqual([{ ...withoutSession(live[0]), timestamp: expect.any(Number) }])
+			const [firstFailure] = await session.getEventsByType(llmEvents, 'inference_failed')
+			expect(await stoppedAgents(session)).toEqual([{ ...withoutSession(live[0]), timestamp: firstFailure.timestamp }])
 
 			await harness.shutdown()
 		})
