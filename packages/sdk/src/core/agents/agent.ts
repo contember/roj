@@ -58,7 +58,7 @@ import { RuntimeFileStore } from '../sessions/context.js'
 import { isValidSessionId, SessionId } from '../sessions/schema.js'
 import type { SessionStore } from '../sessions/session-store.js'
 import type { SessionState } from '../sessions/state.js'
-import { isOmittedToolResult, resolveAgentOverrides } from '../sessions/state.js'
+import { isOmittedToolResult, rejectsContent, resolveAgentOverrides } from '../sessions/state.js'
 import type { SessionEnvironment, ToolExecutor } from '../tools/index.js'
 import type { AgentContext } from './context.js'
 import { sanitizeLLMResponse } from './response-sanitizer.js'
@@ -911,8 +911,14 @@ export class Agent {
 			// server_error, network_error, timeout) keep the preserve-for-retry semantics.
 			// The user's text stays queued while the turn carried another suspect: the retry leaves out a rejected
 			// attachment with a note, or counts toward the rejected-turn pause while the tool results stay unchanged.
+			// Sources with `markRejected` are never consumed here: when the content is not at fault, their input stays queued.
+			const inferenceFailure: InferenceFailure = {
+				errorType: llmResponse.error.type,
+				model: request.model,
+				providerError: llmResponse.error.providerError,
+			}
 			if (!isRetryableLLMError(llmResponse.error)) {
-				const leftOut = await this.markDequeuedRejected(pluginDequeued, llmResponse.error.type)
+				const leftOut = rejectsContent(inferenceFailure) && await this.markDequeuedRejected(pluginDequeued, llmResponse.error.type)
 				const otherSuspect = leftOut || agentState.pendingToolResults.some((result) => !isOmittedToolResult(result))
 				await this.consumeDequeuedTokens(pluginDequeued.filter((dequeued) =>
 					dequeued.plugin.dequeue?.markRejected === undefined && !(otherSuspect && dequeued.plugin.dequeue?.inputKind === 'userText')
@@ -937,11 +943,6 @@ export class Agent {
 				}),
 			))
 			const errorState = this.state
-			const inferenceFailure: InferenceFailure = {
-				errorType: llmResponse.error.type,
-				model: request.model,
-				providerError: llmResponse.error.providerError,
-			}
 			const rejected = errorState?.consecutiveRejectedTurns ?? 0
 			// A rejected tool-result turn is rebuilt unchanged after every restart and fails again; pausing stops
 			// the restart from resetting it and tells the parent once, through the onPause hooks.

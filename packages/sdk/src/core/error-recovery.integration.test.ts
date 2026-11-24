@@ -686,13 +686,19 @@ describe('core: an agent the provider keeps rejecting', () => {
 		await harness.shutdown()
 	})
 
-	/** An entry agent whose provider rejects any turn that carries the content of an upload named `refused.txt`. */
-	async function entryAgentWithRefusedUpload() {
+	/**
+	 * An entry agent whose provider rejects any turn that carries the content of an upload named `refused.txt` or the
+	 * text 'A huge paste'. With `unauthorizedOnce`, the first request fails with a 401 instead, which rejects no content.
+	 */
+	async function entryAgentWithRefusedUpload(options: { unauthorizedOnce?: boolean } = {}) {
 		const REFUSED = '[File uploaded: refused.txt]'
 		const sent: InferenceRequest[] = []
 		const llmProvider = new MockLLMProvider((request) => {
 			sent.push(request)
-			if (sentUserText(request).includes(REFUSED)) {
+			if (options.unauthorizedOnce && sent.length === 1) {
+				throw { type: 'invalid_request', message: 'Unauthorized', statusCode: 401, providerError: { statusCode: 401, body: '{"message":"Unauthorized"}' } }
+			}
+			if (sentUserText(request).includes(REFUSED) || sentUserText(request).includes('A huge paste')) {
 				throw { type: 'invalid_request', message: REJECTED, statusCode: 400, providerError: { statusCode: 400, body: REJECTION_BODY } }
 			}
 			return { content: 'Answered', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
@@ -702,29 +708,26 @@ describe('core: an agent the provider keeps rejecting', () => {
 		const harness = new TestHarness({ presets: [rootPreset], llmProvider })
 		const session = await harness.createSession('test')
 		const entryId = session.getEntryAgentId()!
+		const sessionId = String(session.sessionId)
 		const uploadPage = async (filename: string) => {
 			const fileContent = Buffer.from('A page')
-			const uploaded = await session.callPluginMethod('uploads.upload', {
-				sessionId: String(session.sessionId),
-				filename,
-				mimeType: 'text/plain',
-				size: fileContent.length,
-				fileBuffer: fileContent,
-			})
+			const uploaded = await session.callPluginMethod('uploads.upload', { sessionId, filename, mimeType: 'text/plain', size: fileContent.length, fileBuffer: fileContent })
 			if (!uploaded.ok) throw new Error(uploaded.error.message)
 			return z.object({ uploadId: z.string() }).parse(uploaded.value).uploadId
 		}
-		const unconsumedUploads = async () => {
-			const listed = await session.callPluginMethod('uploads.listPending', { sessionId: String(session.sessionId) })
+		/** The uploads a client offers as attachments for the next message. */
+		const attachableUploads = async () => {
+			const listed = await session.callPluginMethod('uploads.listPending', { sessionId })
 			if (!listed.ok) throw new Error(listed.error.message)
 			return z.object({ uploads: z.array(z.object({ uploadId: z.string() })) }).parse(listed.value).uploads.map((upload) => upload.uploadId)
 		}
+		const failures = async () => (await session.getEventsByType(llmEvents, 'inference_failed')).length
 		const answered = () => waitUntil(async () => session.state.agents.get(entryId)?.conversationHistory.at(-1)?.content === 'Answered')
-		return { REFUSED, sent, harness, session, uploadPage, unconsumedUploads, answered }
+		return { REFUSED, sent, harness, session, sessionId, uploadPage, attachableUploads, failures, answered }
 	}
 
 	it('a rejected turn that carried an attachment keeps the user\'s text and retries it with a note that the attachment was omitted', async () => {
-		const { REFUSED, sent, harness, session, uploadPage, unconsumedUploads, answered } = await entryAgentWithRefusedUpload()
+		const { REFUSED, sent, harness, session, sessionId, uploadPage, attachableUploads, answered } = await entryAgentWithRefusedUpload()
 		const uploadId = await uploadPage('refused.txt')
 
 		await session.sendMessage('Put this on the about page')
@@ -738,19 +741,58 @@ describe('core: an agent the provider keeps rejecting', () => {
 		expect(sentUserText(sent[1])).toContain(`<attachment uploadId=\\"${uploadId}\\" filename=\\"refused.txt\\" type=\\"text/plain\\">\\ncontent omitted: the provider rejected it: invalid_request`)
 		expect(countHistoryMentions(session, 'Put this on the about page')).toBe(1)
 		expect(await session.getEventsByType(agentEvents, 'agent_paused')).toHaveLength(0)
-		// Left out, not consumed: the upload is still the user's to delete, and the note went out once.
-		expect(await session.getEventsByType(uploadEvents, 'attachments_consumed')).toHaveLength(0)
-		expect(await unconsumedUploads()).toEqual([uploadId])
 		await session.sendAndWaitForIdle('Anything else?')
 		expect(sent).toHaveLength(3)
 		expect(sentUserText(sent[2]).split('content omitted')).toHaveLength(2)
+		expect(countHistoryMentions(session, 'content omitted')).toBe(1)
+		// Left out, not consumed: no longer offered for the next message, but still the user's to delete.
+		expect(await session.getEventsByType(uploadEvents, 'attachments_consumed')).toHaveLength(0)
+		expect(await attachableUploads()).toEqual([])
+		const deleted = await session.callPluginMethod('uploads.delete', { sessionId, uploadId })
+		expect(deleted.ok).toBe(true)
+
+		await harness.shutdown()
+	})
+
+	it('a retried turn rejected with only the omission note drops the user\'s text and keeps the note for the next message', async () => {
+		const { REFUSED, sent, harness, session, uploadPage, failures, answered } = await entryAgentWithRefusedUpload()
+		await uploadPage('refused.txt')
+
+		await session.sendMessage('A huge paste')
+		await waitUntil(async () => (await failures()) === 2)
+		// The note is no suspect, so the text that is itself the problem is not retried again.
+		expect(sentUserText(sent[1])).toContain('content omitted')
+		expect(sentUserText(sent[1])).not.toContain(REFUSED)
+
+		await session.sendMessage('Just a question')
+		await answered()
+		expect(sent).toHaveLength(3)
+		expect(sentUserText(sent[2])).not.toContain('A huge paste')
+		expect(sentUserText(sent[2])).toContain('content omitted')
 		expect(countHistoryMentions(session, 'content omitted')).toBe(1)
 
 		await harness.shutdown()
 	})
 
+	it('a turn that fails without rejecting its content keeps the attachment queued with no note', async () => {
+		const { sent, harness, session, uploadPage, failures, answered } = await entryAgentWithRefusedUpload({ unauthorizedOnce: true })
+		await uploadPage('accepted.txt')
+
+		await session.sendMessage('Put this on the about page')
+		await waitUntil(async () => (await failures()) === 1)
+		await session.sendMessage('Try again')
+		await answered()
+
+		expect(sent).toHaveLength(2)
+		expect(sentUserText(sent[1])).toContain('[File uploaded: accepted.txt]')
+		expect(sentUserText(sent[1])).not.toContain('content omitted')
+		expect(await session.getEventsByType(uploadEvents, 'attachments_rejected')).toHaveLength(0)
+
+		await harness.shutdown()
+	})
+
 	it('an accepted turn that carried an attachment sends it without a note and consumes it', async () => {
-		const { sent, harness, session, uploadPage, unconsumedUploads, answered } = await entryAgentWithRefusedUpload()
+		const { sent, harness, session, uploadPage, attachableUploads, answered } = await entryAgentWithRefusedUpload()
 		const uploadId = await uploadPage('accepted.txt')
 
 		await session.sendMessage('Put this on the about page')
@@ -759,9 +801,10 @@ describe('core: an agent the provider keeps rejecting', () => {
 		expect(sent).toHaveLength(1)
 		expect(sentUserText(sent[0])).toContain('[File uploaded: accepted.txt]')
 		expect(sentUserText(sent[0])).not.toContain('content omitted')
+		// Consumption follows the commit, and its meta.json write follows the event.
+		await waitUntil(async () => (await attachableUploads()).length === 0)
 		const consumed = await session.getEventsByType(uploadEvents, 'attachments_consumed')
 		expect(consumed.map((event) => event.uploadIds.map(String))).toEqual([[uploadId]])
-		expect(await unconsumedUploads()).toEqual([])
 
 		await harness.shutdown()
 	})

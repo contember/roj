@@ -26,7 +26,7 @@ import {
 	type UploadSourceRef,
 } from './schema.js'
 import { fileUploadSource, type UploadBlobContext, type UploadBlobStore, type UploadSource } from './source.js'
-import { type OmittedUpload, type PendingUpload, type ProcessingUpload, type UploadsState, uploadEvents } from './state.js'
+import { type PendingUpload, type ProcessingUpload, type RejectedUpload, type UploadsState, uploadEvents } from './state.js'
 
 // ============================================================================
 // Notification schemas
@@ -239,7 +239,7 @@ function formatUploadsForLLM(uploads: PendingUpload[], sessionRoot: string): str
 }
 
 /** Tells the agent an attachment was in a turn the provider rejected and is left out. */
-function formatOmittedUploadsForLLM(uploads: OmittedUpload[]): string {
+function formatOmittedUploadsForLLM(uploads: RejectedUpload[]): string {
 	return uploads
 		.map((u) =>
 			`<attachment uploadId="${u.uploadId}" filename="${escapeMarkup(u.filename)}" type="${escapeMarkup(u.mimeType)}">\n${
@@ -1155,7 +1155,7 @@ export const uploadsPlugin = definePlugin('uploads')
 	.notification('uploadStatusChanged', { schema: statusChangedSchema })
 	.state<UploadsState>({
 		key: 'uploads',
-		initial: (): UploadsState => ({ pending: [], omitted: [], terminal: {}, processing: {}, blobRefs: {} }),
+		initial: (): UploadsState => ({ pending: [], rejected: [], terminal: {}, processing: {}, blobRefs: {} }),
 		reduce: (state, event) => {
 			switch (event.type) {
 				case 'attachment_uploaded': {
@@ -1204,6 +1204,7 @@ export const uploadsPlugin = definePlugin('uploads')
 					return {
 						...state,
 						pending: state.pending.filter((u) => !consumedIds.has(String(u.uploadId))),
+						rejected: state.rejected.filter((u) => !consumedIds.has(String(u.uploadId))),
 						terminal: withoutKeys(state.terminal, [...consumedIds]),
 						// A consumed upload can no longer be deleted, so nothing would release these.
 						blobRefs: withoutKeys(state.blobRefs, [...consumedIds]),
@@ -1211,25 +1212,29 @@ export const uploadsPlugin = definePlugin('uploads')
 				}
 				case 'attachments_rejected': {
 					const rejectedIds = new Set(event.uploadIds.map(String))
-					const rejected = state.pending.filter((u) => rejectedIds.has(String(u.uploadId)))
+					const leftOut = state.pending.filter((u) => rejectedIds.has(String(u.uploadId)))
 					return {
 						...state,
 						pending: state.pending.filter((u) => !rejectedIds.has(String(u.uploadId))),
-						omitted: [
-							...state.omitted,
-							...rejected.map((u) => ({ uploadId: u.uploadId, filename: u.filename, mimeType: u.mimeType, errorType: event.errorType })),
+						rejected: [
+							...state.rejected,
+							...leftOut.map((u) => ({ uploadId: u.uploadId, filename: u.filename, mimeType: u.mimeType, errorType: event.errorType })),
 						],
 					}
 				}
 				case 'attachment_omissions_sent': {
 					const sentIds = new Set(event.uploadIds.map(String))
-					return { ...state, omitted: state.omitted.filter((u) => !sentIds.has(String(u.uploadId))) }
+					return {
+						...state,
+						rejected: state.rejected.map((u): RejectedUpload => sentIds.has(String(u.uploadId)) ? { ...u, noteSent: true } : u),
+					}
 				}
 				case 'attachment_deletion_completed': {
 					const uploadId = String(event.uploadId)
 					return {
 						...state,
 						pending: state.pending.filter((upload) => String(upload.uploadId) !== uploadId),
+						rejected: state.rejected.filter((upload) => String(upload.uploadId) !== uploadId),
 						terminal: withoutKeys(state.terminal, [uploadId]),
 						processing: withoutKeys(state.processing, [uploadId]),
 						blobRefs: withoutKeys(state.blobRefs, [uploadId]),
@@ -1255,17 +1260,18 @@ export const uploadsPlugin = definePlugin('uploads')
 		hasPendingMessages: () => false,
 		getPendingMessages: (ctx) => {
 			const uploads = ctx.pluginState
-			if (uploads.pending.length === 0 && uploads.omitted.length === 0) return null
+			const unnoted = uploads.rejected.filter((u) => !u.noteSent)
+			if (uploads.pending.length === 0 && unnoted.length === 0) return null
 			if (ctx.agentId !== getEntryAgentId(ctx.sessionState)) return null
 			if (!hasPendingUserInput(ctx.sessionState, ctx.agentId)) return null
 			const sessionRoot = ctx.files.getRoots().session
 			const blocks = [
-				...(uploads.omitted.length > 0 ? [formatOmittedUploadsForLLM(uploads.omitted)] : []),
+				...(unnoted.length > 0 ? [formatOmittedUploadsForLLM(unnoted)] : []),
 				...(uploads.pending.length > 0 ? [formatUploadsForLLM(uploads.pending, sessionRoot)] : []),
 			]
 			return {
 				messages: [{ role: 'user', content: blocks.join('\n') }],
-				token: { uploadIds: uploads.pending.map((u) => u.uploadId), omittedIds: uploads.omitted.map((u) => u.uploadId) },
+				token: { uploadIds: uploads.pending.map((u) => u.uploadId), omittedIds: unnoted.map((u) => u.uploadId) },
 			}
 		},
 		markConsumed: async (ctx, token) => {
@@ -1301,7 +1307,7 @@ export const uploadsPlugin = definePlugin('uploads')
 			})
 		},
 		// Rejected attachments leave the queue unconsumed, so they can still be deleted, and the retry carries a note.
-		// Omission notes stay queued until a turn carrying them commits.
+		// The notes stay queued until a turn carrying them commits; a turn of notes alone is no suspect.
 		markRejected: async (ctx, token, errorType) => {
 			if (token.uploadIds.length === 0) return false
 			await runTrackedMutation({
@@ -1335,6 +1341,8 @@ export const uploadsPlugin = definePlugin('uploads')
 
 			const uploadsPath = `sessions/${sessionId}/uploads`
 			const listResult = await dataFileStore.list(uploadsPath)
+			// Not consumed, but no longer offered as attachable: it would never reach the agent again.
+			const rejectedIds = new Set(ctx.pluginState.rejected.map((upload) => String(upload.uploadId)))
 
 			if (!listResult.ok) {
 				return Ok({ uploads: [] })
@@ -1356,8 +1364,9 @@ export const uploadsPlugin = definePlugin('uploads')
 
 				const meta: UploadMetadata = JSON.parse(metaResult.value)
 
-				// Skip used, deleted, or non-matching session uploads
+				// Skip used, rejected, deleted, or non-matching session uploads
 				if (meta.usedInMessageId) continue
+				if (rejectedIds.has(String(meta.uploadId))) continue
 				if (meta.sessionId !== sessionId) continue
 				if (meta.status === 'deleted') continue
 

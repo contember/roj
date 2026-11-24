@@ -661,7 +661,7 @@ const repeatsInferenceError = (agent: AgentState, event: InferenceFailedEvent): 
 	&& (agent.consecutiveInferenceFailures ?? 0) > 0
 
 /** A 4xx the provider answered to the request's content; a 401/403 rejects the credentials, a 429 is retried. */
-const rejectsContent = (failure: InferenceFailure): boolean => {
+export const rejectsContent = (failure: InferenceFailure): boolean => {
 	const status = failure.providerError?.statusCode
 	return status !== undefined && status >= 400 && status < 500 && status !== 401 && status !== 403
 		&& !isRetryableLLMErrorType(failure.errorType)

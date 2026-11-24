@@ -35,7 +35,7 @@ export const uploadEvents = createEventsFactory({
 			uploadIds: z4.array(uploadIdSchema),
 			errorType: llmErrorTypeSchema,
 		}),
-		/** A turn carrying the omission notes of these rejected uploads was committed. */
+		/** A turn carrying the notes that these rejected uploads were left out was committed. */
 		attachment_omissions_sent: z4.object({
 			agentId: z4.string(),
 			uploadIds: z4.array(uploadIdSchema),
@@ -62,12 +62,14 @@ export interface PendingUpload {
 	originalHeldByHost?: true
 }
 
-/** An upload left out of a turn the provider rejected, whose omission note the agent has not been sent yet. */
-export interface OmittedUpload {
+/** An upload left out of a turn the provider rejected. */
+export interface RejectedUpload {
 	uploadId: string
 	filename: string
 	mimeType: string
 	errorType: LLMErrorType
+	/** Set once a committed turn carried the note that the upload was left out. */
+	noteSent?: true
 }
 
 /** An upload whose processing started and has not reached a terminal event. */
@@ -84,8 +86,11 @@ export interface ProcessingUpload {
 export interface UploadsState {
 	/** Uploads that have been uploaded but not yet consumed by an agent */
 	pending: PendingUpload[]
-	/** Rejected uploads the next turn tells the agent about. Their uploads stay unconsumed, so they can be deleted. */
-	omitted: OmittedUpload[]
+	/**
+	 * Uploads left out of a turn the provider rejected: not consumed, so they can be deleted, but no longer offered as
+	 * attachable. The next turn tells the agent about those whose note is not sent yet.
+	 */
+	rejected: RejectedUpload[]
 	/**
 	 * Small terminal projection for uploads still visible to the user.
 	 *

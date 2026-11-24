@@ -25,9 +25,10 @@ export interface PluginDequeueHook<TCtx, TToken = unknown> {
 	getPendingMessages: (ctx: TCtx) => PluginPendingMessages<TToken> | null
 	markConsumed: (ctx: TCtx, token: TToken) => Promise<void>
 	/**
-	 * Called instead of `markConsumed` when the provider rejects the turn with a non-retryable error. The source leaves
-	 * its input out of later turns, and may send a note that it did. Returns whether the token carried input the
-	 * provider may have rejected, which keeps `userText` queued for a retry.
+	 * Called instead of `markConsumed` when the provider rejects the turn's content (a non-retryable 4xx other than
+	 * 401/403). The source leaves its input out of later turns, and may send a note that it did. Returns whether the
+	 * token carried input the provider may have rejected, which keeps `userText` queued for a retry. On any other
+	 * non-retryable failure the source's input stays queued.
 	 */
 	markRejected?: (ctx: TCtx, token: TToken, errorType: LLMErrorType) => Promise<boolean>
 	/**
