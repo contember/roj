@@ -48,7 +48,7 @@ describe('VipsImageResizer', () => {
 
 	it('returns original path and mimeType when jpeg is within limits', async () => {
 		execFileImpl = (cmd, _args, _opts, cb) => {
-			if (cmd === 'vipsheader') cb(null, '4000\n3000\n', '')
+			if (cmd === 'vipsheader') cb(null, '1600\n1200\n', '')
 		}
 
 		const resizer = createResizer()
@@ -59,7 +59,7 @@ describe('VipsImageResizer', () => {
 
 	it('returns original path when jpeg is exactly at dimension limit', async () => {
 		execFileImpl = (cmd, _args, _opts, cb) => {
-			if (cmd === 'vipsheader') cb(null, '8000\n8000\n', '')
+			if (cmd === 'vipsheader') cb(null, '2000\n2000\n', '')
 		}
 
 		const resizer = createResizer()
@@ -74,7 +74,7 @@ describe('VipsImageResizer', () => {
 		execFileImpl = (cmd, _args, _opts, cb) => {
 			if (cmd === 'vipsheader') {
 				controller.abort(reason)
-				cb(null, '4000\n3000\n', '')
+				cb(null, '1600\n1200\n', '')
 			}
 		}
 
@@ -85,7 +85,7 @@ describe('VipsImageResizer', () => {
 
 	it('converts png to jpeg even when within dimension limits', async () => {
 		execFileImpl = (cmd, _args, _opts, cb) => {
-			if (cmd === 'vipsheader') cb(null, '4000\n3000\n', '')
+			if (cmd === 'vipsheader') cb(null, '1600\n1200\n', '')
 			else if (cmd === 'vipsthumbnail') cb(null, '', '')
 		}
 
@@ -116,7 +116,7 @@ describe('VipsImageResizer', () => {
 		expect(result.path).toEndWith('.jpg')
 		expect(result.mimeType).toBe('image/jpeg')
 		expect(thumbnailArgs).toContain('--size')
-		expect(thumbnailArgs).toContain('8000x8000')
+		expect(thumbnailArgs).toContain('2000x2000>')
 		expect(thumbnailArgs).toContain('/tmp/test.png')
 	})
 
@@ -286,7 +286,7 @@ describe('VipsImageResizer', () => {
 		const result = await resizer.resize(testJpegPath, 'image/jpeg')
 
 		expect(result.tempFile).toBeDefined()
-		expect(thumbnailArgs).toContain('4000x4000')
+		expect(thumbnailArgs).toContain('4000x4000>')
 	})
 
 	describe('compression (maxFileSizeBytes)', () => {
@@ -305,7 +305,7 @@ describe('VipsImageResizer', () => {
 				},
 			}
 			execFileImpl = (cmd, _args, _opts, cb) => {
-				if (cmd === 'vipsheader') cb(null, '4000\n3000\n', '')
+				if (cmd === 'vipsheader') cb(null, '1600\n1200\n', '')
 			}
 
 			await expect(
@@ -337,7 +337,7 @@ describe('VipsImageResizer', () => {
 			}
 			execFileImpl = (cmd, args, _opts, cb) => {
 				if (cmd === 'vipsheader') {
-					cb(null, '4000\n3000\n', '')
+					cb(null, '1600\n1200\n', '')
 				} else if (cmd === 'vipsthumbnail') {
 					outputPath = args[args.indexOf('-o') + 1].replace(/\[.*\]$/, '')
 					Bun.write(outputPath, Buffer.alloc(50)).then(() => cb(null, '', ''))
@@ -361,7 +361,7 @@ describe('VipsImageResizer', () => {
 			await Bun.write(testPath, Buffer.alloc(100))
 
 			execFileImpl = (cmd, _args, _opts, cb) => {
-				if (cmd === 'vipsheader') cb(null, '4000\n3000\n', '')
+				if (cmd === 'vipsheader') cb(null, '1600\n1200\n', '')
 			}
 
 			const resizer = createResizer()
@@ -382,7 +382,7 @@ describe('VipsImageResizer', () => {
 
 			execFileImpl = (cmd, args, _opts, cb) => {
 				if (cmd === 'vipsheader') {
-					cb(null, '4000\n3000\n', '')
+					cb(null, '1600\n1200\n', '')
 				} else if (cmd === 'vipsthumbnail') {
 					thumbnailCalls.push({ args })
 					// Write a small file so it fits on first compression attempt
@@ -418,7 +418,7 @@ describe('VipsImageResizer', () => {
 
 			execFileImpl = (cmd, args, _opts, cb) => {
 				if (cmd === 'vipsheader') {
-					cb(null, '4000\n3000\n', '')
+					cb(null, '1600\n1200\n', '')
 				} else if (cmd === 'vipsthumbnail') {
 					compressionAttempts++
 					const outputArg = args[args.indexOf('-o') + 1]
@@ -452,7 +452,7 @@ describe('VipsImageResizer', () => {
 
 			execFileImpl = (cmd, args, _opts, cb) => {
 				if (cmd === 'vipsheader') {
-					cb(null, '4000\n3000\n', '')
+					cb(null, '1600\n1200\n', '')
 				} else if (cmd === 'vipsthumbnail') {
 					compressionAttempts++
 					dimensionArgs.push(args[args.indexOf('--size') + 1])
@@ -472,8 +472,8 @@ describe('VipsImageResizer', () => {
 			// 4 full-dim attempts + 3 half-dim attempts
 			expect(compressionAttempts).toBe(7)
 			// First 4 at full dimension, last 3 at half
-			expect(dimensionArgs[0]).toBe('8000x8000')
-			expect(dimensionArgs[4]).toBe('4000x4000')
+			expect(dimensionArgs[0]).toBe('2000x2000>')
+			expect(dimensionArgs[4]).toBe('1000x1000>')
 			expect(result.mimeType).toBe('image/jpeg')
 
 			if (result.tempFile) {
@@ -488,7 +488,7 @@ describe('VipsImageResizer', () => {
 
 			execFileImpl = (cmd, args, _opts, cb) => {
 				if (cmd === 'vipsheader') {
-					cb(null, '4000\n3000\n', '')
+					cb(null, '1600\n1200\n', '')
 				} else if (cmd === 'vipsthumbnail') {
 					const outputArg = args[args.indexOf('-o') + 1]
 					const outputPath = outputArg.replace(/\[.*\]$/, '')
@@ -519,7 +519,7 @@ describe('VipsImageResizer', () => {
 
 			execFileImpl = (cmd, args, _opts, cb) => {
 				if (cmd === 'vipsheader') {
-					cb(null, '4000\n3000\n', '')
+					cb(null, '1600\n1200\n', '')
 				} else if (cmd === 'vipsthumbnail') {
 					const outputArg = args[args.indexOf('-o') + 1]
 					const outputPath = outputArg.replace(/\[.*\]$/, '')
@@ -553,7 +553,7 @@ describe('VipsImageResizer', () => {
 
 			execFileImpl = (cmd, args, _opts, cb) => {
 				if (cmd === 'vipsheader') {
-					cb(null, '4000\n3000\n', '')
+					cb(null, '1600\n1200\n', '')
 				} else if (cmd === 'vipsthumbnail') {
 					const outputArg = args[args.indexOf('-o') + 1]
 					const outputPath = outputArg.replace(/\[.*\]$/, '')

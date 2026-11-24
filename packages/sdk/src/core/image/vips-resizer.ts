@@ -1,7 +1,11 @@
 import { join } from 'node:path'
 import type { FileSystem } from '~/platform/fs.js'
 import type { ProcessRunner } from '~/platform/process.js'
+import { MAX_IMAGE_DIMENSION } from './dimensions.js'
 import type { ImageResizeOptions, ImageResizer, ImageResizeResult } from './types.js'
+
+/** A `--size` that only shrinks: without the `>`, vipsthumbnail enlarges a smaller image to the box. */
+const shrinkOnly = (dimension: number): string => `${dimension}x${dimension}>`
 
 export interface VipsImageResizerOptions {
 	fs: FileSystem
@@ -20,7 +24,7 @@ export class VipsImageResizer implements ImageResizer {
 		this.fs = options.fs
 		this.process = options.process
 		this.tmpDir = options.tmpDir
-		this.maxDimension = options.maxDimension ?? 8000
+		this.maxDimension = options.maxDimension ?? MAX_IMAGE_DIMENSION
 	}
 
 	async resize(filePath: string, mimeType: string, options?: ImageResizeOptions): Promise<ImageResizeResult> {
@@ -109,7 +113,7 @@ export class VipsImageResizer implements ImageResizer {
 		try {
 			await this.process.execFile(
 				'vipsthumbnail',
-				[filePath, '--size', `${maxDimension}x${maxDimension}`, '-o', outputPath],
+				[filePath, '--size', shrinkOnly(maxDimension), '-o', outputPath],
 				{ timeout: 30_000, signal },
 			)
 			signal?.throwIfAborted()
@@ -149,7 +153,7 @@ export class VipsImageResizer implements ImageResizer {
 				try {
 					await this.process.execFile(
 						'vipsthumbnail',
-						[filePath, '--size', `${dimension}x${dimension}`, '-o', `${outputPath}[Q=${quality}]`],
+						[filePath, '--size', shrinkOnly(dimension), '-o', `${outputPath}[Q=${quality}]`],
 						{ timeout: 30_000, signal },
 					)
 					signal?.throwIfAborted()

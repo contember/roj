@@ -211,7 +211,7 @@ describe('DefaultImageProcessor', () => {
 		await rm(base, { recursive: true, force: true })
 	})
 
-	it('passes maxFileSizeBytes to resizer', async () => {
+	it('passes maxFileSizeBytes and the dimension limit to resizer', async () => {
 		const testPath = join(tempDir, `test-opts-${Date.now()}.png`)
 		await Bun.write(testPath, Buffer.from('fake-png-data'))
 
@@ -229,7 +229,7 @@ describe('DefaultImageProcessor', () => {
 		]
 
 		await processor.resolveContent(content)
-		expect(receivedOptions).toEqual({ maxFileSizeBytes: 999 })
+		expect(receivedOptions).toEqual({ maxFileSizeBytes: 999, maxDimension: 2000 })
 
 		await import('node:fs/promises').then(fs => fs.unlink(testPath).catch(() => {}))
 	})
