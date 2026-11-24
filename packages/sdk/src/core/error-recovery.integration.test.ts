@@ -607,7 +607,8 @@ describe('core: an agent the provider keeps rejecting', () => {
 		}
 		await waitUntil(async () => (await pauses()).length === 1)
 		expect(sent).toHaveLength(4)
-		expect((await pauses())[0]).toMatchObject({ reason: 'limit', resumeOnInput: true })
+		expect((await pauses())[0]).toMatchObject({ reason: 'limit' })
+		expect(entryState()?.pauseResumesOnInput).toBe(true)
 		expect(entryState()?.consecutiveRejectedTurns).toBe(3)
 		return { harness, session, sent, provider, failures, pauses, entryState }
 	}
@@ -640,8 +641,9 @@ describe('core: an agent the provider keeps rejecting', () => {
 		provider.entry = 'rejectAll'
 		await session.sendMessage('Please go on')
 		await waitUntil(async () => (await failures()) === 4)
-		// The message reached the provider in the resumed turn.
+		// The message reached the provider in the resumed turn; rejected with it, it is consumed like any rejected message.
 		expect(sentUserText(sent[4])).toContain('Please go on')
+		expect(countHistoryMentions(session, 'Please go on')).toBe(0)
 		// A fresh streak: one rejection leaves it errored, not paused at once.
 		await Bun.sleep(50)
 		expect(entryState()?.status).toBe('errored')
@@ -657,7 +659,8 @@ describe('core: an agent the provider keeps rejecting', () => {
 
 		expect(sent).toHaveLength(7)
 		expect(entryState()?.status).toBe('paused')
-		expect((await pauses())[1]).toMatchObject({ reason: 'limit', resumeOnInput: true })
+		expect((await pauses())[1]).toMatchObject({ reason: 'limit' })
+		expect(entryState()?.pauseResumesOnInput).toBe(true)
 
 		await harness.shutdown()
 	})

@@ -64,7 +64,7 @@ export const agentEvents = createEventsFactory({
 			message: z4.string().optional(),
 			/** The failed inference that caused the pause, when one did. */
 			inferenceFailure: inferenceFailureSchema.optional(),
-			/** Set by a restore's hold and by the entry agent's rejected-turn pause: the next user message resumes it. */
+			/** Set by a restore's hold: the next user message to the agent resumes it. */
 			resumeOnInput: z4.boolean().optional(),
 		}),
 		agent_resumed: z4.object({

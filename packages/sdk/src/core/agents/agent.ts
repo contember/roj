@@ -58,7 +58,7 @@ import { RuntimeFileStore } from '../sessions/context.js'
 import { isValidSessionId, SessionId } from '../sessions/schema.js'
 import type { SessionStore } from '../sessions/session-store.js'
 import type { SessionState } from '../sessions/state.js'
-import { getEntryAgentId, resolveAgentOverrides } from '../sessions/state.js'
+import { resolveAgentOverrides } from '../sessions/state.js'
 import type { SessionEnvironment, ToolExecutor } from '../tools/index.js'
 import type { AgentContext } from './context.js'
 import { sanitizeLLMResponse } from './response-sanitizer.js'
@@ -939,9 +939,7 @@ export class Agent {
 			// A rejected tool-result turn is rebuilt unchanged after every restart and fails again; pausing stops
 			// the restart from resetting it and tells the parent once, through the onPause hooks.
 			if (errorState && !isRetryableLLMError(llmResponse.error) && rejected >= Agent.MAX_CONSECUTIVE_REJECTED_TURNS) {
-				// Only its user can unblock the entry agent, so the user's next message resumes it with fresh attempts.
-				const resumeOnInput = getEntryAgentId(this.store.getState()) === this.id
-				await this.emitPause('limit', `The provider rejected this turn ${rejected} times in a row and the agent will not retry it on its own. Last error: ${llmResponse.error.message}`, inferenceFailure, resumeOnInput)
+				await this.emitPause('limit', `The provider rejected this turn ${rejected} times in a row and the agent will not retry it on its own. Last error: ${llmResponse.error.message}`, inferenceFailure)
 				return
 			}
 			// Notify plugins (e.g. mailbox sends error message to parent). For retryable
@@ -1309,7 +1307,7 @@ export class Agent {
 	/**
 	 * Emit agent_paused, then run onPause plugin hooks.
 	 */
-	private async emitPause(reason: 'handler' | 'limit', message?: string, inferenceFailure?: InferenceFailure, resumeOnInput = false): Promise<void> {
+	private async emitPause(reason: 'handler' | 'limit', message?: string, inferenceFailure?: InferenceFailure): Promise<void> {
 		await this.store.emit(withSessionId(
 			this.store.sessionId,
 			agentEvents.create('agent_paused', {
@@ -1317,7 +1315,6 @@ export class Agent {
 				reason,
 				message,
 				inferenceFailure,
-				...(resumeOnInput && { resumeOnInput }),
 			}),
 		))
 		await this.executeOnPause(message)

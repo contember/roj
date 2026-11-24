@@ -557,7 +557,8 @@ export const coreReducer = createTypedReducer(
 					pauseReason: event.reason,
 					pauseMessage: event.message,
 					pauseInferenceFailure: event.inferenceFailure,
-					pauseResumesOnInput: event.resumeOnInput,
+					// Only its user can unblock an entry agent the provider keeps rejecting, so the user's next message resumes it.
+					pauseResumesOnInput: event.resumeOnInput === true || (event.reason === 'limit' && getEntryAgentId(state) === event.agentId) || undefined,
 				}))
 
 			case 'agent_resumed':
