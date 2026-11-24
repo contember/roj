@@ -909,8 +909,11 @@ export class Agent {
 			// inference_failed so decide()'s resume_from_error path doesn't re-feed the
 			// same message into a doomed retry loop. Retryable errors (rate_limit,
 			// server_error, network_error, timeout) keep the preserve-for-retry semantics.
+			// The user's text stays queued when the turn carried other input the provider may have rejected instead:
+			// the retry leaves out what was dropped, or counts toward the rejected-turn pause while tool results stay.
 			if (!isRetryableLLMError(llmResponse.error)) {
-				await this.consumeDequeuedTokens(pluginDequeued)
+				const carriedOtherInput = hasToolResults || pluginDequeued.some((dequeued) => dequeued.plugin.dequeue?.userText !== true)
+				await this.consumeDequeuedTokens(carriedOtherInput ? pluginDequeued.filter((dequeued) => dequeued.plugin.dequeue?.userText !== true) : pluginDequeued)
 			}
 
 			// 4a. Inference failed — emit inference_failed without marking plugin messages

@@ -406,6 +406,8 @@ export interface ConfiguredPlugin {
 		hasPendingMessages: (ctx: BasePluginHookContext) => boolean
 		getPendingMessages: (ctx: BasePluginHookContext) => PluginPendingMessages | null
 		markConsumed: (ctx: BasePluginHookContext, token: unknown) => Promise<void>
+		/** See `PluginDequeueHook.userText`. */
+		userText?: boolean
 	}
 	/** Gate run before delivering another plugin's dequeued messages — return 'hold' to keep them queued this cycle. */
 	beforeDequeue?: (ctx: BasePluginHookContext & { sourcePlugin: string }) => BeforeDequeueResult
@@ -506,6 +508,7 @@ interface BuilderConfig {
 		hasPendingMessages: (ctx: BasePluginHookContext) => boolean
 		getPendingMessages: (ctx: BasePluginHookContext) => PluginPendingMessages | null
 		markConsumed: (ctx: BasePluginHookContext, token: unknown) => Promise<void>
+		userText?: boolean
 	} | undefined
 	beforeDequeueFn: ((ctx: BasePluginHookContext & { sourcePlugin: string }) => BeforeDequeueResult) | undefined
 }
@@ -1012,6 +1015,7 @@ function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): Confi
 			hasPendingMessages: (ctx: BasePluginHookContext) => dequeueHook.hasPendingMessages({ ...ctx, pluginConfig, notify: notifyFor(ctx) }),
 			getPendingMessages: (ctx: BasePluginHookContext) => dequeueHook.getPendingMessages({ ...ctx, pluginConfig, notify: notifyFor(ctx) }),
 			markConsumed: (ctx: BasePluginHookContext, token: unknown) => dequeueHook.markConsumed({ ...ctx, pluginConfig, notify: notifyFor(ctx) }, token),
+			userText: dequeueHook.userText,
 		}
 		: undefined
 

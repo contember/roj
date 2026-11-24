@@ -23,6 +23,11 @@ export interface PluginDequeueHook<TCtx, TToken = unknown> {
 	hasPendingMessages: (ctx: TCtx) => boolean
 	getPendingMessages: (ctx: TCtx) => PluginPendingMessages<TToken> | null
 	markConsumed: (ctx: TCtx, token: TToken) => Promise<void>
+	/**
+	 * Its messages are the user's own text. When the provider rejects a turn that also carried other input (tool
+	 * results, another source's messages), they stay queued for the next turn instead of being dropped with it.
+	 */
+	userText?: boolean
 }
 
 // ============================================================================
