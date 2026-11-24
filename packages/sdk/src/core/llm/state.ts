@@ -121,6 +121,8 @@ export const llmEvents = createEventsFactory({
 			providerError: providerErrorDetailSchema.optional(),
 			/** Absent in events written before it was recorded. */
 			errorType: llmErrorTypeSchema.optional(),
+			/** The model the failed request was sent to. Absent in events written before it was recorded. */
+			model: z4.string().optional(),
 		}),
 		/**
 		 * A plugin's afterInference hook requested a retry of the turn. Rolls back

@@ -100,6 +100,26 @@ export type AgentInputConsumedEvent = (typeof agentEvents)['Events']['agent_inpu
 export type CommunicatorLinkedEvent = (typeof agentEvents)['Events']['communicator_linked']
 export type AgentConversationSplicedEvent = (typeof agentEvents)['Events']['agent_conversation_spliced']
 
+/**
+ * An agent that stopped on its own (paused or errored): the `agent-status` plugin's live `agentStopped`
+ * notification, and what `sessions.get` lists so a client can show the stop again after a reload.
+ */
+export const agentStopSchema = z4.object({
+	agentId: agentIdSchema,
+	definitionName: z4.string().optional(),
+	kind: z4.enum(['paused', 'errored']),
+	/** Present when kind === 'paused' — why the agent was paused. */
+	reason: z4.enum(['limit', 'handler', 'manual']).optional(),
+	/** Human-readable detail (budget message / error message). */
+	message: z4.string().optional(),
+	/** The failed inference behind the stop: on `errored`, and on `paused` when the provider rejected the same turn repeatedly. */
+	inferenceFailure: inferenceFailureSchema.optional(),
+	/** When the agent stopped: the event's time, so it can differ slightly from the live notification's. */
+	timestamp: z4.number(),
+})
+
+export type AgentStop = z4.infer<typeof agentStopSchema>
+
 // ============================================================================
 // Agent status
 // ============================================================================
@@ -267,6 +287,13 @@ export interface AgentState {
 	pauseInferenceFailure?: InferenceFailure
 	/** Paused by a restore's hold or as an entry agent on the rejected-turn limit, so `Session.releaseHold` resumes it (`agent_paused.resumeOnInput`) */
 	pauseResumesOnInput?: boolean
+	/** When the current pause began (`agent_paused` timestamp) */
+	pausedAt?: number
+	/**
+	 * The failure that opened the current inference-failure episode (a repeat keeps the first, as `onError` reports only
+	 * that one), until a turn commits. A restart keeps it: resetting the agent does not answer the input that failed.
+	 */
+	inferenceError?: { message: string; failure?: InferenceFailure; at: number }
 	/** Metrics from the most recent completed inference — used by plugins (e.g. context-compact) to size context against the provider-reported truth. */
 	lastInferenceMetrics?: LLMMetrics
 	/** Consecutive inference_failed count since the last committed turn — drives the outer error-resume backoff. */
@@ -312,6 +339,35 @@ export interface ToolResult {
 // ============================================================================
 // AgentState tree helpers
 // ============================================================================
+
+/**
+ * The agent's stop while it lasts. A pause lasts until a resume; an error until a turn commits, also across the
+ * restart that resets the agent to pending, but not while the agent runs again.
+ */
+export const getAgentStop = (agent: AgentState): AgentStop | null => {
+	if (agent.status === 'paused' && agent.pausedAt !== undefined) {
+		return {
+			agentId: agent.id,
+			definitionName: agent.definitionName,
+			kind: 'paused',
+			reason: agent.pauseReason,
+			message: agent.pauseMessage,
+			inferenceFailure: agent.pauseInferenceFailure,
+			timestamp: agent.pausedAt,
+		}
+	}
+	if ((agent.status === 'errored' || agent.status === 'pending') && agent.inferenceError !== undefined) {
+		return {
+			agentId: agent.id,
+			definitionName: agent.definitionName,
+			kind: 'errored',
+			message: agent.inferenceError.message,
+			inferenceFailure: agent.inferenceError.failure,
+			timestamp: agent.inferenceError.at,
+		}
+	}
+	return null
+}
 
 export const getChildren = (
 	session: { agents: Map<AgentId, AgentState> },
