@@ -19,11 +19,12 @@
  * a dedicated `agentStopped` notification carrying the pause reason / error detail,
  * so consumers (e.g. a Cloudflare worker) can alert on a budget pause or crash —
  * which the coarse `idle` status alone can't distinguish from a normal completion.
+ * The notification is live only; `sessions.get` lists the same stops (`stoppedAgents`) for a client that reloads.
  */
 
 import z from 'zod/v4'
 import { agentIdSchema, protocolAgentStatusSchema } from '~/core/agents/schema.js'
-import { inferenceFailureSchema } from '~/core/llm/schema.js'
+import { agentStopSchema } from '~/core/agents/state.js'
 import { definePlugin } from '~/core/plugins/index.js'
 import { sessionIdSchema } from '~/core/sessions/schema.js'
 
@@ -31,18 +32,8 @@ import { sessionIdSchema } from '~/core/sessions/schema.js'
  * Payload for the `agentStopped` notification — emitted when an agent reaches an
  * abnormal terminal state (paused or errored), as opposed to a normal idle.
  */
-export const agentStoppedNotificationSchema = z.object({
+export const agentStoppedNotificationSchema = agentStopSchema.extend({
 	sessionId: sessionIdSchema,
-	agentId: agentIdSchema,
-	definitionName: z.string().optional(),
-	kind: z.enum(['paused', 'errored']),
-	/** Present when kind === 'paused' — why the agent was paused. */
-	reason: z.enum(['limit', 'handler', 'manual']).optional(),
-	/** Human-readable detail (budget message / error message). */
-	message: z.string().optional(),
-	/** The failed inference behind the stop: always on `errored`, on `paused` when the provider rejected the same turn repeatedly. */
-	inferenceFailure: inferenceFailureSchema.optional(),
-	timestamp: z.number(),
 })
 
 export type AgentStoppedNotification = z.infer<typeof agentStoppedNotificationSchema>

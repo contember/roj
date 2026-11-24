@@ -7,7 +7,7 @@ import { contextEvents } from '~/core/context/state.js'
 import { createEventsFactory } from '~/core/events/types'
 import type { DomainEvent } from '~/core/events/types.js'
 import { type InferenceFailure, isRetryableLLMErrorType, modelIdSchema } from '~/core/llm/schema.js'
-import { llmEvents } from '~/core/llm/state.js'
+import { type InferenceFailedEvent, llmEvents } from '~/core/llm/state.js'
 import { SessionId, sessionIdSchema } from '~/core/sessions/schema.js'
 import type { PendingToolResult } from '~/core/tools/schema.js'
 import type { ToolCallId } from '~/core/tools/schema.js'
@@ -284,6 +284,7 @@ export const coreReducer = createTypedReducer(
 						lastInferenceMetrics: event.metrics,
 						consecutiveInferenceFailures: 0,
 						lastInferenceFailureAt: undefined,
+						inferenceError: undefined,
 						consecutiveRejectedTurns: undefined,
 						turnNumber: (agent.turnNumber ?? 0) + 1,
 						inferenceCall: undefined,
@@ -307,6 +308,12 @@ export const coreReducer = createTypedReducer(
 					inferenceCall: undefined,
 					consecutiveInferenceFailures: (agent.consecutiveInferenceFailures ?? 0) + 1,
 					lastInferenceFailureAt: event.timestamp,
+					inferenceError: repeatsInferenceError(agent, event) ? agent.inferenceError : {
+						message: event.error,
+						failure: event.errorType !== undefined && event.model !== undefined
+							? { errorType: event.errorType, model: event.model, providerError: event.providerError }
+							: undefined,
+					},
 					// A rejected message is consumed, so only a rejected tool-result turn comes back unchanged.
 					consecutiveRejectedTurns: event.errorType !== undefined && !isRetryableLLMErrorType(event.errorType) && agent.pendingToolResults.length > 0
 						? (agent.consecutiveRejectedTurns ?? 0) + 1
@@ -559,6 +566,7 @@ export const coreReducer = createTypedReducer(
 					pauseInferenceFailure: event.inferenceFailure,
 					// Only its user can unblock an entry agent the provider keeps rejecting, so the user's next message resumes it.
 					pauseResumesOnInput: event.resumeOnInput === true || (event.reason === 'limit' && getEntryAgentId(state) === event.agentId) || undefined,
+					pausedAt: event.timestamp,
 				}))
 
 			case 'agent_resumed':
@@ -574,6 +582,7 @@ export const coreReducer = createTypedReducer(
 					pauseMessage: undefined,
 					pauseInferenceFailure: undefined,
 					pauseResumesOnInput: undefined,
+					pausedAt: undefined,
 					completionHandled: undefined,
 				}))
 
@@ -643,6 +652,11 @@ export const checkRecoveryNeeded = (state: SessionState): {
 
 const carriesMedia = (result: PendingToolResult): boolean =>
 	typeof result.content !== 'string' && result.content.some((item) => item.type !== 'text')
+
+/** A retryable failure within an open failure episode, which `Agent` reports only once (see `repeatsRetryableFailure`). */
+const repeatsInferenceError = (agent: AgentState, event: InferenceFailedEvent): boolean =>
+	agent.inferenceError !== undefined && event.errorType !== undefined && isRetryableLLMErrorType(event.errorType)
+	&& (agent.consecutiveInferenceFailures ?? 0) > 0
 
 /** A 4xx the provider answered to the request's content; a 401/403 rejects the credentials, a 429 is retried. */
 const rejectsContent = (failure: InferenceFailure): boolean => {

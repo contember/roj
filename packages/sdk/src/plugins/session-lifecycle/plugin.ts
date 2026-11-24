@@ -8,6 +8,7 @@
 
 import z4 from 'zod/v4'
 import { agentIdSchema } from '~/core/agents'
+import { agentStopSchema, getAgentStop } from '~/core/agents/state.js'
 import { COMMUNICATOR_ROLE, ORCHESTRATOR_ROLE } from '~/core/agents/agent-roles.js'
 import { type DomainError, PresetErrors, SessionErrors, ValidationErrors } from '~/core/errors.js'
 import { definePlugin } from '~/core/plugins/index.js'
@@ -198,6 +199,8 @@ export const sessionLifecyclePlugin = definePlugin('sessions')
 			closedAt: z4.number().optional(),
 			agentCount: z4.number(),
 			entryAgentId: agentIdSchema.nullable(),
+			/** Agents paused or errored right now, as their `agentStopped` notification reported them. */
+			stoppedAgents: z4.array(agentStopSchema),
 			// Reported back so a caller can tell "the override did not apply" from
 			// "this build predates overrides and dropped the field on input".
 			overrides: z4.object({
@@ -215,6 +218,7 @@ export const sessionLifecyclePlugin = definePlugin('sessions')
 				closedAt: state.closedAt,
 				agentCount: state.agents.size,
 				entryAgentId: getEntryAgentId(state),
+				stoppedAgents: [...state.agents.values()].flatMap((agent) => getAgentStop(agent) ?? []),
 				overrides: {
 					defaults: state.overrides.defaults,
 					agents: Object.fromEntries(state.overrides.agents),

@@ -927,6 +927,7 @@ export class Agent {
 					llmCallId,
 					providerError: repeatsRetryableFailure ? undefined : llmResponse.error.providerError,
 					errorType: llmResponse.error.type,
+					model: request.model,
 				}),
 			))
 			const errorState = this.state
