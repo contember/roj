@@ -13,6 +13,10 @@
  * to tell a completed batch from a truncated one — and because running every item
  * makes the batch length the work one request buys, the length is capped.
  *
+ * Every `error` carries `httpStatus`, the status the error stands for. A domain error
+ * still answers HTTP 200 (the transport worked), so the field is the only place a
+ * caller can tell a refused call (4xx) from a failed one (5xx).
+ *
  * Routing order:
  * 1. Manager methods (session creation, listing, etc.)
  * 2. Session plugin methods (require sessionId in input)
@@ -22,19 +26,21 @@
 import { Hono } from 'hono'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import { AgentId } from '~/core/agents/schema.js'
-import type { DomainError } from '~/core/errors.js'
+import { createDomainError, type DomainError } from '~/core/errors.js'
 import { type CallerContext, DEFAULT_CALLER } from '~/core/plugins/plugin-builder.js'
 import { parseSessionId } from '~/core/sessions/schema.js'
 import type { SessionManager } from '~/core/sessions/session-manager.js'
 import { getServices } from '../context.js'
 import type { AppEnv } from '../context.js'
 
+type ErrorEnvelope = { ok: false; error: { type: string; message: string; httpStatus: number } }
+
 type MethodResult =
 	| { ok: true; value: unknown }
-	| { ok: false; error: { type: string; message: string } }
+	| ErrorEnvelope
 
-function formatError(error: DomainError): { ok: false; error: { type: string; message: string } } {
-	return { ok: false, error: { type: error.type, message: error.message } }
+function formatError(error: DomainError): ErrorEnvelope {
+	return { ok: false, error: { type: error.type, message: error.message, httpStatus: error.httpStatus } }
 }
 
 /**
@@ -97,7 +103,7 @@ async function dispatchMethod(
 	}
 
 	// 3. Method not found — transport error, use 400
-	return { httpStatus: 400, body: { ok: false, error: { type: 'method_not_found', message: `Unknown method: ${method}` } } }
+	return { httpStatus: 400, body: formatError(createDomainError('method_not_found', `Unknown method: ${method}`, 400)) }
 }
 
 /** Every item runs, so one request buys this much dispatch and no more. */
@@ -135,7 +141,7 @@ export function createRpcRoutes(): Hono<AppEnv> {
 			body = await c.req.json()
 		} catch {
 			return c.json(
-				{ ok: false, error: { type: 'invalid_json', message: 'Invalid JSON in request body' } },
+				formatError(createDomainError('invalid_json', 'Invalid JSON in request body', 400)),
 				400,
 			)
 		}
@@ -148,7 +154,7 @@ export function createRpcRoutes(): Hono<AppEnv> {
 		if (isBatchRequest(body)) {
 			if (body.batch.length > MAX_BATCH_ITEMS) {
 				return c.json(
-					{ ok: false, error: { type: 'batch_too_large', message: `Batch holds more than ${MAX_BATCH_ITEMS} calls` } },
+					formatError(createDomainError('batch_too_large', `Batch holds more than ${MAX_BATCH_ITEMS} calls`, 400)),
 					400,
 				)
 			}
@@ -157,7 +163,7 @@ export function createRpcRoutes(): Hono<AppEnv> {
 
 			for (const call of body.batch) {
 				if (!isBatchCall(call)) {
-					results.push({ ok: false, error: { type: 'missing_method', message: "Missing 'method' field in batch call" } })
+					results.push(formatError(createDomainError('missing_method', "Missing 'method' field in batch call", 400)))
 					continue
 				}
 
@@ -167,7 +173,7 @@ export function createRpcRoutes(): Hono<AppEnv> {
 					logger.error('Batch RPC call failed', error instanceof Error ? error : new Error(String(error)), {
 						method: call.method,
 					})
-					results.push({ ok: false, error: { type: 'internal_error', message: 'Internal server error' } })
+					results.push(formatError(createDomainError('internal_error', 'Internal server error', 500)))
 				}
 			}
 
@@ -180,7 +186,7 @@ export function createRpcRoutes(): Hono<AppEnv> {
 
 		if (!method || typeof method !== 'string') {
 			return c.json(
-				{ ok: false, error: { type: 'missing_method', message: "Missing 'method' field in request" } },
+				formatError(createDomainError('missing_method', "Missing 'method' field in request", 400)),
 				400,
 			)
 		}

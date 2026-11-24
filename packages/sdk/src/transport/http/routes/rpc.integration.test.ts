@@ -16,7 +16,7 @@ import { createRpcRoutes } from './rpc.js'
 interface RpcResponse<T = unknown> {
 	ok: boolean
 	value?: T
-	error?: { type: string; message: string }
+	error?: { type: string; message: string; httpStatus: number }
 }
 
 interface BatchResponse {
@@ -216,6 +216,7 @@ describe('RPC integration', () => {
 			expect(await conflict.json()).toEqual({ ok: false, error: {
 				type: 'user_chat_delivery_conflict',
 				message: 'Delivery ID was already used with different content, context, agent target or keepHold',
+				httpStatus: 409,
 			} })
 			const invalid = await rpcCall(app, 'user-chat.sendMessage', { ...input, deliveryId: '' })
 			expect(invalid.status).toBe(200)
@@ -441,6 +442,7 @@ describe('RPC session leases', () => {
 		expect(json.results[0].ok).toBe(true)
 		expect(json.results[1].ok).toBe(false)
 		expect(json.results[1].error!.type).toBe('internal_error')
+		expect(json.results[1].error!.httpStatus).toBe(500)
 		expect(json.results[2].ok).toBe(true)
 		expect(httpLeaseReasons()).toEqual([])
 	})
