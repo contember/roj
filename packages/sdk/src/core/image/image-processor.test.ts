@@ -266,7 +266,7 @@ const fixture = (name: string) => readFile(join(import.meta.dir, 'fixtures', nam
 
 /** A session store whose own reads or writes fail; the image itself is read through the platform fs, so only the cache is hit. */
 class FaultyStore extends SessionFileStore {
-	constructor(dir: string, private readonly fail: { read?: boolean; write?: boolean }) {
+	constructor(dir: string, private readonly fail: { read?: boolean; write?: 'throw' | 'error' }) {
 		super(dir, undefined, false, createNodeFileSystem(), 'session')
 	}
 
@@ -282,7 +282,8 @@ class FaultyStore extends SessionFileStore {
 	}
 
 	override async write(path: string, content: string | Buffer): Promise<Result<{ path: string }, string>> {
-		if (this.fail.write) throw new Error('store unavailable')
+		if (this.fail.write === 'throw') throw new Error('store unavailable')
+		if (this.fail.write === 'error') return Err(`Failed to write: ${path}`)
 		return super.write(path, content, { atomic: true })
 	}
 }
@@ -344,6 +345,7 @@ describe('DefaultImageProcessor resize cache', () => {
 		expect(resizer.calls).toBe(2)
 	})
 
+	// The processor always asks for MAX_IMAGE_DIMENSION, so a changed dimension is shown on the key itself.
 	it('keys an entry by the max dimension, so another dimension misses', async () => {
 		const source = await fixture('37x21.png')
 		const jpeg = { bytes: await fixture('37x21.jpg'), mimeType: 'image/jpeg' }
@@ -363,16 +365,18 @@ describe('DefaultImageProcessor resize cache', () => {
 		expect(item).toEqual({ type: 'image_url', imageUrl: { url: await resizedUrl(), detail: undefined } })
 	})
 
-	it('still sends the image when the cache cannot be written, and resizes it again next turn', async () => {
-		const resizer = countingResizer()
-		const faulty = new FaultyStore(sessionDir, { write: true })
+	for (const write of ['throw', 'error'] as const) {
+		it(`still sends the image when the cache write fails (${write}), and resizes it again next turn`, async () => {
+			const resizer = countingResizer()
+			const faulty = new FaultyStore(sessionDir, { write })
 
-		const first = await turn(resizer, faulty)
-		await turn(resizer, faulty)
+			const first = await turn(resizer, faulty)
+			await turn(resizer, faulty)
 
-		expect(first).toEqual({ type: 'image_url', imageUrl: { url: await resizedUrl(), detail: undefined } })
-		expect(resizer.calls).toBe(2)
-	})
+			expect(first).toEqual({ type: 'image_url', imageUrl: { url: await resizedUrl(), detail: undefined } })
+			expect(resizer.calls).toBe(2)
+		})
+	}
 
 	it('replaces an entry that is not an image', async () => {
 		const resizer = countingResizer()
@@ -386,9 +390,27 @@ describe('DefaultImageProcessor resize cache', () => {
 		expect(await readFile(join(sessionDir, path))).toEqual(await fixture('37x21.jpg'))
 	})
 
-	it('keeps nothing for an image the resizer returned unchanged', async () => {
-		await turn(new NoopImageResizer(), store())
+	it('remembers an image the resizer returned unchanged without keeping a copy of it', async () => {
+		let calls = 0
+		const passThrough: ImageResizer = {
+			async resize(filePath, mimeType) {
+				calls++
+				return { path: filePath, mimeType }
+			},
+		}
 
-		expect(await readdir(join(sessionDir, IMAGE_CACHE_DIR)).catch(() => [])).toEqual([])
+		const first = await turn(passThrough, store())
+		const second = await turn(passThrough, store())
+
+		expect(calls).toBe(1)
+		const expected: ChatMessageContentItem = {
+			type: 'image_url',
+			imageUrl: { url: `data:image/png;base64,${(await fixture('37x21.png')).toString('base64')}`, detail: undefined },
+		}
+		expect(first).toEqual(expected)
+		expect(second).toEqual(expected)
+		const entries = await readdir(join(sessionDir, IMAGE_CACHE_DIR))
+		expect(entries).toHaveLength(1)
+		expect(await readFile(join(sessionDir, IMAGE_CACHE_DIR, entries[0]))).toHaveLength(0)
 	})
 })

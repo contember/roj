@@ -5,7 +5,7 @@ import type { ChatMessageContentItem, ChatMessageContentItemImage, ChatMessageCo
 import { getImageMimeType } from '~/lib/mime.js'
 import type { FileSystem } from '~/platform/fs.js'
 import { exceedsMaxDimension, MAX_IMAGE_DIMENSION, readImageDimensions } from './dimensions.js'
-import { readCachedResize, resizeCachePath, type ResizeCacheOptions, writeCachedResize } from './resize-cache.js'
+import { readCachedResize, resizeCachePath, type ResizeCacheOptions, UNCHANGED, writeCachedResize } from './resize-cache.js'
 import type { ImageProcessor, ImageProcessorConfig, ImageResizer } from './types.js'
 
 /** A resolved image, or the text that says why it could not be. */
@@ -134,13 +134,30 @@ export class DefaultImageProcessor implements ImageProcessor {
 		}
 	}
 
-	/** Where the resize of this file would be cached, or undefined when the file cannot be read to hash it. */
-	private async cachePathOf(filePath: string, mimeType: string, options: ResizeCacheOptions): Promise<string | undefined> {
+	/**
+	 * The cached image for this file, and where a new resize of it goes; undefined when the file cannot be read to hash it.
+	 * The source is read here so that it is let go before a miss calls the resizer, which reads the file itself.
+	 */
+	private async lookUpCache(
+		filePath: string,
+		mimeType: string,
+		options: ResizeCacheOptions,
+		store: FileStore,
+		detail: 'auto' | 'low' | 'high' | undefined,
+	): Promise<{ path: string; hit?: ResolvedImage } | undefined> {
+		let source: Buffer
 		try {
-			return resizeCachePath(await this.fs.readFile(filePath), mimeType, options)
+			source = await this.fs.readFile(filePath)
 		} catch {
 			return undefined
 		}
+		const path = resizeCachePath(source, mimeType, options)
+		const cached = await readCachedResize(store, path)
+		const image = cached === UNCHANGED ? { bytes: source, mimeType } : cached
+		// An entry over the limits is a miss: the image is resized again and the entry replaced.
+		if (image === undefined || image.bytes.length > this.config.maxFileSizeBytes) return { path }
+		const encoded = this.encode(filePath, image.bytes, image.mimeType, detail)
+		return encoded.type === 'image_url' ? { path, hit: encoded } : { path }
 	}
 
 	/**
@@ -154,17 +171,8 @@ export class DefaultImageProcessor implements ImageProcessor {
 		cacheStore?: FileStore,
 	): Promise<ResolvedImage> {
 		const options = { maxFileSizeBytes: this.config.maxFileSizeBytes, maxDimension: MAX_IMAGE_DIMENSION }
-		const cachePath = cacheStore === undefined ? undefined : await this.cachePathOf(filePath, mimeType, options)
-		const cache = cacheStore !== undefined && cachePath !== undefined ? { store: cacheStore, path: cachePath } : undefined
-
-		if (cache !== undefined) {
-			const cached = await readCachedResize(cache.store, cache.path)
-			// An entry over the limits is a miss: the image is resized again and the entry replaced.
-			const encoded = cached !== undefined && cached.bytes.length <= this.config.maxFileSizeBytes
-				? this.encode(filePath, cached.bytes, cached.mimeType, detail)
-				: undefined
-			if (encoded?.type === 'image_url') return encoded
-		}
+		const lookup = cacheStore === undefined ? undefined : await this.lookUpCache(filePath, mimeType, options, cacheStore, detail)
+		if (lookup?.hit !== undefined) return lookup.hit
 
 		let resized: { path: string; mimeType: string; tempFile?: string } | undefined
 		try {
@@ -180,9 +188,12 @@ export class DefaultImageProcessor implements ImageProcessor {
 
 			const buffer = await this.fs.readFile(resized.path)
 			const encoded = this.encode(filePath, buffer, resized.mimeType, detail)
-			// Only an image the resizer changed is kept, so the store never holds a second copy of an unchanged one.
-			if (cache !== undefined && encoded.type === 'image_url' && resized.path !== filePath) {
-				await writeCachedResize(cache.store, cache.path, { bytes: buffer, mimeType: resized.mimeType })
+			if (cacheStore !== undefined && lookup !== undefined && encoded.type === 'image_url') {
+				if (resized.path !== filePath) {
+					await writeCachedResize(cacheStore, lookup.path, { bytes: buffer, mimeType: resized.mimeType })
+				} else if (resized.mimeType === mimeType) {
+					await writeCachedResize(cacheStore, lookup.path, UNCHANGED)
+				}
 			}
 			return encoded
 		} finally {
