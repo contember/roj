@@ -18,23 +18,35 @@ const startsWith = (bytes: Uint8Array, prefix: readonly number[], offset = 0): b
 
 const ascii = (text: string): number[] => Array.from(text, (char) => char.charCodeAt(0))
 
+/** Type of a PNG, JPEG, GIF or WebP image, read from its signature. Undefined for any other format. */
+export function readImageMimeType(bytes: Uint8Array): 'image/png' | 'image/gif' | 'image/webp' | 'image/jpeg' | undefined {
+	if (startsWith(bytes, PNG_SIGNATURE)) return 'image/png'
+	if (startsWith(bytes, ascii('GIF8'))) return 'image/gif'
+	if (startsWith(bytes, ascii('RIFF')) && startsWith(bytes, ascii('WEBP'), 8)) return 'image/webp'
+	if (startsWith(bytes, [0xff, 0xd8])) return 'image/jpeg'
+	return undefined
+}
+
 /**
  * Pixel size of a PNG, JPEG, GIF or WebP image, read from its header without decoding it.
  * Undefined for any other format or a header cut short.
  */
 export function readImageDimensions(bytes: Uint8Array): ImageDimensions | undefined {
 	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-	if (startsWith(bytes, PNG_SIGNATURE)) {
-		if (bytes.length < 24) return undefined
-		return { width: view.getUint32(16), height: view.getUint32(20) }
+	switch (readImageMimeType(bytes)) {
+		case 'image/png':
+			if (bytes.length < 24) return undefined
+			return { width: view.getUint32(16), height: view.getUint32(20) }
+		case 'image/gif':
+			if (bytes.length < 10) return undefined
+			return { width: view.getUint16(6, true), height: view.getUint16(8, true) }
+		case 'image/webp':
+			return readWebpDimensions(bytes, view)
+		case 'image/jpeg':
+			return readJpegDimensions(bytes, view)
+		case undefined:
+			return undefined
 	}
-	if (startsWith(bytes, ascii('GIF8'))) {
-		if (bytes.length < 10) return undefined
-		return { width: view.getUint16(6, true), height: view.getUint16(8, true) }
-	}
-	if (startsWith(bytes, ascii('RIFF')) && startsWith(bytes, ascii('WEBP'), 8)) return readWebpDimensions(bytes, view)
-	if (startsWith(bytes, [0xff, 0xd8])) return readJpegDimensions(bytes, view)
-	return undefined
 }
 
 function readWebpDimensions(bytes: Uint8Array, view: DataView): ImageDimensions | undefined {

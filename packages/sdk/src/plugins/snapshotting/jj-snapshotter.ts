@@ -1,10 +1,12 @@
 import { join } from 'node:path'
+import { IMAGE_CACHE_DIR } from '~/core/image/resize-cache.js'
 import type { FileSystem } from '~/platform/fs.js'
 import type { ProcessRunner } from '~/platform/process.js'
 import type { Logger } from '../../lib/logger/logger.js'
 import type { ForkSnapshotOptions, SnapshotRefs, Snapshotter } from './snapshotter.js'
 
-const JJ_IGNORE_CONTENT = '.roj/\n.events/\n'
+// The resize cache is rebuilt on demand, so a snapshot need not keep a copy of every image in it.
+const JJ_IGNORE_CONTENT = `.roj/\n.events/\n${IMAGE_CACHE_DIR}/\n`
 
 /**
  * Run a command and return stdout as string.
