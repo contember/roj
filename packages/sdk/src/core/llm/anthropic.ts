@@ -221,6 +221,71 @@ interface AnthropicRequestBody {
 
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages'
 const ANTHROPIC_VERSION = '2023-06-01'
+const ANTHROPIC_HEADERS: Readonly<Record<string, string>> = {
+	'content-type': 'application/json',
+	'anthropic-version': ANTHROPIC_VERSION,
+}
+
+/** Where the API points at a block of the request: `messages.<i>.content.<j>`, then `.content.<k>` inside a tool result. */
+const CONTENT_PATH = /messages\.(\d+)\.content\.(\d+)(?:\.content\.(\d+))?/g
+
+const REJECTED_IMAGE_TEXT = '[Image omitted: the model provider rejected it]'
+
+/** The error code of a rejection for image dimensions over the provider's limit. */
+const IMAGE_DIMENSIONS_TOO_LARGE = 'image_dimensions_too_large'
+
+const rejectedImagePlaceholder = (image: AnthropicImageBlockParam): AnthropicTextBlockParam =>
+	image.cache_control === undefined
+		? { type: 'text', text: REJECTED_IMAGE_TEXT }
+		: { type: 'text', text: REJECTED_IMAGE_TEXT, cache_control: image.cache_control }
+
+/** The image blocks of a request by the path the API names them with: `messages.<i>.content.<j>[.content.<k>]`. */
+function imageBlocksByPath(body: AnthropicRequestBody): Map<string, AnthropicImageBlockParam> {
+	const images = new Map<string, AnthropicImageBlockParam>()
+	body.messages.forEach((message, i) => {
+		if (typeof message.content === 'string') return
+		message.content.forEach((block, j) => {
+			if (block.type === 'image') images.set(`messages.${i}.content.${j}`, block)
+			if (block.type !== 'tool_result' || typeof block.content === 'string') return
+			block.content.forEach((nested, k) => {
+				if (nested.type === 'image') images.set(`messages.${i}.content.${j}.content.${k}`, nested)
+			})
+		})
+	})
+	return images
+}
+
+/**
+ * Paths of the images to drop after an `invalid_request`: those its message names. A dimension rejection that names
+ * none drops the images nothing here could bound (remote URLs, which the API fetches itself), or else every image.
+ */
+function rejectedImagePaths(images: ReadonlyMap<string, AnthropicImageBlockParam>, errorMessage: string, errorBody: string): string[] {
+	const named = new Set(Array.from(errorMessage.matchAll(CONTENT_PATH), ([path]) => path).filter((path) => images.has(path)))
+	if (named.size > 0 || !errorBody.includes(IMAGE_DIMENSIONS_TOO_LARGE)) return [...named]
+	const remote = [...images].filter(([, image]) => image.source.type === 'url').map(([path]) => path)
+	return remote.length > 0 ? remote : [...images.keys()]
+}
+
+/** The request with the image blocks at `paths` replaced by a note. */
+function withImagesOmitted(body: AnthropicRequestBody, paths: readonly string[]): AnthropicRequestBody {
+	const omitted = new Set(paths)
+	const replace = (path: string, block: AnthropicUserContentBlockParam): AnthropicUserContentBlockParam =>
+		block.type === 'image' && omitted.has(path) ? rejectedImagePlaceholder(block) : block
+	return {
+		...body,
+		messages: body.messages.map((message, i) =>
+			typeof message.content === 'string' ? message : {
+				...message,
+				content: message.content.map((block, j) => {
+					const path = `messages.${i}.content.${j}`
+					if (block.type === 'image') return replace(path, block)
+					if (block.type !== 'tool_result' || typeof block.content === 'string') return block
+					return { ...block, content: block.content.map((nested, k) => replace(`${path}.content.${k}`, nested)) }
+				}),
+			}
+		),
+	}
+}
 
 /** Anthropic model prefix used by OpenRouter */
 const ANTHROPIC_PREFIX = 'anthropic/'
@@ -293,18 +358,33 @@ export class AnthropicProvider implements RoutableLLMProvider {
 				})),
 			}
 
-			const httpRequest = await this.buildHttpRequest(rawRequest, context)
+			const body = await this.buildRequestBody(rawRequest, context)
 			return await runProviderRequest({ callerSignal: context?.signal, timeoutMs: this.timeout }, async (signal) => {
-				const response = await this.fetchFn(httpRequest.url, {
-					method: httpRequest.method,
-					headers: {
-						...httpRequest.headers,
-						'x-api-key': this.apiKey,
-						'anthropic-dangerous-direct-browser-access': 'true',
-					},
-					body: JSON.stringify(httpRequest.body),
-					signal,
-				})
+				const send = (requestBody: AnthropicRequestBody) =>
+					this.fetchFn(ANTHROPIC_API_URL, {
+						method: 'POST',
+						headers: {
+							...ANTHROPIC_HEADERS,
+							'x-api-key': this.apiKey,
+							'anthropic-dangerous-direct-browser-access': 'true',
+						},
+						body: JSON.stringify(requestBody),
+						signal,
+					})
+
+				// History rebuilds the same request every turn, so a rejected image would fail every turn after this one too.
+				// Each resend drops at least one image, so the image count bounds the loop.
+				let sent = body
+				let response = await send(sent)
+				while (response.status === 400) {
+					const errorBody = await response.text()
+					const error = this.mapHttpError(response.status, errorBody)
+					const paths = error.type === 'invalid_request' ? rejectedImagePaths(imageBlocksByPath(sent), error.message, errorBody) : []
+					if (paths.length === 0) return Err(error)
+					this.logger?.warn('Provider rejected images in the request; resending it with them omitted', { paths })
+					sent = withImagesOmitted(sent, paths)
+					response = await send(sent)
+				}
 
 				if (!response.ok) {
 					const body = await response.text()
@@ -371,6 +451,10 @@ export class AnthropicProvider implements RoutableLLMProvider {
 	}
 
 	async buildHttpRequest(request: RawInferenceRequest, context?: InferenceContext): Promise<ProviderHttpRequest> {
+		return { url: ANTHROPIC_API_URL, method: 'POST', headers: { ...ANTHROPIC_HEADERS }, body: await this.buildRequestBody(request, context) }
+	}
+
+	private async buildRequestBody(request: RawInferenceRequest, context?: InferenceContext): Promise<AnthropicRequestBody> {
 		const sanitizedMessages = limitDocumentBytes(sanitizeProviderMessages(request.messages, this.name, this.logger))
 		const mappedMessages = await Promise.all(sanitizedMessages.map((m) => this.mapMessage(m, context)))
 		const mergedMessages = this.mergeConsecutiveMessages(mappedMessages)
@@ -410,15 +494,7 @@ export class AnthropicProvider implements RoutableLLMProvider {
 			body.thinking = { type: 'enabled', budget_tokens: thinkingBudget }
 		}
 
-		return {
-			url: ANTHROPIC_API_URL,
-			method: 'POST',
-			headers: {
-				'content-type': 'application/json',
-				'anthropic-version': ANTHROPIC_VERSION,
-			},
-			body,
-		}
+		return body
 	}
 
 	// ============================================================================

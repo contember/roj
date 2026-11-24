@@ -47,6 +47,12 @@ jobs:
           bunx tsc -p packages/isolate-runtime/tsconfig.worker.json
           bunx tsc -p packages/isolate-runtime/e2e/tsconfig.json
 
+      # The image tests downscale with the real vipsthumbnail.
+      - name: Install libvips
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvips-tools
+
       - name: Run tests
         run: bun run test
 

@@ -4,10 +4,28 @@ import { STORED_IMAGE_PATH } from '~/core/llm/document-content.js'
 import type { ChatMessageContentItem, ChatMessageContentItemImage, ChatMessageContentItemText, ToolResultContent } from '~/core/llm/llm-log-types.js'
 import { getImageMimeType } from '~/lib/mime.js'
 import type { FileSystem } from '~/platform/fs.js'
+import { exceedsMaxDimension, MAX_IMAGE_DIMENSION, readImageDimensions } from './dimensions.js'
 import type { ImageProcessor, ImageProcessorConfig, ImageResizer } from './types.js'
 
 /** A resolved image, or the text that says why it could not be. */
 type ResolvedImage = ChatMessageContentItemImage | ChatMessageContentItemText
+
+const BASE64_DATA_URL = /^data:([^;,]*)(?:;[^;,]*)*;base64,/i
+
+/**
+ * An inline `data:` image over the dimension limit becomes a note: an agent stores every one as a file, so only a
+ * direct provider call sends one, and the processor has nowhere to write it for the resizer.
+ */
+function withinLimitInline(item: ChatMessageContentItemImage): ResolvedImage {
+	const match = BASE64_DATA_URL.exec(item.imageUrl.url)
+	if (match === null) return item
+	const dimensions = readImageDimensions(Buffer.from(item.imageUrl.url.slice(match[0].length), 'base64'))
+	if (dimensions === undefined || !exceedsMaxDimension(dimensions)) return item
+	return {
+		type: 'text',
+		text: `[Image unavailable: inline ${match[1] || 'image'} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit]`,
+	}
+}
 
 function formatFileSize(bytes: number): string {
 	return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
@@ -26,7 +44,8 @@ export class DefaultImageProcessor implements ImageProcessor {
 		return Promise.all(
 			content.map(async (item): Promise<ChatMessageContentItem> => {
 				if (item.type !== 'image_url') return item
-				if (!item.imageUrl.url.startsWith('file://')) return item
+				// A remote URL is fetched by the provider itself, so its size is unknown here.
+				if (!item.imageUrl.url.startsWith('file://')) return withinLimitInline(item)
 
 				const rawPath = item.imageUrl.url.slice(7)
 
@@ -56,14 +75,16 @@ export class DefaultImageProcessor implements ImageProcessor {
 	}
 
 	/**
-	 * An image an agent stored from a `data:` URL, read back as it arrived: not resized, which would
-	 * re-encode it, and from the session store, so a fork reads its own copy.
+	 * An image an agent stored from a `data:` URL, read from the session store, so a fork reads its own copy.
+	 * Within the dimension limit it is sent as it arrived, since resizing would re-encode it; above, it is downscaled.
 	 */
 	private async readStored(path: string, detail: 'auto' | 'low' | 'high' | undefined, fileStore: FileStore): Promise<ResolvedImage> {
 		const mimeType = getImageMimeType(path)
 		if (!mimeType) return { type: 'text', text: `[Image unavailable: ${path} - unsupported format]` }
 		const read = await fileStore.session.read(path, { type: 'buffer' })
 		if (!read.ok) return { type: 'text', text: `[Image unavailable: ${path} - ${read.error}]` }
+		const dimensions = readImageDimensions(read.value)
+		if (dimensions !== undefined && exceedsMaxDimension(dimensions)) return this.resolveViaStore(path, detail, fileStore.session)
 		return { type: 'image_url', imageUrl: { url: `data:${mimeType};base64,${read.value.toString('base64')}`, detail } }
 	}
 
@@ -119,7 +140,7 @@ export class DefaultImageProcessor implements ImageProcessor {
 	): Promise<ResolvedImage> {
 		let resized: { path: string; mimeType: string; tempFile?: string } | undefined
 		try {
-			resized = await this.resizer.resize(filePath, mimeType, { maxFileSizeBytes: this.config.maxFileSizeBytes })
+			resized = await this.resizer.resize(filePath, mimeType, { maxFileSizeBytes: this.config.maxFileSizeBytes, maxDimension: MAX_IMAGE_DIMENSION })
 
 			const resultSize = (await this.fs.stat(resized.path)).size
 			if (resultSize > this.config.maxFileSizeBytes) {
@@ -130,6 +151,14 @@ export class DefaultImageProcessor implements ImageProcessor {
 			}
 
 			const buffer = await this.fs.readFile(resized.path)
+			// A resizer that is missing or failed returns the original image.
+			const dimensions = readImageDimensions(buffer)
+			if (dimensions !== undefined && exceedsMaxDimension(dimensions)) {
+				return {
+					type: 'text',
+					text: `[Image unavailable: ${filePath} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit, and it could not be downscaled]`,
+				}
+			}
 			const base64 = buffer.toString('base64')
 			return {
 				type: 'image_url',

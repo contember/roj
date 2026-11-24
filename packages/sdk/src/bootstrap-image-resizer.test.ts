@@ -91,7 +91,7 @@ describe('bootstrap image resizer', () => {
 		await classifyImage(host)
 
 		expect(resizeCalls).toEqual([
-			{ filePath: host.imagePath, options: { maxFileSizeBytes: 5 * 1024 * 1024 } },
+			{ filePath: host.imagePath, options: { maxFileSizeBytes: 5 * 1024 * 1024, maxDimension: 2000 } },
 			{ filePath: host.imagePath, options: expect.objectContaining({ maxDimension: 1024, maxFileSizeBytes: 1024 * 1024 }) },
 		])
 		expect(trap.commands).toEqual([])
