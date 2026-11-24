@@ -37,7 +37,7 @@ interface RpcOkResponse<T> {
 
 interface RpcErrResponse {
 	ok: false
-	error: { type: string; message: string }
+	error: { type: string; message: string; httpStatus: number }
 }
 
 type RpcResponse<T> = RpcOkResponse<T> | RpcErrResponse
@@ -82,6 +82,7 @@ describe('RPC Routes', () => {
 			const json = await parseJson<never>(res)
 			expect(json.ok).toBe(false)
 			expect(!json.ok && json.error.type).toBe('invalid_json')
+			expect(!json.ok && json.error.httpStatus).toBe(400)
 		})
 
 		it('should return error for missing method', async () => {
@@ -95,6 +96,7 @@ describe('RPC Routes', () => {
 			const json = await parseJson<never>(res)
 			expect(json.ok).toBe(false)
 			expect(!json.ok && json.error.type).toBe('missing_method')
+			expect(!json.ok && json.error.httpStatus).toBe(400)
 		})
 
 		it('should return error for unknown method', async () => {
@@ -108,6 +110,7 @@ describe('RPC Routes', () => {
 			const json = await parseJson<never>(res)
 			expect(json.ok).toBe(false)
 			expect(!json.ok && json.error.type).toBe('method_not_found')
+			expect(!json.ok && json.error.httpStatus).toBe(400)
 		})
 
 		it('should return validation error for invalid input', async () => {
@@ -124,6 +127,8 @@ describe('RPC Routes', () => {
 			const json = await parseJson<never>(res)
 			expect(json.ok).toBe(false)
 			expect(!json.ok && json.error.type).toBe('validation_error')
+			// The call was refused, not failed: a client reads that from the envelope, as HTTP stays 200.
+			expect(!json.ok && json.error.httpStatus).toBe(400)
 		})
 	})
 
@@ -224,6 +229,7 @@ describe('RPC Routes', () => {
 			const json = await parseJson<never>(res)
 			expect(json.ok).toBe(false)
 			expect(!json.ok && json.error.type).toBe('session_not_found')
+			expect(!json.ok && json.error.httpStatus).toBe(404)
 		})
 	})
 
