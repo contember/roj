@@ -5,6 +5,7 @@ import type { ChatMessageContentItem, ChatMessageContentItemImage, ChatMessageCo
 import { getImageMimeType } from '~/lib/mime.js'
 import type { FileSystem } from '~/platform/fs.js'
 import { exceedsMaxDimension, MAX_IMAGE_DIMENSION, readImageDimensions } from './dimensions.js'
+import { readCachedResize, resizeCachePath, type ResizeCacheOptions, writeCachedResize } from './resize-cache.js'
 import type { ImageProcessor, ImageProcessorConfig, ImageResizer } from './types.js'
 
 /** A resolved image, or the text that says why it could not be. */
@@ -127,20 +128,47 @@ export class DefaultImageProcessor implements ImageProcessor {
 		}
 
 		try {
-			return await this.readAndEncode(resolved.value, mimeType, detail)
+			return await this.readAndEncode(resolved.value, mimeType, detail, fileStore.session)
 		} catch {
 			return { type: 'text', text: `[Image unavailable: ${path} - read error]` }
 		}
 	}
 
+	/** Where the resize of this file would be cached, or undefined when the file cannot be read to hash it. */
+	private async cachePathOf(filePath: string, mimeType: string, options: ResizeCacheOptions): Promise<string | undefined> {
+		try {
+			return resizeCachePath(await this.fs.readFile(filePath), mimeType, options)
+		} catch {
+			return undefined
+		}
+	}
+
+	/**
+	 * Resizes the image and encodes it as a data URL. With a session store, a resize is cached there under the hash of
+	 * the source and the options, so an image that stays in history is resized once rather than on every turn.
+	 */
 	private async readAndEncode(
 		filePath: string,
 		mimeType: string,
 		detail: 'auto' | 'low' | 'high' | undefined,
+		cacheStore?: FileStore,
 	): Promise<ResolvedImage> {
+		const options = { maxFileSizeBytes: this.config.maxFileSizeBytes, maxDimension: MAX_IMAGE_DIMENSION }
+		const cachePath = cacheStore === undefined ? undefined : await this.cachePathOf(filePath, mimeType, options)
+		const cache = cacheStore !== undefined && cachePath !== undefined ? { store: cacheStore, path: cachePath } : undefined
+
+		if (cache !== undefined) {
+			const cached = await readCachedResize(cache.store, cache.path)
+			// An entry over the limits is a miss: the image is resized again and the entry replaced.
+			const encoded = cached !== undefined && cached.bytes.length <= this.config.maxFileSizeBytes
+				? this.encode(filePath, cached.bytes, cached.mimeType, detail)
+				: undefined
+			if (encoded?.type === 'image_url') return encoded
+		}
+
 		let resized: { path: string; mimeType: string; tempFile?: string } | undefined
 		try {
-			resized = await this.resizer.resize(filePath, mimeType, { maxFileSizeBytes: this.config.maxFileSizeBytes, maxDimension: MAX_IMAGE_DIMENSION })
+			resized = await this.resizer.resize(filePath, mimeType, options)
 
 			const resultSize = (await this.fs.stat(resized.path)).size
 			if (resultSize > this.config.maxFileSizeBytes) {
@@ -151,26 +179,34 @@ export class DefaultImageProcessor implements ImageProcessor {
 			}
 
 			const buffer = await this.fs.readFile(resized.path)
-			// A resizer that is missing or failed returns the original image.
-			const dimensions = readImageDimensions(buffer)
-			if (dimensions !== undefined && exceedsMaxDimension(dimensions)) {
-				return {
-					type: 'text',
-					text: `[Image unavailable: ${filePath} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit, and it could not be downscaled]`,
-				}
+			const encoded = this.encode(filePath, buffer, resized.mimeType, detail)
+			// Only an image the resizer changed is kept, so the store never holds a second copy of an unchanged one.
+			if (cache !== undefined && encoded.type === 'image_url' && resized.path !== filePath) {
+				await writeCachedResize(cache.store, cache.path, { bytes: buffer, mimeType: resized.mimeType })
 			}
-			const base64 = buffer.toString('base64')
-			return {
-				type: 'image_url',
-				imageUrl: {
-					url: `data:${resized.mimeType};base64,${base64}`,
-					detail,
-				},
-			}
+			return encoded
 		} finally {
 			if (resized?.tempFile) {
 				await this.fs.unlink(resized.tempFile).catch(() => {})
 			}
+		}
+	}
+
+	private encode(filePath: string, buffer: Buffer, mimeType: string, detail: 'auto' | 'low' | 'high' | undefined): ResolvedImage {
+		// A resizer that is missing or failed returns the original image.
+		const dimensions = readImageDimensions(buffer)
+		if (dimensions !== undefined && exceedsMaxDimension(dimensions)) {
+			return {
+				type: 'text',
+				text: `[Image unavailable: ${filePath} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit, and it could not be downscaled]`,
+			}
+		}
+		return {
+			type: 'image_url',
+			imageUrl: {
+				url: `data:${mimeType};base64,${buffer.toString('base64')}`,
+				detail,
+			},
 		}
 	}
 }
