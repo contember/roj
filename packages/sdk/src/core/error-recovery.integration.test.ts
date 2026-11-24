@@ -748,7 +748,7 @@ describe('core: an agent the provider keeps rejecting', () => {
 		expect(sentUserText(sent[0])).toContain('Child report')
 		expect(session.state.agents.get(entryId)?.status).toBe('errored')
 		const consumed = await session.getEventsByType(agentEvents, 'agent_input_consumed')
-		expect(consumed.at(-1)?.sourcePlugins.toSorted()).toEqual(['mailbox', 'user-chat'])
+		expect([...(consumed.at(-1)?.sourcePlugins ?? [])].sort()).toEqual(['mailbox', 'user-chat'])
 
 		await session.sendAndWaitForIdle('Just a question')
 		expect(sent).toHaveLength(2)
