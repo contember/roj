@@ -567,6 +567,8 @@ export const coreReducer = createTypedReducer(
 					// 'pending' would run inference with unresolved tool calls (unpaired tool_use).
 					status: agent.pendingToolCalls.length > 0 ? 'tool_exec' : 'pending',
 					pendingToolResults: withoutRejectedToolResults(agent),
+					// A user's message is a new attempt; an operator's resume keeps the streak, so a turn still rejected pauses at once.
+					consecutiveRejectedTurns: event.onInput === true && agent.pauseReason === 'limit' ? undefined : agent.consecutiveRejectedTurns,
 					pauseReason: undefined,
 					pauseMessage: undefined,
 					pauseInferenceFailure: undefined,

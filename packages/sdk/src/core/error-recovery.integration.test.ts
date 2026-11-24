@@ -572,6 +572,112 @@ describe('core: an agent the provider keeps rejecting', () => {
 		expect(failures.map((e) => e.errorType)).toEqual(['invalid_request', 'invalid_request', 'invalid_request', 'server_error'])
 	})
 
+	/**
+	 * An entry agent whose first turn calls a tool and whose turns carrying its image result are rejected. The first
+	 * failure follows the tool; each of two more user messages retries the turn once, and the third failure pauses it.
+	 */
+	async function entryAgentPausedOnRejectedTurns() {
+		const ENTRY_SYSTEM = 'Entry agent: inspect the page.'
+		const sent: InferenceRequest[] = []
+		const provider: { entry: 'rejectImages' | 'rejectAll' } = { entry: 'rejectImages' }
+		const llmProvider = new MockLLMProvider((request) => {
+			sent.push(request)
+			if (sent.length === 1) {
+				return { content: null, toolCalls: [{ id: ToolCallId('look-1'), name: 'look', input: {} }], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			}
+			if (provider.entry === 'rejectImages' && !sendsImageToolResult(request)) {
+				return { content: 'Inspected', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+			}
+			throw { type: 'invalid_request', message: REJECTED, statusCode: 400, providerError: { statusCode: 400, body: REJECTION_BODY } }
+		})
+		const base = createTestPreset({ orchestratorSystem: ENTRY_SYSTEM })
+		const entryPreset = { ...base, orchestrator: { ...base.orchestrator, tools: [lookTool], errorResumeBackoff: { baseDelayMs: 1, maxDelayMs: 1 } } }
+		const harness = new TestHarness({ presets: [entryPreset], llmProvider })
+		const session = await harness.createSession('test')
+		const entryId = session.getEntryAgentId()!
+		const failures = async () => (await session.getEventsByType(llmEvents, 'inference_failed')).filter((e) => e.agentId === entryId).length
+		const pauses = async () => (await session.getEventsByType(agentEvents, 'agent_paused')).filter((e) => e.agentId === entryId)
+		const entryState = () => session.state.agents.get(entryId)
+
+		await session.sendMessage('Inspect the page')
+		await waitUntil(async () => (await failures()) === 1)
+		for (const expected of [2, 3]) {
+			await session.sendMessage(`Try again ${expected}`)
+			await waitUntil(async () => (await failures()) === expected)
+		}
+		await waitUntil(async () => (await pauses()).length === 1)
+		expect(sent).toHaveLength(4)
+		expect((await pauses())[0]).toMatchObject({ reason: 'limit', resumeOnInput: true })
+		expect(entryState()?.consecutiveRejectedTurns).toBe(3)
+		return { harness, session, sent, provider, failures, pauses, entryState }
+	}
+
+	const sentUserText = (request: InferenceRequest): string => JSON.stringify(request.messages.filter((message) => message.role === 'user'))
+
+	it('a paused entry agent resumes on its user\'s next message and answers it', async () => {
+		const { harness, session, sent, pauses, entryState } = await entryAgentPausedOnRejectedTurns()
+
+		await session.sendMessage('Please go on')
+		await waitUntil(async () => entryState()?.conversationHistory.at(-1)?.content === 'Inspected')
+
+		expect(sent).toHaveLength(5)
+		expect(sentUserText(sent[4])).toContain('Please go on')
+		const toolResults = sent[4].messages.filter((message) => message.role === 'tool')
+		expect(toolResults.map((message) => message.content)).toEqual(['content omitted: the provider rejected it: invalid_request'])
+		const state = entryState()
+		expect(state?.status).not.toBe('paused')
+		expect(state?.consecutiveRejectedTurns).toBeUndefined()
+		expect(state?.conversationHistory.at(-1)).toMatchObject({ role: 'assistant', content: 'Inspected' })
+		expect(countHistoryMentions(session, 'Please go on')).toBe(1)
+		expect(await pauses()).toHaveLength(1)
+
+		await harness.shutdown()
+	})
+
+	it('a resumed entry agent whose turn is still rejected gets a fresh set of attempts, one per message, and pauses again', async () => {
+		const { harness, session, sent, provider, failures, pauses, entryState } = await entryAgentPausedOnRejectedTurns()
+
+		provider.entry = 'rejectAll'
+		await session.sendMessage('Please go on')
+		await waitUntil(async () => (await failures()) === 4)
+		// The message reached the provider in the resumed turn.
+		expect(sentUserText(sent[4])).toContain('Please go on')
+		// A fresh streak: one rejection leaves it errored, not paused at once.
+		await Bun.sleep(50)
+		expect(entryState()?.status).toBe('errored')
+		expect(entryState()?.consecutiveRejectedTurns).toBe(1)
+		expect(sent).toHaveLength(5)
+
+		for (const expected of [5, 6]) {
+			await session.sendMessage(`Go on ${expected}`)
+			await waitUntil(async () => (await failures()) === expected)
+		}
+		await waitUntil(async () => (await pauses()).length === 2)
+		await Bun.sleep(50)
+
+		expect(sent).toHaveLength(7)
+		expect(entryState()?.status).toBe('paused')
+		expect((await pauses())[1]).toMatchObject({ reason: 'limit', resumeOnInput: true })
+
+		await harness.shutdown()
+	})
+
+	it('an operator resume of a paused entry agent keeps its rejected-turn streak', async () => {
+		const { harness, session, sent, provider, pauses, entryState } = await entryAgentPausedOnRejectedTurns()
+
+		provider.entry = 'rejectAll'
+		const live = await harness.sessionManager.getSession(session.sessionId)
+		if (!live.ok) throw new Error(live.error.message)
+		const resumed = await live.value.resumeAgent(session.getEntryAgentId()!)
+		if (!resumed.ok) throw new Error(resumed.error.message)
+		await waitUntil(async () => (await pauses()).length === 2)
+
+		expect(sent).toHaveLength(5)
+		expect(entryState()?.consecutiveRejectedTurns).toBe(4)
+
+		await harness.shutdown()
+	})
+
 	it('a root agent whose messages are rejected answers the next valid message', async () => {
 		let calls = 0
 		const llmProvider = new MockLLMProvider((request) => {

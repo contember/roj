@@ -64,11 +64,13 @@ export const agentEvents = createEventsFactory({
 			message: z4.string().optional(),
 			/** The failed inference that caused the pause, when one did. */
 			inferenceFailure: inferenceFailureSchema.optional(),
-			/** Set by a restore's hold: the next user message to the agent resumes it. */
+			/** Set by a restore's hold and by the entry agent's rejected-turn pause: the next user message resumes it. */
 			resumeOnInput: z4.boolean().optional(),
 		}),
 		agent_resumed: z4.object({
 			agentId: agentIdSchema,
+			/** Resumed by a user message (`Session.releaseHold`); a rejected-turn pause then starts a new streak. */
+			onInput: z4.boolean().optional(),
 		}),
 		agent_input_consumed: z4.object({
 			agentId: agentIdSchema,
@@ -263,7 +265,7 @@ export interface AgentState {
 	pauseMessage?: string
 	/** The failed inference that caused the pause (`agent_paused.inferenceFailure`) */
 	pauseInferenceFailure?: InferenceFailure
-	/** Paused by a restore's hold, so `Session.releaseHold` resumes it (`agent_paused.resumeOnInput`) */
+	/** Paused by a restore's hold or as an entry agent on the rejected-turn limit, so `Session.releaseHold` resumes it (`agent_paused.resumeOnInput`) */
 	pauseResumesOnInput?: boolean
 	/** Metrics from the most recent completed inference — used by plugins (e.g. context-compact) to size context against the provider-reported truth. */
 	lastInferenceMetrics?: LLMMetrics
