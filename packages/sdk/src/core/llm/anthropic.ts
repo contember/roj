@@ -231,36 +231,60 @@ const CONTENT_PATH = /messages\.(\d+)\.content\.(\d+)(?:\.content\.(\d+))?/g
 
 const REJECTED_IMAGE_TEXT = '[Image omitted: the model provider rejected it]'
 
+/** The error code of a rejection for image dimensions over the provider's limit. */
+const IMAGE_DIMENSIONS_TOO_LARGE = 'image_dimensions_too_large'
+
 const rejectedImagePlaceholder = (image: AnthropicImageBlockParam): AnthropicTextBlockParam =>
 	image.cache_control === undefined
 		? { type: 'text', text: REJECTED_IMAGE_TEXT }
 		: { type: 'text', text: REJECTED_IMAGE_TEXT, cache_control: image.cache_control }
 
+/** The image blocks of a request by the path the API names them with: `messages.<i>.content.<j>[.content.<k>]`. */
+function imageBlocksByPath(body: AnthropicRequestBody): Map<string, AnthropicImageBlockParam> {
+	const images = new Map<string, AnthropicImageBlockParam>()
+	body.messages.forEach((message, i) => {
+		if (typeof message.content === 'string') return
+		message.content.forEach((block, j) => {
+			if (block.type === 'image') images.set(`messages.${i}.content.${j}`, block)
+			if (block.type !== 'tool_result' || typeof block.content === 'string') return
+			block.content.forEach((nested, k) => {
+				if (nested.type === 'image') images.set(`messages.${i}.content.${j}.content.${k}`, nested)
+			})
+		})
+	})
+	return images
+}
+
 /**
- * The request with every image block a rejection's message names replaced by a note, or undefined when it names none.
- * The API names the blocks it rejects by path (e.g. an image over its dimension limit), so only those go.
+ * Paths of the images to drop after an `invalid_request`: those its message names. A dimension rejection that names
+ * none drops the images nothing here could bound (remote URLs, which the API fetches itself), or else every image.
  */
-function withoutRejectedImages(body: AnthropicRequestBody, errorMessage: string): { body: AnthropicRequestBody; paths: string[] } | undefined {
-	const messages = body.messages.map((message) => ({ ...message, content: typeof message.content === 'string' ? message.content : [...message.content] }))
-	const paths: string[] = []
-	for (const [path, messageIndex, blockIndex, nestedIndex] of errorMessage.matchAll(CONTENT_PATH)) {
-		const content = messages[Number(messageIndex)]?.content
-		if (content === undefined || typeof content === 'string') continue
-		const block = content[Number(blockIndex)]
-		if (nestedIndex === undefined) {
-			if (block?.type !== 'image') continue
-			content[Number(blockIndex)] = rejectedImagePlaceholder(block)
-		} else {
-			if (block?.type !== 'tool_result' || typeof block.content === 'string') continue
-			const nested = block.content[Number(nestedIndex)]
-			if (nested?.type !== 'image') continue
-			const nestedContent = [...block.content]
-			nestedContent[Number(nestedIndex)] = rejectedImagePlaceholder(nested)
-			content[Number(blockIndex)] = { ...block, content: nestedContent }
-		}
-		paths.push(path)
+function rejectedImagePaths(images: ReadonlyMap<string, AnthropicImageBlockParam>, errorMessage: string, errorBody: string): string[] {
+	const named = new Set(Array.from(errorMessage.matchAll(CONTENT_PATH), ([path]) => path).filter((path) => images.has(path)))
+	if (named.size > 0 || !errorBody.includes(IMAGE_DIMENSIONS_TOO_LARGE)) return [...named]
+	const remote = [...images].filter(([, image]) => image.source.type === 'url').map(([path]) => path)
+	return remote.length > 0 ? remote : [...images.keys()]
+}
+
+/** The request with the image blocks at `paths` replaced by a note. */
+function withImagesOmitted(body: AnthropicRequestBody, paths: readonly string[]): AnthropicRequestBody {
+	const omitted = new Set(paths)
+	const replace = (path: string, block: AnthropicUserContentBlockParam): AnthropicUserContentBlockParam =>
+		block.type === 'image' && omitted.has(path) ? rejectedImagePlaceholder(block) : block
+	return {
+		...body,
+		messages: body.messages.map((message, i) =>
+			typeof message.content === 'string' ? message : {
+				...message,
+				content: message.content.map((block, j) => {
+					const path = `messages.${i}.content.${j}`
+					if (block.type === 'image') return replace(path, block)
+					if (block.type !== 'tool_result' || typeof block.content === 'string') return block
+					return { ...block, content: block.content.map((nested, k) => replace(`${path}.content.${k}`, nested)) }
+				}),
+			}
+		),
 	}
-	return paths.length === 0 ? undefined : { body: { ...body, messages }, paths }
 }
 
 /** Anthropic model prefix used by OpenRouter */
@@ -353,11 +377,12 @@ export class AnthropicProvider implements RoutableLLMProvider {
 				let sent = body
 				let response = await send(sent)
 				while (response.status === 400) {
-					const error = this.mapHttpError(response.status, await response.text())
-					const retry = error.type === 'invalid_request' ? withoutRejectedImages(sent, error.message) : undefined
-					if (retry === undefined) return Err(error)
-					this.logger?.warn('Provider rejected images in the request; resending it with them omitted', { paths: retry.paths })
-					sent = retry.body
+					const errorBody = await response.text()
+					const error = this.mapHttpError(response.status, errorBody)
+					const paths = error.type === 'invalid_request' ? rejectedImagePaths(imageBlocksByPath(sent), error.message, errorBody) : []
+					if (paths.length === 0) return Err(error)
+					this.logger?.warn('Provider rejected images in the request; resending it with them omitted', { paths })
+					sent = withImagesOmitted(sent, paths)
 					response = await send(sent)
 				}
 

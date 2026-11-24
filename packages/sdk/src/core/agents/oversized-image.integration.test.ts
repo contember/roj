@@ -326,6 +326,30 @@ describe('a provider rejection of an image', () => {
 		await harness.shutdown()
 	})
 
+	it('without paths, drops the remote images first, then every image', async () => {
+		// The code alone, as a rejection might carry it without naming the blocks.
+		const pathless = JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'image dimensions exceed the limit' }, error_code: 'image_dimensions_too_large' })
+		const inline = pngDataUrl(40, 30)
+		const sources = (body: AnthropicBody) => imageBlocks(body).map((block) => block.source?.type)
+		const { provider, bodies } = fakeAnthropic(new NoopImageResizer(), (body) =>
+			imageBlocks(body).length > 0 ? new Response(pathless, { status: 400 }) : undefined)
+
+		const result = await provider.inference({
+			model: ModelId('claude-test'),
+			systemPrompt: 'test',
+			messages: [{
+				role: 'user',
+				content: [{ type: 'image_url', imageUrl: { url: 'https://example.com/large.png' } }, { type: 'image_url', imageUrl: { url: inline } }, {
+					type: 'text',
+					text: 'hello',
+				}],
+			}],
+		})
+
+		expect(result.ok).toBe(true)
+		expect(bodies.map(sources)).toEqual([['url', 'base64'], ['base64'], []])
+	})
+
 	it('is returned as it is when it names no image', async () => {
 		const notAnImage = JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'messages.0.content.0: some other problem' } })
 		const { provider, bodies } = fakeAnthropic(new NoopImageResizer(), () => new Response(notAnImage, { status: 400 }))
