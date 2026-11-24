@@ -230,6 +230,18 @@ describe('an image over the dimension limit', () => {
 		await rm(dir, { recursive: true, force: true })
 	})
 
+	it('becomes a note when it is inline, as a direct provider call sends it', async () => {
+		const resolved = await new DefaultImageProcessor(vipsResizer(), createNodeFileSystem()).resolveContent([
+			{ type: 'image_url', imageUrl: { url: pngDataUrl(3500, 1000) } },
+			{ type: 'image_url', imageUrl: { url: pngDataUrl(500, 300) } },
+		])
+
+		expect(resolved).toEqual([
+			{ type: 'text', text: '[Image unavailable: inline image/png - 3500x1000 px, over the 2000 px limit]' },
+			{ type: 'image_url', imageUrl: { url: pngDataUrl(500, 300) } },
+		])
+	})
+
 	it('becomes a note when no resizer can shrink it', async () => {
 		const { provider, bodies } = fakeAnthropic(new NoopImageResizer())
 		const harness = new TestHarness({ presets: [createTestPreset()], systemPlugins: [imageSourcePlugin(pngDataUrl(3500, 1000), pngDataUrl(20, 10))], llmProvider: provider })
@@ -272,13 +284,14 @@ const toolResultImagePaths = (body: AnthropicBody): string[] =>
 
 describe('a provider rejection of an image', () => {
 	it('is recovered from on every turn: the request is resent with the image replaced and the agent never pauses', async () => {
-		// Rejects every request that still carries a screenshot, as the provider does for as long as it stays in history.
+		// Rejects every request that still carries a screenshot, as the provider does for as long as it stays in history,
+		// and names only the first one, so a request with several screenshots is rejected once per screenshot.
 		const rejections: string[] = []
 		const { provider, bodies } = fakeAnthropic(new NoopImageResizer(), (body) => {
-			const paths = toolResultImagePaths(body)
-			if (paths.length === 0) return undefined
-			rejections.push(imageDimensionsRejection(paths))
-			return new Response(imageDimensionsRejection(paths), { status: 400 })
+			const [first] = toolResultImagePaths(body)
+			if (first === undefined) return undefined
+			rejections.push(imageDimensionsRejection([first]))
+			return new Response(imageDimensionsRejection([first]), { status: 400 })
 		})
 		const harness = new TestHarness({ presets: [createTestPreset()], systemPlugins: [imageSourcePlugin(undefined, pngDataUrl(40, 30))], llmProvider: provider })
 
@@ -303,8 +316,9 @@ describe('a provider rejection of an image', () => {
 		// More turns than the pause threshold of consecutive rejected turns; each one is rejected once and resent.
 		for (let turn = 0; turn < 4; turn++) await session.sendAndWaitForIdle(`Turn ${turn}.`)
 
-		// Each later turn makes two inferences (the screenshot call, then the answer), each rejected once and resent.
-		expect(bodies.length).toBe(3 + 4 * 4)
+		// Later turn n (1-4) makes two inferences, the screenshot call with n screenshots in history and the answer with
+		// n + 1; each request is rejected once per screenshot, then accepted.
+		expect(bodies.length).toBe(3 + [1, 2, 3, 4].reduce((sum, n) => sum + (n + 1) + (n + 2), 0))
 		expect(bodies.filter((body) => imageBlocks(body).length > 0)).toHaveLength(rejections.length)
 		expect(await session.getEventsByType('inference_failed')).toEqual([])
 		expect(await session.getEventsByType('agent_paused')).toEqual([])
@@ -320,5 +334,20 @@ describe('a provider rejection of an image', () => {
 
 		expect(result.ok ? undefined : result.error.type).toBe('invalid_request')
 		expect(bodies).toHaveLength(1)
+	})
+
+	it('is returned as it is when it is another kind of rejection, even one naming an image', async () => {
+		const tooLong = JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'messages.0.content.0: prompt is too long: 210000 tokens > 200000 maximum' } })
+		const { provider, bodies } = fakeAnthropic(new NoopImageResizer(), () => new Response(tooLong, { status: 400 }))
+
+		const result = await provider.inference({
+			model: ModelId('claude-test'),
+			systemPrompt: 'test',
+			messages: [{ role: 'user', content: [{ type: 'image_url', imageUrl: { url: pngDataUrl(40, 30) } }, { type: 'text', text: 'hello' }] }],
+		})
+
+		expect(result.ok ? undefined : result.error.type).toBe('context_length')
+		expect(bodies).toHaveLength(1)
+		expect(imageBlocks(bodies[0])).toHaveLength(1)
 	})
 })

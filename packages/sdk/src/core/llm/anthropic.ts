@@ -237,13 +237,13 @@ const rejectedImagePlaceholder = (image: AnthropicImageBlockParam): AnthropicTex
 		: { type: 'text', text: REJECTED_IMAGE_TEXT, cache_control: image.cache_control }
 
 /**
- * The request with every image block a rejection names replaced by a note, or undefined when it names none.
+ * The request with every image block a rejection's message names replaced by a note, or undefined when it names none.
  * The API names the blocks it rejects by path (e.g. an image over its dimension limit), so only those go.
  */
-function withoutRejectedImages(body: AnthropicRequestBody, errorBody: string): { body: AnthropicRequestBody; paths: string[] } | undefined {
+function withoutRejectedImages(body: AnthropicRequestBody, errorMessage: string): { body: AnthropicRequestBody; paths: string[] } | undefined {
 	const messages = body.messages.map((message) => ({ ...message, content: typeof message.content === 'string' ? message.content : [...message.content] }))
 	const paths: string[] = []
-	for (const [path, messageIndex, blockIndex, nestedIndex] of errorBody.matchAll(CONTENT_PATH)) {
+	for (const [path, messageIndex, blockIndex, nestedIndex] of errorMessage.matchAll(CONTENT_PATH)) {
 		const content = messages[Number(messageIndex)]?.content
 		if (content === undefined || typeof content === 'string') continue
 		const block = content[Number(blockIndex)]
@@ -348,14 +348,17 @@ export class AnthropicProvider implements RoutableLLMProvider {
 						signal,
 					})
 
-				let response = await send(body)
 				// History rebuilds the same request every turn, so a rejected image would fail every turn after this one too.
-				if (response.status === 400) {
-					const errorBody = await response.text()
-					const retry = withoutRejectedImages(body, errorBody)
-					if (retry === undefined) return Err(this.mapHttpError(response.status, errorBody))
+				// Each resend drops at least one image, so the image count bounds the loop.
+				let sent = body
+				let response = await send(sent)
+				while (response.status === 400) {
+					const error = this.mapHttpError(response.status, await response.text())
+					const retry = error.type === 'invalid_request' ? withoutRejectedImages(sent, error.message) : undefined
+					if (retry === undefined) return Err(error)
 					this.logger?.warn('Provider rejected images in the request; resending it with them omitted', { paths: retry.paths })
-					response = await send(retry.body)
+					sent = retry.body
+					response = await send(sent)
 				}
 
 				if (!response.ok) {

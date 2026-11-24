@@ -10,6 +10,23 @@ import type { ImageProcessor, ImageProcessorConfig, ImageResizer } from './types
 /** A resolved image, or the text that says why it could not be. */
 type ResolvedImage = ChatMessageContentItemImage | ChatMessageContentItemText
 
+const BASE64_DATA_URL = /^data:([^;,]*)(?:;[^;,]*)*;base64,/i
+
+/**
+ * An inline `data:` image over the dimension limit becomes a note: an agent stores every one as a file, so only a
+ * direct provider call sends one, and the processor has nowhere to write it for the resizer.
+ */
+function withinLimitInline(item: ChatMessageContentItemImage): ResolvedImage {
+	const match = BASE64_DATA_URL.exec(item.imageUrl.url)
+	if (match === null) return item
+	const dimensions = readImageDimensions(Buffer.from(item.imageUrl.url.slice(match[0].length), 'base64'))
+	if (dimensions === undefined || !exceedsMaxDimension(dimensions)) return item
+	return {
+		type: 'text',
+		text: `[Image unavailable: inline ${match[1] || 'image'} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit]`,
+	}
+}
+
 function formatFileSize(bytes: number): string {
 	return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
 }
@@ -27,7 +44,8 @@ export class DefaultImageProcessor implements ImageProcessor {
 		return Promise.all(
 			content.map(async (item): Promise<ChatMessageContentItem> => {
 				if (item.type !== 'image_url') return item
-				if (!item.imageUrl.url.startsWith('file://')) return item
+				// A remote URL is fetched by the provider itself, so its size is unknown here.
+				if (!item.imageUrl.url.startsWith('file://')) return withinLimitInline(item)
 
 				const rawPath = item.imageUrl.url.slice(7)
 
