@@ -667,6 +667,7 @@ const rejectsContent = (failure: InferenceFailure): boolean => {
 		&& !isRetryableLLMErrorType(failure.errorType)
 }
 
+// Persisted in tool results of the event log: changing it changes how `isOmittedToolResult` classifies stored ones.
 const OMITTED_REJECTED_CONTENT = 'content omitted: the provider rejected it'
 
 /** A tool result a resume already replaced with the omission note, so the provider cannot be rejecting its content. */
