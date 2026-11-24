@@ -13,9 +13,11 @@
  * to tell a completed batch from a truncated one — and because running every item
  * makes the batch length the work one request buys, the length is capped.
  *
- * Every `error` carries `httpStatus`, the status the error stands for. A domain error
- * still answers HTTP 200 (the transport worked), so the field is the only place a
- * caller can tell a refused call (4xx) from a failed one (5xx).
+ * Every `error` this route builds carries `httpStatus`, the status the error stands for.
+ * A domain error still answers HTTP 200 (the transport worked), so the field is the only
+ * place a caller can tell a refused call (4xx) from a failed one (5xx). A failure that
+ * escapes to the app's error handler (a thrown single call, a rejected bearer token) has
+ * no field; read the response status then.
  *
  * Routing order:
  * 1. Manager methods (session creation, listing, etc.)

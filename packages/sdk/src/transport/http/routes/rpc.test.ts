@@ -82,6 +82,7 @@ describe('RPC Routes', () => {
 			const json = await parseJson<never>(res)
 			expect(json.ok).toBe(false)
 			expect(!json.ok && json.error.type).toBe('invalid_json')
+			expect(!json.ok && json.error.httpStatus).toBe(400)
 		})
 
 		it('should return error for missing method', async () => {
@@ -95,6 +96,7 @@ describe('RPC Routes', () => {
 			const json = await parseJson<never>(res)
 			expect(json.ok).toBe(false)
 			expect(!json.ok && json.error.type).toBe('missing_method')
+			expect(!json.ok && json.error.httpStatus).toBe(400)
 		})
 
 		it('should return error for unknown method', async () => {

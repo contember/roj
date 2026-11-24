@@ -127,6 +127,7 @@ describe('RPC integration', () => {
 			const json: RpcResponse = JSON.parse(await res.text())
 			expect(json.ok).toBe(false)
 			expect(json.error!.type).toBe('batch_too_large')
+			expect(json.error!.httpStatus).toBe(400)
 		})
 
 		it('runs a batch that sits on the cap', async () => {
@@ -152,6 +153,7 @@ describe('RPC integration', () => {
 			expect(json.results).toHaveLength(2)
 			expect(json.results[0].ok).toBe(false)
 			expect(json.results[0].error!.type).toBe('missing_method')
+			expect(json.results[0].error!.httpStatus).toBe(400)
 			expect(json.results[1].ok).toBe(true)
 		})
 	})
