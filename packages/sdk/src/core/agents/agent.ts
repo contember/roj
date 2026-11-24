@@ -58,7 +58,7 @@ import { RuntimeFileStore } from '../sessions/context.js'
 import { isValidSessionId, SessionId } from '../sessions/schema.js'
 import type { SessionStore } from '../sessions/session-store.js'
 import type { SessionState } from '../sessions/state.js'
-import { resolveAgentOverrides } from '../sessions/state.js'
+import { isOmittedToolResult, resolveAgentOverrides } from '../sessions/state.js'
 import type { SessionEnvironment, ToolExecutor } from '../tools/index.js'
 import type { AgentContext } from './context.js'
 import { sanitizeLLMResponse } from './response-sanitizer.js'
@@ -909,11 +909,12 @@ export class Agent {
 			// inference_failed so decide()'s resume_from_error path doesn't re-feed the
 			// same message into a doomed retry loop. Retryable errors (rate_limit,
 			// server_error, network_error, timeout) keep the preserve-for-retry semantics.
-			// The user's text stays queued when the turn carried other input the provider may have rejected instead:
-			// the retry leaves out what was dropped, or counts toward the rejected-turn pause while tool results stay.
+			// The user's text stays queued while the turn carried another suspect: the retry leaves out a dropped
+			// attachment, or counts toward the rejected-turn pause while the tool results stay unchanged.
 			if (!isRetryableLLMError(llmResponse.error)) {
-				const carriedOtherInput = hasToolResults || pluginDequeued.some((dequeued) => dequeued.plugin.dequeue?.userText !== true)
-				await this.consumeDequeuedTokens(carriedOtherInput ? pluginDequeued.filter((dequeued) => dequeued.plugin.dequeue?.userText !== true) : pluginDequeued)
+				const otherSuspect = agentState.pendingToolResults.some((result) => !isOmittedToolResult(result))
+					|| pluginDequeued.some((dequeued) => dequeued.plugin.dequeue?.inputKind === 'attachments')
+				await this.consumeDequeuedTokens(otherSuspect ? pluginDequeued.filter((dequeued) => dequeued.plugin.dequeue?.inputKind !== 'userText') : pluginDequeued)
 			}
 
 			// 4a. Inference failed — emit inference_failed without marking plugin messages

@@ -899,7 +899,7 @@ export const userChatPlugin = definePlugin("user-chat")
 		},
 	})
 	.dequeue({
-		userText: true,
+		inputKind: "userText",
 		hasPendingMessages: (ctx) =>
 			ctx.pluginState.pendingInbound.some((m) => m.agentId === ctx.agentId),
 

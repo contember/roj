@@ -24,10 +24,11 @@ export interface PluginDequeueHook<TCtx, TToken = unknown> {
 	getPendingMessages: (ctx: TCtx) => PluginPendingMessages<TToken> | null
 	markConsumed: (ctx: TCtx, token: TToken) => Promise<void>
 	/**
-	 * Its messages are the user's own text. When the provider rejects a turn that also carried other input (tool
-	 * results, another source's messages), they stay queued for the next turn instead of being dropped with it.
+	 * What the source delivers, for a turn the provider rejects. `userText` (the user's messages, answers and context)
+	 * stays queued for the next turn when the turn also carried `attachments` or tool results not yet replaced by the
+	 * omission note, which the provider may have rejected instead. Every other input is consumed with the turn.
 	 */
-	userText?: boolean
+	inputKind?: 'userText' | 'attachments'
 }
 
 // ============================================================================

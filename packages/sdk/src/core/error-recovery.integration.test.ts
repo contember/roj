@@ -640,30 +640,31 @@ describe('core: an agent the provider keeps rejecting', () => {
 		await harness.shutdown()
 	})
 
-	it('a resumed entry agent whose turn is still rejected retries it up to the limit, pauses again and loses no message', async () => {
+	it('a resumed entry agent whose turn is rejected without the image drops the text with it, one attempt per message, and pauses again', async () => {
 		const { harness, session, sent, provider, failures, pauses, entryState } = await entryAgentPausedOnRejectedTurns()
 
 		provider.entry = 'rejectAll'
 		await session.sendMessage('Please go on')
-		// A fresh streak of three attempts, each with both kept messages, then the same pause.
+		await waitUntil(async () => (await failures()) === 4)
+		await Bun.sleep(50)
+		// The resume replaced the image with the omission note, so the user's text is the only suspect left.
+		expect(sentUserText(sent[4])).toContain('Try again')
+		expect(sentUserText(sent[4])).toContain('Please go on')
+		expect(sent).toHaveLength(5)
+		expect(entryState()?.status).toBe('errored')
+		expect(entryState()?.consecutiveRejectedTurns).toBe(1)
+
+		for (const expected of [5, 6]) {
+			await session.sendMessage(`Go on ${expected}`)
+			await waitUntil(async () => (await failures()) === expected)
+		}
 		await waitUntil(async () => (await pauses()).length === 2)
 		await Bun.sleep(50)
-		expect(await failures()).toBe(6)
+
 		expect(sent).toHaveLength(7)
-		for (const request of sent.slice(4)) {
-			expect(sentUserText(request)).toContain('Try again')
-			expect(sentUserText(request)).toContain('Please go on')
-		}
+		expect(sentUserText(sent[6])).not.toContain('Please go on')
 		expect(entryState()?.status).toBe('paused')
 		expect((await pauses())[1]).toMatchObject({ reason: 'limit' })
-		expect(entryState()?.pauseResumesOnInput).toBe(true)
-
-		// Once the provider takes the turn, every message the user sent is in it.
-		provider.entry = 'rejectImages'
-		await session.sendMessage('Last try')
-		await waitUntil(async () => entryState()?.conversationHistory.at(-1)?.content === 'Inspected')
-		expect(sent).toHaveLength(8)
-		for (const text of ['Try again', 'Please go on', 'Last try']) expect(countHistoryMentions(session, text)).toBe(1)
 
 		await harness.shutdown()
 	})
@@ -718,6 +719,40 @@ describe('core: an agent the provider keeps rejecting', () => {
 		expect(sentUserText(sent[1])).toContain('Put this on the about page')
 		expect(countHistoryMentions(session, 'Put this on the about page')).toBe(1)
 		expect(await session.getEventsByType(agentEvents, 'agent_paused')).toHaveLength(0)
+
+		await harness.shutdown()
+	})
+
+	it('an entry agent drops the user\'s text rejected with a child\'s report, which is no suspect of its own', async () => {
+		const sent: InferenceRequest[] = []
+		const llmProvider = new MockLLMProvider((request) => {
+			sent.push(request)
+			if (sentUserText(request).includes('A huge paste')) throw { type: 'invalid_request', message: REJECTED, statusCode: 400, providerError: { statusCode: 400, body: REJECTION_BODY } }
+			return { content: 'Answered', toolCalls: [], finishReason: 'stop', metrics: MockLLMProvider.defaultMetrics() }
+		})
+		const base = createTestPreset()
+		const rootPreset = { ...base, orchestrator: { ...base.orchestrator, errorResumeBackoff: { baseDelayMs: 1, maxDelayMs: 1 } } }
+		const harness = new TestHarness({ presets: [rootPreset], llmProvider })
+		const session = await harness.createSession('test')
+		const entryId = session.getEntryAgentId()!
+		// Held, so the report and the user's text go out in one turn.
+		await session.pauseAgent(entryId, 'Hold the inputs')
+		const report = await session.callPluginMethod('mailbox.send', { debug: true, toAgentId: entryId, content: 'Child report' })
+		if (!report.ok) throw new Error(report.error.message)
+		await session.sendMessage('A huge paste')
+		await session.resumeAgent(entryId)
+		await waitUntil(async () => (await session.getEventsByType(llmEvents, 'inference_failed')).length === 1)
+		await Bun.sleep(50)
+
+		expect(sent).toHaveLength(1)
+		expect(sentUserText(sent[0])).toContain('Child report')
+		expect(session.state.agents.get(entryId)?.status).toBe('errored')
+		const consumed = await session.getEventsByType(agentEvents, 'agent_input_consumed')
+		expect(consumed.at(-1)?.sourcePlugins.toSorted()).toEqual(['mailbox', 'user-chat'])
+
+		await session.sendAndWaitForIdle('Just a question')
+		expect(sent).toHaveLength(2)
+		expect(sentUserText(sent[1])).not.toContain('A huge paste')
 
 		await harness.shutdown()
 	})
