@@ -786,6 +786,8 @@ describe('core: an agent the provider keeps rejecting', () => {
 		expect(sent).toHaveLength(2)
 		expect(sentUserText(sent[1])).toContain('[File uploaded: accepted.txt]')
 		expect(sentUserText(sent[1])).not.toContain('content omitted')
+		// No suspect left the turn, so its text was consumed as for a text-only turn; keeping it would retry forever.
+		expect(sentUserText(sent[1])).not.toContain('Put this on the about page')
 		expect(await session.getEventsByType(uploadEvents, 'attachments_rejected')).toHaveLength(0)
 
 		await harness.shutdown()
