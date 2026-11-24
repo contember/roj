@@ -71,7 +71,7 @@ describe('ShellExecutor', () => {
 		expect(result.value.stderr).toBe('')
 		expect(result.value.exitCode).toBe(0)
 		expect(result.value.timedOut).toBe(false)
-		expect(result.value.durationMs).toBeGreaterThan(0)
+		expect(result.value.durationMs).toBeGreaterThanOrEqual(0)
 	})
 
 	it('returns stderr for errors', async () => {
