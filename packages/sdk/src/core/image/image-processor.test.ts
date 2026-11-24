@@ -262,7 +262,7 @@ describe('DefaultImageProcessor', () => {
 	})
 })
 
-const fixture = (name: string): Promise<Buffer> => readFile(join(import.meta.dir, 'fixtures', name))
+const fixture = (name: string) => readFile(join(import.meta.dir, 'fixtures', name))
 
 /** A session store whose own reads or writes fail; the image itself is read through the platform fs, so only the cache is hit. */
 class FaultyStore extends SessionFileStore {
@@ -330,7 +330,7 @@ describe('DefaultImageProcessor resize cache', () => {
 		const second = await turn(resizer, store())
 
 		expect(resizer.calls).toBe(1)
-		const expected = { type: 'image_url', imageUrl: { url: await resizedUrl(), detail: undefined } }
+		const expected: ChatMessageContentItem = { type: 'image_url', imageUrl: { url: await resizedUrl(), detail: undefined } }
 		expect(first).toEqual(expected)
 		expect(second).toEqual(expected)
 	})
