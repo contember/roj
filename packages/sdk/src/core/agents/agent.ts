@@ -20,7 +20,7 @@ import { storeInlineData, storeMessageInlineData } from '~/core/llm/document-con
 import type { ToolResultContent } from '~/core/llm/llm-log-types.js'
 import type { LLMLogger } from '~/core/llm/logger.js'
 import type { InferenceRequest, InferenceResponse, LLMError, LLMMessage, LLMProvider } from '~/core/llm/provider.js'
-import { generateLLMCallId, type InferenceFailure, LLMCallId, ModelId } from '~/core/llm/schema.js'
+import { generateLLMCallId, type InferenceFailure, LLMCallId, type LLMErrorType, ModelId } from '~/core/llm/schema.js'
 import type { LLMResponse } from '~/core/llm/state.js'
 import { llmEvents } from '~/core/llm/state.js'
 import type {
@@ -58,7 +58,7 @@ import { RuntimeFileStore } from '../sessions/context.js'
 import { isValidSessionId, SessionId } from '../sessions/schema.js'
 import type { SessionStore } from '../sessions/session-store.js'
 import type { SessionState } from '../sessions/state.js'
-import { isOmittedToolResult, resolveAgentOverrides } from '../sessions/state.js'
+import { isOmittedToolResult, rejectsContent, resolveAgentOverrides } from '../sessions/state.js'
 import type { SessionEnvironment, ToolExecutor } from '../tools/index.js'
 import type { AgentContext } from './context.js'
 import { sanitizeLLMResponse } from './response-sanitizer.js'
@@ -909,12 +909,20 @@ export class Agent {
 			// inference_failed so decide()'s resume_from_error path doesn't re-feed the
 			// same message into a doomed retry loop. Retryable errors (rate_limit,
 			// server_error, network_error, timeout) keep the preserve-for-retry semantics.
-			// The user's text stays queued while the turn carried another suspect: the retry leaves out a dropped
-			// attachment, or counts toward the rejected-turn pause while the tool results stay unchanged.
+			// The user's text stays queued while the turn carried another suspect: the retry leaves out a rejected
+			// attachment with a note, or counts toward the rejected-turn pause while the tool results stay unchanged.
+			// Sources with `markRejected` are never consumed here: when the content is not at fault, their input stays queued.
+			const inferenceFailure: InferenceFailure = {
+				errorType: llmResponse.error.type,
+				model: request.model,
+				providerError: llmResponse.error.providerError,
+			}
 			if (!isRetryableLLMError(llmResponse.error)) {
-				const otherSuspect = agentState.pendingToolResults.some((result) => !isOmittedToolResult(result))
-					|| pluginDequeued.some((dequeued) => dequeued.plugin.dequeue?.inputKind === 'attachments')
-				await this.consumeDequeuedTokens(otherSuspect ? pluginDequeued.filter((dequeued) => dequeued.plugin.dequeue?.inputKind !== 'userText') : pluginDequeued)
+				const leftOut = rejectsContent(inferenceFailure) && await this.markDequeuedRejected(pluginDequeued, llmResponse.error.type)
+				const otherSuspect = leftOut || agentState.pendingToolResults.some((result) => !isOmittedToolResult(result))
+				await this.consumeDequeuedTokens(pluginDequeued.filter((dequeued) =>
+					dequeued.plugin.dequeue?.markRejected === undefined && !(otherSuspect && dequeued.plugin.dequeue?.inputKind === 'userText')
+				))
 			}
 
 			// 4a. Inference failed — emit inference_failed without marking plugin messages
@@ -935,11 +943,6 @@ export class Agent {
 				}),
 			))
 			const errorState = this.state
-			const inferenceFailure: InferenceFailure = {
-				errorType: llmResponse.error.type,
-				model: request.model,
-				providerError: llmResponse.error.providerError,
-			}
 			const rejected = errorState?.consecutiveRejectedTurns ?? 0
 			// A rejected tool-result turn is rebuilt unchanged after every restart and fails again; pausing stops
 			// the restart from resetting it and tells the parent once, through the onPause hooks.
@@ -2047,6 +2050,26 @@ export class Agent {
 		}
 
 		return collected
+	}
+
+	/**
+	 * Hand a rejected turn's tokens to the sources that leave their input out instead of consuming it.
+	 * Returns whether any of them carried input the provider may have rejected.
+	 */
+	private async markDequeuedRejected(
+		pluginDequeued: Array<{ plugin: ConfiguredPlugin; messages: LLMMessage[]; token: unknown }>,
+		errorType: LLMErrorType,
+	): Promise<boolean> {
+		const currentAgentState = this.state
+		if (!currentAgentState) return false
+		const ctx = this.buildAgentContext(currentAgentState)
+		let leftOut = false
+		for (const dequeued of pluginDequeued) {
+			const markRejected = dequeued.plugin.dequeue?.markRejected
+			if (!markRejected) continue
+			if (await markRejected(this.buildPluginHookContext(dequeued.plugin, ctx), dequeued.token, errorType)) leftOut = true
+		}
+		return leftOut
 	}
 
 	/**

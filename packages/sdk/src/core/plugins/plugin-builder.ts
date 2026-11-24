@@ -11,7 +11,7 @@ import type { BaseEvent, DomainEvent } from '../events/types.js'
 import type { ToolResultContent } from '../llm/llm-log-types.js'
 import type { LLMLogger } from '../llm/logger.js'
 import type { LLMMessage } from '../llm/provider.js'
-import type { InferenceFailure } from '../llm/schema.js'
+import type { InferenceFailure, LLMErrorType } from '../llm/schema.js'
 import type { LLMResponse } from '../llm/state.js'
 import type { Preset } from '../preset/index.js'
 import type { SessionContext } from '../sessions/context.js'
@@ -406,8 +406,10 @@ export interface ConfiguredPlugin {
 		hasPendingMessages: (ctx: BasePluginHookContext) => boolean
 		getPendingMessages: (ctx: BasePluginHookContext) => PluginPendingMessages | null
 		markConsumed: (ctx: BasePluginHookContext, token: unknown) => Promise<void>
+		/** See `PluginDequeueHook.markRejected`. */
+		markRejected?: (ctx: BasePluginHookContext, token: unknown, errorType: LLMErrorType) => Promise<boolean>
 		/** See `PluginDequeueHook.inputKind`. */
-		inputKind?: 'userText' | 'attachments'
+		inputKind?: 'userText'
 	}
 	/** Gate run before delivering another plugin's dequeued messages — return 'hold' to keep them queued this cycle. */
 	beforeDequeue?: (ctx: BasePluginHookContext & { sourcePlugin: string }) => BeforeDequeueResult
@@ -508,7 +510,8 @@ interface BuilderConfig {
 		hasPendingMessages: (ctx: BasePluginHookContext) => boolean
 		getPendingMessages: (ctx: BasePluginHookContext) => PluginPendingMessages | null
 		markConsumed: (ctx: BasePluginHookContext, token: unknown) => Promise<void>
-		inputKind?: 'userText' | 'attachments'
+		markRejected?: (ctx: BasePluginHookContext, token: unknown, errorType: LLMErrorType) => Promise<boolean>
+		inputKind?: 'userText'
 	} | undefined
 	beforeDequeueFn: ((ctx: BasePluginHookContext & { sourcePlugin: string }) => BeforeDequeueResult) | undefined
 }
@@ -1010,11 +1013,15 @@ function buildConfiguredPlugin(cfg: BuilderConfig, pluginConfig: unknown): Confi
 		: undefined
 
 	const dequeueHook = cfg.dequeueHook
+	const markRejected = dequeueHook?.markRejected
 	const wrappedDequeue = dequeueHook
 		? {
 			hasPendingMessages: (ctx: BasePluginHookContext) => dequeueHook.hasPendingMessages({ ...ctx, pluginConfig, notify: notifyFor(ctx) }),
 			getPendingMessages: (ctx: BasePluginHookContext) => dequeueHook.getPendingMessages({ ...ctx, pluginConfig, notify: notifyFor(ctx) }),
 			markConsumed: (ctx: BasePluginHookContext, token: unknown) => dequeueHook.markConsumed({ ...ctx, pluginConfig, notify: notifyFor(ctx) }, token),
+			markRejected: markRejected
+				? (ctx: BasePluginHookContext, token: unknown, errorType: LLMErrorType) => markRejected({ ...ctx, pluginConfig, notify: notifyFor(ctx) }, token, errorType)
+				: undefined,
 			inputKind: dequeueHook.inputKind,
 		}
 		: undefined

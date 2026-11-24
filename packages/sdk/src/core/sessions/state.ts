@@ -6,7 +6,7 @@ import { agentEvents } from '~/core/agents/state.js'
 import { contextEvents } from '~/core/context/state.js'
 import { createEventsFactory } from '~/core/events/types'
 import type { DomainEvent } from '~/core/events/types.js'
-import { type InferenceFailure, isRetryableLLMErrorType, modelIdSchema } from '~/core/llm/schema.js'
+import { type InferenceFailure, isRetryableLLMErrorType, type LLMErrorType, modelIdSchema } from '~/core/llm/schema.js'
 import { type InferenceFailedEvent, llmEvents } from '~/core/llm/state.js'
 import { SessionId, sessionIdSchema } from '~/core/sessions/schema.js'
 import type { PendingToolResult } from '~/core/tools/schema.js'
@@ -661,7 +661,7 @@ const repeatsInferenceError = (agent: AgentState, event: InferenceFailedEvent): 
 	&& (agent.consecutiveInferenceFailures ?? 0) > 0
 
 /** A 4xx the provider answered to the request's content; a 401/403 rejects the credentials, a 429 is retried. */
-const rejectsContent = (failure: InferenceFailure): boolean => {
+export const rejectsContent = (failure: InferenceFailure): boolean => {
 	const status = failure.providerError?.statusCode
 	return status !== undefined && status >= 400 && status < 500 && status !== 401 && status !== 403
 		&& !isRetryableLLMErrorType(failure.errorType)
@@ -669,6 +669,9 @@ const rejectsContent = (failure: InferenceFailure): boolean => {
 
 // Persisted in tool results of the event log: changing it changes how `isOmittedToolResult` classifies stored ones.
 const OMITTED_REJECTED_CONTENT = 'content omitted: the provider rejected it'
+
+/** The note sent in place of content the provider rejected: a tool result after a pause, or an attachment. */
+export const omittedRejectedContent = (errorType: LLMErrorType): string => `${OMITTED_REJECTED_CONTENT}: ${errorType}`
 
 /** A tool result a resume already replaced with the omission note, so the provider cannot be rejecting its content. */
 export const isOmittedToolResult = (result: PendingToolResult): boolean =>
@@ -684,7 +687,7 @@ const withoutRejectedToolResults = (agent: AgentState): PendingToolResult[] => {
 	if (agent.status !== 'paused' || failure === undefined || !rejectsContent(failure)) {
 		return agent.pendingToolResults
 	}
-	const content = `${OMITTED_REJECTED_CONTENT}: ${failure.errorType}`
+	const content = omittedRejectedContent(failure.errorType)
 	const rejected = agent.pendingToolResults.some(carriesMedia) ? carriesMedia : () => true
 	return agent.pendingToolResults.map((result) => rejected(result) ? { ...result, content } : result)
 }

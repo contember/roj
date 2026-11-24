@@ -1,5 +1,6 @@
 import z4 from 'zod/v4'
 import { createEventsFactory } from '~/core/events/types'
+import { type LLMErrorType, llmErrorTypeSchema } from '~/core/llm/schema.js'
 import type { UploadArtifact, UploadCapabilities } from './preprocessor.js'
 import { uploadArtifactSchema, uploadCapabilitiesSchema, uploadIdSchema, type UploadSourceRef, uploadSourceRefSchema } from './schema.js'
 
@@ -28,6 +29,17 @@ export const uploadEvents = createEventsFactory({
 		attachment_deletion_completed: z4.object({
 			uploadId: uploadIdSchema,
 		}),
+		/** The provider rejected the turn that carried these: they are left out, not consumed, and a note says so. */
+		attachments_rejected: z4.object({
+			agentId: z4.string(),
+			uploadIds: z4.array(uploadIdSchema),
+			errorType: llmErrorTypeSchema,
+		}),
+		/** A turn carrying the notes that these rejected uploads were left out was committed. */
+		attachment_omissions_sent: z4.object({
+			agentId: z4.string(),
+			uploadIds: z4.array(uploadIdSchema),
+		}),
 	},
 })
 
@@ -50,6 +62,16 @@ export interface PendingUpload {
 	originalHeldByHost?: true
 }
 
+/** An upload left out of a turn the provider rejected. */
+export interface RejectedUpload {
+	uploadId: string
+	filename: string
+	mimeType: string
+	errorType: LLMErrorType
+	/** Set once a committed turn carried the note that the upload was left out. */
+	noteSent?: true
+}
+
 /** An upload whose processing started and has not reached a terminal event. */
 export interface ProcessingUpload {
 	filename: string
@@ -64,6 +86,11 @@ export interface ProcessingUpload {
 export interface UploadsState {
 	/** Uploads that have been uploaded but not yet consumed by an agent */
 	pending: PendingUpload[]
+	/**
+	 * Uploads left out of a turn the provider rejected: not consumed, so they can be deleted, but no longer offered as
+	 * attachable. The next turn tells the agent about those whose note is not sent yet.
+	 */
+	rejected: RejectedUpload[]
 	/**
 	 * Small terminal projection for uploads still visible to the user.
 	 *

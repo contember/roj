@@ -1,4 +1,5 @@
 import type { LLMMessage } from '../llm/provider.js'
+import type { LLMErrorType } from '../llm/schema.js'
 
 // ============================================================================
 // Plugin Dequeue
@@ -24,11 +25,19 @@ export interface PluginDequeueHook<TCtx, TToken = unknown> {
 	getPendingMessages: (ctx: TCtx) => PluginPendingMessages<TToken> | null
 	markConsumed: (ctx: TCtx, token: TToken) => Promise<void>
 	/**
-	 * What the source delivers, for a turn the provider rejects. `userText` (the user's messages, answers and context)
-	 * stays queued for the next turn when the turn also carried `attachments` or tool results not yet replaced by the
-	 * omission note, which the provider may have rejected instead. Every other input is consumed with the turn.
+	 * Called instead of `markConsumed` when the provider rejects the turn's content (a non-retryable 4xx other than
+	 * 401/403). The source leaves its input out of later turns, and may send a note that it did. Returns whether the
+	 * token carried input the provider may have rejected, which keeps `userText` queued for a retry. On any other
+	 * non-retryable failure the source's input stays queued.
 	 */
-	inputKind?: 'userText' | 'attachments'
+	markRejected?: (ctx: TCtx, token: TToken, errorType: LLMErrorType) => Promise<boolean>
+	/**
+	 * What the source delivers, for a turn the provider rejects. `userText` (the user's messages, answers and context)
+	 * stays queued for the next turn when the turn also carried input `markRejected` left out or tool results not yet
+	 * replaced by the omission note, which the provider may have rejected instead. Every other input is consumed with
+	 * the turn.
+	 */
+	inputKind?: 'userText'
 }
 
 // ============================================================================

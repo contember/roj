@@ -9,7 +9,7 @@ import { RuntimeFileStore } from '~/core/sessions/context.js'
 import type { RuntimeLeaseRelease, RuntimeOperation, SessionRuntimeActivity } from '~/core/sessions/runtime-activity.js'
 import { SessionId } from '~/core/sessions/schema.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
-import { getEntryAgentId } from '~/core/sessions/state.js'
+import { getEntryAgentId, omittedRejectedContent } from '~/core/sessions/state.js'
 import { hasPendingUserInput } from '~/plugins/user-chat/plugin.js'
 import { ArchiveBudget, type ArchiveLimitOverrides } from '~/lib/archive/index.js'
 import type { Logger } from '~/lib/logger/logger.js'
@@ -26,7 +26,7 @@ import {
 	type UploadSourceRef,
 } from './schema.js'
 import { fileUploadSource, type UploadBlobContext, type UploadBlobStore, type UploadSource } from './source.js'
-import { type PendingUpload, type ProcessingUpload, type UploadsState, uploadEvents } from './state.js'
+import { type PendingUpload, type ProcessingUpload, type RejectedUpload, type UploadsState, uploadEvents } from './state.js'
 
 // ============================================================================
 // Notification schemas
@@ -236,6 +236,23 @@ function formatUploadsForLLM(uploads: PendingUpload[], sessionRoot: string): str
 		return `<attachment ${attributes}${capabilitiesAttribute}>\n${body}\n</attachment>`
 	})
 	return blocks.join('\n')
+}
+
+/** Tells the agent an attachment was in a turn the provider rejected and is left out. */
+function formatOmittedUploadsForLLM(uploads: RejectedUpload[]): string {
+	return uploads
+		.map((u) =>
+			`<attachment uploadId="${u.uploadId}" filename="${escapeMarkup(u.filename)}" type="${escapeMarkup(u.mimeType)}">\n${
+				omittedRejectedContent(u.errorType)
+			}\n</attachment>`
+		)
+		.join('\n')
+}
+
+/** What a turn carried from this source: the attachments themselves and the omission notes of rejected ones. */
+interface UploadsDequeueToken {
+	uploadIds: string[]
+	omittedIds: string[]
 }
 
 /** Where a ready attachment can be read: the original, or for a stored upload its first artifact or the upload dir. */
@@ -1138,7 +1155,7 @@ export const uploadsPlugin = definePlugin('uploads')
 	.notification('uploadStatusChanged', { schema: statusChangedSchema })
 	.state<UploadsState>({
 		key: 'uploads',
-		initial: (): UploadsState => ({ pending: [], terminal: {}, processing: {}, blobRefs: {} }),
+		initial: (): UploadsState => ({ pending: [], rejected: [], terminal: {}, processing: {}, blobRefs: {} }),
 		reduce: (state, event) => {
 			switch (event.type) {
 				case 'attachment_uploaded': {
@@ -1187,9 +1204,29 @@ export const uploadsPlugin = definePlugin('uploads')
 					return {
 						...state,
 						pending: state.pending.filter((u) => !consumedIds.has(String(u.uploadId))),
+						rejected: state.rejected.filter((u) => !consumedIds.has(String(u.uploadId))),
 						terminal: withoutKeys(state.terminal, [...consumedIds]),
 						// A consumed upload can no longer be deleted, so nothing would release these.
 						blobRefs: withoutKeys(state.blobRefs, [...consumedIds]),
+					}
+				}
+				case 'attachments_rejected': {
+					const rejectedIds = new Set(event.uploadIds.map(String))
+					const leftOut = state.pending.filter((u) => rejectedIds.has(String(u.uploadId)))
+					return {
+						...state,
+						pending: state.pending.filter((u) => !rejectedIds.has(String(u.uploadId))),
+						rejected: [
+							...state.rejected,
+							...leftOut.map((u) => ({ uploadId: u.uploadId, filename: u.filename, mimeType: u.mimeType, errorType: event.errorType })),
+						],
+					}
+				}
+				case 'attachment_omissions_sent': {
+					const sentIds = new Set(event.uploadIds.map(String))
+					return {
+						...state,
+						rejected: state.rejected.map((u): RejectedUpload => sentIds.has(String(u.uploadId)) ? { ...u, noteSent: true } : u),
 					}
 				}
 				case 'attachment_deletion_completed': {
@@ -1197,6 +1234,7 @@ export const uploadsPlugin = definePlugin('uploads')
 					return {
 						...state,
 						pending: state.pending.filter((upload) => String(upload.uploadId) !== uploadId),
+						rejected: state.rejected.filter((upload) => String(upload.uploadId) !== uploadId),
 						terminal: withoutKeys(state.terminal, [uploadId]),
 						processing: withoutKeys(state.processing, [uploadId]),
 						blobRefs: withoutKeys(state.blobRefs, [uploadId]),
@@ -1216,25 +1254,24 @@ export const uploadsPlugin = definePlugin('uploads')
 			closing: false,
 		}),
 	)
-	.dequeue({
-		inputKind: 'attachments',
+	.dequeue<UploadsDequeueToken>({
 		// A ready upload is not work on its own: it goes out with the user's message or answer it came with,
 		// never in a turn without user input, which would answer the file before the text.
 		hasPendingMessages: () => false,
 		getPendingMessages: (ctx) => {
 			const uploads = ctx.pluginState
-			if (uploads.pending.length === 0) return null
+			const unnoted = uploads.rejected.filter((u) => !u.noteSent)
+			if (uploads.pending.length === 0 && unnoted.length === 0) return null
 			if (ctx.agentId !== getEntryAgentId(ctx.sessionState)) return null
 			if (!hasPendingUserInput(ctx.sessionState, ctx.agentId)) return null
 			const sessionRoot = ctx.files.getRoots().session
+			const blocks = [
+				...(unnoted.length > 0 ? [formatOmittedUploadsForLLM(unnoted)] : []),
+				...(uploads.pending.length > 0 ? [formatUploadsForLLM(uploads.pending, sessionRoot)] : []),
+			]
 			return {
-				messages: [
-					{
-						role: 'user',
-						content: formatUploadsForLLM(uploads.pending, sessionRoot),
-					},
-				],
-				token: uploads.pending.map((u) => u.uploadId),
+				messages: [{ role: 'user', content: blocks.join('\n') }],
+				token: { uploadIds: uploads.pending.map((u) => u.uploadId), omittedIds: unnoted.map((u) => u.uploadId) },
 			}
 		},
 		markConsumed: async (ctx, token) => {
@@ -1243,15 +1280,19 @@ export const uploadsPlugin = definePlugin('uploads')
 				runtimeActivity: ctx.runtimeActivity,
 				reason: 'uploads:consume',
 				run: async () => {
+					if (token.omittedIds.length > 0) {
+						await ctx.emitEvent(uploadEvents.create('attachment_omissions_sent', { agentId: ctx.agentId, uploadIds: token.omittedIds.map(UploadId) }))
+					}
+					if (token.uploadIds.length === 0) return
 					await ctx.emitEvent(
 						uploadEvents.create('attachments_consumed', {
 							agentId: ctx.agentId,
-							uploadIds: token.map(UploadId),
+							uploadIds: token.uploadIds.map(UploadId),
 						}),
 					)
 
 					const dataFileStore = new RuntimeFileStore(ctx.pluginConfig.dataFileStore, ctx.runtimeActivity)
-					for (const uploadIdStr of token) {
+					for (const uploadIdStr of token.uploadIds) {
 						await withUploadLock(ctx.pluginContext, uploadIdStr, async () => {
 							const uploadStore = dataFileStore.scoped(`sessions/${ctx.sessionId}/uploads/${uploadIdStr}`)
 							const metaResult = await uploadStore.read('meta.json')
@@ -1264,6 +1305,18 @@ export const uploadsPlugin = definePlugin('uploads')
 					}
 				},
 			})
+		},
+		// Rejected attachments leave the queue unconsumed, so they can still be deleted, and the retry carries a note.
+		// The notes stay queued until a turn carrying them commits; a turn of notes alone is no suspect.
+		markRejected: async (ctx, token, errorType) => {
+			if (token.uploadIds.length === 0) return false
+			await runTrackedMutation({
+				pluginContext: ctx.pluginContext,
+				runtimeActivity: ctx.runtimeActivity,
+				reason: 'uploads:reject',
+				run: () => ctx.emitEvent(uploadEvents.create('attachments_rejected', { agentId: ctx.agentId, uploadIds: token.uploadIds.map(UploadId), errorType })),
+			})
+			return true
 		},
 	})
 	.method('listPending', {
@@ -1288,6 +1341,8 @@ export const uploadsPlugin = definePlugin('uploads')
 
 			const uploadsPath = `sessions/${sessionId}/uploads`
 			const listResult = await dataFileStore.list(uploadsPath)
+			// Not consumed, but no longer offered as attachable: it would never reach the agent again.
+			const rejectedIds = new Set(ctx.pluginState.rejected.map((upload) => String(upload.uploadId)))
 
 			if (!listResult.ok) {
 				return Ok({ uploads: [] })
@@ -1309,8 +1364,9 @@ export const uploadsPlugin = definePlugin('uploads')
 
 				const meta: UploadMetadata = JSON.parse(metaResult.value)
 
-				// Skip used, deleted, or non-matching session uploads
+				// Skip used, rejected, deleted, or non-matching session uploads
 				if (meta.usedInMessageId) continue
+				if (rejectedIds.has(String(meta.uploadId))) continue
 				if (meta.sessionId !== sessionId) continue
 				if (meta.status === 'deleted') continue
 
