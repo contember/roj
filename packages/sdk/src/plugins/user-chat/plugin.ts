@@ -187,7 +187,7 @@ export interface SendMessageOutput {
 function deliveryConflict(): DomainError {
 	return createDomainError(
 		"user_chat_delivery_conflict",
-		"Delivery ID was already used with different content, context, agent target or keepHold",
+		"Delivery ID was already used with different content, context, agent target, keepHold or schedule",
 		409,
 	);
 }
@@ -197,9 +197,16 @@ async function deliveryFingerprint(
 	context: string | undefined,
 	agentId: AgentId | undefined,
 	keepHold: boolean | undefined,
+	schedule: boolean | undefined,
 ): Promise<string> {
-	// `keepHold` only when set, so every receipt written before it existed keeps its identity.
-	const fields = [content, context ?? null, agentId ?? null, ...(keepHold === true ? [true] : [])];
+	// `keepHold` and `schedule` only when they differ from the default, so every receipt written before they existed keeps its identity.
+	const fields = [
+		content,
+		context ?? null,
+		agentId ?? null,
+		...(keepHold === true ? [true] : []),
+		...(schedule === false ? [{ schedule: false }] : []),
+	];
 	const bytes = new TextEncoder().encode(JSON.stringify(fields));
 	const digest = await crypto.subtle.digest("SHA-256", bytes);
 	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -743,6 +750,8 @@ export const userChatPlugin = definePlugin("user-chat")
 			context: z.string().optional(),
 			// A notice from the host, not its user: it waits for a held session's release instead of releasing it.
 			keepHold: z.boolean().optional(),
+			// `false` leaves the message in the inbox without starting a turn; the agent reads it at its next one.
+			schedule: z.boolean().optional(),
 		}),
 		output: z.object({
 			messageId: chatMessageIdSchema,
@@ -751,7 +760,7 @@ export const userChatPlugin = definePlugin("user-chat")
 			const releaseHold = async (): Promise<Result<void, DomainError>> => input.keepHold === true ? Ok(undefined) : ctx.releaseHold();
 			const fingerprint = input.deliveryId === undefined
 				? undefined
-				: await deliveryFingerprint(input.content, input.context, input.agentId, input.keepHold);
+				: await deliveryFingerprint(input.content, input.context, input.agentId, input.keepHold, input.schedule);
 			if (input.deliveryId !== undefined) {
 				const state = selectPluginState<UserChatState>(ctx.getSessionState(), "messages");
 				const receipt = state?.acceptedDeliveries?.get(input.deliveryId);
@@ -761,7 +770,7 @@ export const userChatPlugin = definePlugin("user-chat")
 					const released = await releaseHold();
 					if (!released.ok) return released;
 					const unread = pendingInboundOf(ctx.getSessionState()).find((m) => m.messageId === receipt.messageId);
-					if (unread) ctx.scheduleAgent(unread.agentId);
+					if (unread && input.schedule !== false) ctx.scheduleAgent(unread.agentId);
 					return Ok({ messageId: receipt.messageId });
 				}
 				const inFlight = ctx.pluginContext.inFlightDeliveries.get(input.deliveryId);
@@ -831,7 +840,7 @@ export const userChatPlugin = definePlugin("user-chat")
 				// After the message lands, so the resumed agent answers it rather than only its old work.
 				const released = await releaseHold();
 				if (!released.ok) return released;
-				ctx.scheduleAgent(agentId);
+				if (input.schedule !== false) ctx.scheduleAgent(agentId);
 				return Ok({ messageId });
 			};
 			if (input.deliveryId === undefined || fingerprint === undefined) return run();

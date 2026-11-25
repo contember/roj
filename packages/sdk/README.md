@@ -129,7 +129,7 @@ work too.
 
 ## Retryable user-chat acceptance
 
-`user-chat.sendMessage` accepts `{ content, agentId?, deliveryId?, keepHold? }` and returns
+`user-chat.sendMessage` accepts `{ content, agentId?, deliveryId?, keepHold?, schedule? }` and returns
 `{ messageId }` in a successful `Result`. `deliveryId` is an optional nonempty
 opaque string of at most 256 characters, scoped to the session. Without it, calls do not deduplicate.
 
@@ -139,6 +139,12 @@ such a message does not release the hold: a held
 agent reads it once the hold is released, and an agent that is not held answers it as
 usual. That agent's `resume_agent` and `worker_resume` refuse what the hold paused.
 `keepHold: true` is part of the delivery fingerprint, so a retry that changes it conflicts.
+
+`schedule: false` is for a note the agent should read but not act on now. The
+message waits in the agent's inbox and no turn starts; the agent reads it at
+the start of its next turn, before whatever started that turn. An agent already
+in a turn reads it at its next inference. `schedule: false` is part of the
+delivery fingerprint too.
 
 - A matching retry returns the original `messageId`, including after replay.
 - Concurrent matching calls in one runtime share the in-flight acceptance.
