@@ -5,6 +5,7 @@ import { MockLLMProvider } from '~/core/llm/mock.js'
 import { selectPluginState } from '~/core/sessions/reducer.js'
 import { ToolCallId } from '~/core/tools/schema.js'
 import { createTestPreset, TestHarness } from '~/testing/index.js'
+import { waitForAllAgentsIdle } from '~/testing/wait-helpers.js'
 import { userChatEvents, userChatPlugin } from './index.js'
 import type { UserChatState } from './plugin.js'
 import { ChatMessageId } from './schema.js'
@@ -133,6 +134,30 @@ describe('user-chat plugin', () => {
 			expect(sent.indexOf('The user reverted README.md')).toBeLessThan(sent.indexOf('Add a contact page'))
 
 			await harness.shutdown()
+		})
+
+		it('an unscheduled note starts no turn when another runtime loads the session either', async () => {
+			const first = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+			const session = await first.createSession('test')
+			await session.sendAndWaitForIdle('Build the site')
+			const note = await session.callPluginMethod('user-chat.sendMessage', { content: 'The user reverted README.md', schedule: false })
+			expect(note.ok).toBe(true)
+			await first.shutdown()
+
+			const second = new TestHarness({
+				presets: [createTestPreset()],
+				eventStore: first.eventStore,
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+			const loaded = await second.sessionManager.getSession(session.sessionId)
+			if (!loaded.ok) throw new Error(`getSession failed: ${loaded.error.message}`)
+			await waitForAllAgentsIdle(loaded.value)
+			expect(second.llmProvider.getCallCount()).toBe(0)
+
+			await second.shutdown()
 		})
 
 		it('a retried unscheduled delivery starts no turn either, and a different schedule conflicts', async () => {

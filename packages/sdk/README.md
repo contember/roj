@@ -141,10 +141,12 @@ usual. That agent's `resume_agent` and `worker_resume` refuse what the hold paus
 `keepHold: true` is part of the delivery fingerprint, so a retry that changes it conflicts.
 
 `schedule: false` is for a note the agent should read but not act on now. The
-message waits in the agent's inbox and no turn starts; the agent reads it at
-the start of its next turn, before whatever started that turn. An agent already
-in a turn reads it at its next inference. `schedule: false` is part of the
-delivery fingerprint too.
+message waits in the agent's inbox, and neither the call nor a later load of the
+session starts a turn for it. The agent reads it with the input of its next
+turn; an agent already in a turn reads it at its next inference. Without
+`keepHold: true` the call still releases a held session, and the resumed agent
+reads the note in that turn. `schedule: false` is part of the delivery
+fingerprint too.
 
 - A matching retry returns the original `messageId`, including after replay.
 - Concurrent matching calls in one runtime share the in-flight acceptance.

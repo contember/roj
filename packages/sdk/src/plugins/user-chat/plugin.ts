@@ -62,6 +62,8 @@ export const userChatEvents = createEventsFactory({
 				id: z.string().min(1),
 				fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
 			}).optional(),
+			// Sent with `schedule: false`: a note that waits for a turn something else starts.
+			schedule: z.literal(false).optional(),
 		}),
 		user_chat_answer_received: z.object({
 			agentId: agentIdSchema,
@@ -140,6 +142,8 @@ export interface PendingInboundMessage {
 	messageIndex?: number;
 	/** For answers: the question's message ID */
 	questionId?: ChatMessageId;
+	/** A note sent with `schedule: false`: read with the next turn's input, never a reason to start one. */
+	unscheduled?: true;
 }
 
 export interface PendingAnswerRecord {
@@ -535,6 +539,7 @@ export const userChatPlugin = definePlugin("user-chat")
 						messageId: event.messageId,
 						agentId: event.agentId,
 						messageIndex: state.messages.length,
+						...(event.schedule === false && { unscheduled: true }),
 					};
 					const acceptedDeliveries = event.delivery
 						? new Map(state.acceptedDeliveries ?? []).set(event.delivery.id, {
@@ -835,6 +840,7 @@ export const userChatPlugin = definePlugin("user-chat")
 						...(input.deliveryId !== undefined && fingerprint !== undefined
 							? { delivery: { id: input.deliveryId, fingerprint } }
 							: {}),
+						...(input.schedule === false && { schedule: false }),
 					}),
 				);
 				// After the message lands, so the resumed agent answers it rather than only its old work.
@@ -909,8 +915,9 @@ export const userChatPlugin = definePlugin("user-chat")
 	})
 	.dequeue({
 		inputKind: "userText",
+		// A note waits for other input; `getPendingMessages` still hands it over with that input.
 		hasPendingMessages: (ctx) =>
-			ctx.pluginState.pendingInbound.some((m) => m.agentId === ctx.agentId),
+			ctx.pluginState.pendingInbound.some((m) => m.agentId === ctx.agentId && m.unscheduled !== true),
 
 		getPendingMessages: (ctx) => {
 			const pending = ctx.pluginState.pendingInbound.filter(
