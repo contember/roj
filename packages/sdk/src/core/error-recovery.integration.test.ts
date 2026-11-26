@@ -481,8 +481,13 @@ describe('core: an agent the provider keeps rejecting', () => {
 		const pauses = await childPauses()
 		expect(pauses).toHaveLength(1)
 		expect(pauses[0].reason).toBe('limit')
+		// Order by position in the store: a restart can share the pause's millisecond timestamp.
+		const events = await session.getEvents()
+		const pauseIndex = events.indexOf(pauses[0])
+		expect(pauseIndex).toBeGreaterThanOrEqual(0)
+		const restartsBeforePause = events.slice(0, pauseIndex).filter((e) => e.type === 'session_restarted').length
 		const restarts = await session.getEventsByType(sessionEvents, 'session_restarted')
-		const resetAfterPause = restarts.filter((e) => e.timestamp >= pauses[0].timestamp).flatMap((e) => e.resetAgentIds)
+		const resetAfterPause = restarts.slice(restartsBeforePause).flatMap((e) => e.resetAgentIds)
 		expect(resetAfterPause).not.toContain(childId)
 
 		const fromChild = await childNotices()
