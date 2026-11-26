@@ -1015,6 +1015,38 @@ describe('user-chat plugin', () => {
 			await harness.shutdown()
 		})
 
+		it('answerQuestion → an answer missing from the request still lands, as JSON drops an undefined one', async () => {
+			const harness = new TestHarness({
+				presets: [createTestPreset()],
+				llmProvider: MockLLMProvider.withSequence([
+					{
+						toolCalls: [{
+							id: ToolCallId('tc1'),
+							name: 'ask_user',
+							input: { question: 'Anything?', inputType: 'text' },
+						}],
+					},
+					{ content: 'Waiting', toolCalls: [] },
+					{ content: 'Got it', toolCalls: [] },
+				]),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Hi')
+
+			const questionEvents = await session.getEventsByType(userChatEvents, 'user_question_asked')
+			const questionId = questionEvents[0].messageId
+			const entryAgentId = session.getEntryAgentId()!
+
+			const result = await session.callPluginMethod('user-chat.answerQuestion', { agentId: String(entryAgentId), questionId })
+			expect(result.ok).toBe(true)
+			await session.waitForIdle()
+
+			expect(await session.getEventsByType('user_chat_answer_received')).toHaveLength(1)
+
+			await harness.shutdown()
+		})
+
 		it('answerQuestion → a resubmitted answer is dropped, not delivered twice', async () => {
 			const harness = new TestHarness({
 				presets: [createTestPreset()],

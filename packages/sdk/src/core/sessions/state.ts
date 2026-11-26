@@ -102,7 +102,7 @@ export const sessionEvents = createEventsFactory({
 		}),
 		session_metadata_set: z4.object({
 			key: z4.string(),
-			value: z4.unknown(),
+			value: z4.unknown().optional(),
 		}),
 		session_overrides_set: sessionOverridesPatchSchema,
 		session_handler_started: z4.object({

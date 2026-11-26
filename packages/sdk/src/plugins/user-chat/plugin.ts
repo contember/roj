@@ -69,7 +69,7 @@ export const userChatEvents = createEventsFactory({
 			agentId: agentIdSchema,
 			messageId: chatMessageIdSchema,
 			questionId: chatMessageIdSchema,
-			answerValue: z.unknown(),
+			answerValue: z.unknown().optional(),
 			timestamp: z.number(),
 		}),
 		user_chat_messages_consumed: z.object({
@@ -867,7 +867,7 @@ export const userChatPlugin = definePlugin("user-chat")
 		input: z.object({
 			agentId: agentIdSchema,
 			questionId: chatMessageIdSchema,
-			answer: z.unknown(),
+			answer: z.unknown().optional(),
 		}),
 		output: z.object({}),
 		handler: async (ctx, input) => {
