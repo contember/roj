@@ -584,7 +584,7 @@ export const workerPlugin = definePlugin('workers')
 			sessionId: z.string(),
 			agentId: agentIdSchema,
 			workerType: z.string(),
-			config: z.unknown(),
+			config: z.unknown().optional(),
 		}),
 		output: z.object({
 			workerId: z.string(),

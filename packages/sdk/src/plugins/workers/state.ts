@@ -21,7 +21,7 @@ export const workerEvents = createEventsFactory({
 			workerId: workerIdSchema,
 			agentId: agentIdSchema,
 			workerType: z.string(),
-			config: z.unknown(),
+			config: z.unknown().optional(),
 			pendingStart: z.boolean().optional(),
 		}),
 		worker_execution_started: z.object({ workerId: workerIdSchema }),

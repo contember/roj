@@ -505,6 +505,27 @@ describe('workers plugin', () => {
 			await harnessNoWorkers.shutdown()
 		})
 
+		it('spawn without a config reaches the worker lookup, as JSON drops an undefined one', async () => {
+			const harness = createWorkersHarness({
+				presets: [createWorkersPreset()],
+				llmProvider: MockLLMProvider.withFixedResponse({ content: 'Ok', toolCalls: [] }),
+			})
+
+			const session = await harness.createSession('test')
+			await session.sendAndWaitForIdle('Hi')
+
+			const result = await session.callPluginMethod('workers.spawn', {
+				sessionId: String(session.sessionId),
+				agentId: String(session.getEntryAgentId()!),
+				workerType: 'nonexistent',
+			})
+			expect(result.ok).toBe(false)
+			if (result.ok) throw new Error('Expected the unknown worker type to be refused')
+			expect(result.error.message).toContain('Unknown worker type: nonexistent')
+
+			await harness.shutdown()
+		})
+
 		it('spawn with invalid config → validation error', async () => {
 			const harness = createWorkersHarness({
 				presets: [createWorkersPreset()],
