@@ -75,6 +75,26 @@ describe('DefaultImageProcessor', () => {
 		errorSpy.mockRestore()
 	})
 
+	it('puts the resizer\'s reason into the note when the original it returned is also over the size limit', async () => {
+		const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+		const dir = await inlineTempDir()
+		const png = encodePng({ width: 2500, height: 10, data: new Uint8Array(2500 * 10 * 3), channels: 3 })
+		const refusing: ImageResizer = {
+			async resize(filePath, mimeType) {
+				return { path: filePath, mimeType, failure: 'too large to decode here' }
+			},
+		}
+		const processor = new DefaultImageProcessor(refusing, createNodeFileSystem(), { maxFileSizeBytes: 10, tmpDir: dir })
+
+		const result = await processor.resolveContent([{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${Buffer.from(png).toString('base64')}` } }])
+
+		if (typeof result === 'string' || result[0]?.type !== 'text') throw new Error(`expected a note, got ${JSON.stringify(result)}`)
+		expect(result[0].text).toStartWith('[Image unavailable: inline image/png - file too large (')
+		expect(result[0].text).toEndWith(', and it could not be shrunk: too large to decode here]')
+		expect(errorSpy).toHaveBeenCalledTimes(1)
+		errorSpy.mockRestore()
+	})
+
 	it('downscales an inline image over the dimension limit through the resizer, and leaves no temp file', async () => {
 		const dir = await inlineTempDir()
 		const png = encodePng({ width: 3000, height: 600, data: new Uint8Array(3000 * 600 * 3).fill(90), channels: 3 })

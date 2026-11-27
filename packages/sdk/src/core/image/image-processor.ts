@@ -203,10 +203,11 @@ export class DefaultImageProcessor implements ImageProcessor {
 
 			const resultSize = (await this.fs.stat(resized.path)).size
 			if (resultSize > this.config.maxFileSizeBytes) {
-				return {
-					type: 'text',
-					text: `[Image unavailable: ${label} - file too large (${formatFileSize(resultSize)}, limit ${formatFileSize(this.config.maxFileSizeBytes)})]`,
-				}
+				const text = `[Image unavailable: ${label} - file too large (${formatFileSize(resultSize)}, limit ${formatFileSize(this.config.maxFileSizeBytes)})${
+					resized.failure === undefined ? '' : `, and it could not be shrunk: ${resized.failure}`
+				}]`
+				if (resized.failure !== undefined) console.error(`[ImageProcessor] ${text}`)
+				return { type: 'text', text }
 			}
 
 			const buffer = await this.fs.readFile(resized.path)

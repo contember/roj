@@ -41,7 +41,8 @@ function decodeBytesPerPixel(bytes: Uint8Array, mimeType: 'image/jpeg' | 'image/
 	}
 	if (bytes.length < 26) return undefined
 	const depth = bytes[24]
-	const channels = depth < 8 ? 3 : PNG_CHANNELS[bytes[25]]
+	const colorType = bytes[25]
+	const channels = depth < 8 && colorType !== 3 ? 3 : PNG_CHANNELS[colorType]
 	return channels === undefined ? undefined : 4 + 3 * channels * (depth === 16 ? 2 : 1)
 }
 
