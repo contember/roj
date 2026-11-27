@@ -42,8 +42,10 @@ export function readImageDimensions(bytes: Uint8Array): ImageDimensions | undefi
 			return { width: view.getUint16(6, true), height: view.getUint16(8, true) }
 		case 'image/webp':
 			return readWebpDimensions(bytes, view)
-		case 'image/jpeg':
-			return readJpegDimensions(bytes, view)
+		case 'image/jpeg': {
+			const frame = readJpegFrame(bytes)
+			return frame && { width: frame.width, height: frame.height }
+		}
 		case undefined:
 			return undefined
 	}
@@ -70,7 +72,9 @@ function readWebpDimensions(bytes: Uint8Array, view: DataView): ImageDimensions 
 /** Start-of-frame markers carry the size; C4 (Huffman table), C8 (reserved) and CC (arithmetic coding) do not. */
 const isStartOfFrame = (marker: number): boolean => marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc
 
-function readJpegDimensions(bytes: Uint8Array, view: DataView): ImageDimensions | undefined {
+/** Size and colour component count of a JPEG, from its start-of-frame header. */
+export function readJpegFrame(bytes: Uint8Array): (ImageDimensions & { components: number }) | undefined {
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
 	let offset = 2
 	while (offset + 4 <= bytes.length) {
 		if (bytes[offset] !== 0xff) return undefined
@@ -86,8 +90,8 @@ function readJpegDimensions(bytes: Uint8Array, view: DataView): ImageDimensions 
 			continue
 		}
 		if (isStartOfFrame(marker)) {
-			if (offset + 9 > bytes.length) return undefined
-			return { width: view.getUint16(offset + 7), height: view.getUint16(offset + 5) }
+			if (offset + 10 > bytes.length) return undefined
+			return { width: view.getUint16(offset + 7), height: view.getUint16(offset + 5), components: bytes[offset + 9] }
 		}
 		offset += 2 + view.getUint16(offset + 2)
 	}

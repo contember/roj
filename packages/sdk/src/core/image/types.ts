@@ -23,10 +23,14 @@ export interface ImageResizeResult {
 	mimeType: string
 	/** A file the resizer created; the caller owns it from here and deletes it. */
 	tempFile?: string
+	/** Why the original came back, when the resizer could not shrink it. */
+	failure?: string
 }
 
 export interface ImageProcessorConfig {
 	maxFileSizeBytes: number
+	/** Where an inline image over the dimension limit is written for the resizer; without it, it becomes a note. */
+	tmpDir?: string
 }
 
 export interface ImageProcessor {

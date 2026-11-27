@@ -2,12 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:te
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { encode as encodePng } from 'fast-png'
 import { SessionFileStore } from '~/core/file-store/file-store.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import type { ChatMessageContentItem, ToolResultContent } from '~/core/llm/llm-log-types.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
+import { readImageDimensions } from './dimensions.js'
 import { DefaultImageProcessor } from './image-processor.js'
+import { JsImageResizer } from './js-resizer.js'
 import { NoopImageResizer } from './noop-resizer.js'
 import { IMAGE_CACHE_DIR, readCachedResize, resizeCachePath, writeCachedResize } from './resize-cache.js'
 import type { ImageResizer } from './types.js'
@@ -41,6 +44,91 @@ describe('DefaultImageProcessor', () => {
 		]
 		const result = await processor.resolveContent(content)
 		expect(result).toEqual([{ type: 'document', document: { mediaType: 'application/pdf', data: 'JVBERi0xLjQK', filename: 'scan.pdf' } }])
+	})
+
+	const inlineDirs: string[] = []
+	afterEach(async () => {
+		for (const dir of inlineDirs.splice(0)) await rm(dir, { recursive: true, force: true })
+	})
+	async function inlineTempDir(): Promise<string> {
+		const dir = await mkdtemp(join(tmpdir(), 'roj-inline-'))
+		inlineDirs.push(dir)
+		return dir
+	}
+
+	it('puts the reason the resizer gives for not shrinking an image into its note, and logs it as an error', async () => {
+		const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+		const dir = await inlineTempDir()
+		const png = encodePng({ width: 2500, height: 10, data: new Uint8Array(2500 * 10 * 3), channels: 3 })
+		const refusing: ImageResizer = {
+			async resize(filePath, mimeType) {
+				return { path: filePath, mimeType, failure: 'too large to decode here' }
+			},
+		}
+		const processor = new DefaultImageProcessor(refusing, createNodeFileSystem(), { maxFileSizeBytes: 5 * 1024 * 1024, tmpDir: dir })
+
+		const result = await processor.resolveContent([{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${Buffer.from(png).toString('base64')}` } }])
+
+		const text = '[Image unavailable: inline image/png - 2500x10 px, over the 2000 px limit, and it could not be downscaled: too large to decode here]'
+		expect(result).toEqual([{ type: 'text', text }])
+		expect(errorSpy).toHaveBeenCalledWith(`[ImageProcessor] ${text}`)
+		errorSpy.mockRestore()
+	})
+
+	it('puts the resizer\'s reason into the note when the original it returned is also over the size limit', async () => {
+		const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+		const dir = await inlineTempDir()
+		const png = encodePng({ width: 2500, height: 10, data: new Uint8Array(2500 * 10 * 3), channels: 3 })
+		const refusing: ImageResizer = {
+			async resize(filePath, mimeType) {
+				return { path: filePath, mimeType, failure: 'too large to decode here' }
+			},
+		}
+		const processor = new DefaultImageProcessor(refusing, createNodeFileSystem(), { maxFileSizeBytes: 10, tmpDir: dir })
+
+		const result = await processor.resolveContent([{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${Buffer.from(png).toString('base64')}` } }])
+
+		if (typeof result === 'string' || result[0]?.type !== 'text') throw new Error(`expected a note, got ${JSON.stringify(result)}`)
+		expect(result[0].text).toStartWith('[Image unavailable: inline image/png - file too large (')
+		expect(result[0].text).toEndWith(', and it could not be shrunk: too large to decode here]')
+		expect(errorSpy).toHaveBeenCalledTimes(1)
+		errorSpy.mockRestore()
+	})
+
+	it('downscales an inline image over the dimension limit through the resizer, and leaves no temp file', async () => {
+		const dir = await inlineTempDir()
+		const png = encodePng({ width: 3000, height: 600, data: new Uint8Array(3000 * 600 * 3).fill(90), channels: 3 })
+		const fs = createNodeFileSystem()
+		const processor = new DefaultImageProcessor(new JsImageResizer({ fs, tmpDir: dir }), fs, { maxFileSizeBytes: 5 * 1024 * 1024, tmpDir: dir })
+
+		const result = await processor.resolveContent([{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${Buffer.from(png).toString('base64')}`, detail: 'high' } }])
+		if (typeof result === 'string') throw new Error('resolveContent collapsed the array form')
+		const item = result[0]
+		if (item.type !== 'image_url') throw new Error(`expected an image, got ${JSON.stringify(item)}`)
+
+		expect(item.imageUrl.detail).toBe('high')
+		expect(item.imageUrl.url).toStartWith('data:image/jpeg;base64,')
+		expect(readImageDimensions(Buffer.from(item.imageUrl.url.slice('data:image/jpeg;base64,'.length), 'base64'))).toEqual({ width: 2000, height: 400 })
+		expect(await readdir(dir)).toEqual([])
+	})
+
+	it('names an inline image the resizer could not shrink, without its temp path', async () => {
+		const dir = await inlineTempDir()
+		const png = encodePng({ width: 2500, height: 10, data: new Uint8Array(2500 * 10 * 3), channels: 3 })
+		const processor = new DefaultImageProcessor(new NoopImageResizer(), createNodeFileSystem(), { maxFileSizeBytes: 5 * 1024 * 1024, tmpDir: dir })
+
+		const result = await processor.resolveContent([{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${Buffer.from(png).toString('base64')}` } }])
+
+		expect(result).toEqual([{ type: 'text', text: '[Image unavailable: inline image/png - 2500x10 px, over the 2000 px limit, and it could not be downscaled]' }])
+		expect(await readdir(dir)).toEqual([])
+	})
+
+	it('leaves out an inline image over the limit when it has no temp directory to resize it in', async () => {
+		const png = encodePng({ width: 2500, height: 10, data: new Uint8Array(2500 * 10 * 3), channels: 3 })
+
+		const result = await createProcessor().resolveContent([{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${Buffer.from(png).toString('base64')}` } }])
+
+		expect(result).toEqual([{ type: 'text', text: '[Image unavailable: inline image/png - 2500x10 px, over the 2000 px limit, with no temp directory to resize it in]' }])
 	})
 
 	it('passes through non-file:// image URLs unchanged', async () => {

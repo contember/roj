@@ -4,6 +4,17 @@ import type { ProcessRunner } from '~/platform/process.js'
 import { MAX_IMAGE_DIMENSION } from './dimensions.js'
 import type { ImageResizeOptions, ImageResizer, ImageResizeResult } from './types.js'
 
+/** The steps taken to fit a size limit: lower JPEG quality first, then half the max dimension. */
+export const COMPRESSION_STEPS: ReadonlyArray<{ scale: number; quality: number }> = [
+	{ scale: 1, quality: 85 },
+	{ scale: 1, quality: 70 },
+	{ scale: 1, quality: 50 },
+	{ scale: 1, quality: 30 },
+	{ scale: 0.5, quality: 70 },
+	{ scale: 0.5, quality: 50 },
+	{ scale: 0.5, quality: 30 },
+]
+
 /** A `--size` that only shrinks: without the `>`, vipsthumbnail enlarges a smaller image to the box. */
 const shrinkOnly = (dimension: number): string => `${dimension}x${dimension}>`
 
@@ -12,6 +23,8 @@ export interface VipsImageResizerOptions {
 	process: ProcessRunner
 	tmpDir: string
 	maxDimension?: number
+	/** Resizes when vips fails, e.g. on a host without its binaries. Without one, the original image is returned. */
+	fallback?: ImageResizer
 }
 
 export class VipsImageResizer implements ImageResizer {
@@ -19,12 +32,14 @@ export class VipsImageResizer implements ImageResizer {
 	private readonly process: ProcessRunner
 	private readonly tmpDir: string
 	private readonly maxDimension: number
+	private readonly fallback: ImageResizer | undefined
 
 	constructor(options: VipsImageResizerOptions) {
 		this.fs = options.fs
 		this.process = options.process
 		this.tmpDir = options.tmpDir
 		this.maxDimension = options.maxDimension ?? MAX_IMAGE_DIMENSION
+		this.fallback = options.fallback
 	}
 
 	async resize(filePath: string, mimeType: string, options?: ImageResizeOptions): Promise<ImageResizeResult> {
@@ -68,8 +83,13 @@ export class VipsImageResizer implements ImageResizer {
 				await this.fs.unlink(ownedTempFile).catch(() => {})
 			}
 			if (signal?.aborted) signal.throwIfAborted()
-			console.warn('[image-resize] failed, using original image:', e instanceof Error ? e.message : e)
-			return { path: filePath, mimeType }
+			const failure = e instanceof Error ? e.message : String(e)
+			if (this.fallback !== undefined) {
+				console.warn('[image-resize] vips failed, resizing without it:', failure)
+				return this.fallback.resize(filePath, mimeType, { ...options, maxDimension: effectiveMaxDimension })
+			}
+			console.warn('[image-resize] failed, using original image:', failure)
+			return { path: filePath, mimeType, failure }
 		}
 	}
 
@@ -131,16 +151,7 @@ export class VipsImageResizer implements ImageResizer {
 		maxDimension: number,
 		signal?: AbortSignal,
 	): Promise<ImageResizeResult> {
-		const halfDim = Math.floor(maxDimension / 2)
-		const attempts = [
-			{ dimension: maxDimension, quality: 85 },
-			{ dimension: maxDimension, quality: 70 },
-			{ dimension: maxDimension, quality: 50 },
-			{ dimension: maxDimension, quality: 30 },
-			{ dimension: halfDim, quality: 70 },
-			{ dimension: halfDim, quality: 50 },
-			{ dimension: halfDim, quality: 30 },
-		]
+		const attempts = COMPRESSION_STEPS.map(({ scale, quality }) => ({ dimension: Math.floor(maxDimension * scale), quality }))
 
 		let lastResult: ImageResizeResult | undefined
 
