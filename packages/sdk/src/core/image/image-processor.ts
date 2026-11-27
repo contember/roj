@@ -5,6 +5,7 @@ import type { ChatMessageContentItem, ChatMessageContentItemImage, ChatMessageCo
 import { getImageMimeType } from '~/lib/mime.js'
 import type { FileSystem } from '~/platform/fs.js'
 import { exceedsMaxDimension, MAX_IMAGE_DIMENSION, readImageDimensions } from './dimensions.js'
+import { downscaleImage } from './js-resizer.js'
 import { readCachedResize, resizeCachePath, type ResizeCacheOptions, UNCHANGED, writeCachedResize } from './resize-cache.js'
 import type { ImageProcessor, ImageProcessorConfig, ImageResizer } from './types.js'
 
@@ -14,17 +15,25 @@ type ResolvedImage = ChatMessageContentItemImage | ChatMessageContentItemText
 const BASE64_DATA_URL = /^data:([^;,]*)(?:;[^;,]*)*;base64,/i
 
 /**
- * An inline `data:` image over the dimension limit becomes a note: an agent stores every one as a file, so only a
- * direct provider call sends one, and the processor has nowhere to write it for the resizer.
+ * An inline `data:` image over the dimension limit is downscaled in memory: an agent stores every one as a file, so
+ * only a direct provider call sends one, and the processor has nowhere to write it for the resizer.
  */
-function withinLimitInline(item: ChatMessageContentItemImage): ResolvedImage {
+function withinLimitInline(item: ChatMessageContentItemImage, maxFileSizeBytes: number): ResolvedImage {
 	const match = BASE64_DATA_URL.exec(item.imageUrl.url)
 	if (match === null) return item
-	const dimensions = readImageDimensions(Buffer.from(item.imageUrl.url.slice(match[0].length), 'base64'))
+	const bytes = Buffer.from(item.imageUrl.url.slice(match[0].length), 'base64')
+	const dimensions = readImageDimensions(bytes)
 	if (dimensions === undefined || !exceedsMaxDimension(dimensions)) return item
-	return {
-		type: 'text',
-		text: `[Image unavailable: inline ${match[1] || 'image'} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit]`,
+	try {
+		const resized = downscaleImage(bytes, { maxDimension: MAX_IMAGE_DIMENSION, maxFileSizeBytes })
+		return { type: 'image_url', imageUrl: { url: `data:image/jpeg;base64,${resized.toString('base64')}`, detail: item.imageUrl.detail } }
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error)
+		console.warn(`[ImageProcessor] Could not downscale an inline ${match[1] || 'image'} of ${dimensions.width}x${dimensions.height} px: ${reason}`)
+		return {
+			type: 'text',
+			text: `[Image unavailable: inline ${match[1] || 'image'} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit, and it could not be downscaled: ${reason}]`,
+		}
 	}
 }
 
@@ -46,7 +55,7 @@ export class DefaultImageProcessor implements ImageProcessor {
 			content.map(async (item): Promise<ChatMessageContentItem> => {
 				if (item.type !== 'image_url') return item
 				// A remote URL is fetched by the provider itself, so its size is unknown here.
-				if (!item.imageUrl.url.startsWith('file://')) return withinLimitInline(item)
+				if (!item.imageUrl.url.startsWith('file://')) return withinLimitInline(item, this.config.maxFileSizeBytes)
 
 				const rawPath = item.imageUrl.url.slice(7)
 

@@ -9,6 +9,7 @@ import { FileEventStore, MemoryEventStore } from '~/core/events/index.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import { DefaultImageProcessor } from '~/core/image/image-processor.js'
 import type { ImageResizer } from '~/core/image/types.js'
+import { JsImageResizer } from '~/core/image/js-resizer.js'
 import { VipsImageResizer } from '~/core/image/vips-resizer.js'
 import { AnthropicProvider } from '~/core/llm/anthropic.js'
 import { LLMLogger, LoggingLLMProvider, MockLLMProvider } from '~/core/llm/index.js'
@@ -201,7 +202,12 @@ export function bootstrap(config: Config, userConfig: RojConfig, platform: Platf
 			? new MemoryEventStore()
 			: new FileEventStore(config.dataPath, platform.fs, logger))
 
-	const imageResizer = platform.imageResizer ?? new VipsImageResizer({ fs: platform.fs, process: platform.process, tmpDir: platform.tmpDir })
+	const imageResizer = platform.imageResizer ?? new VipsImageResizer({
+		fs: platform.fs,
+		process: platform.process,
+		tmpDir: platform.tmpDir,
+		fallback: new JsImageResizer({ fs: platform.fs, tmpDir: platform.tmpDir }),
+	})
 	const { llmProvider, llmProviders, llmLogger } = createLLMProvider(config, logger, platform, imageResizer)
 
 	// The one place the declared sandbox settings are folded in — every host lands here.

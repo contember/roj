@@ -12,6 +12,8 @@ export interface VipsImageResizerOptions {
 	process: ProcessRunner
 	tmpDir: string
 	maxDimension?: number
+	/** Resizes when vips fails, e.g. on a host without its binaries. Without one, the original image is returned. */
+	fallback?: ImageResizer
 }
 
 export class VipsImageResizer implements ImageResizer {
@@ -19,12 +21,14 @@ export class VipsImageResizer implements ImageResizer {
 	private readonly process: ProcessRunner
 	private readonly tmpDir: string
 	private readonly maxDimension: number
+	private readonly fallback: ImageResizer | undefined
 
 	constructor(options: VipsImageResizerOptions) {
 		this.fs = options.fs
 		this.process = options.process
 		this.tmpDir = options.tmpDir
 		this.maxDimension = options.maxDimension ?? MAX_IMAGE_DIMENSION
+		this.fallback = options.fallback
 	}
 
 	async resize(filePath: string, mimeType: string, options?: ImageResizeOptions): Promise<ImageResizeResult> {
@@ -68,7 +72,12 @@ export class VipsImageResizer implements ImageResizer {
 				await this.fs.unlink(ownedTempFile).catch(() => {})
 			}
 			if (signal?.aborted) signal.throwIfAborted()
-			console.warn('[image-resize] failed, using original image:', e instanceof Error ? e.message : e)
+			const reason = e instanceof Error ? e.message : e
+			if (this.fallback !== undefined) {
+				console.warn('[image-resize] vips failed, resizing without it:', reason)
+				return this.fallback.resize(filePath, mimeType, { ...options, maxDimension: effectiveMaxDimension })
+			}
+			console.warn('[image-resize] failed, using original image:', reason)
 			return { path: filePath, mimeType }
 		}
 	}

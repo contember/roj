@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import type { FileSystem } from '~/platform/fs.js'
 import type { ExecFileResult, ProcessRunner } from '~/platform/process.js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
+import type { ImageResizeOptions, ImageResizer } from './types.js'
 import { VipsImageResizer } from './vips-resizer.js'
 
 type ExecFileCallback = (error: Error | null, stdout: string, stderr: string) => void
@@ -183,6 +184,25 @@ describe('VipsImageResizer', () => {
 
 		expect(result).toEqual({ path: testJpegPath, mimeType: 'image/png' })
 		expect(warnSpy).toHaveBeenCalled()
+	})
+
+	it('hands the image to the fallback when vips fails, with the effective max dimension', async () => {
+		execFileImpl = (_cmd, _args, _opts, cb) => {
+			cb(new Error('vipsheader: command not found'), '', '')
+		}
+		const calls: Array<{ filePath: string; mimeType: string; options?: ImageResizeOptions }> = []
+		const fallback: ImageResizer = {
+			async resize(filePath, mimeType, options) {
+				calls.push({ filePath, mimeType, options })
+				return { path: '/tmp/fallback.jpg', mimeType: 'image/jpeg', tempFile: '/tmp/fallback.jpg' }
+			},
+		}
+		const resizer = new VipsImageResizer({ fs: createNodeFileSystem(), process: createFakeProcessRunner(), tmpDir: tmpdir(), maxDimension: 1500, fallback })
+
+		const result = await resizer.resize(testJpegPath, 'image/png', { maxFileSizeBytes: 1000 })
+
+		expect(result).toEqual({ path: '/tmp/fallback.jpg', mimeType: 'image/jpeg', tempFile: '/tmp/fallback.jpg' })
+		expect(calls).toEqual([{ filePath: testJpegPath, mimeType: 'image/png', options: { maxFileSizeBytes: 1000, maxDimension: 1500 } }])
 	})
 
 	it('returns original path when vipsthumbnail fails (graceful degradation)', async () => {

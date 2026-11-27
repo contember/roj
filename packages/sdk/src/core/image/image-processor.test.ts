@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:te
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { encode as encodePng } from 'fast-png'
 import { SessionFileStore } from '~/core/file-store/file-store.js'
 import type { FileStore } from '~/core/file-store/types.js'
 import type { ChatMessageContentItem, ToolResultContent } from '~/core/llm/llm-log-types.js'
 import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
+import { readImageDimensions } from './dimensions.js'
 import { DefaultImageProcessor } from './image-processor.js'
 import { NoopImageResizer } from './noop-resizer.js'
 import { IMAGE_CACHE_DIR, readCachedResize, resizeCachePath, writeCachedResize } from './resize-cache.js'
@@ -41,6 +43,36 @@ describe('DefaultImageProcessor', () => {
 		]
 		const result = await processor.resolveContent(content)
 		expect(result).toEqual([{ type: 'document', document: { mediaType: 'application/pdf', data: 'JVBERi0xLjQK', filename: 'scan.pdf' } }])
+	})
+
+	it('downscales an inline image over the dimension limit without a resizer', async () => {
+		const png = encodePng({ width: 3000, height: 600, data: new Uint8Array(3000 * 600 * 3).fill(90), channels: 3 })
+		const processor = createProcessor()
+
+		const result = await processor.resolveContent([{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${Buffer.from(png).toString('base64')}`, detail: 'high' } }])
+		if (typeof result === 'string') throw new Error('resolveContent collapsed the array form')
+		const item = result[0]
+		if (item.type !== 'image_url') throw new Error(`expected an image, got ${JSON.stringify(item)}`)
+
+		expect(item.imageUrl.detail).toBe('high')
+		expect(item.imageUrl.url).toStartWith('data:image/jpeg;base64,')
+		expect(readImageDimensions(Buffer.from(item.imageUrl.url.slice('data:image/jpeg;base64,'.length), 'base64'))).toEqual({ width: 2000, height: 400 })
+	})
+
+	it('says why an inline image over the limit in a format it cannot decode is left out', async () => {
+		const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+		// A GIF header that claims 2500×100 px.
+		const gif = Buffer.from([...Buffer.from('GIF89a', 'latin1'), 0xc4, 0x09, 0x64, 0x00])
+		const processor = createProcessor()
+
+		const result = await processor.resolveContent([{ type: 'image_url', imageUrl: { url: `data:image/gif;base64,${gif.toString('base64')}` } }])
+
+		expect(result).toEqual([{
+			type: 'text',
+			text: '[Image unavailable: inline image/gif - 2500x100 px, over the 2000 px limit, and it could not be downscaled: image/gif cannot be decoded without libvips]',
+		}])
+		expect(warnSpy).toHaveBeenCalledTimes(1)
+		warnSpy.mockRestore()
 	})
 
 	it('passes through non-file:// image URLs unchanged', async () => {

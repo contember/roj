@@ -80,8 +80,8 @@ export interface Platform {
 	 */
 	llmCallLog?: LLMCallStore
 	/**
-	 * Shrinks images before they reach a model. Absent on hosts with a process table,
-	 * which keep resizing with the `vipsheader` / `vipsthumbnail` binaries.
+	 * Shrinks images before they reach a model. When absent, the `vipsheader` / `vipsthumbnail`
+	 * binaries resize, and a slower JS resizer for JPEG and PNG takes over where they cannot run.
 	 */
 	imageResizer?: ImageResizer
 	/** Absolute path to the OS temp directory (equivalent to `os.tmpdir()` on Node/Bun). */
