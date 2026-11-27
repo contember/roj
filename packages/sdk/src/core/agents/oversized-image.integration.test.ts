@@ -230,16 +230,18 @@ describe('an image over the dimension limit', () => {
 		await rm(dir, { recursive: true, force: true })
 	})
 
-	it('becomes a note when it is inline, as a direct provider call sends it', async () => {
+	it('is downscaled in memory when it is inline, as a direct provider call sends it, and a smaller one is sent as it is', async () => {
 		const resolved = await new DefaultImageProcessor(vipsResizer(), createNodeFileSystem()).resolveContent([
 			{ type: 'image_url', imageUrl: { url: pngDataUrl(3500, 1000) } },
 			{ type: 'image_url', imageUrl: { url: pngDataUrl(500, 300) } },
 		])
 
-		expect(resolved).toEqual([
-			{ type: 'text', text: '[Image unavailable: inline image/png - 3500x1000 px, over the 2000 px limit]' },
-			{ type: 'image_url', imageUrl: { url: pngDataUrl(500, 300) } },
-		])
+		if (typeof resolved === 'string') throw new Error('expected content items')
+		const [large, small] = resolved
+		if (large?.type !== 'image_url') throw new Error(`expected an image, got ${JSON.stringify(large)}`)
+		expect(large.imageUrl.url).toStartWith('data:image/jpeg;base64,')
+		expect(readImageDimensions(Buffer.from(large.imageUrl.url.split(',')[1], 'base64'))).toEqual({ width: 2000, height: 571 })
+		expect(small).toEqual({ type: 'image_url', imageUrl: { url: pngDataUrl(500, 300) } })
 	})
 
 	it('becomes a note when no resizer can shrink it', async () => {
