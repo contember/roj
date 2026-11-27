@@ -6,7 +6,7 @@ import { getImageMimeType } from '~/lib/mime.js'
 import type { FileSystem } from '~/platform/fs.js'
 import { exceedsMaxDimension, MAX_IMAGE_DIMENSION, readImageDimensions, readImageMimeType } from './dimensions.js'
 import { readCachedResize, resizeCachePath, type ResizeCacheOptions, UNCHANGED, writeCachedResize } from './resize-cache.js'
-import type { ImageProcessor, ImageProcessorConfig, ImageResizer } from './types.js'
+import type { ImageProcessor, ImageProcessorConfig, ImageResizer, ImageResizeResult } from './types.js'
 
 /** A resolved image, or the text that says why it could not be. */
 type ResolvedImage = ChatMessageContentItemImage | ChatMessageContentItemText
@@ -84,6 +84,11 @@ export class DefaultImageProcessor implements ImageProcessor {
 		const path = join(this.config.tmpDir, `roj-inline-${Date.now()}-${Math.random().toString(36).slice(2)}.${mimeType.slice('image/'.length)}`)
 		try {
 			await this.fs.writeFile(path, bytes)
+		} catch (error) {
+			console.warn(`[ImageProcessor] Could not write ${label} to ${path} for the resizer:`, error instanceof Error ? error.message : error)
+			return { type: 'text', text: `[Image unavailable: ${label} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit, and it could not be written out to resize]` }
+		}
+		try {
 			return await this.readAndEncode(path, mimeType, item.imageUrl.detail, undefined, label)
 		} catch {
 			return { type: 'text', text: `[Image unavailable: ${label} - read error]` }
@@ -192,7 +197,7 @@ export class DefaultImageProcessor implements ImageProcessor {
 		const lookup = cacheStore === undefined ? undefined : await this.lookUpCache(filePath, mimeType, options, cacheStore, detail)
 		if (lookup?.hit !== undefined) return lookup.hit
 
-		let resized: { path: string; mimeType: string; tempFile?: string } | undefined
+		let resized: ImageResizeResult | undefined
 		try {
 			resized = await this.resizer.resize(filePath, mimeType, options)
 
@@ -205,7 +210,7 @@ export class DefaultImageProcessor implements ImageProcessor {
 			}
 
 			const buffer = await this.fs.readFile(resized.path)
-			const encoded = this.encode(label, buffer, resized.mimeType, detail)
+			const encoded = this.encode(label, buffer, resized.mimeType, detail, resized.failure)
 			if (cacheStore !== undefined && lookup !== undefined && encoded.type === 'image_url') {
 				if (resized.path !== filePath) {
 					await writeCachedResize(cacheStore, lookup.path, { bytes: buffer, mimeType: resized.mimeType })
@@ -221,14 +226,15 @@ export class DefaultImageProcessor implements ImageProcessor {
 		}
 	}
 
-	private encode(label: string, buffer: Buffer, mimeType: string, detail: 'auto' | 'low' | 'high' | undefined): ResolvedImage {
+	private encode(label: string, buffer: Buffer, mimeType: string, detail: 'auto' | 'low' | 'high' | undefined, failure?: string): ResolvedImage {
 		// A resizer that is missing or failed returns the original image.
 		const dimensions = readImageDimensions(buffer)
 		if (dimensions !== undefined && exceedsMaxDimension(dimensions)) {
-			return {
-				type: 'text',
-				text: `[Image unavailable: ${label} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit, and it could not be downscaled]`,
-			}
+			const text = `[Image unavailable: ${label} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit, and it could not be downscaled${
+				failure === undefined ? '' : `: ${failure}`
+			}]`
+			console.error(`[ImageProcessor] ${text}`)
+			return { type: 'text', text }
 		}
 		return {
 			type: 'image_url',

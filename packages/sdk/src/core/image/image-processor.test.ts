@@ -46,8 +46,37 @@ describe('DefaultImageProcessor', () => {
 		expect(result).toEqual([{ type: 'document', document: { mediaType: 'application/pdf', data: 'JVBERi0xLjQK', filename: 'scan.pdf' } }])
 	})
 
-	it('downscales an inline image over the dimension limit through the resizer, and leaves no temp file', async () => {
+	const inlineDirs: string[] = []
+	afterEach(async () => {
+		for (const dir of inlineDirs.splice(0)) await rm(dir, { recursive: true, force: true })
+	})
+	async function inlineTempDir(): Promise<string> {
 		const dir = await mkdtemp(join(tmpdir(), 'roj-inline-'))
+		inlineDirs.push(dir)
+		return dir
+	}
+
+	it('puts the reason the resizer gives for not shrinking an image into its note, and logs it as an error', async () => {
+		const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+		const dir = await inlineTempDir()
+		const png = encodePng({ width: 2500, height: 10, data: new Uint8Array(2500 * 10 * 3), channels: 3 })
+		const refusing: ImageResizer = {
+			async resize(filePath, mimeType) {
+				return { path: filePath, mimeType, failure: 'too large to decode here' }
+			},
+		}
+		const processor = new DefaultImageProcessor(refusing, createNodeFileSystem(), { maxFileSizeBytes: 5 * 1024 * 1024, tmpDir: dir })
+
+		const result = await processor.resolveContent([{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${Buffer.from(png).toString('base64')}` } }])
+
+		const text = '[Image unavailable: inline image/png - 2500x10 px, over the 2000 px limit, and it could not be downscaled: too large to decode here]'
+		expect(result).toEqual([{ type: 'text', text }])
+		expect(errorSpy).toHaveBeenCalledWith(`[ImageProcessor] ${text}`)
+		errorSpy.mockRestore()
+	})
+
+	it('downscales an inline image over the dimension limit through the resizer, and leaves no temp file', async () => {
+		const dir = await inlineTempDir()
 		const png = encodePng({ width: 3000, height: 600, data: new Uint8Array(3000 * 600 * 3).fill(90), channels: 3 })
 		const fs = createNodeFileSystem()
 		const processor = new DefaultImageProcessor(new JsImageResizer({ fs, tmpDir: dir }), fs, { maxFileSizeBytes: 5 * 1024 * 1024, tmpDir: dir })
@@ -61,11 +90,10 @@ describe('DefaultImageProcessor', () => {
 		expect(item.imageUrl.url).toStartWith('data:image/jpeg;base64,')
 		expect(readImageDimensions(Buffer.from(item.imageUrl.url.slice('data:image/jpeg;base64,'.length), 'base64'))).toEqual({ width: 2000, height: 400 })
 		expect(await readdir(dir)).toEqual([])
-		await rm(dir, { recursive: true, force: true })
 	})
 
 	it('names an inline image the resizer could not shrink, without its temp path', async () => {
-		const dir = await mkdtemp(join(tmpdir(), 'roj-inline-'))
+		const dir = await inlineTempDir()
 		const png = encodePng({ width: 2500, height: 10, data: new Uint8Array(2500 * 10 * 3), channels: 3 })
 		const processor = new DefaultImageProcessor(new NoopImageResizer(), createNodeFileSystem(), { maxFileSizeBytes: 5 * 1024 * 1024, tmpDir: dir })
 
@@ -73,7 +101,6 @@ describe('DefaultImageProcessor', () => {
 
 		expect(result).toEqual([{ type: 'text', text: '[Image unavailable: inline image/png - 2500x10 px, over the 2000 px limit, and it could not be downscaled]' }])
 		expect(await readdir(dir)).toEqual([])
-		await rm(dir, { recursive: true, force: true })
 	})
 
 	it('leaves out an inline image over the limit when it has no temp directory to resize it in', async () => {

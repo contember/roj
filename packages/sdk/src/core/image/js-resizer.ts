@@ -2,7 +2,7 @@ import { join } from 'node:path'
 import { convertIndexedToRgb, type DecodedPng, decode as decodePng } from 'fast-png'
 import { decode as decodeJpeg, encode as encodeJpeg } from 'jpeg-js'
 import type { FileSystem } from '~/platform/fs.js'
-import { MAX_IMAGE_DIMENSION, readImageDimensions, readImageMimeType } from './dimensions.js'
+import { MAX_IMAGE_DIMENSION, readImageDimensions, readImageMimeType, readJpegFrame } from './dimensions.js'
 import type { ImageResizeOptions, ImageResizer, ImageResizeResult } from './types.js'
 import { COMPRESSION_STEPS } from './vips-resizer.js'
 
@@ -24,14 +24,26 @@ interface Rgba {
 	data: Uint8Array
 }
 
-/**
- * Peak bytes per pixel to decode and shrink, measured as process RSS under Node: jpeg-js keeps every DCT block as
- * its own typed array (28 B/px at 4:2:0 chroma, 60 at 4:4:4), fast-png about 12.
- */
-const DECODE_BYTES_PER_PIXEL = { 'image/jpeg': 60, 'image/png': 16 }
-
-/** Decode budget where the process has memory to spare: a JPEG up to ~4 MP, a PNG up to ~16 MP. */
+/** Decode budget where the process has memory to spare: a 3-component JPEG up to ~4 MP, an RGB PNG up to ~20 MP. */
 export const DEFAULT_MAX_DECODE_BYTES = 256 * 1024 * 1024
+
+/** PNG samples per pixel by colour type; palette and packed gray expand to RGB(A) before shrinking. */
+const PNG_CHANNELS: Record<number, number> = { 0: 1, 2: 3, 3: 4, 4: 2, 6: 4 }
+
+/**
+ * Peak bytes per pixel to decode and shrink, fitted to process RSS measured under a cgroup cap: jpeg-js keeps every
+ * DCT block as its own typed array (~20 B/px per component), fast-png holds the inflated rows and the samples.
+ */
+function decodeBytesPerPixel(bytes: Uint8Array, mimeType: 'image/jpeg' | 'image/png'): number | undefined {
+	if (mimeType === 'image/jpeg') {
+		const components = readJpegFrame(bytes)?.components
+		return components === undefined ? undefined : 20 * components
+	}
+	if (bytes.length < 26) return undefined
+	const depth = bytes[24]
+	const channels = depth < 8 ? 3 : PNG_CHANNELS[bytes[25]]
+	return channels === undefined ? undefined : 4 + 3 * channels * (depth === 16 ? 2 : 1)
+}
 
 export interface DownscaleOptions {
 	maxDimension: number
@@ -50,7 +62,9 @@ export function downscaleImage(bytes: Uint8Array, options: DownscaleOptions): Bu
 	if (mimeType !== 'image/jpeg' && mimeType !== 'image/png') throw new Error(`${mimeType ?? 'this format'} cannot be decoded without libvips`)
 	const dimensions = readImageDimensions(bytes)
 	if (dimensions === undefined) throw new Error(`the ${mimeType} header cannot be read`)
-	const decodeBytes = dimensions.width * dimensions.height * DECODE_BYTES_PER_PIXEL[mimeType]
+	const bytesPerPixel = decodeBytesPerPixel(bytes, mimeType)
+	if (bytesPerPixel === undefined) throw new Error(`the ${mimeType} header cannot be read`)
+	const decodeBytes = dimensions.width * dimensions.height * bytesPerPixel
 	if (decodeBytes > options.maxDecodeBytes) {
 		throw new Error(
 			`a ${dimensions.width}x${dimensions.height} px ${mimeType} takes ~${megabytes(decodeBytes)} MB to decode, over the ${
@@ -59,10 +73,9 @@ export function downscaleImage(bytes: Uint8Array, options: DownscaleOptions): Bu
 		)
 	}
 
-	const raster = mimeType === 'image/jpeg' ? decodeJpegRaster(bytes) : decodePngRaster(bytes)
 	const orientation = mimeType === 'image/jpeg' ? readJpegOrientation(bytes) : 1
-	// The decoded image is let go here; the half-size steps shrink the full-size result.
-	const full = orient(shrink(raster, options.maxDimension), orientation)
+	// The half-size steps shrink the full-size result, so nothing keeps the decoded image.
+	const full = orient(shrink(mimeType === 'image/jpeg' ? decodeJpegRaster(bytes) : decodePngRaster(bytes), options.maxDimension), orientation)
 	let half: Rgba | undefined
 
 	let encoded: Buffer | undefined
@@ -280,8 +293,9 @@ export class JsImageResizer implements ImageResizer {
 		} catch (error) {
 			if (outputPath !== undefined) await this.fs.unlink(outputPath).catch(() => {})
 			if (signal?.aborted) signal.throwIfAborted()
-			console.warn(`[image-resize] could not resize ${filePath} without libvips, using the original image:`, error instanceof Error ? error.message : error)
-			return { path: filePath, mimeType }
+			const failure = error instanceof Error ? error.message : String(error)
+			console.warn(`[image-resize] could not resize ${filePath} without libvips, using the original image: ${failure}`)
+			return { path: filePath, mimeType, failure }
 		}
 	}
 }

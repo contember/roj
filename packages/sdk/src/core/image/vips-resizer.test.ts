@@ -182,7 +182,7 @@ describe('VipsImageResizer', () => {
 		const resizer = createResizer()
 		const result = await resizer.resize(testJpegPath, 'image/png')
 
-		expect(result).toEqual({ path: testJpegPath, mimeType: 'image/png' })
+		expect(result).toEqual({ path: testJpegPath, mimeType: 'image/png', failure: 'vipsheader: command not found' })
 		expect(warnSpy).toHaveBeenCalled()
 	})
 
@@ -214,7 +214,7 @@ describe('VipsImageResizer', () => {
 		const resizer = createResizer()
 		const result = await resizer.resize(testJpegPath, 'image/png')
 
-		expect(result).toEqual({ path: testJpegPath, mimeType: 'image/png' })
+		expect(result).toEqual({ path: testJpegPath, mimeType: 'image/png', failure: 'vipsthumbnail: command not found' })
 		expect(warnSpy).toHaveBeenCalled()
 	})
 
@@ -231,7 +231,7 @@ describe('VipsImageResizer', () => {
 
 		const result = await createResizer().resize(testJpegPath, 'image/png')
 
-		expect(result).toEqual({ path: testJpegPath, mimeType: 'image/png' })
+		expect(result).toEqual({ path: testJpegPath, mimeType: 'image/png', failure: 'resize failed' })
 		expect(await Bun.file(partialPath).exists()).toBe(false)
 	})
 
@@ -559,7 +559,7 @@ describe('VipsImageResizer', () => {
 				maxFileSizeBytes: 100,
 			})
 
-			expect(result).toEqual({ path: testPath, mimeType: 'image/jpeg' })
+			expect(result).toEqual({ path: testPath, mimeType: 'image/jpeg', failure: expect.stringContaining('ENOENT') })
 			expect(outputPaths).toHaveLength(2)
 			for (const outputPath of outputPaths) {
 				expect(await Bun.file(outputPath).exists()).toBe(false)

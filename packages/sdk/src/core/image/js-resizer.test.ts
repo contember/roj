@@ -170,6 +170,15 @@ describe('downscaleImage', () => {
 		expectColor(pixel(fromBits, 6, 1), WHITE)
 	})
 
+	it('estimates the decode cost from the header: a 16-bit RGBA PNG costs more than an 8-bit RGB one', () => {
+		const budget = { maxDimension: 500, maxDecodeBytes: 20 * 1024 * 1024 }
+		const rgb8 = encodePng({ width: 1000, height: 1000, data: new Uint8Array(1000 * 1000 * 3), channels: 3 })
+		const rgba16 = encodePng({ width: 1000, height: 1000, data: new Uint16Array(1000 * 1000 * 4), channels: 4, depth: 16 })
+
+		expect(readImageDimensions(downscaleImage(rgb8, budget))).toEqual({ width: 500, height: 500 })
+		expect(() => downscaleImage(rgba16, budget)).toThrow('a 1000x1000 px image/png takes ~27 MB to decode, over the 20 MB this host allows without libvips')
+	})
+
 	it('refuses, before decoding, an image over the decode budget', () => {
 		expect(() => downscaleImage(jpeg(3000, 1000), { maxDimension: 2000, maxDecodeBytes: 64 * 1024 * 1024 })).toThrow(
 			'a 3000x1000 px image/jpeg takes ~172 MB to decode, over the 64 MB this host allows without libvips',
@@ -239,7 +248,11 @@ describe('JsImageResizer', () => {
 		const gif = Buffer.from(await readFile(join(import.meta.dir, 'fixtures', '37x21.gif')))
 		await writeFile(source, gif)
 
-		expect(await resizer.resize(source, 'image/gif', { maxDimension: 10 })).toEqual({ path: source, mimeType: 'image/gif' })
+		expect(await resizer.resize(source, 'image/gif', { maxDimension: 10 })).toEqual({
+			path: source,
+			mimeType: 'image/gif',
+			failure: 'image/gif cannot be decoded without libvips',
+		})
 		expect(warnSpy).toHaveBeenCalledTimes(1)
 		expect(await readdir(dir)).toEqual(['big.gif'])
 	})

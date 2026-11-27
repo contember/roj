@@ -40,7 +40,7 @@ export type { LiveScheduler, Scheduler, WakeHandler } from './scheduler.js'
 export type { SessionLogPage, SessionLogStore } from './session-log.js'
 export type { ShellConfinement, ShellGrant, ShellLimits, ShellRunner, ShellRunOptions, ShellRunResult } from './shell.js'
 
-export { DEFAULT_MAX_DECODE_BYTES, JsImageResizer } from '../core/image/js-resizer.js'
+export { JsImageResizer } from '../core/image/js-resizer.js'
 export type { JsImageResizerOptions } from '../core/image/js-resizer.js'
 export type { ImageResizeOptions, ImageResizer, ImageResizeResult } from '../core/image/types.js'
 export type { ServiceExecutorPort } from '../plugins/services/service.js'

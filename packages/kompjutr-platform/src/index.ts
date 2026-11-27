@@ -38,10 +38,10 @@ export interface KompjutrPlatformOptions {
 }
 
 /**
- * Decode budget of the JS image resizer, out of a Durable Object isolate's 128 MB: a PNG screenshot up to ~4 MP fits, a JPEG
- * over the dimension limit does not and reaches the model as a note.
+ * Decode budget of the JS image resizer, a guess at what a Durable Object isolate's 128 MB leaves to it: an RGB PNG
+ * up to ~3.8 MP (2560×1440) shrinks; a JPEG over the dimension limit does not, and reaches the model as a note.
  */
-const ISOLATE_MAX_DECODE_BYTES = 64 * 1024 * 1024
+const ISOLATE_MAX_DECODE_BYTES = 48 * 1024 * 1024
 
 export function createKompjutrPlatform(workspace: Workspace, options: KompjutrPlatformOptions = {}): Platform {
 	const tmpDir = options.tmpDir ?? '/tmp'

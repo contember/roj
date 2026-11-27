@@ -83,13 +83,13 @@ export class VipsImageResizer implements ImageResizer {
 				await this.fs.unlink(ownedTempFile).catch(() => {})
 			}
 			if (signal?.aborted) signal.throwIfAborted()
-			const reason = e instanceof Error ? e.message : e
+			const failure = e instanceof Error ? e.message : String(e)
 			if (this.fallback !== undefined) {
-				console.warn('[image-resize] vips failed, resizing without it:', reason)
+				console.warn('[image-resize] vips failed, resizing without it:', failure)
 				return this.fallback.resize(filePath, mimeType, { ...options, maxDimension: effectiveMaxDimension })
 			}
-			console.warn('[image-resize] failed, using original image:', reason)
-			return { path: filePath, mimeType }
+			console.warn('[image-resize] failed, using original image:', failure)
+			return { path: filePath, mimeType, failure }
 		}
 	}
 
