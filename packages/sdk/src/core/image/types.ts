@@ -27,6 +27,8 @@ export interface ImageResizeResult {
 
 export interface ImageProcessorConfig {
 	maxFileSizeBytes: number
+	/** Where an inline image over the dimension limit is written for the resizer; without it, it becomes a note. */
+	tmpDir?: string
 }
 
 export interface ImageProcessor {

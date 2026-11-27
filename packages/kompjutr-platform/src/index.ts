@@ -7,7 +7,7 @@
  */
 
 import type { Platform, Scheduler, ShellConfinement } from '@roj-ai/sdk/platform'
-import { createTimerScheduler } from '@roj-ai/sdk/platform'
+import { createTimerScheduler, JsImageResizer } from '@roj-ai/sdk/platform'
 import type { Git, Workspace } from '@kompjutr/do'
 import { KompjutrEventStore } from './event-store.js'
 import { createKompjutrFileSystem } from './fs.js'
@@ -37,19 +37,27 @@ export interface KompjutrPlatformOptions {
 	shellConfinement?: ShellConfinement
 }
 
+/**
+ * Decode budget of the JS image resizer, out of a Durable Object isolate's 128 MB: a PNG screenshot up to ~4 MP fits, a JPEG
+ * over the dimension limit does not and reaches the model as a note.
+ */
+const ISOLATE_MAX_DECODE_BYTES = 64 * 1024 * 1024
+
 export function createKompjutrPlatform(workspace: Workspace, options: KompjutrPlatformOptions = {}): Platform {
 	const tmpDir = options.tmpDir ?? '/tmp'
 	// A fresh workspace holds only `/`, and the port promises tmpDir is there.
 	workspace.filesystem.mkdir(tmpDir, { recursive: true })
 
 	const git = workspaceGit(workspace)
+	const fs = createKompjutrFileSystem({
+		compat: workspace.fs,
+		filesystem: workspace.filesystem,
+	})
 
 	return {
-		fs: createKompjutrFileSystem({
-			compat: workspace.fs,
-			filesystem: workspace.filesystem,
-		}),
+		fs,
 		process: createUnsupportedProcessRunner(),
+		imageResizer: new JsImageResizer({ fs, tmpDir, maxDecodeBytes: ISOLATE_MAX_DECODE_BYTES }),
 		shell: createKompjutrShellRunner({
 			filesystem: workspace.filesystem,
 			git,

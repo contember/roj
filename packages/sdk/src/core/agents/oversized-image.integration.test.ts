@@ -230,8 +230,9 @@ describe('an image over the dimension limit', () => {
 		await rm(dir, { recursive: true, force: true })
 	})
 
-	it('is downscaled in memory when it is inline, as a direct provider call sends it, and a smaller one is sent as it is', async () => {
-		const resolved = await new DefaultImageProcessor(vipsResizer(), createNodeFileSystem()).resolveContent([
+	it('is downscaled through the resizer when it is inline, as a direct provider call sends it, and a smaller one is sent as it is', async () => {
+		const processor = new DefaultImageProcessor(vipsResizer(), createNodeFileSystem(), { maxFileSizeBytes: 5 * 1024 * 1024, tmpDir: tmpdir() })
+		const resolved = await processor.resolveContent([
 			{ type: 'image_url', imageUrl: { url: pngDataUrl(3500, 1000) } },
 			{ type: 'image_url', imageUrl: { url: pngDataUrl(500, 300) } },
 		])

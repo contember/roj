@@ -1,11 +1,10 @@
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { FileStore } from '~/core/file-store/types.js'
 import { STORED_IMAGE_PATH } from '~/core/llm/document-content.js'
 import type { ChatMessageContentItem, ChatMessageContentItemImage, ChatMessageContentItemText, ToolResultContent } from '~/core/llm/llm-log-types.js'
 import { getImageMimeType } from '~/lib/mime.js'
 import type { FileSystem } from '~/platform/fs.js'
-import { exceedsMaxDimension, MAX_IMAGE_DIMENSION, readImageDimensions } from './dimensions.js'
-import { downscaleImage } from './js-resizer.js'
+import { exceedsMaxDimension, MAX_IMAGE_DIMENSION, readImageDimensions, readImageMimeType } from './dimensions.js'
 import { readCachedResize, resizeCachePath, type ResizeCacheOptions, UNCHANGED, writeCachedResize } from './resize-cache.js'
 import type { ImageProcessor, ImageProcessorConfig, ImageResizer } from './types.js'
 
@@ -14,28 +13,8 @@ type ResolvedImage = ChatMessageContentItemImage | ChatMessageContentItemText
 
 const BASE64_DATA_URL = /^data:([^;,]*)(?:;[^;,]*)*;base64,/i
 
-/**
- * An inline `data:` image over the dimension limit is downscaled in memory: an agent stores every one as a file, so
- * only a direct provider call sends one, and the processor has nowhere to write it for the resizer.
- */
-function withinLimitInline(item: ChatMessageContentItemImage, maxFileSizeBytes: number): ResolvedImage {
-	const match = BASE64_DATA_URL.exec(item.imageUrl.url)
-	if (match === null) return item
-	const bytes = Buffer.from(item.imageUrl.url.slice(match[0].length), 'base64')
-	const dimensions = readImageDimensions(bytes)
-	if (dimensions === undefined || !exceedsMaxDimension(dimensions)) return item
-	try {
-		const resized = downscaleImage(bytes, { maxDimension: MAX_IMAGE_DIMENSION, maxFileSizeBytes })
-		return { type: 'image_url', imageUrl: { url: `data:image/jpeg;base64,${resized.toString('base64')}`, detail: item.imageUrl.detail } }
-	} catch (error) {
-		const reason = error instanceof Error ? error.message : String(error)
-		console.warn(`[ImageProcessor] Could not downscale an inline ${match[1] || 'image'} of ${dimensions.width}x${dimensions.height} px: ${reason}`)
-		return {
-			type: 'text',
-			text: `[Image unavailable: inline ${match[1] || 'image'} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit, and it could not be downscaled: ${reason}]`,
-		}
-	}
-}
+/** Default for ImageProcessorConfig.maxFileSizeBytes. */
+export const DEFAULT_MAX_IMAGE_FILE_SIZE_BYTES = 5 * 1024 * 1024
 
 function formatFileSize(bytes: number): string {
 	return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
@@ -45,7 +24,7 @@ export class DefaultImageProcessor implements ImageProcessor {
 	constructor(
 		private resizer: ImageResizer,
 		private fs: FileSystem,
-		private config: ImageProcessorConfig = { maxFileSizeBytes: 5 * 1024 * 1024 },
+		private config: ImageProcessorConfig = { maxFileSizeBytes: DEFAULT_MAX_IMAGE_FILE_SIZE_BYTES },
 	) {}
 
 	async resolveContent(content: ToolResultContent, fileStore?: FileStore): Promise<ToolResultContent> {
@@ -55,7 +34,7 @@ export class DefaultImageProcessor implements ImageProcessor {
 			content.map(async (item): Promise<ChatMessageContentItem> => {
 				if (item.type !== 'image_url') return item
 				// A remote URL is fetched by the provider itself, so its size is unknown here.
-				if (!item.imageUrl.url.startsWith('file://')) return withinLimitInline(item, this.config.maxFileSizeBytes)
+				if (!item.imageUrl.url.startsWith('file://')) return this.withinLimitInline(item)
 
 				const rawPath = item.imageUrl.url.slice(7)
 
@@ -82,6 +61,35 @@ export class DefaultImageProcessor implements ImageProcessor {
 				return result
 			}),
 		)
+	}
+
+	/**
+	 * An inline `data:` image over the dimension limit goes through the resizer by way of a temp file. Only a direct
+	 * provider call sends one: an agent stores every one as a file.
+	 */
+	private async withinLimitInline(item: ChatMessageContentItemImage): Promise<ResolvedImage> {
+		const match = BASE64_DATA_URL.exec(item.imageUrl.url)
+		if (match === null) return item
+		const bytes = Buffer.from(item.imageUrl.url.slice(match[0].length), 'base64')
+		const dimensions = readImageDimensions(bytes)
+		const mimeType = readImageMimeType(bytes)
+		if (dimensions === undefined || mimeType === undefined || !exceedsMaxDimension(dimensions)) return item
+		const label = `inline ${match[1] || 'image'}`
+		if (this.config.tmpDir === undefined) {
+			return {
+				type: 'text',
+				text: `[Image unavailable: ${label} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit, with no temp directory to resize it in]`,
+			}
+		}
+		const path = join(this.config.tmpDir, `roj-inline-${Date.now()}-${Math.random().toString(36).slice(2)}.${mimeType.slice('image/'.length)}`)
+		try {
+			await this.fs.writeFile(path, bytes)
+			return await this.readAndEncode(path, mimeType, item.imageUrl.detail, undefined, label)
+		} catch {
+			return { type: 'text', text: `[Image unavailable: ${label} - read error]` }
+		} finally {
+			await this.fs.unlink(path).catch(() => {})
+		}
 	}
 
 	/**
@@ -178,6 +186,7 @@ export class DefaultImageProcessor implements ImageProcessor {
 		mimeType: string,
 		detail: 'auto' | 'low' | 'high' | undefined,
 		cacheStore?: FileStore,
+		label = filePath,
 	): Promise<ResolvedImage> {
 		const options = { maxFileSizeBytes: this.config.maxFileSizeBytes, maxDimension: MAX_IMAGE_DIMENSION }
 		const lookup = cacheStore === undefined ? undefined : await this.lookUpCache(filePath, mimeType, options, cacheStore, detail)
@@ -191,12 +200,12 @@ export class DefaultImageProcessor implements ImageProcessor {
 			if (resultSize > this.config.maxFileSizeBytes) {
 				return {
 					type: 'text',
-					text: `[Image unavailable: ${filePath} - file too large (${formatFileSize(resultSize)}, limit ${formatFileSize(this.config.maxFileSizeBytes)})]`,
+					text: `[Image unavailable: ${label} - file too large (${formatFileSize(resultSize)}, limit ${formatFileSize(this.config.maxFileSizeBytes)})]`,
 				}
 			}
 
 			const buffer = await this.fs.readFile(resized.path)
-			const encoded = this.encode(filePath, buffer, resized.mimeType, detail)
+			const encoded = this.encode(label, buffer, resized.mimeType, detail)
 			if (cacheStore !== undefined && lookup !== undefined && encoded.type === 'image_url') {
 				if (resized.path !== filePath) {
 					await writeCachedResize(cacheStore, lookup.path, { bytes: buffer, mimeType: resized.mimeType })
@@ -212,13 +221,13 @@ export class DefaultImageProcessor implements ImageProcessor {
 		}
 	}
 
-	private encode(filePath: string, buffer: Buffer, mimeType: string, detail: 'auto' | 'low' | 'high' | undefined): ResolvedImage {
+	private encode(label: string, buffer: Buffer, mimeType: string, detail: 'auto' | 'low' | 'high' | undefined): ResolvedImage {
 		// A resizer that is missing or failed returns the original image.
 		const dimensions = readImageDimensions(buffer)
 		if (dimensions !== undefined && exceedsMaxDimension(dimensions)) {
 			return {
 				type: 'text',
-				text: `[Image unavailable: ${filePath} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit, and it could not be downscaled]`,
+				text: `[Image unavailable: ${label} - ${dimensions.width}x${dimensions.height} px, over the ${MAX_IMAGE_DIMENSION} px limit, and it could not be downscaled]`,
 			}
 		}
 		return {

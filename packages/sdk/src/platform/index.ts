@@ -40,6 +40,8 @@ export type { LiveScheduler, Scheduler, WakeHandler } from './scheduler.js'
 export type { SessionLogPage, SessionLogStore } from './session-log.js'
 export type { ShellConfinement, ShellGrant, ShellLimits, ShellRunner, ShellRunOptions, ShellRunResult } from './shell.js'
 
+export { DEFAULT_MAX_DECODE_BYTES, JsImageResizer } from '../core/image/js-resizer.js'
+export type { JsImageResizerOptions } from '../core/image/js-resizer.js'
 export type { ImageResizeOptions, ImageResizer, ImageResizeResult } from '../core/image/types.js'
 export type { ServiceExecutorPort } from '../plugins/services/service.js'
 export type { PortPool } from '../plugins/services/port-pool.js'
@@ -81,7 +83,8 @@ export interface Platform {
 	llmCallLog?: LLMCallStore
 	/**
 	 * Shrinks images before they reach a model. When absent, the `vipsheader` / `vipsthumbnail`
-	 * binaries resize, and a slower JS resizer for JPEG and PNG takes over where they cannot run.
+	 * binaries resize, and a JsImageResizer with the default decode budget takes over where they
+	 * cannot run. A host short of memory provides a JsImageResizer with a smaller budget.
 	 */
 	imageResizer?: ImageResizer
 	/** Absolute path to the OS temp directory (equivalent to `os.tmpdir()` on Node/Bun). */

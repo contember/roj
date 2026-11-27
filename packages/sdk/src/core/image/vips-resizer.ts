@@ -4,6 +4,17 @@ import type { ProcessRunner } from '~/platform/process.js'
 import { MAX_IMAGE_DIMENSION } from './dimensions.js'
 import type { ImageResizeOptions, ImageResizer, ImageResizeResult } from './types.js'
 
+/** The steps taken to fit a size limit: lower JPEG quality first, then half the max dimension. */
+export const COMPRESSION_STEPS: ReadonlyArray<{ scale: number; quality: number }> = [
+	{ scale: 1, quality: 85 },
+	{ scale: 1, quality: 70 },
+	{ scale: 1, quality: 50 },
+	{ scale: 1, quality: 30 },
+	{ scale: 0.5, quality: 70 },
+	{ scale: 0.5, quality: 50 },
+	{ scale: 0.5, quality: 30 },
+]
+
 /** A `--size` that only shrinks: without the `>`, vipsthumbnail enlarges a smaller image to the box. */
 const shrinkOnly = (dimension: number): string => `${dimension}x${dimension}>`
 
@@ -140,16 +151,7 @@ export class VipsImageResizer implements ImageResizer {
 		maxDimension: number,
 		signal?: AbortSignal,
 	): Promise<ImageResizeResult> {
-		const halfDim = Math.floor(maxDimension / 2)
-		const attempts = [
-			{ dimension: maxDimension, quality: 85 },
-			{ dimension: maxDimension, quality: 70 },
-			{ dimension: maxDimension, quality: 50 },
-			{ dimension: maxDimension, quality: 30 },
-			{ dimension: halfDim, quality: 70 },
-			{ dimension: halfDim, quality: 50 },
-			{ dimension: halfDim, quality: 30 },
-		]
+		const attempts = COMPRESSION_STEPS.map(({ scale, quality }) => ({ dimension: Math.floor(maxDimension * scale), quality }))
 
 		let lastResult: ImageResizeResult | undefined
 

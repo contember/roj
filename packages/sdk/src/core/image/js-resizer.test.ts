@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it, spyOn } from 'bun:test'
+import { afterAll, afterEach, describe, expect, it, spyOn } from 'bun:test'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { crc32, deflateSync } from 'node:zlib'
 import { encode as encodePng } from 'fast-png'
 import { decode as decodeJpeg, encode as encodeJpeg } from 'jpeg-js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
@@ -10,7 +11,47 @@ import { downscaleImage, JsImageResizer, readJpegOrientation } from './js-resize
 
 type Color = readonly [number, number, number]
 const RED: Color = [220, 30, 30]
+const GREEN: Color = [30, 220, 30]
 const BLUE: Color = [30, 30, 220]
+const WHITE: Color = [255, 255, 255]
+const BUDGET = { maxDecodeBytes: 1024 * 1024 * 1024 }
+
+/** A PNG built chunk by chunk, for the pixel formats the encoder does not write. */
+function rawPng(width: number, height: number, depth: number, colorType: number, rows: Uint8Array[], extra: Buffer[] = []): Buffer {
+	const chunk = (type: string, data: Buffer) => {
+		const typed = Buffer.concat([Buffer.from(type, 'latin1'), data])
+		const length = Buffer.alloc(4)
+		length.writeUInt32BE(data.length)
+		const checksum = Buffer.alloc(4)
+		checksum.writeUInt32BE(crc32(typed))
+		return Buffer.concat([length, typed, checksum])
+	}
+	const header = Buffer.alloc(13)
+	header.writeUInt32BE(width, 0)
+	header.writeUInt32BE(height, 4)
+	header[8] = depth
+	header[9] = colorType
+	const scanlines = Buffer.concat(rows.map(row => Buffer.concat([Buffer.from([0]), row])))
+	return Buffer.concat([
+		Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+		chunk('IHDR', header),
+		...extra.map(data => chunk(data.subarray(0, 4).toString('latin1'), data.subarray(4))),
+		chunk('IDAT', deflateSync(scanlines)),
+		chunk('IEND', Buffer.alloc(0)),
+	])
+}
+
+/** RGBA pixels in four quadrants: red top left, green top right, blue bottom left, white bottom right. */
+function quadrants(width: number, height: number): Uint8Array {
+	const data = new Uint8Array(width * height * 4)
+	for (let y = 0; y < height; y++) {
+		for (let x = 0; x < width; x++) {
+			const color = y < height / 2 ? (x < width / 2 ? RED : GREEN) : (x < width / 2 ? BLUE : WHITE)
+			data.set([...color, 255], (y * width + x) * 4)
+		}
+	}
+	return data
+}
 
 /** RGBA pixels, left half `left` and right half `right`. */
 function halves(width: number, height: number, left: Color, right: Color): Uint8Array {
@@ -58,7 +99,7 @@ function expectColor(actual: number[], expected: Color) {
 
 describe('downscaleImage', () => {
 	it('shrinks a JPEG to the max dimension on its long edge and keeps its colours', () => {
-		const result = decoded(downscaleImage(jpeg(3000, 1200), { maxDimension: 2000 }))
+		const result = decoded(downscaleImage(jpeg(3000, 1200), { maxDimension: 2000, ...BUDGET }))
 
 		expect([result.width, result.height]).toEqual([2000, 800])
 		expectColor(pixel(result, 100, 400), RED)
@@ -71,7 +112,7 @@ describe('downscaleImage', () => {
 		const data = halves(width, height, RED, BLUE)
 		// The right half is fully transparent.
 		for (let i = 0; i < width * height; i++) if (i % width >= width / 2) data[i * 4 + 3] = 0
-		const result = decoded(downscaleImage(encodePng({ width, height, data, channels: 4 }), { maxDimension: 1200 }))
+		const result = decoded(downscaleImage(encodePng({ width, height, data, channels: 4 }), { maxDimension: 1200, ...BUDGET }))
 
 		expect([result.width, result.height]).toEqual([1200, 300])
 		expectColor(pixel(result, 100, 150), RED)
@@ -80,25 +121,59 @@ describe('downscaleImage', () => {
 
 	it('reads 16-bit and grayscale PNGs', () => {
 		const rgb16 = new Uint16Array(30 * 10 * 3).fill(65535)
-		const white = decoded(downscaleImage(encodePng({ width: 30, height: 10, data: rgb16, channels: 3, depth: 16 }), { maxDimension: 15 }))
+		const white = decoded(downscaleImage(encodePng({ width: 30, height: 10, data: rgb16, channels: 3, depth: 16 }), { maxDimension: 15, ...BUDGET }))
 		expect([white.width, white.height]).toEqual([15, 5])
 		expectColor(pixel(white, 7, 2), [255, 255, 255])
 
 		const gray = new Uint8Array(30 * 10).fill(128)
-		const result = decoded(downscaleImage(encodePng({ width: 30, height: 10, data: gray, channels: 1 }), { maxDimension: 15 }))
+		const result = decoded(downscaleImage(encodePng({ width: 30, height: 10, data: gray, channels: 1 }), { maxDimension: 15, ...BUDGET }))
 		expectColor(pixel(result, 7, 2), [128, 128, 128])
 	})
 
-	it('turns the image the way its EXIF orientation displays it', () => {
-		// Stored 400×200, red on the left; displayed rotated 90° clockwise, so 200×400 with red on top.
-		const rotated = withOrientation(jpeg(400, 200), 6)
-		expect(readJpegOrientation(rotated)).toBe(6)
+	// Stored 400×200; what the displayed image shows at its top-left and top-right corners.
+	const orientations: Array<[number, Color, Color]> = [
+		[1, RED, GREEN],
+		[2, GREEN, RED],
+		[3, WHITE, BLUE],
+		[4, BLUE, WHITE],
+		[5, RED, BLUE],
+		[6, BLUE, RED],
+		[7, WHITE, GREEN],
+		[8, GREEN, WHITE],
+	]
+	for (const [orientation, topLeft, topRight] of orientations) {
+		it(`turns the image the way EXIF orientation ${orientation} displays it`, () => {
+			const image = withOrientation(encodeJpeg({ width: 400, height: 200, data: quadrants(400, 200) }, 95).data, orientation)
+			expect(readJpegOrientation(image)).toBe(orientation)
 
-		const result = decoded(downscaleImage(rotated, { maxDimension: 200 }))
+			const result = decoded(downscaleImage(image, { maxDimension: 200, ...BUDGET }))
 
-		expect([result.width, result.height]).toEqual([100, 200])
-		expectColor(pixel(result, 50, 20), RED)
-		expectColor(pixel(result, 50, 180), BLUE)
+			expect([result.width, result.height]).toEqual(orientation >= 5 ? [100, 200] : [200, 100])
+			expectColor(pixel(result, 5, 5), topLeft)
+			expectColor(pixel(result, result.width - 5, 5), topRight)
+		})
+	}
+
+	it('reads palette PNGs, with transparency, and gray packed below a byte', () => {
+		// Two palette entries: opaque red, and blue made fully transparent by tRNS; left half index 0, right half 1.
+		const plte = Buffer.concat([Buffer.from('PLTE', 'latin1'), Buffer.from([220, 30, 30, 30, 30, 220])])
+		const trns = Buffer.concat([Buffer.from('tRNS', 'latin1'), Buffer.from([255, 0])])
+		const indexed = rawPng(16, 4, 8, 3, Array.from({ length: 4 }, () => Uint8Array.from({ length: 16 }, (_, x) => (x < 8 ? 0 : 1))), [plte, trns])
+		const fromPalette = decoded(downscaleImage(indexed, { maxDimension: 8, ...BUDGET }))
+		expectColor(pixel(fromPalette, 1, 1), RED)
+		expectColor(pixel(fromPalette, 6, 1), WHITE)
+
+		// 1-bit gray: the left byte of each row black, the right byte white.
+		const bits = rawPng(16, 4, 1, 0, Array.from({ length: 4 }, () => Uint8Array.from([0x00, 0xff])))
+		const fromBits = decoded(downscaleImage(bits, { maxDimension: 8, ...BUDGET }))
+		expectColor(pixel(fromBits, 1, 1), [0, 0, 0])
+		expectColor(pixel(fromBits, 6, 1), WHITE)
+	})
+
+	it('refuses, before decoding, an image over the decode budget', () => {
+		expect(() => downscaleImage(jpeg(3000, 1000), { maxDimension: 2000, maxDecodeBytes: 64 * 1024 * 1024 })).toThrow(
+			'a 3000x1000 px image/jpeg takes ~172 MB to decode, over the 64 MB this host allows without libvips',
+		)
 	})
 
 	it('lowers quality, then the dimension, until the image fits the size limit', () => {
@@ -107,10 +182,10 @@ describe('downscaleImage', () => {
 		const noise = new Uint8Array(width * height * 4)
 		for (let i = 0; i < noise.length; i++) noise[i] = (i * 2654435761) >>> 24
 		const source = encodeJpeg({ width, height, data: noise }, 100).data
-		const unlimited = downscaleImage(source, { maxDimension: 1000 })
+		const unlimited = downscaleImage(source, { maxDimension: 1000, ...BUDGET })
 		const limit = Math.floor(unlimited.length / 4)
 
-		const result = downscaleImage(source, { maxDimension: 1000, maxFileSizeBytes: limit })
+		const result = downscaleImage(source, { maxDimension: 1000, maxFileSizeBytes: limit, ...BUDGET })
 
 		expect(result.length).toBeLessThanOrEqual(limit)
 		expect(readImageDimensions(result)).toBeDefined()
@@ -118,13 +193,14 @@ describe('downscaleImage', () => {
 
 	it('throws for a format it cannot decode', async () => {
 		const gif = await readFile(join(import.meta.dir, 'fixtures', '37x21.gif'))
-		expect(() => downscaleImage(gif, { maxDimension: 10 })).toThrow('image/gif cannot be decoded without libvips')
+		expect(() => downscaleImage(gif, { maxDimension: 10, ...BUDGET })).toThrow('image/gif cannot be decoded without libvips')
 	})
 })
 
 describe('JsImageResizer', () => {
 	const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
 	const dirs: string[] = []
+	afterAll(() => warnSpy.mockRestore())
 	afterEach(async () => {
 		warnSpy.mockClear()
 		for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true })

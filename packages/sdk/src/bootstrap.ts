@@ -7,7 +7,7 @@
 import type { EventStore } from '~/core/events/event-store.js'
 import { FileEventStore, MemoryEventStore } from '~/core/events/index.js'
 import type { FileStore } from '~/core/file-store/types.js'
-import { DefaultImageProcessor } from '~/core/image/image-processor.js'
+import { DEFAULT_MAX_IMAGE_FILE_SIZE_BYTES, DefaultImageProcessor } from '~/core/image/image-processor.js'
 import type { ImageResizer } from '~/core/image/types.js'
 import { JsImageResizer } from '~/core/image/js-resizer.js'
 import { VipsImageResizer } from '~/core/image/vips-resizer.js'
@@ -283,7 +283,7 @@ function createLLMProvider(config: Config, logger: Logger, platform: Platform, i
 		return { llmProvider: mock, llmProviders: new Map([['mock', mock]]) }
 	}
 
-	const imageProcessor = new DefaultImageProcessor(imageResizer, platform.fs)
+	const imageProcessor = new DefaultImageProcessor(imageResizer, platform.fs, { maxFileSizeBytes: DEFAULT_MAX_IMAGE_FILE_SIZE_BYTES, tmpDir: platform.tmpDir })
 
 	const routableProviders: RoutableLLMProvider[] = []
 	let fallbackProvider: LLMProvider | undefined

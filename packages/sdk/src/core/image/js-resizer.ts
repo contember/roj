@@ -4,6 +4,7 @@ import { decode as decodeJpeg, encode as encodeJpeg } from 'jpeg-js'
 import type { FileSystem } from '~/platform/fs.js'
 import { MAX_IMAGE_DIMENSION, readImageDimensions, readImageMimeType } from './dimensions.js'
 import type { ImageResizeOptions, ImageResizer, ImageResizeResult } from './types.js'
+import { COMPRESSION_STEPS } from './vips-resizer.js'
 
 /**
  * Pixels as decoded: 1 channel is gray, 2 gray and alpha, 3 RGB, 4 RGBA; every sample runs from 0 to `max`.
@@ -16,53 +17,57 @@ interface Raster {
 	data: ArrayLike<number>
 }
 
-/** RGBA, 8 bits per sample: what the JPEG encoder takes. */
+/** RGBA, 8 bits per sample, alpha always opaque: what the JPEG encoder takes. */
 interface Rgba {
 	width: number
 	height: number
 	data: Uint8Array
 }
 
-/** The steps VipsImageResizer takes to fit the size limit: lower quality first, then half the dimension. */
-const ATTEMPTS = [
-	{ scale: 1, quality: 85 },
-	{ scale: 1, quality: 70 },
-	{ scale: 1, quality: 50 },
-	{ scale: 1, quality: 30 },
-	{ scale: 0.5, quality: 70 },
-	{ scale: 0.5, quality: 50 },
-	{ scale: 0.5, quality: 30 },
-]
+/**
+ * Peak bytes per pixel to decode and shrink, measured as process RSS under Node: jpeg-js keeps every DCT block as
+ * its own typed array (28 B/px at 4:2:0 chroma, 60 at 4:4:4), fast-png about 12.
+ */
+const DECODE_BYTES_PER_PIXEL = { 'image/jpeg': 60, 'image/png': 16 }
+
+/** Decode budget where the process has memory to spare: a JPEG up to ~4 MP, a PNG up to ~16 MP. */
+export const DEFAULT_MAX_DECODE_BYTES = 256 * 1024 * 1024
 
 export interface DownscaleOptions {
 	maxDimension: number
 	maxFileSizeBytes?: number
+	/** An image whose decoding would take more is refused before it is decoded. */
+	maxDecodeBytes: number
 }
 
 /**
  * Re-encodes a JPEG or PNG as a JPEG whose long edge fits `maxDimension`, at the highest quality that fits
- * `maxFileSizeBytes`, or the most compressed attempt when none does. Throws for any other format.
- * Pure JS rather than wasm: the isolate loader takes text modules only.
+ * `maxFileSizeBytes`, or the most compressed attempt when none does. Throws, with the reason, for any other format
+ * and for an image over the decode budget. Pure JS rather than wasm: the isolate loader takes text modules only.
  */
 export function downscaleImage(bytes: Uint8Array, options: DownscaleOptions): Buffer {
 	const mimeType = readImageMimeType(bytes)
-	const raster = mimeType === 'image/jpeg'
-		? decodeJpegRaster(bytes)
-		: mimeType === 'image/png'
-		? decodePngRaster(bytes)
-		: undefined
-	if (raster === undefined) throw new Error(`${mimeType ?? 'this format'} cannot be decoded without libvips`)
-	const orientation = mimeType === 'image/jpeg' ? readJpegOrientation(bytes) : 1
+	if (mimeType !== 'image/jpeg' && mimeType !== 'image/png') throw new Error(`${mimeType ?? 'this format'} cannot be decoded without libvips`)
+	const dimensions = readImageDimensions(bytes)
+	if (dimensions === undefined) throw new Error(`the ${mimeType} header cannot be read`)
+	const decodeBytes = dimensions.width * dimensions.height * DECODE_BYTES_PER_PIXEL[mimeType]
+	if (decodeBytes > options.maxDecodeBytes) {
+		throw new Error(
+			`a ${dimensions.width}x${dimensions.height} px ${mimeType} takes ~${megabytes(decodeBytes)} MB to decode, over the ${
+				megabytes(options.maxDecodeBytes)
+			} MB this host allows without libvips`,
+		)
+	}
 
-	const shrunk = new Map<number, Rgba>()
+	const raster = mimeType === 'image/jpeg' ? decodeJpegRaster(bytes) : decodePngRaster(bytes)
+	const orientation = mimeType === 'image/jpeg' ? readJpegOrientation(bytes) : 1
+	// The decoded image is let go here; the half-size steps shrink the full-size result.
+	const full = orient(shrink(raster, options.maxDimension), orientation)
+	let half: Rgba | undefined
+
 	let encoded: Buffer | undefined
-	for (const { scale, quality } of ATTEMPTS) {
-		const dimension = Math.max(1, Math.floor(options.maxDimension * scale))
-		let pixels = shrunk.get(dimension)
-		if (pixels === undefined) {
-			pixels = orient(shrink(raster, dimension), orientation)
-			shrunk.set(dimension, pixels)
-		}
+	for (const { scale, quality } of COMPRESSION_STEPS) {
+		const pixels = scale === 1 ? full : (half ??= shrink({ ...full, channels: 4, max: 255 }, Math.max(1, Math.floor(options.maxDimension * scale))))
 		encoded = encodeJpeg(pixels, quality).data
 		if (options.maxFileSizeBytes === undefined || encoded.length <= options.maxFileSizeBytes) return encoded
 	}
@@ -70,9 +75,11 @@ export function downscaleImage(bytes: Uint8Array, options: DownscaleOptions): Bu
 	return encoded
 }
 
+const megabytes = (bytes: number): number => Math.round(bytes / (1024 * 1024))
+
 function decodeJpegRaster(bytes: Uint8Array): Raster {
-	const decoded = decodeJpeg(bytes, { useTArray: true, formatAsRGBA: true })
-	return { width: decoded.width, height: decoded.height, channels: 4, max: 255, data: decoded.data }
+	const decoded = decodeJpeg(bytes, { useTArray: true, formatAsRGBA: false })
+	return { width: decoded.width, height: decoded.height, channels: 3, max: 255, data: decoded.data }
 }
 
 function decodePngRaster(bytes: Uint8Array): Raster {
@@ -95,73 +102,62 @@ function decodePngRaster(bytes: Uint8Array): Raster {
 	return { width: png.width, height: png.height, channels: png.channels, max: 2 ** png.depth - 1, data: png.data }
 }
 
-/** Box filter to fit `dimension` on the long edge, only ever shrinking; alpha is flattened onto white. */
+/** Where each of `target` cells starts along an edge of `source` pixels, and where the last ends. */
+function cellBounds(source: number, target: number): Int32Array {
+	const bounds = new Int32Array(target + 1)
+	for (let i = 0; i <= target; i++) bounds[i] = Math.floor(i * source / target)
+	return bounds
+}
+
+/**
+ * Box filter to fit `dimension` on the long edge, only ever shrinking; alpha is flattened onto white.
+ * One target row is summed at a time, so the only buffer besides the result is a row of sums.
+ */
 function shrink(raster: Raster, dimension: number): Rgba {
-	const { width, height } = raster
+	const { width, height, channels, max, data } = raster
 	const scale = Math.min(1, dimension / Math.max(width, height))
 	const targetWidth = Math.max(1, Math.round(width * scale))
 	const targetHeight = Math.max(1, Math.round(height * scale))
-	return shrinkColumns(shrinkRows(raster, targetWidth), height, targetWidth, targetHeight)
-}
-
-/** Averages each row down to `targetWidth` RGB pixels. */
-function shrinkRows(raster: Raster, targetWidth: number): Float32Array {
-	const { width, height, channels, max, data } = raster
+	const columns = cellBounds(width, targetWidth)
+	const rows = cellBounds(height, targetHeight)
 	const gray = channels <= 2
 	const alphaOffset = channels === 2 || channels === 4 ? channels - 1 : -1
 	const toByte = 255 / max
-	const out = new Float32Array(targetWidth * height * 3)
-	for (let y = 0; y < height; y++) {
-		for (let tx = 0; tx < targetWidth; tx++) {
-			const x0 = Math.floor(tx * width / targetWidth)
-			const x1 = Math.max(x0 + 1, Math.floor((tx + 1) * width / targetWidth))
-			let r = 0
-			let g = 0
-			let b = 0
-			for (let x = x0; x < x1; x++) {
-				const i = (y * width + x) * channels
-				const alpha = alphaOffset < 0 ? 1 : data[i + alphaOffset] / max
-				const background = 255 * (1 - alpha)
-				const red = data[i] * toByte * alpha + background
-				r += red
-				g += gray ? red : data[i + 1] * toByte * alpha + background
-				b += gray ? red : data[i + 2] * toByte * alpha + background
-			}
-			const count = x1 - x0
-			const o = (y * targetWidth + tx) * 3
-			out[o] = r / count
-			out[o + 1] = g / count
-			out[o + 2] = b / count
-		}
-	}
-	return out
-}
 
-/** Averages each column of RGB rows down to `targetHeight`, as RGBA bytes. */
-function shrinkColumns(rows: Float32Array, height: number, width: number, targetHeight: number): Rgba {
-	const data = new Uint8Array(width * targetHeight * 4)
+	const sums = new Float64Array(targetWidth * 3)
+	const out = new Uint8Array(targetWidth * targetHeight * 4)
 	for (let ty = 0; ty < targetHeight; ty++) {
-		const y0 = Math.floor(ty * height / targetHeight)
-		const y1 = Math.max(y0 + 1, Math.floor((ty + 1) * height / targetHeight))
-		const count = y1 - y0
-		for (let x = 0; x < width; x++) {
-			let r = 0
-			let g = 0
-			let b = 0
-			for (let y = y0; y < y1; y++) {
-				const i = (y * width + x) * 3
-				r += rows[i]
-				g += rows[i + 1]
-				b += rows[i + 2]
+		sums.fill(0)
+		for (let y = rows[ty]; y < rows[ty + 1]; y++) {
+			for (let tx = 0; tx < targetWidth; tx++) {
+				let r = 0
+				let g = 0
+				let b = 0
+				for (let x = columns[tx]; x < columns[tx + 1]; x++) {
+					const i = (y * width + x) * channels
+					const alpha = alphaOffset < 0 ? 1 : data[i + alphaOffset] / max
+					const background = 255 * (1 - alpha)
+					const red = data[i] * toByte * alpha + background
+					r += red
+					g += gray ? red : data[i + 1] * toByte * alpha + background
+					b += gray ? red : data[i + 2] * toByte * alpha + background
+				}
+				sums[tx * 3] += r
+				sums[tx * 3 + 1] += g
+				sums[tx * 3 + 2] += b
 			}
-			const o = (ty * width + x) * 4
-			data[o] = Math.round(r / count)
-			data[o + 1] = Math.round(g / count)
-			data[o + 2] = Math.round(b / count)
-			data[o + 3] = 255
+		}
+		const cellHeight = rows[ty + 1] - rows[ty]
+		for (let tx = 0; tx < targetWidth; tx++) {
+			const count = (columns[tx + 1] - columns[tx]) * cellHeight
+			const o = (ty * targetWidth + tx) * 4
+			out[o] = Math.round(sums[tx * 3] / count)
+			out[o + 1] = Math.round(sums[tx * 3 + 1] / count)
+			out[o + 2] = Math.round(sums[tx * 3 + 2] / count)
+			out[o + 3] = 255
 		}
 	}
-	return { width, height: targetHeight, data }
+	return { width: targetWidth, height: targetHeight, data: out }
 }
 
 /** The EXIF orientation of a JPEG, 1 to 8; 1 (as stored) when it has none or it cannot be read. */
@@ -242,21 +238,25 @@ export interface JsImageResizerOptions {
 	fs: FileSystem
 	tmpDir: string
 	maxDimension?: number
+	/** Images whose decoding would take more memory are left as they are. Defaults to DEFAULT_MAX_DECODE_BYTES. */
+	maxDecodeBytes?: number
 }
 
 /**
- * Shrinks JPEG and PNG images in JS, for hosts without the libvips binaries. Slower than vips and limited to those
- * two formats; any other image comes back as it was, per the ImageResizer contract.
+ * Shrinks JPEG and PNG images in JS, for hosts without the libvips binaries. Slower than vips, limited to those two
+ * formats and to the decode budget; any other image comes back as it was, per the ImageResizer contract.
  */
 export class JsImageResizer implements ImageResizer {
 	private readonly fs: FileSystem
 	private readonly tmpDir: string
 	private readonly maxDimension: number
+	private readonly maxDecodeBytes: number
 
 	constructor(options: JsImageResizerOptions) {
 		this.fs = options.fs
 		this.tmpDir = options.tmpDir
 		this.maxDimension = options.maxDimension ?? MAX_IMAGE_DIMENSION
+		this.maxDecodeBytes = options.maxDecodeBytes ?? DEFAULT_MAX_DECODE_BYTES
 	}
 
 	async resize(filePath: string, mimeType: string, options?: ImageResizeOptions): Promise<ImageResizeResult> {
@@ -271,7 +271,7 @@ export class JsImageResizer implements ImageResizer {
 			const fitsDimension = dimensions !== undefined && Math.max(dimensions.width, dimensions.height) <= maxDimension
 			if (fitsDimension && (maxFileSizeBytes === undefined || source.length <= maxFileSizeBytes)) return { path: filePath, mimeType }
 
-			const bytes = downscaleImage(source, { maxDimension, maxFileSizeBytes })
+			const bytes = downscaleImage(source, { maxDimension, maxFileSizeBytes, maxDecodeBytes: this.maxDecodeBytes })
 			signal?.throwIfAborted()
 			outputPath = join(this.tmpDir, `roj-resize-${Date.now()}-${Math.random().toString(36).slice(2)}.jpg`)
 			await this.fs.writeFile(outputPath, bytes)

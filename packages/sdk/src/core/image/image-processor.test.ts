@@ -10,6 +10,7 @@ import { Err, Ok, type Result } from '~/lib/utils/result.js'
 import { createNodeFileSystem } from '~/testing/node-platform.js'
 import { readImageDimensions } from './dimensions.js'
 import { DefaultImageProcessor } from './image-processor.js'
+import { JsImageResizer } from './js-resizer.js'
 import { NoopImageResizer } from './noop-resizer.js'
 import { IMAGE_CACHE_DIR, readCachedResize, resizeCachePath, writeCachedResize } from './resize-cache.js'
 import type { ImageResizer } from './types.js'
@@ -45,9 +46,11 @@ describe('DefaultImageProcessor', () => {
 		expect(result).toEqual([{ type: 'document', document: { mediaType: 'application/pdf', data: 'JVBERi0xLjQK', filename: 'scan.pdf' } }])
 	})
 
-	it('downscales an inline image over the dimension limit without a resizer', async () => {
+	it('downscales an inline image over the dimension limit through the resizer, and leaves no temp file', async () => {
+		const dir = await mkdtemp(join(tmpdir(), 'roj-inline-'))
 		const png = encodePng({ width: 3000, height: 600, data: new Uint8Array(3000 * 600 * 3).fill(90), channels: 3 })
-		const processor = createProcessor()
+		const fs = createNodeFileSystem()
+		const processor = new DefaultImageProcessor(new JsImageResizer({ fs, tmpDir: dir }), fs, { maxFileSizeBytes: 5 * 1024 * 1024, tmpDir: dir })
 
 		const result = await processor.resolveContent([{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${Buffer.from(png).toString('base64')}`, detail: 'high' } }])
 		if (typeof result === 'string') throw new Error('resolveContent collapsed the array form')
@@ -57,22 +60,28 @@ describe('DefaultImageProcessor', () => {
 		expect(item.imageUrl.detail).toBe('high')
 		expect(item.imageUrl.url).toStartWith('data:image/jpeg;base64,')
 		expect(readImageDimensions(Buffer.from(item.imageUrl.url.slice('data:image/jpeg;base64,'.length), 'base64'))).toEqual({ width: 2000, height: 400 })
+		expect(await readdir(dir)).toEqual([])
+		await rm(dir, { recursive: true, force: true })
 	})
 
-	it('says why an inline image over the limit in a format it cannot decode is left out', async () => {
-		const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
-		// A GIF header that claims 2500×100 px.
-		const gif = Buffer.from([...Buffer.from('GIF89a', 'latin1'), 0xc4, 0x09, 0x64, 0x00])
-		const processor = createProcessor()
+	it('names an inline image the resizer could not shrink, without its temp path', async () => {
+		const dir = await mkdtemp(join(tmpdir(), 'roj-inline-'))
+		const png = encodePng({ width: 2500, height: 10, data: new Uint8Array(2500 * 10 * 3), channels: 3 })
+		const processor = new DefaultImageProcessor(new NoopImageResizer(), createNodeFileSystem(), { maxFileSizeBytes: 5 * 1024 * 1024, tmpDir: dir })
 
-		const result = await processor.resolveContent([{ type: 'image_url', imageUrl: { url: `data:image/gif;base64,${gif.toString('base64')}` } }])
+		const result = await processor.resolveContent([{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${Buffer.from(png).toString('base64')}` } }])
 
-		expect(result).toEqual([{
-			type: 'text',
-			text: '[Image unavailable: inline image/gif - 2500x100 px, over the 2000 px limit, and it could not be downscaled: image/gif cannot be decoded without libvips]',
-		}])
-		expect(warnSpy).toHaveBeenCalledTimes(1)
-		warnSpy.mockRestore()
+		expect(result).toEqual([{ type: 'text', text: '[Image unavailable: inline image/png - 2500x10 px, over the 2000 px limit, and it could not be downscaled]' }])
+		expect(await readdir(dir)).toEqual([])
+		await rm(dir, { recursive: true, force: true })
+	})
+
+	it('leaves out an inline image over the limit when it has no temp directory to resize it in', async () => {
+		const png = encodePng({ width: 2500, height: 10, data: new Uint8Array(2500 * 10 * 3), channels: 3 })
+
+		const result = await createProcessor().resolveContent([{ type: 'image_url', imageUrl: { url: `data:image/png;base64,${Buffer.from(png).toString('base64')}` } }])
+
+		expect(result).toEqual([{ type: 'text', text: '[Image unavailable: inline image/png - 2500x10 px, over the 2000 px limit, with no temp directory to resize it in]' }])
 	})
 
 	it('passes through non-file:// image URLs unchanged', async () => {
